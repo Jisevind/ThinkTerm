@@ -8,7 +8,8 @@ Wezterm checks regularly if there is a new stable version available
 on github, and shows a simple UI to let you know about the update
 (See [show_update_window](show_update_window.md) to control this UI).
 
-By default it is checked once every 24 hours.
+By default it is checked a few seconds after each start, and then
+every 12 hours while it runs.
 
 NOTE that it doesn't automatically download the release.
 No data are collected for the wezterm project as part of this.
@@ -18,5 +19,5 @@ Set `check_for_updates` to `false` to disable this completely or set
 
 ```lua
 config.check_for_updates = true
-config.check_for_updates_interval_seconds = 86400
+config.check_for_updates_interval_seconds = 43200
 ```

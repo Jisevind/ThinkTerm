@@ -2195,7 +2195,7 @@ fn default_tab_max_width() -> usize {
 }
 
 fn default_update_interval() -> u64 {
-    86400
+    12 * 60 * 60
 }
 
 fn default_prefer_egl() -> bool {

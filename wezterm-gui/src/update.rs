@@ -173,27 +173,13 @@ fn record_latest_release(latest: &Release) -> anyhow::Result<()> {
 
 /// Returns true if the provided socket path is dead.
 fn update_checker() {
-    // Compute how long we should sleep for;
-    // if we've never checked, give it a few seconds after the first
-    // launch, otherwise compute the interval based on the time of
-    // the last check.
-    let update_interval = Duration::from_secs(configuration().check_for_updates_interval_seconds);
+    // Every launch checks, a few seconds in so the check does not compete
+    // with starting up; after that, once every interval while it runs.
     let initial_interval = Duration::from_secs(10);
 
     let force_ui = always_show_update_ui();
 
-    let update_file_name = config::DATA_DIR.join("check_update");
-    let delay = update_file_name
-        .metadata()
-        .and_then(|metadata| metadata.modified())
-        .map_err(|_| ())
-        .and_then(|systime| {
-            let elapsed = systime.elapsed().unwrap_or(Duration::new(0, 0));
-            update_interval.checked_sub(elapsed).ok_or(())
-        })
-        .unwrap_or(initial_interval);
-
-    std::thread::sleep(if force_ui { initial_interval } else { delay });
+    std::thread::sleep(initial_interval);
 
     let my_sock = config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
 
