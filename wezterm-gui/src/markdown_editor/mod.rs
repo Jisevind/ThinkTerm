@@ -34,5 +34,5 @@ pub(crate) use store::{
 pub(crate) use surface::wrap_visual_document_by_width;
 pub(crate) use surface::{
     build_visual_document, fit_table_columns, wrap_visual_document_by_width_cached, VisualDocument,
-    VisualLineKind, VisualWrapCache,
+    VisualLine, VisualLineKind, VisualWrapCache,
 };

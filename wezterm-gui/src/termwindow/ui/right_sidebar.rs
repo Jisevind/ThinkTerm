@@ -4,7 +4,7 @@ use crate::markdown_editor::{
     vault_markdown_paths, wrap_visual_document_by_width_cached, AutosaveWakeAction, BlockKind,
     EditorMode, InlineStyle, NoteCodeBlockLayout, NoteLineGeometry, NoteLineLayout, NoteRunLayout,
     NoteSpellingIssue, ProjectedCodeBlock, ProjectedObject, SaveState, SourceSelection,
-    TableAlignment, VisualDocument, VisualLineKind,
+    TableAlignment, VisualDocument, VisualLine, VisualLineKind,
 };
 use crate::quad::{
     QuadClipRect, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
@@ -71,11 +71,11 @@ use termwiz::image::{ImageData, ImageDataType};
 use termwiz::input::{KeyCode as TermKeyCode, Modifiers as TermModifiers};
 use thinkterm_syntax::{HighlightKind, HighlightResult, HighlightSpan, LanguageId};
 use unicode_segmentation::UnicodeSegmentation;
-use wezterm_font::LoadedFont;
+use wezterm_font::{LoadedFont, LoadedFontId};
 use window::color::LinearRgba;
 use window::{
     Clipboard, ContextMenuIcon, ContextMenuItem, DeadKeyStatus, FolderPickerOptions,
-    IntegratedTitleButtonStyle, Point, Rect, WindowOps,
+    IntegratedTitleButtonStyle, Point, Rect, RectF, WindowOps,
 };
 
 const RIGHT_SIDEBAR_SECTION_GAP: usize = 12;
@@ -180,10 +180,35 @@ const NOTE_BODY_PADDING: usize = 24;
 /// The widest a rendered Markdown file preview's text runs.
 const MARKDOWN_PREVIEW_READING_MAX_WIDTH: usize = 1500;
 const NOTE_LINE_GAP: usize = 5;
+/// A blank line's height, as a share of a line of text: after a heading, beside
+/// a rule, and anywhere else.
+const NOTE_BLANK_AFTER_HEADING_SCALE: f32 = 0.3;
+const NOTE_BLANK_BY_RULE_SCALE: f32 = 0.4;
+const NOTE_BLANK_LINE_SCALE: f32 = 0.6;
+/// Space above and below a heading, and between list items, in lines.
+const NOTE_HEADING_SPACE_ABOVE: f32 = 0.5;
+const NOTE_HEADING_SPACE_BELOW: f32 = 0.25;
+const NOTE_LIST_ITEM_SPACING: f32 = 0.2;
+/// Body text is regular and bold is semibold, so emphasis reads as
+/// emphasis; headings are bold and a step or three larger.
+const NOTE_BODY_FONT_WEIGHT: u16 = 400;
+const NOTE_STRONG_FONT_WEIGHT: u16 = 600;
+const NOTE_HEADING_FONT_WEIGHT: u16 = 700;
+const NOTE_H1_SIZE_STEP: f64 = 8.0;
+const NOTE_H2_SIZE_STEP: f64 = 5.0;
+const NOTE_H3_SIZE_STEP: f64 = 3.0;
 const NOTE_CARET_WIDTH: f32 = 2.0;
+const NOTE_INLINE_CODE_PADDING: f32 = 3.0;
+const NOTE_INLINE_CODE_RADIUS: f32 = 4.0;
 const NOTE_TABLE_CELL_HORIZONTAL_PADDING: usize = 10;
 const NOTE_TABLE_CELL_VERTICAL_PADDING: usize = 7;
-const NOTE_TABLE_MIN_COLUMN_WIDTH: usize = 120;
+const NOTE_TABLE_MIN_COLUMN_WIDTH: usize = 64;
+/// A table at least this much of the text's width is stretched to all of
+/// it; a smaller one keeps its own width.
+const NOTE_TABLE_STRETCH_FRACTION: f32 = 0.6;
+const NOTE_TABLE_RADIUS: f32 = 8.0;
+/// The widest a column grows to keep one word whole; a longer word breaks.
+const NOTE_TABLE_WORD_CAP: f32 = 160.0;
 const NOTE_TABLE_MAX_COLUMN_WIDTH: usize = 480;
 const NOTE_TABLE_SCROLLBAR_HEIGHT: usize = 3;
 const NOTE_CODE_HEADER_HEIGHT: usize = 38;
@@ -566,27 +591,187 @@ fn virtual_note_line_range(
     start..end
 }
 
-#[derive(Debug, Clone, Copy)]
-struct NoteApproximateTextMetrics {
-    latin: f32,
-    space: f32,
+/// The most characters one font's width table keeps beyond ASCII.
+const NOTE_GLYPH_WIDTHS_MAX_CHARS: usize = 4096;
+/// The most fonts the window keeps width tables for; past it they are all
+/// measured afresh.
+const NOTE_GLYPH_WIDTHS_MAX_FONTS: usize = 16;
+/// The most unmeasured characters waiting for the next paint.
+const NOTE_GLYPH_WIDTHS_MAX_PENDING: usize = 512;
+
+/// One font's character advances, measured on the UI thread so text can be
+/// wrapped off it, where a `LoadedFont` cannot go. Wrapping by one average
+/// width broke lines early (capitals and digits pull the average up) and
+/// set a list item's second line off from its first.
+#[derive(Debug, Clone)]
+pub(crate) struct NoteGlyphWidths {
+    ascii: [f32; 128],
+    other: HashMap<char, f32>,
+    /// Stand-ins for a character not measured yet: generous, so a line
+    /// holding one breaks early rather than runs past the edge.
+    narrow: f32,
     wide: f32,
 }
 
-fn approximate_note_text_width(text: &str, metrics: NoteApproximateTextMetrics) -> f32 {
-    text.graphemes(true)
-        .map(|grapheme| {
-            if grapheme.chars().all(char::is_whitespace) {
-                metrics.space
-            } else if grapheme.is_ascii() {
-                metrics.latin
-            } else if unicode_width::UnicodeWidthStr::width(grapheme) >= 2 {
-                metrics.wide
-            } else {
-                metrics.latin
+impl NoteGlyphWidths {
+    fn char_width(&self, ch: char) -> Option<f32> {
+        if ch.is_ascii() {
+            return Some(self.ascii[ch as usize]);
+        }
+        match unicode_width::UnicodeWidthChar::width(ch) {
+            Some(0) => Some(0.0),
+            // East Asian wide text is set on one square em; measuring each
+            // of a Chinese document's thousands of characters buys nothing.
+            Some(2) => Some(self.wide),
+            _ => self.other.get(&ch).copied(),
+        }
+    }
+
+    /// `text`'s width. A character not measured yet counts as an average
+    /// one and is noted in `unknown`, to be measured before the next wrap.
+    fn text_width(&self, text: &str, unknown: &mut HashSet<char>) -> f32 {
+        let mut width = 0.0;
+        for grapheme in text.graphemes(true) {
+            // A cluster is as wide as its base: what follows combines with
+            // it (accents, joined emoji, conjoining jamo).
+            let Some(base) = grapheme.chars().next() else {
+                continue;
+            };
+            width += match self.char_width(base) {
+                Some(advance) => advance,
+                None => {
+                    if unknown.len() < NOTE_GLYPH_WIDTHS_MAX_PENDING {
+                        unknown.insert(base);
+                    }
+                    self.narrow
+                }
+            };
+        }
+        width
+    }
+}
+
+/// The Chinese text a font's square em is measured from.
+const NOTE_WIDE_SAMPLE: &str = "系统";
+
+/// The fonts a Note is painted in, for measuring their widths.
+struct NoteWrapFonts<'a> {
+    base_size: f64,
+    normal: (&'a Rc<LoadedFont>, RenderMetrics),
+    bold: (&'a Rc<LoadedFont>, RenderMetrics),
+    h1: (&'a Rc<LoadedFont>, RenderMetrics),
+    h2: (&'a Rc<LoadedFont>, RenderMetrics),
+    h3: (&'a Rc<LoadedFont>, RenderMetrics),
+    code: (&'a Rc<LoadedFont>, RenderMetrics),
+}
+
+/// The widths a Note wraps with, one table per font it is painted in.
+/// Italics share their upright's: the system fonts' italics advance nearly
+/// as their uprights do.
+#[derive(Debug, Clone)]
+struct NoteWrapWidths {
+    normal: Arc<NoteGlyphWidths>,
+    bold: Arc<NoteGlyphWidths>,
+    h1: Arc<NoteGlyphWidths>,
+    h2: Arc<NoteGlyphWidths>,
+    h3: Arc<NoteGlyphWidths>,
+    code: Arc<NoteGlyphWidths>,
+}
+
+impl NoteWrapWidths {
+    fn for_run(&self, block: BlockKind, style: InlineStyle) -> &NoteGlyphWidths {
+        match block {
+            BlockKind::Heading(1) => &self.h1,
+            BlockKind::Heading(2) => &self.h2,
+            BlockKind::Heading(_) => &self.h3,
+            BlockKind::CodeBlock => &self.code,
+            _ if style.strong => &self.bold,
+            _ => &self.normal,
+        }
+    }
+}
+
+/// Every Note font's width table, kept while the window lives: each costs
+/// one shaped line of ASCII plus the other characters its documents showed.
+#[derive(Default)]
+pub(crate) struct NoteGlyphWidthStore {
+    fonts: HashMap<LoadedFontId, Arc<NoteGlyphWidths>>,
+    /// Characters a wrap met unmeasured, measured on the next paint.
+    pending: HashSet<char>,
+    /// Moves on whenever a width changes, so a wrap made with the old one is
+    /// not reused.
+    generation: u64,
+}
+
+impl NoteGlyphWidthStore {
+    pub(crate) fn note_unknown(&mut self, chars: HashSet<char>) {
+        for ch in chars {
+            if self.pending.len() >= NOTE_GLYPH_WIDTHS_MAX_PENDING {
+                break;
             }
-        })
-        .sum()
+            self.pending.insert(ch);
+        }
+    }
+
+    /// Forget `chars`: a fallback font arrived for them, so what was
+    /// measured before it did is wrong.
+    pub(crate) fn forget(&mut self, chars: &[char]) {
+        // The wide stand-in was measured from these: start over.
+        if chars.iter().any(|ch| NOTE_WIDE_SAMPLE.contains(*ch)) {
+            self.clear();
+            return;
+        }
+        let mut changed = false;
+        for widths in self.fonts.values_mut() {
+            if chars.iter().any(|ch| widths.other.contains_key(ch)) {
+                let widths = Arc::make_mut(widths);
+                for ch in chars {
+                    changed |= widths.other.remove(ch).is_some();
+                }
+            }
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        if !self.fonts.is_empty() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.fonts.clear();
+        self.pending.clear();
+    }
+}
+
+/// Shape `chars` spaced apart, so neither kerning nor ligatures join them,
+/// and read each one's advance.
+fn note_glyph_advances(
+    sample: &str,
+    shaped: &[crate::shapecache::ShapedInfo],
+) -> HashMap<char, f32> {
+    let mut advances = HashMap::new();
+    for info in shaped {
+        let Some(ch) = sample
+            .get(info.cluster..)
+            .and_then(|rest| rest.chars().next())
+        else {
+            continue;
+        };
+        if ch != ' ' {
+            *advances.entry(ch).or_insert(0.0) += info.glyph.x_advance.get() as f32;
+        }
+    }
+    advances
+}
+
+fn spaced_sample(chars: impl Iterator<Item = char>) -> String {
+    let mut sample = String::new();
+    for ch in chars {
+        sample.push(ch);
+        sample.push(' ');
+    }
+    sample
 }
 
 #[derive(Debug, Clone)]
@@ -599,13 +784,35 @@ struct NoteTableRowPaintLayout {
     total_width: f32,
     horizontal_offset: f32,
     max_horizontal_scroll: f32,
+    /// The row's height: its tallest cell, padding included.
+    height: f32,
+    /// Per cell, the byte offsets in its text where its wrapped lines after
+    /// the first begin.
+    cell_breaks: Rc<Vec<Vec<usize>>>,
 }
 
-fn scrollable_note_table_columns(
+impl NoteTableRowPaintLayout {
+    fn line_count(&self) -> usize {
+        self.cell_breaks
+            .iter()
+            .map(|breaks| breaks.len() + 1)
+            .max()
+            .unwrap_or(1)
+    }
+}
+
+/// Column widths for a table whose cells wrap. A table that fits keeps its
+/// columns' one-line widths, stretched to the text's width when it nearly
+/// fills it. One that does not gives each column at least its longest word
+/// and shares the rest in proportion to what each needs unwrapped; only
+/// when the longest words alone do not fit does it scroll sideways.
+fn wrapping_note_table_columns(
     desired: &[f32],
+    longest_word: &[f32],
     available_width: f32,
     minimum_width: f32,
     maximum_width: f32,
+    word_cap: f32,
 ) -> Vec<f32> {
     if desired.is_empty() {
         return Vec::new();
@@ -618,11 +825,116 @@ fn scrollable_note_table_columns(
         .map(|width| width.clamp(minimum_width, maximum_width))
         .collect::<Vec<_>>();
     let total = widths.iter().sum::<f32>();
-    if total < available_width {
-        fit_table_columns(&widths, available_width, minimum_width)
-    } else {
-        widths
+    if total <= available_width {
+        return if total >= available_width * NOTE_TABLE_STRETCH_FRACTION {
+            fit_table_columns(&widths, available_width, minimum_width)
+        } else {
+            widths
+        };
     }
+    // A long word (a URL) may claim no more than its share of the room, or
+    // `word_cap` where that share is smaller: it breaks rather than push the
+    // other columns off the side, while ordinary words stay whole.
+    let word_cap = (available_width / widths.len() as f32)
+        .max(word_cap)
+        .max(minimum_width);
+    let floors = widths
+        .iter()
+        .zip(longest_word.iter().chain(std::iter::repeat(&0.0)))
+        .map(|(width, word)| word.clamp(minimum_width, word_cap).min(*width))
+        .collect::<Vec<_>>();
+    let floor_total = floors.iter().sum::<f32>();
+    if floor_total >= available_width {
+        return floors;
+    }
+    let room = available_width - floor_total;
+    let flexible = widths
+        .iter()
+        .zip(&floors)
+        .map(|(width, floor)| (width - floor).max(0.0))
+        .collect::<Vec<_>>();
+    let flexible_total = flexible.iter().sum::<f32>();
+    floors
+        .iter()
+        .zip(&flexible)
+        .map(|(floor, flex)| {
+            if flexible_total > 0.0 {
+                floor + room * flex / flexible_total
+            } else {
+                floor + room / floors.len() as f32
+            }
+        })
+        .collect()
+}
+
+/// Where `text`'s lines after the first begin when it is wrapped to `width`:
+/// at a break Unicode allows, and inside a word only when the word alone is
+/// wider than the line.
+fn note_wrap_breaks(
+    text: &str,
+    width: f32,
+    widths: &NoteGlyphWidths,
+    unknown: &mut HashSet<char>,
+) -> Vec<usize> {
+    let mut breaks = Vec::new();
+    let mut line_start = 0usize;
+    let mut line_width = 0.0f32;
+    let mut piece_start = 0usize;
+    for (piece_end, _) in unicode_linebreak::linebreaks(text) {
+        let piece = &text[piece_start..piece_end];
+        // Trailing spaces may hang past the edge; they never wrap a line.
+        let fit = widths.text_width(piece.trim_end(), unknown);
+        if piece_start > line_start && line_width + fit > width {
+            breaks.push(piece_start);
+            line_start = piece_start;
+            line_width = 0.0;
+        }
+        if fit > width {
+            for (offset, grapheme) in piece.grapheme_indices(true) {
+                let at = piece_start + offset;
+                let advance = widths.text_width(grapheme, unknown);
+                if at > line_start && line_width + advance > width && !grapheme.trim().is_empty() {
+                    breaks.push(at);
+                    line_start = at;
+                    line_width = 0.0;
+                }
+                line_width += advance;
+            }
+        } else {
+            line_width += widths.text_width(piece, unknown);
+        }
+        piece_start = piece_end;
+    }
+    breaks
+}
+
+/// The byte ranges of a run's text painted as separate lines: the whole run,
+/// or a wrapped table cell's lines.
+fn note_run_pieces(len: usize, breaks: Option<&Vec<usize>>) -> Vec<std::ops::Range<usize>> {
+    let Some(breaks) = breaks.filter(|breaks| !breaks.is_empty()) else {
+        return vec![0..len];
+    };
+    let mut pieces = Vec::with_capacity(breaks.len() + 1);
+    let mut start = 0;
+    for &at in breaks {
+        let at = at.clamp(start, len);
+        pieces.push(start..at);
+        start = at;
+    }
+    pieces.push(start..len);
+    pieces
+}
+
+/// The widest piece of `text` that cannot be broken.
+fn note_longest_word(text: &str, widths: &NoteGlyphWidths, unknown: &mut HashSet<char>) -> f32 {
+    let mut longest = 0.0f32;
+    let mut piece_start = 0usize;
+    for (piece_end, _) in unicode_linebreak::linebreaks(text) {
+        let piece = text[piece_start..piece_end].trim_end();
+        longest = longest.max(widths.text_width(piece, unknown));
+        piece_start = piece_end;
+    }
+    longest
 }
 
 fn note_image_display_size(
@@ -2101,6 +2413,7 @@ impl crate::TermWindow {
         self.right_sidebar_note_code_highlight = NoteCodeHighlightState::default();
         self.right_sidebar_note_paint_cache = NotePaintCache::default();
         self.ui_shape_caches.borrow_mut().clear_note();
+        self.note_glyph_widths.clear();
         self.publish_ui_shape_cache_diagnostics();
     }
 
@@ -2232,8 +2545,6 @@ impl crate::TermWindow {
     fn paint_right_sidebar_markdown_preview(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
-        ui_font: &Rc<LoadedFont>,
-        ui_metrics: RenderMetrics,
         chrome: UiPalette,
         foreground: LinearRgba,
         muted_fg: LinearRgba,
@@ -2246,8 +2557,6 @@ impl crate::TermWindow {
         self.with_note_surface(NoteSurface::FilePreview, |term_window| {
             term_window.paint_note_editor_area(
                 layers,
-                ui_font,
-                ui_metrics,
                 chrome,
                 foreground,
                 muted_fg,
@@ -5825,11 +6134,7 @@ impl crate::TermWindow {
         &mut self,
         wrap_key: usize,
         wrap_width: f32,
-        normal_metrics: NoteApproximateTextMetrics,
-        h1_metrics: NoteApproximateTextMetrics,
-        h2_metrics: NoteApproximateTextMetrics,
-        h3_metrics: NoteApproximateTextMetrics,
-        code_metrics: NoteApproximateTextMetrics,
+        widths: NoteWrapWidths,
     ) {
         let Some((key, visual, mut wrap_cache)) =
             self.right_sidebar_note.background_wrap_request(wrap_key)
@@ -5847,32 +6152,29 @@ impl crate::TermWindow {
                 // Worker-side wrap: slow is acceptable here. Decisions about
                 // real incremental wrapping must look at note_wrap_sync only.
                 let stage = crate::input_diagnostics::StageTimer::begin("note_wrap_background");
+                let mut unknown = HashSet::new();
                 let wrapped = wrap_visual_document_by_width_cached(
                     &visual,
                     wrap_width,
                     wrap_key,
                     &mut wrap_cache,
-                    |block, _, text| {
-                        let metrics = match block {
-                            BlockKind::Heading(1) => h1_metrics,
-                            BlockKind::Heading(2) => h2_metrics,
-                            BlockKind::Heading(_) => h3_metrics,
-                            BlockKind::CodeBlock => code_metrics,
-                            _ => normal_metrics,
-                        };
-                        Ok::<f32, anyhow::Error>(approximate_note_text_width(text, metrics))
+                    |block, style, text| {
+                        Ok::<f32, anyhow::Error>(
+                            widths.for_run(block, style).text_width(text, &mut unknown),
+                        )
                     },
                 )?;
                 stage.finish(true);
-                Ok((wrapped, wrap_cache))
+                Ok((wrapped, wrap_cache, unknown))
             })
             .await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.with_note_surface_ticket(ticket, move |term_window| match result {
-                    Ok((wrapped, wrap_cache)) => {
+                    Ok((wrapped, wrap_cache, unknown)) => {
                         term_window
                             .right_sidebar_note
                             .apply_background_wrap(key, wrapped, wrap_cache);
+                        term_window.note_glyph_widths.note_unknown(unknown);
                     }
                     Err(err) => {
                         if term_window.right_sidebar_note.background_wrap_in_flight_key == Some(key)
@@ -5888,30 +6190,164 @@ impl crate::TermWindow {
         .detach();
     }
 
-    fn note_approximate_text_metrics(
-        &self,
+    /// `font`'s width table, measured from one shaped line of ASCII the
+    /// first time the font is used.
+    /// `wide`, when given, is the font's square em, worked out from another
+    /// font's: measuring it means finding the font a Chinese character falls
+    /// back to, which each font does for itself and which costs more than
+    /// all of its ASCII.
+    fn note_glyph_widths(
+        &mut self,
         font: &Rc<LoadedFont>,
-        render_metrics: &RenderMetrics,
-    ) -> anyhow::Result<NoteApproximateTextMetrics> {
-        // Background wrapping cannot move LoadedFont to its worker thread. Shape
-        // a tiny representative sample on the UI thread and pass only these
-        // Copy metrics across. Using the terminal cell width for every grapheme
-        // made proportional Latin text almost twice as wide as what we paint,
-        // causing long notes to wrap much earlier than short notes.
-        const LATIN_SAMPLE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        const WIDE_SAMPLE: &str = "系统";
-
-        let latin = self.cached_ui_text_advance(font, render_metrics, LATIN_SAMPLE)?
-            / LATIN_SAMPLE.chars().count() as f32;
-        let space = self.cached_ui_text_advance(font, render_metrics, " ")?;
-        let wide = self.cached_ui_text_advance(font, render_metrics, WIDE_SAMPLE)?
-            / WIDE_SAMPLE.chars().count() as f32;
-
-        Ok(NoteApproximateTextMetrics {
-            latin: latin.max(1.0),
-            space: space.max(1.0),
+        metrics: &RenderMetrics,
+        wide: Option<f32>,
+    ) -> anyhow::Result<Arc<NoteGlyphWidths>> {
+        if let Some(widths) = self.note_glyph_widths.fonts.get(&font.id()) {
+            return Ok(Arc::clone(widths));
+        }
+        let sample = spaced_sample((0x21u8..0x7f).map(char::from));
+        let (shaped, _) = self.cached_ui_shape(font, metrics, &sample)?;
+        let advances = note_glyph_advances(&sample, &shaped);
+        let space = shaped
+            .iter()
+            .find(|info| sample.as_bytes().get(info.cluster) == Some(&b' '))
+            .map(|info| info.glyph.x_advance.get() as f32)
+            .unwrap_or(metrics.cell_size.width as f32 / 2.0);
+        let wide = match wide {
+            Some(wide) => wide,
+            None => {
+                self.cached_ui_text_advance(font, metrics, NOTE_WIDE_SAMPLE)?
+                    / NOTE_WIDE_SAMPLE.chars().count() as f32
+            }
+        };
+        let mut ascii = [0.0f32; 128];
+        for (ch, advance) in &advances {
+            if ch.is_ascii() {
+                ascii[*ch as usize] = *advance;
+            }
+        }
+        ascii[b' ' as usize] = space;
+        ascii[b'\t' as usize] = space * 4.0;
+        // An unmeasured character counts as wide as the widest small letter:
+        // until it is measured its line may break early, but never runs past
+        // the edge.
+        let narrow = (b'a'..=b'z')
+            .map(|ch| ascii[ch as usize])
+            .fold(0.0f32, f32::max);
+        // Nothing shaped (no GPU state yet): a stand-in, not kept.
+        let measured = !advances.is_empty();
+        if !measured {
+            ascii.fill(metrics.cell_size.width as f32);
+        }
+        let widths = Arc::new(NoteGlyphWidths {
+            ascii,
+            other: HashMap::new(),
+            narrow: if measured {
+                narrow.max(1.0)
+            } else {
+                metrics.cell_size.width as f32
+            },
             wide: wide.max(1.0),
+        });
+        if measured {
+            let store = &mut self.note_glyph_widths;
+            if store.fonts.len() >= NOTE_GLYPH_WIDTHS_MAX_FONTS {
+                store.fonts.clear();
+            }
+            store.fonts.insert(font.id(), Arc::clone(&widths));
+        }
+        Ok(widths)
+    }
+
+    /// The widths to wrap `visual` with. Only the fonts it is set in are
+    /// measured: a heading level or code that never appears costs nothing,
+    /// and the others' Chinese width is the body's, scaled to their size.
+    fn note_wrap_widths(
+        &mut self,
+        fonts: &NoteWrapFonts,
+        visual: &VisualDocument,
+    ) -> anyhow::Result<NoteWrapWidths> {
+        let (mut h1, mut h2, mut h3, mut code) = (false, false, false, false);
+        for line in &visual.lines {
+            match line.block {
+                BlockKind::Heading(1) => h1 = true,
+                BlockKind::Heading(2) => h2 = true,
+                BlockKind::Heading(_) => h3 = true,
+                BlockKind::CodeBlock => code = true,
+                _ => continue,
+            }
+            if h1 && h2 && h3 && code {
+                break;
+            }
+        }
+        let normal = self.note_glyph_widths(fonts.normal.0, &fonts.normal.1, None)?;
+        let scaled = |step: f64| normal.wide * ((fonts.base_size + step) / fonts.base_size) as f32;
+        let bold = self.note_glyph_widths(fonts.bold.0, &fonts.bold.1, Some(normal.wide))?;
+        let mut heading = |used: bool, (font, metrics): (&Rc<LoadedFont>, RenderMetrics), step| {
+            if used {
+                self.note_glyph_widths(font, &metrics, Some(scaled(step)))
+            } else {
+                Ok(Arc::clone(&normal))
+            }
+        };
+        let h1 = heading(h1, fonts.h1, NOTE_H1_SIZE_STEP)?;
+        let h2 = heading(h2, fonts.h2, NOTE_H2_SIZE_STEP)?;
+        let h3 = heading(h3, fonts.h3, NOTE_H3_SIZE_STEP)?;
+        let code = if code {
+            self.note_glyph_widths(fonts.code.0, &fonts.code.1, None)?
+        } else {
+            Arc::clone(&normal)
+        };
+        Ok(NoteWrapWidths {
+            normal,
+            bold,
+            h1,
+            h2,
+            h3,
+            code,
         })
+    }
+
+    /// Measure, in each of `fonts`, the characters wraps have met without a
+    /// width, so the next wrap has them.
+    fn learn_note_glyph_widths(
+        &mut self,
+        fonts: &[(&Rc<LoadedFont>, RenderMetrics)],
+    ) -> anyhow::Result<()> {
+        if self.note_glyph_widths.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.note_glyph_widths.pending)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let sample = spaced_sample(pending.iter().copied());
+        let mut changed = false;
+        for (font, metrics) in fonts {
+            let Some(current) = self.note_glyph_widths.fonts.get(&font.id()).cloned() else {
+                continue;
+            };
+            let (shaped, _) = self.cached_ui_shape(font, metrics, &sample)?;
+            let advances = note_glyph_advances(&sample, &shaped);
+            let mut widths = (*current).clone();
+            for ch in &pending {
+                if widths.other.len() >= NOTE_GLYPH_WIDTHS_MAX_CHARS {
+                    break;
+                }
+                if !widths.other.contains_key(ch) {
+                    widths
+                        .other
+                        .insert(*ch, advances.get(ch).copied().unwrap_or(widths.narrow));
+                    changed = true;
+                }
+            }
+            self.note_glyph_widths
+                .fonts
+                .insert(font.id(), Arc::new(widths));
+        }
+        if changed {
+            self.note_glyph_widths.generation = self.note_glyph_widths.generation.wrapping_add(1);
+        }
+        Ok(())
     }
 
     /// Register (or refresh) the pre-warm target for the currently painted
@@ -8740,8 +9176,6 @@ impl crate::TermWindow {
             let inset = self.ui_px(SIDEBAR_INSET);
             return self.paint_note_editor_area(
                 layers,
-                ui_font,
-                ui_metrics,
                 chrome,
                 foreground,
                 muted_fg,
@@ -8807,8 +9241,6 @@ impl crate::TermWindow {
         };
         self.paint_note_editor_area(
             layers,
-            ui_font,
-            ui_metrics,
             chrome,
             foreground,
             muted_fg,
@@ -8822,6 +9254,95 @@ impl crate::TermWindow {
         )
     }
 
+    /// A table row's share of the table's rounded 1px frame: its sides, and
+    /// the top or bottom edge with its corners when it is the first or last.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_note_table_frame_edges(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        radius: f32,
+        top: bool,
+        bottom: bool,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        use crate::termwindow::render::corners::{
+            BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE, BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE,
+            TOP_LEFT_ROUNDED_CORNER_OUTLINE, TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
+        };
+        let radius = radius
+            .min(rect.width() / 2.0)
+            .min(rect.height() / if top && bottom { 2.0 } else { 1.0 })
+            .floor();
+        let rounded = radius >= 1.0;
+        let corner = euclid::size2(radius, radius);
+        let inset = if rounded { radius } else { 0.0 };
+        let mut corners = Vec::new();
+        if top {
+            if rounded {
+                corners.push((rect.min_x(), rect.min_y(), TOP_LEFT_ROUNDED_CORNER_OUTLINE));
+                corners.push((
+                    rect.max_x() - radius,
+                    rect.min_y(),
+                    TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
+                ));
+            }
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    rect.min_x() + inset,
+                    rect.min_y(),
+                    rect.width() - inset * 2.0,
+                    1.0,
+                ),
+                color,
+            )?;
+        }
+        if bottom {
+            if rounded {
+                corners.push((
+                    rect.min_x(),
+                    rect.max_y() - radius,
+                    BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE,
+                ));
+                corners.push((
+                    rect.max_x() - radius,
+                    rect.max_y() - radius,
+                    BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE,
+                ));
+            }
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    rect.min_x() + inset,
+                    rect.max_y() - 1.0,
+                    rect.width() - inset * 2.0,
+                    1.0,
+                ),
+                color,
+            )?;
+        }
+        for (x, y, sprite) in corners {
+            self.poly_quad(layers, 1, euclid::point2(x, y), sprite, 0, corner, color)?
+                .set_grayscale();
+        }
+        let side_top = rect.min_y() + if top { inset } else { 0.0 };
+        let side_bottom = rect.max_y() - if bottom { inset } else { 0.0 };
+        if side_bottom > side_top {
+            for x in [rect.min_x(), rect.max_x() - 1.0] {
+                self.filled_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(x, side_top, 1.0, side_bottom - side_top),
+                    color,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Paint the Note toolbar and editor body into an arbitrary content rect —
     /// either inline in the sidebar column or in the expanded Note pane.
     /// Routes all shaping inside (wrap measurement, prose, preedit, toolbar)
@@ -8830,8 +9351,6 @@ impl crate::TermWindow {
     fn paint_note_editor_area(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
-        ui_font: &Rc<LoadedFont>,
-        ui_metrics: RenderMetrics,
         chrome: UiPalette,
         foreground: LinearRgba,
         muted_fg: LinearRgba,
@@ -8848,8 +9367,6 @@ impl crate::TermWindow {
             .replace(crate::shapecache::UiTextDomain::Note);
         let result = self.paint_note_editor_area_impl(
             layers,
-            ui_font,
-            ui_metrics,
             chrome,
             foreground,
             muted_fg,
@@ -8869,8 +9386,6 @@ impl crate::TermWindow {
     fn paint_note_editor_area_impl(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
-        ui_font: &Rc<LoadedFont>,
-        ui_metrics: RenderMetrics,
         chrome: UiPalette,
         foreground: LinearRgba,
         muted_fg: LinearRgba,
@@ -8926,33 +9441,48 @@ impl crate::TermWindow {
 
         let settings = crate::native_settings::load();
         let normal_weight = crate::native_settings::settings_font_weight(&settings);
+        // Prose is set in the regular weight. The sidebar's own font is the
+        // title font, Medium on macOS and Bold elsewhere, which left bold
+        // text no heavier than the words around it.
+        // Never heavier than regular; lighter when that weight was chosen.
+        let body_weight = normal_weight.min(NOTE_BODY_FONT_WEIGHT);
+        let body_font = self
+            .fonts
+            .title_font_with_size_and_weight(base_font_size, body_weight)?;
+        let ui_font = &body_font;
+        let ui_metrics = RenderMetrics::with_font_metrics(&body_font.metrics());
+        let strong_weight = normal_weight.max(NOTE_STRONG_FONT_WEIGHT);
+        let heading_weight = normal_weight.max(NOTE_HEADING_FONT_WEIGHT);
         let bold_font = self
             .fonts
-            .title_font_with_size_and_weight(base_font_size, normal_weight.max(700))?;
+            .title_font_with_size_and_weight(base_font_size, strong_weight)?;
         let italic_font = self
             .fonts
-            .title_font_with_size_weight_and_italic(base_font_size, normal_weight)?;
+            .title_font_with_size_weight_and_italic(base_font_size, body_weight)?;
         let bold_italic_font = self
             .fonts
-            .title_font_with_size_weight_and_italic(base_font_size, normal_weight.max(700))?;
+            .title_font_with_size_weight_and_italic(base_font_size, strong_weight)?;
         let h1_font = self
             .fonts
-            .title_font_with_size_and_weight(base_font_size + 7.0, normal_weight.max(760))?;
+            .title_font_with_size_and_weight(base_font_size + NOTE_H1_SIZE_STEP, heading_weight)?;
         let h2_font = self
             .fonts
-            .title_font_with_size_and_weight(base_font_size + 4.0, normal_weight.max(730))?;
+            .title_font_with_size_and_weight(base_font_size + NOTE_H2_SIZE_STEP, heading_weight)?;
         let h3_font = self
             .fonts
-            .title_font_with_size_and_weight(base_font_size + 2.0, normal_weight.max(700))?;
-        let h1_italic_font = self
-            .fonts
-            .title_font_with_size_weight_and_italic(base_font_size + 7.0, normal_weight.max(760))?;
-        let h2_italic_font = self
-            .fonts
-            .title_font_with_size_weight_and_italic(base_font_size + 4.0, normal_weight.max(730))?;
-        let h3_italic_font = self
-            .fonts
-            .title_font_with_size_weight_and_italic(base_font_size + 2.0, normal_weight.max(700))?;
+            .title_font_with_size_and_weight(base_font_size + NOTE_H3_SIZE_STEP, strong_weight)?;
+        let h1_italic_font = self.fonts.title_font_with_size_weight_and_italic(
+            base_font_size + NOTE_H1_SIZE_STEP,
+            heading_weight,
+        )?;
+        let h2_italic_font = self.fonts.title_font_with_size_weight_and_italic(
+            base_font_size + NOTE_H2_SIZE_STEP,
+            heading_weight,
+        )?;
+        let h3_italic_font = self.fonts.title_font_with_size_weight_and_italic(
+            base_font_size + NOTE_H3_SIZE_STEP,
+            strong_weight,
+        )?;
         let code_font = self
             .fonts
             .resolve_font(&self.config.font)
@@ -9009,8 +9539,30 @@ impl crate::TermWindow {
         let clip_left = text_left;
         let clip_right = text_left + reading_width;
         let wrap_width = (clip_right - clip_left).max(1.0);
+        self.learn_note_glyph_widths(&[
+            (ui_font, ui_metrics),
+            (&bold_font, bold_metrics),
+            (&h1_font, h1_metrics),
+            (&h2_font, h2_metrics),
+            (&h3_font, h3_metrics),
+            (&code_font, code_metrics),
+        ])?;
+        let wrap_fonts = NoteWrapFonts {
+            base_size: base_font_size,
+            normal: (ui_font, ui_metrics),
+            bold: (&bold_font, bold_metrics),
+            h1: (&h1_font, h1_metrics),
+            h2: (&h2_font, h2_metrics),
+            h3: (&h3_font, h3_metrics),
+            code: (&code_font, code_metrics),
+        };
         let mut wrap_hasher = DefaultHasher::new();
         (wrap_width.floor() as usize).hash(&mut wrap_hasher);
+        // Only a wrap made from the width tables changes when they learn a
+        // character; a short document is measured exactly.
+        if self.right_sidebar_note.prefers_background_wrap() {
+            self.note_glyph_widths.generation.hash(&mut wrap_hasher);
+        }
         self.dimensions.dpi.hash(&mut wrap_hasher);
         // LoadedFont ids are allocation identities. Appearance changes rebuild
         // those objects even when typography is identical, which used to
@@ -9041,12 +9593,6 @@ impl crate::TermWindow {
             visual
         } else if self.right_sidebar_note.should_background_wrap(wrap_key) {
             note_profile.wrap_source = "background-provisional";
-            let normal_approx_metrics = self.note_approximate_text_metrics(ui_font, &ui_metrics)?;
-            let h1_approx_metrics = self.note_approximate_text_metrics(&h1_font, &h1_metrics)?;
-            let h2_approx_metrics = self.note_approximate_text_metrics(&h2_font, &h2_metrics)?;
-            let h3_approx_metrics = self.note_approximate_text_metrics(&h3_font, &h3_metrics)?;
-            let code_approx_metrics =
-                self.note_approximate_text_metrics(&code_font, &code_metrics)?;
             let provisional = self.right_sidebar_note.provisional_wrapped_visual();
             if provisional.lines.is_empty() && !self.right_sidebar_note.visual.lines.is_empty() {
                 // Freshly opened note with no wrapped content yet. The
@@ -9060,24 +9606,29 @@ impl crate::TermWindow {
                 // seed, and their full wrap goes to the worker below on a
                 // later frame.
                 let wrap_stage = crate::input_diagnostics::StageTimer::begin("note_wrap_sync");
+                let unwrapped = Arc::clone(&self.right_sidebar_note.visual);
+                let wrap_widths = self.note_wrap_widths(&wrap_fonts, &unwrapped)?;
                 let mut wrap_cache = std::mem::take(&mut self.right_sidebar_note.wrap_cache);
+                let mut unknown = HashSet::new();
                 let wrapped = wrap_visual_document_by_width_cached(
-                    &Arc::clone(&self.right_sidebar_note.visual),
+                    &unwrapped,
                     wrap_width,
                     wrap_key,
                     &mut wrap_cache,
-                    |block, _, text| {
-                        let metrics = match block {
-                            BlockKind::Heading(1) => h1_approx_metrics,
-                            BlockKind::Heading(2) => h2_approx_metrics,
-                            BlockKind::Heading(_) => h3_approx_metrics,
-                            BlockKind::CodeBlock => code_approx_metrics,
-                            _ => normal_approx_metrics,
-                        };
-                        Ok::<f32, anyhow::Error>(approximate_note_text_width(text, metrics))
+                    |block, style, text| {
+                        Ok::<f32, anyhow::Error>(
+                            wrap_widths
+                                .for_run(block, style)
+                                .text_width(text, &mut unknown),
+                        )
                     },
                 );
                 self.right_sidebar_note.wrap_cache = wrap_cache;
+                if !unknown.is_empty() {
+                    // Measured on the next paint, which wraps again with them.
+                    self.note_glyph_widths.note_unknown(unknown);
+                    self.invalidate_window();
+                }
                 match wrapped {
                     Ok(wrapped) => {
                         wrap_stage.finish(true);
@@ -9091,15 +9642,9 @@ impl crate::TermWindow {
                     }
                 }
             } else {
-                self.schedule_right_sidebar_note_wrap(
-                    wrap_key,
-                    wrap_width,
-                    normal_approx_metrics,
-                    h1_approx_metrics,
-                    h2_approx_metrics,
-                    h3_approx_metrics,
-                    code_approx_metrics,
-                );
+                let unwrapped = Arc::clone(&self.right_sidebar_note.visual);
+                let wrap_widths = self.note_wrap_widths(&wrap_fonts, &unwrapped)?;
+                self.schedule_right_sidebar_note_wrap(wrap_key, wrap_width, wrap_widths);
                 provisional
             }
         } else {
@@ -9187,7 +9732,7 @@ impl crate::TermWindow {
         }
         let table_horizontal_padding = self.ui_f32(NOTE_TABLE_CELL_HORIZONTAL_PADDING as f32);
         let table_vertical_padding = self.ui_f32(NOTE_TABLE_CELL_VERTICAL_PADDING as f32);
-        let table_row_height = ui_metrics.cell_size.height as f32 + table_vertical_padding * 2.0;
+        let table_line_height = ui_metrics.cell_size.height as f32;
         let use_dark_syntax_theme = matches!(
             crate::native_settings::effective_appearance(),
             window::Appearance::Dark | window::Appearance::DarkHighContrast
@@ -9200,6 +9745,10 @@ impl crate::TermWindow {
         let active_document = self.right_sidebar_note.document.clone();
         let mut component_hasher = DefaultHasher::new();
         wrap_key.hash(&mut component_hasher);
+        // Tables are always laid out from the width tables.
+        self.note_glyph_widths
+            .generation
+            .hash(&mut component_hasher);
         // Diagrams are drawn in the note's look.
         use_dark_syntax_theme.hash(&mut component_hasher);
         (Arc::as_ptr(&visual) as usize).hash(&mut component_hasher);
@@ -9242,11 +9791,8 @@ impl crate::TermWindow {
             // approximate widths the wrap pass uses; they only feed column
             // sizing and horizontal-scroll bounds, where a few px of error
             // is invisible and the paint-side clamp absorbs it.
-            let normal_approx_metrics = self.note_approximate_text_metrics(ui_font, &ui_metrics)?;
-            let bold_approx_metrics =
-                self.note_approximate_text_metrics(&bold_font, &bold_metrics)?;
-            let code_approx_metrics =
-                self.note_approximate_text_metrics(&code_font, &code_metrics)?;
+            let mut unknown = HashSet::new();
+            let wrap_widths = self.note_wrap_widths(&wrap_fonts, &visual)?;
             // Component geometry only needs heavyweight objects. Avoid a deep
             // clone of every inline emphasis/link/tag in a multi-megabyte
             // projection when the first full layout is published.
@@ -9302,27 +9848,41 @@ impl crate::TermWindow {
                 if row_indices.is_empty() || column_count == 0 {
                     continue;
                 }
-                let mut desired_widths = vec![0.0f32; column_count];
-                for (row_index, row) in table.rows.iter().enumerate() {
-                    let approx = if row_index == 0 {
-                        bold_approx_metrics
+                // The header row is set in bold.
+                let row_widths = |row_index: usize| {
+                    if row_index == 0 {
+                        Arc::clone(&wrap_widths.bold)
                     } else {
-                        normal_approx_metrics
-                    };
+                        Arc::clone(&wrap_widths.normal)
+                    }
+                };
+                let mut desired_widths = vec![0.0f32; column_count];
+                let mut longest_words = vec![0.0f32; column_count];
+                for (row_index, row) in table.rows.iter().enumerate() {
+                    let widths = row_widths(row_index);
                     for (column_index, cell) in row.iter().enumerate() {
-                        let width = approximate_note_text_width(&cell.text, approx)
+                        let width = widths.text_width(&cell.text, &mut unknown)
                             + table_horizontal_padding * 2.0;
                         desired_widths[column_index] = desired_widths[column_index].max(width);
+                        let word = note_longest_word(&cell.text, &widths, &mut unknown)
+                            + table_horizontal_padding * 2.0;
+                        longest_words[column_index] = longest_words[column_index].max(word);
                     }
                 }
-                let column_widths = Rc::new(scrollable_note_table_columns(
+                let column_widths = Rc::new(wrapping_note_table_columns(
                     &desired_widths,
+                    &longest_words,
                     wrap_width,
                     self.ui_f32(NOTE_TABLE_MIN_COLUMN_WIDTH as f32),
                     self.ui_f32(NOTE_TABLE_MAX_COLUMN_WIDTH as f32),
+                    self.ui_f32(NOTE_TABLE_WORD_CAP),
                 ));
                 let total_width = column_widths.iter().sum::<f32>();
-                let max_horizontal_scroll = (total_width - wrap_width).max(0.0);
+                // Columns shared out to fill the width can sum a hair over it;
+                // that is not a table to scroll.
+                let max_horizontal_scroll = Some(total_width - wrap_width)
+                    .filter(|overflow| *overflow >= 1.0)
+                    .unwrap_or(0.0);
                 current_table_starts.insert(table.source.start);
                 let horizontal_offset = self
                     .right_sidebar_note_table_horizontal_offsets
@@ -9335,6 +9895,32 @@ impl crate::TermWindow {
                 let alignments = Rc::new(alignments);
                 let row_count = row_indices.len();
                 for (row_index, visual_index) in row_indices.into_iter().enumerate() {
+                    let widths = row_widths(row_index);
+                    let cell_breaks = table
+                        .rows
+                        .get(row_index)
+                        .map(|row| {
+                            row.iter()
+                                .enumerate()
+                                .map(|(column_index, cell)| {
+                                    let inner =
+                                        column_widths.get(column_index).copied().unwrap_or(0.0)
+                                            - table_horizontal_padding * 2.0;
+                                    note_wrap_breaks(
+                                        &cell.text,
+                                        inner.max(1.0),
+                                        &widths,
+                                        &mut unknown,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let lines = cell_breaks
+                        .iter()
+                        .map(|breaks| breaks.len() + 1)
+                        .max()
+                        .unwrap_or(1);
                     table_rows.insert(
                         visual_index,
                         NoteTableRowPaintLayout {
@@ -9346,6 +9932,8 @@ impl crate::TermWindow {
                             total_width,
                             horizontal_offset,
                             max_horizontal_scroll,
+                            height: table_line_height * lines as f32 + table_vertical_padding * 2.0,
+                            cell_breaks: Rc::new(cell_breaks),
                         },
                     );
                 }
@@ -9382,8 +9970,8 @@ impl crate::TermWindow {
                 let mut max_content_width = 0.0f32;
                 for raw_line in code.text.split_inclusive('\n') {
                     let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-                    max_content_width = max_content_width
-                        .max(approximate_note_text_width(line, code_approx_metrics));
+                    max_content_width =
+                        max_content_width.max(wrap_widths.code.text_width(line, &mut unknown));
                 }
                 let max_horizontal_scroll = (max_content_width - code_inner_width).max(0.0);
                 let horizontal_offset = self
@@ -9522,6 +10110,11 @@ impl crate::TermWindow {
                     }
                 }
             }
+            if !unknown.is_empty() {
+                // Measured on the next paint, which lays the tables out again.
+                self.note_glyph_widths.note_unknown(unknown);
+                self.invalidate_window();
+            }
             self.right_sidebar_note_paint_cache = NotePaintCache {
                 key: Some(component_key),
                 table_rows: Arc::new(table_rows),
@@ -9561,7 +10154,11 @@ impl crate::TermWindow {
         self.right_sidebar_note
             .visual_key
             .hash(&mut geometry_hasher);
-        table_row_height.to_bits().hash(&mut geometry_hasher);
+        // A table row is as tall as its cells wrap by the width tables.
+        if !table_rows.is_empty() {
+            self.note_glyph_widths.generation.hash(&mut geometry_hasher);
+        }
+        table_line_height.to_bits().hash(&mut geometry_hasher);
         code_line_height.to_bits().hash(&mut geometry_hasher);
         code_header_height.to_bits().hash(&mut geometry_hasher);
         code_vertical_padding.to_bits().hash(&mut geometry_hasher);
@@ -9593,6 +10190,28 @@ impl crate::TermWindow {
                     .unwrap_or_default();
             geometry.clear();
             geometry.reserve(visual.lines.len());
+            // Rendered text is spaced as a document: a blank line is a
+            // paragraph's gap rather than a whole empty line, a heading sits
+            // closer to the text it heads than to what came before, and list
+            // items breathe. Source mode keeps every line alike.
+            let typeset = self.right_sidebar_note.view.mode != EditorMode::Source;
+            let body_line_height = ui_metrics.cell_size.height as f32;
+            let blank = |line: &VisualLine| {
+                line.runs.is_empty()
+                    && line.kind == VisualLineKind::Text
+                    && !matches!(
+                        line.block,
+                        BlockKind::CodeBlock
+                            | BlockKind::Table
+                            | BlockKind::Properties
+                            | BlockKind::Callout
+                            | BlockKind::Embed
+                    )
+            };
+            // `next` is the rest of `line`, wrapped onto a row of its own.
+            let continues = |line: &VisualLine, next: &VisualLine| {
+                line.block == next.block && line.source.end == next.source.start
+            };
             for (line_index, line) in visual.lines.iter().enumerate() {
                 let metrics = match line.block {
                     BlockKind::Heading(1) => h1_metrics,
@@ -9601,7 +10220,50 @@ impl crate::TermWindow {
                     BlockKind::CodeBlock => code_metrics,
                     _ => ui_metrics,
                 };
+                let previous = line_index
+                    .checked_sub(1)
+                    .and_then(|index| visual.lines.get(index));
+                let next = visual.lines.get(line_index + 1);
                 let mut height = metrics.cell_size.height as f32;
+                let mut extra_gap = 0.0;
+                if typeset {
+                    let heading = matches!(line.block, BlockKind::Heading(_));
+                    if blank(line) {
+                        let after_heading = previous.is_some_and(|previous| {
+                            matches!(previous.block, BlockKind::Heading(_)) && !blank(previous)
+                        });
+                        let by_rule = previous
+                            .into_iter()
+                            .chain(next)
+                            .any(|other| other.kind == VisualLineKind::Rule);
+                        height = body_line_height
+                            * if after_heading {
+                                NOTE_BLANK_AFTER_HEADING_SCALE
+                            } else if by_rule {
+                                NOTE_BLANK_BY_RULE_SCALE
+                            } else {
+                                NOTE_BLANK_LINE_SCALE
+                            };
+                    }
+                    if heading
+                        && line_index > 0
+                        && !previous.is_some_and(|previous| continues(previous, line))
+                    {
+                        top += body_line_height * NOTE_HEADING_SPACE_ABOVE;
+                    }
+                    if heading && !next.is_some_and(|next| continues(line, next)) {
+                        extra_gap += body_line_height * NOTE_HEADING_SPACE_BELOW;
+                    }
+                    if line.block == BlockKind::ListItem
+                        && next.is_some_and(|next| {
+                            next.block == BlockKind::ListItem
+                                && next.continuation_indent() == 0.0
+                                && !continues(line, next)
+                        })
+                    {
+                        extra_gap += body_line_height * NOTE_LIST_ITEM_SPACING;
+                    }
+                }
                 if line.kind == VisualLineKind::Image {
                     let image = note_image_paths
                         .get(&line.source.start)
@@ -9614,8 +10276,8 @@ impl crate::TermWindow {
                 ) {
                     height += self.ui_f32(8.0);
                 }
-                if table_rows.contains_key(&line_index) {
-                    height = table_row_height;
+                if let Some(table_row) = table_rows.get(&line_index) {
+                    height = table_row.height;
                 }
                 if let Some(code_row) = code_rows.get(&line_index) {
                     height = note_code_row_height(
@@ -9657,6 +10319,7 @@ impl crate::TermWindow {
                             .unwrap_or(line_gap)
                     }
                 };
+                let gap = gap + extra_gap;
                 geometry.push(NoteLineGeometry { top, height, gap });
                 top += height + gap;
             }
@@ -9971,88 +10634,93 @@ impl crate::TermWindow {
                     }
                 }
                 if let Some(table_row) = table_row {
+                    // The frame is as wide as the columns, or the text when
+                    // they scroll beneath it.
+                    let frame_width = table_row.total_width.min(wrap_width);
+                    let frame_right = text_left + frame_width;
+                    let radius = self.ui_f32(NOTE_TABLE_RADIUS);
+                    let first_row = table_row.row_index == 0;
+                    let last_row = table_row.row_index + 1 == table_row.row_count;
+                    // A wrapped row can stand several lines tall: drawn only
+                    // where the body shows, or it runs out above the panel,
+                    // past the band the header masks.
+                    let shown_top = line_y.max(viewport_top);
+                    let shown_bottom = line_bottom.min(viewport_bottom);
+                    let shown_height = (shown_bottom - shown_top).max(0.0);
+                    let top_shown = line_y >= viewport_top;
+                    let bottom_shown = line_bottom <= viewport_bottom;
                     table_layouts.push(RightSidebarNoteTableLayout {
                         source_start: table_row.table_start,
                         x: text_left,
                         y: line_y.max(viewport_top),
-                        width: wrap_width,
+                        width: frame_width,
                         height: line_bottom.min(viewport_bottom) - line_y.max(viewport_top),
                         max_horizontal_scroll: table_row.max_horizontal_scroll,
                     });
-                    if table_row.row_index == 0 {
+                    if first_row {
+                        self.fill_vertically_rounded_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(text_left, shown_top, frame_width, shown_height),
+                            chrome.sidebar_row_active_bg,
+                            radius,
+                            top_shown,
+                            last_row && bottom_shown,
+                        )?;
+                    } else if top_shown {
                         self.filled_rectangle(
                             layers,
                             1,
-                            euclid::rect(text_left, line_y, wrap_width, line_height),
-                            chrome.sidebar_row_active_bg,
+                            euclid::rect(text_left, line_y, frame_width, 1.0),
+                            chrome.separator.mul_alpha(0.7),
                         )?;
                     }
-                    self.filled_rectangle(
+                    self.paint_note_table_frame_edges(
                         layers,
-                        1,
-                        euclid::rect(text_left, line_y, wrap_width, 1.0),
+                        euclid::rect(text_left, shown_top, frame_width, shown_height),
+                        radius,
+                        first_row && top_shown,
+                        last_row && bottom_shown,
                         chrome.separator,
                     )?;
-                    if table_row.row_index + 1 == table_row.row_count {
-                        self.filled_rectangle(
-                            layers,
-                            1,
-                            euclid::rect(text_left, line_y + line_height - 1.0, wrap_width, 1.0),
-                            chrome.separator,
-                        )?;
-                    }
                     let mut boundary_x = text_left - table_row.horizontal_offset;
-                    if boundary_x >= clip_left && boundary_x <= clip_right {
-                        self.filled_rectangle(
-                            layers,
-                            1,
-                            euclid::rect(boundary_x, line_y, 1.0, line_height),
-                            chrome.separator,
-                        )?;
-                    }
-                    for column_width in table_row.column_widths.iter() {
+                    let inner_columns = table_row.column_widths.len().saturating_sub(1);
+                    for column_width in table_row.column_widths.iter().take(inner_columns) {
                         boundary_x += *column_width;
-                        if boundary_x >= clip_left && boundary_x <= clip_right {
+                        if boundary_x > text_left + 1.0 && boundary_x < frame_right - 1.0 {
                             self.filled_rectangle(
                                 layers,
                                 1,
-                                euclid::rect(boundary_x - 1.0, line_y, 1.0, line_height),
-                                chrome.separator,
+                                euclid::rect(boundary_x - 1.0, shown_top, 1.0, shown_height),
+                                chrome.separator.mul_alpha(0.7),
                             )?;
                         }
                     }
-                    if table_row.row_index + 1 == table_row.row_count
-                        && table_row.max_horizontal_scroll > 0.0
-                    {
+                    if last_row && bottom_shown && table_row.max_horizontal_scroll > 0.0 {
                         let track_height = self.ui_f32(NOTE_TABLE_SCROLLBAR_HEIGHT as f32);
-                        let thumb_width = (wrap_width * wrap_width / table_row.total_width)
+                        let track_left = text_left + radius;
+                        let track_width = (frame_width - radius * 2.0).max(1.0);
+                        let track_y = line_y + line_height - track_height - self.ui_f32(2.0);
+                        let thumb_width = (track_width * wrap_width / table_row.total_width)
                             .max(self.ui_f32(24.0))
-                            .min(wrap_width);
-                        let thumb_x = text_left
-                            + (wrap_width - thumb_width)
+                            .min(track_width);
+                        let thumb_x = track_left
+                            + (track_width - thumb_width)
                                 * (table_row.horizontal_offset
                                     / table_row.max_horizontal_scroll.max(1.0));
-                        self.filled_rectangle(
+                        self.fill_rounded_rectangle(
                             layers,
                             2,
-                            euclid::rect(
-                                text_left,
-                                line_y + line_height - track_height,
-                                wrap_width,
-                                track_height,
-                            ),
+                            euclid::rect(track_left, track_y, track_width, track_height),
                             chrome.separator.mul_alpha(0.46),
+                            track_height / 2.0,
                         )?;
-                        self.filled_rectangle(
+                        self.fill_rounded_rectangle(
                             layers,
                             2,
-                            euclid::rect(
-                                thumb_x,
-                                line_y + line_height - track_height,
-                                thumb_width,
-                                track_height,
-                            ),
+                            euclid::rect(thumb_x, track_y, thumb_width, track_height),
                             chrome.scrollbar_thumb,
+                            track_height / 2.0,
                         )?;
                     }
                 }
@@ -10107,6 +10775,10 @@ impl crate::TermWindow {
             }
             note_profile.visible_lines += 1;
 
+            // A wrapped table cell is painted a line at a time, and each of
+            // the row's lines is laid out as a row of its own for hit tests.
+            let sub_rows = table_row.map_or(1, |row| row.line_count());
+            let mut sub_row_runs: Vec<Vec<NoteRunLayout>> = Vec::new();
             for (run_index, run) in line.runs.iter().enumerate() {
                 let (font, metrics) = match line.block {
                     BlockKind::Heading(1) if run.style.emphasis => {
@@ -10126,244 +10798,344 @@ impl crate::TermWindow {
                     _ if run.style.emphasis => (&italic_font, italic_metrics),
                     _ => (line_font, line_metrics),
                 };
-                let (shaped, _) = self.cached_ui_shape(font, &metrics, &run.text)?;
-                note_profile.painted_runs += 1;
-                let advance = shaped
-                    .iter()
-                    .map(|info| info.glyph.x_advance.get() as f32)
-                    .sum::<f32>();
-                let (run_x, run_y, run_clip_left, run_clip_right, hit_x, hit_width) =
-                    if let Some(table_row) = table_row {
-                        let cell_width = table_row
-                            .column_widths
-                            .get(run_index)
-                            .copied()
-                            .unwrap_or(0.0);
-                        let cell_left = x;
-                        let cell_right = cell_left + cell_width;
-                        let cell_clip_left = (cell_left + table_horizontal_padding)
-                            .max(clip_left)
-                            .min(clip_right);
-                        let cell_clip_right = (cell_right - table_horizontal_padding)
-                            .max(cell_clip_left)
-                            .min(clip_right);
-                        let available = (cell_clip_right - cell_clip_left).max(0.0);
-                        let alignment = table_row
-                            .alignments
-                            .get(run_index)
-                            .copied()
-                            .unwrap_or(TableAlignment::None);
-                        let aligned_x = match alignment {
-                            TableAlignment::Center if advance < available => {
-                                cell_clip_left + (available - advance) / 2.0
-                            }
-                            TableAlignment::Right if advance < available => {
-                                cell_clip_right - advance
-                            }
-                            TableAlignment::None
-                            | TableAlignment::Left
-                            | TableAlignment::Center
-                            | TableAlignment::Right => cell_clip_left,
+                let pieces = note_run_pieces(
+                    run.text.len(),
+                    table_row.and_then(|row| row.cell_breaks.get(run_index)),
+                );
+                let piece_count = pieces.len();
+                let cell_x = x;
+                let mut next_x = x;
+                // A wrapped cell is shaped whole, once, and its glyphs dealt
+                // out to its lines: shaping each line apart cost a call per
+                // line, felt the first time a table scrolls into view.
+                let (shaped_run, _) = self.cached_ui_shape(font, &metrics, &run.text)?;
+                for (sub_row, piece) in pieces.into_iter().enumerate() {
+                    let piece_source = (run.source.start + piece.start).min(run.source.end)
+                        ..if sub_row + 1 == piece_count {
+                            run.source.end
+                        } else {
+                            (run.source.start + piece.end).min(run.source.end)
                         };
-                        (
-                            aligned_x,
-                            line_y + table_vertical_padding,
-                            cell_clip_left,
-                            cell_clip_right,
-                            cell_left,
-                            cell_width,
-                        )
-                    } else if code_row.is_some() {
-                        let content_left = text_left + code_horizontal_padding;
-                        let content_right =
-                            (clip_right - code_horizontal_padding).max(content_left);
-                        (
-                            x,
-                            code_text_y.unwrap_or(line_y),
-                            content_left,
-                            content_right,
-                            content_left,
-                            (content_right - content_left).max(0.0),
-                        )
-                    } else if matches!(
-                        line.block,
-                        BlockKind::Properties | BlockKind::Callout | BlockKind::Embed
-                    ) {
-                        (
-                            x,
-                            line_y + card_vertical_padding,
-                            clip_left + card_horizontal_padding,
-                            clip_right - card_horizontal_padding,
-                            x,
-                            advance,
-                        )
+                    let first = shaped_run.partition_point(|info| info.cluster < piece.start);
+                    let last = shaped_run.partition_point(|info| info.cluster < piece.end);
+                    let shaped = &shaped_run[first..last.max(first)];
+                    note_profile.painted_runs += 1;
+                    let advance = shaped
+                        .iter()
+                        .map(|info| info.glyph.x_advance.get() as f32)
+                        .sum::<f32>();
+                    let (run_x, run_y, run_clip_left, run_clip_right, hit_x, hit_width) =
+                        if let Some(table_row) = table_row {
+                            let cell_width = table_row
+                                .column_widths
+                                .get(run_index)
+                                .copied()
+                                .unwrap_or(0.0);
+                            let cell_left = cell_x;
+                            let cell_right = cell_left + cell_width;
+                            let cell_clip_left = (cell_left + table_horizontal_padding)
+                                .max(clip_left)
+                                .min(clip_right);
+                            let cell_clip_right = (cell_right - table_horizontal_padding)
+                                .max(cell_clip_left)
+                                .min(clip_right);
+                            let available = (cell_clip_right - cell_clip_left).max(0.0);
+                            let alignment = table_row
+                                .alignments
+                                .get(run_index)
+                                .copied()
+                                .unwrap_or(TableAlignment::None);
+                            let aligned_x = match alignment {
+                                TableAlignment::Center if advance < available => {
+                                    cell_clip_left + (available - advance) / 2.0
+                                }
+                                TableAlignment::Right if advance < available => {
+                                    cell_clip_right - advance
+                                }
+                                TableAlignment::None
+                                | TableAlignment::Left
+                                | TableAlignment::Center
+                                | TableAlignment::Right => cell_clip_left,
+                            };
+                            (
+                                aligned_x,
+                                line_y
+                                    + table_vertical_padding
+                                    + sub_row as f32 * table_line_height,
+                                cell_clip_left,
+                                cell_clip_right,
+                                cell_left,
+                                cell_width,
+                            )
+                        } else if code_row.is_some() {
+                            let content_left = text_left + code_horizontal_padding;
+                            let content_right =
+                                (clip_right - code_horizontal_padding).max(content_left);
+                            (
+                                x,
+                                code_text_y.unwrap_or(line_y),
+                                content_left,
+                                content_right,
+                                content_left,
+                                (content_right - content_left).max(0.0),
+                            )
+                        } else if matches!(
+                            line.block,
+                            BlockKind::Properties | BlockKind::Callout | BlockKind::Embed
+                        ) {
+                            (
+                                x,
+                                line_y + card_vertical_padding,
+                                clip_left + card_horizontal_padding,
+                                clip_right - card_horizontal_padding,
+                                x,
+                                advance,
+                            )
+                        } else {
+                            (x, line_y, clip_left, clip_right, x, advance)
+                        };
+                    let run_height = metrics.cell_size.height as f32;
+                    // A wrapped cell's lines outside the body are laid out but
+                    // not drawn (see the row's frame above).
+                    let piece_shown = table_row.is_none()
+                        || (run_y + run_height > viewport_top && run_y < viewport_bottom);
+                    let mut boundaries = Vec::with_capacity(shaped.len() + 2);
+                    if run.atomic {
+                        boundaries.push((run_x, piece_source.start));
                     } else {
-                        (x, line_y, clip_left, clip_right, x, advance)
-                    };
-                let run_height = metrics.cell_size.height as f32;
-                let mut boundaries = Vec::with_capacity(shaped.len() + 2);
-                if run.atomic {
-                    boundaries.push((run_x, run.source.start));
-                } else {
-                    let mut boundary_advance = 0.0f32;
-                    for info in shaped.iter() {
-                        boundaries.push((
-                            run_x + boundary_advance,
-                            (run.source.start + info.cluster).min(run.source.end),
-                        ));
-                        boundary_advance += info.glyph.x_advance.get() as f32;
+                        let mut boundary_advance = 0.0f32;
+                        for info in shaped.iter() {
+                            boundaries.push((
+                                run_x + boundary_advance,
+                                (run.source.start + info.cluster).min(piece_source.end),
+                            ));
+                            boundary_advance += info.glyph.x_advance.get() as f32;
+                        }
                     }
-                }
-                boundaries.push((run_x + advance, run.source.end));
+                    boundaries.push((run_x + advance, piece_source.end));
 
-                if selected.start < selected.end {
-                    let start = selected.start.max(run.source.start);
-                    let end = selected.end.min(run.source.end);
-                    if start < end
-                        || (run.atomic
-                            && selected.start <= run.source.start
-                            && selected.end >= run.source.end)
+                    if piece_shown && selected.start < selected.end {
+                        let start = selected.start.max(piece_source.start);
+                        let end = selected.end.min(piece_source.end);
+                        if start < end
+                            || (run.atomic
+                                && selected.start <= piece_source.start
+                                && selected.end >= piece_source.end)
+                        {
+                            let left = note_boundary_x(&boundaries, start).max(run_clip_left);
+                            let right = note_boundary_x(&boundaries, end).min(run_clip_right);
+                            if right > left {
+                                self.filled_rectangle(
+                                    layers,
+                                    1,
+                                    euclid::rect(left, run_y, right - left, run_height),
+                                    chrome.selected_bg.mul_alpha(0.72),
+                                )?;
+                            }
+                        }
+                    }
+                    if piece_shown
+                        && run.style.code
+                        && line.block != BlockKind::CodeBlock
+                        && advance > 0.0
                     {
-                        let left = note_boundary_x(&boundaries, start).max(run_clip_left);
-                        let right = note_boundary_x(&boundaries, end).min(run_clip_right);
+                        // A chip a little wider than its text, which its
+                        // neighbours' spacing absorbs. In a table it stays in
+                        // its cell, and in the part of the table on show.
+                        let pad = self.ui_f32(NOTE_INLINE_CODE_PADDING);
+                        let (chip_left, chip_right) = if table_row.is_some() {
+                            (
+                                (run_clip_left - pad).max(hit_x).max(clip_left),
+                                (run_clip_right + pad)
+                                    .min(hit_x + hit_width)
+                                    .min(clip_right),
+                            )
+                        } else {
+                            (run_clip_left - pad, run_clip_right + pad)
+                        };
+                        let left = (run_x - pad).max(chip_left);
+                        let right = (run_x + advance + pad).min(chip_right);
                         if right > left {
-                            self.filled_rectangle(
+                            self.fill_rounded_rectangle(
                                 layers,
                                 1,
-                                euclid::rect(left, run_y, right - left, run_height),
-                                chrome.selected_bg.mul_alpha(0.72),
+                                euclid::rect(
+                                    left,
+                                    run_y + 1.0,
+                                    right - left,
+                                    (run_height - 2.0).max(1.0),
+                                ),
+                                chrome.sidebar_button_bg,
+                                self.ui_f32(NOTE_INLINE_CODE_RADIUS),
                             )?;
                         }
                     }
-                }
-                if run.style.code && line.block != BlockKind::CodeBlock && advance > 0.0 {
-                    self.filled_rectangle(
-                        layers,
-                        1,
-                        euclid::rect(
-                            run_x,
-                            run_y,
-                            advance.min((run_clip_right - run_x).max(0.0)),
-                            run_height,
-                        ),
-                        chrome.sidebar_button_bg,
-                    )?;
-                }
-                if !(line.kind == VisualLineKind::Image && note_image.is_some()) {
-                    let color = if run.style.link {
-                        chrome.secondary_text
-                    } else {
-                        foreground
-                    };
-                    let code_colors = code_row.map(|row| {
-                        (
-                            row.row_index,
-                            self.cached_note_code_highlights(&row.code, use_dark_syntax_theme),
-                        )
-                    });
-                    self.paint_cached_ui_shape_pixel_clipped(
-                        layers,
-                        &metrics,
-                        &shaped,
-                        run_x,
-                        run_y,
-                        run_clip_left,
-                        run_clip_right,
-                        |info| {
-                            code_colors
-                                .as_ref()
-                                .and_then(|(row_index, lines)| lines.get(*row_index))
-                                .and_then(|colors| colors.get(info.cluster))
-                                .copied()
-                                .unwrap_or(color)
-                        },
-                    )?;
-                    if run.style.strikethrough && advance > 0.0 {
-                        self.filled_rectangle(
+                    // A bullet is drawn as a dot: the text bullet is heavy, and
+                    // set in the fallback font its size and height vary.
+                    let bullet = run.atomic && run.text.as_str() == "• ";
+                    if bullet {
+                        let glyph_advance = shaped
+                            .first()
+                            .map(|info| info.glyph.x_advance.get() as f32)
+                            .unwrap_or(advance / 2.0);
+                        let size = (run_height * 0.24)
+                            .clamp(self.ui_f32(4.0), self.ui_f32(7.0))
+                            .round();
+                        self.fill_rounded_rectangle(
                             layers,
-                            2,
+                            1,
                             euclid::rect(
-                                run_x.max(run_clip_left),
-                                run_y + run_height * 0.52,
-                                advance.min((run_clip_right - run_x).max(0.0)),
-                                1.0,
+                                (run_x + (glyph_advance - size) / 2.0).round(),
+                                (run_y + run_height * 0.52 - size / 2.0).round(),
+                                size,
+                                size,
                             ),
-                            color,
+                            muted_fg,
+                            size / 2.0,
                         )?;
                     }
-                    if !run.atomic {
-                        if let Some(issues) = spelling_issues.as_ref() {
-                            for issue in issues.iter().filter(|issue| {
-                                issue.source.start < run.source.end
-                                    && run.source.start < issue.source.end
-                                    && !active_spelling_word.as_ref().is_some_and(|active| {
-                                        active.start < issue.source.end
-                                            && issue.source.start < active.end
-                                    })
-                            }) {
-                                let source_start = issue.source.start.max(run.source.start);
-                                let source_end = issue.source.end.min(run.source.end);
-                                let underline_start =
-                                    note_boundary_x(&boundaries, source_start).max(run_clip_left);
-                                let underline_end =
-                                    note_boundary_x(&boundaries, source_end).min(run_clip_right);
-                                let segment_width = self.ui_f32(1.5).max(1.0);
-                                let segment_gap = self.ui_f32(1.0).max(1.0);
-                                let mut underline_x = underline_start;
-                                let mut raised = false;
-                                while underline_x < underline_end {
-                                    let width =
-                                        segment_width.min((underline_end - underline_x).max(0.0));
-                                    if width <= 0.0 {
-                                        break;
+                    if piece_shown
+                        && !(line.kind == VisualLineKind::Image && note_image.is_some())
+                        && !bullet
+                    {
+                        let color = if run.style.link {
+                            chrome.secondary_text
+                        } else if table_row.is_some_and(|row| row.row_index == 0) {
+                            // A header labels its column; the cells are what
+                            // is read.
+                            muted_fg
+                        } else {
+                            foreground
+                        };
+                        let code_colors = code_row.map(|row| {
+                            (
+                                row.row_index,
+                                self.cached_note_code_highlights(&row.code, use_dark_syntax_theme),
+                            )
+                        });
+                        self.paint_cached_ui_shape_pixel_clipped(
+                            layers,
+                            &metrics,
+                            &shaped,
+                            run_x,
+                            run_y,
+                            run_clip_left,
+                            run_clip_right,
+                            |info| {
+                                code_colors
+                                    .as_ref()
+                                    .and_then(|(row_index, lines)| lines.get(*row_index))
+                                    .and_then(|colors| colors.get(info.cluster))
+                                    .copied()
+                                    .unwrap_or(color)
+                            },
+                        )?;
+                        if run.style.strikethrough && advance > 0.0 {
+                            self.filled_rectangle(
+                                layers,
+                                2,
+                                euclid::rect(
+                                    run_x.max(run_clip_left),
+                                    run_y + run_height * 0.52,
+                                    advance.min((run_clip_right - run_x).max(0.0)),
+                                    1.0,
+                                ),
+                                color,
+                            )?;
+                        }
+                        if !run.atomic {
+                            if let Some(issues) = spelling_issues.as_ref() {
+                                for issue in issues.iter().filter(|issue| {
+                                    issue.source.start < piece_source.end
+                                        && piece_source.start < issue.source.end
+                                        && !active_spelling_word.as_ref().is_some_and(|active| {
+                                            active.start < issue.source.end
+                                                && issue.source.start < active.end
+                                        })
+                                }) {
+                                    let source_start = issue.source.start.max(piece_source.start);
+                                    let source_end = issue.source.end.min(piece_source.end);
+                                    let underline_start =
+                                        note_boundary_x(&boundaries, source_start)
+                                            .max(run_clip_left);
+                                    let underline_end = note_boundary_x(&boundaries, source_end)
+                                        .min(run_clip_right);
+                                    let segment_width = self.ui_f32(1.5).max(1.0);
+                                    let segment_gap = self.ui_f32(1.0).max(1.0);
+                                    let mut underline_x = underline_start;
+                                    let mut raised = false;
+                                    while underline_x < underline_end {
+                                        let width = segment_width
+                                            .min((underline_end - underline_x).max(0.0));
+                                        if width <= 0.0 {
+                                            break;
+                                        }
+                                        self.filled_rectangle(
+                                            layers,
+                                            2,
+                                            euclid::rect(
+                                                underline_x,
+                                                run_y + run_height
+                                                    - self.ui_f32(if raised { 1.0 } else { 2.0 }),
+                                                width,
+                                                self.ui_f32(1.0).max(1.0),
+                                            ),
+                                            chrome.spelling_error,
+                                        )?;
+                                        raised = !raised;
+                                        underline_x += segment_width + segment_gap;
                                     }
-                                    self.filled_rectangle(
-                                        layers,
-                                        2,
-                                        euclid::rect(
-                                            underline_x,
-                                            run_y + run_height
-                                                - self.ui_f32(if raised { 1.0 } else { 2.0 }),
-                                            width,
-                                            self.ui_f32(1.0).max(1.0),
-                                        ),
-                                        chrome.spelling_error,
-                                    )?;
-                                    raised = !raised;
-                                    underline_x += segment_width + segment_gap;
                                 }
                             }
                         }
                     }
+                    if focused
+                        && selection.is_caret()
+                        && selection.focus.byte >= piece_source.start
+                        && selection.focus.byte <= piece_source.end
+                    {
+                        caret_rect = Some((
+                            note_boundary_x(&boundaries, selection.focus.byte),
+                            run_y,
+                            run_height,
+                        ));
+                    }
+                    let run_layout = NoteRunLayout {
+                        source: piece_source.clone(),
+                        x: run_x,
+                        width: advance,
+                        hit_x,
+                        hit_width,
+                        boundaries,
+                        atomic: run.atomic,
+                    };
+                    if sub_rows > 1 {
+                        sub_row_runs.resize_with(sub_rows, Vec::new);
+                        // A cell with fewer lines than its row answers for the
+                        // rows below its text with its last line.
+                        let below = if sub_row + 1 == piece_count {
+                            sub_rows
+                        } else {
+                            sub_row + 1
+                        };
+                        for row_runs in &mut sub_row_runs[sub_row + 1..below] {
+                            row_runs.push(run_layout.clone());
+                        }
+                        sub_row_runs[sub_row].push(run_layout);
+                    } else {
+                        run_layouts.push(run_layout);
+                    }
+                    next_x = run_x + advance;
                 }
-                if focused
-                    && selection.is_caret()
-                    && selection.focus.byte >= run.source.start
-                    && selection.focus.byte <= run.source.end
-                {
-                    caret_rect = Some((
-                        note_boundary_x(&boundaries, selection.focus.byte),
-                        run_y,
-                        run_height,
-                    ));
-                }
-                run_layouts.push(NoteRunLayout {
-                    source: run.source.clone(),
-                    x: run_x,
-                    width: advance,
-                    hit_x,
-                    hit_width,
-                    boundaries,
-                    atomic: run.atomic,
-                });
                 x = if let Some(table_row) = table_row {
-                    x + table_row
-                        .column_widths
-                        .get(run_index)
-                        .copied()
-                        .unwrap_or(0.0)
+                    cell_x
+                        + table_row
+                            .column_widths
+                            .get(run_index)
+                            .copied()
+                            .unwrap_or(0.0)
                 } else {
-                    run_x + advance
+                    next_x
                 };
                 if table_row.is_none() && x >= clip_right {
                     break;
@@ -10374,18 +11146,24 @@ impl crate::TermWindow {
                 && line.runs.is_empty()
                 && line.source.start == selection.focus.byte
             {
+                // A blank line set shorter than text still shows a whole
+                // caret, centred on it.
+                let text_height = ui_metrics.cell_size.height as f32;
+                let (caret_y, caret_height) = if code_row.is_some() {
+                    (code_text_y.unwrap_or(line_y), code_line_height)
+                } else if line_height < text_height {
+                    (line_y - (text_height - line_height) / 2.0, text_height)
+                } else {
+                    (line_y, line_height)
+                };
                 caret_rect = Some((
                     if code_row.is_some() {
                         text_left + code_horizontal_padding
                     } else {
                         text_left + continuation_indent
                     },
-                    code_text_y.unwrap_or(line_y),
-                    if code_row.is_some() {
-                        code_line_height
-                    } else {
-                        line_height
-                    },
+                    caret_y,
+                    caret_height,
                 ));
             } else if focused
                 && selection.is_caret()
@@ -10394,16 +11172,39 @@ impl crate::TermWindow {
             {
                 caret_rect = Some((x, line_y, line_height));
             }
-            layouts.push(NoteLineLayout {
-                source: line.source.clone(),
-                y: code_text_y.unwrap_or(line_y),
-                height: if code_row.is_some() {
-                    code_line_height
-                } else {
-                    line_height
-                },
-                runs: run_layouts,
-            });
+            if sub_rows > 1 {
+                let last = sub_row_runs.len().saturating_sub(1);
+                for (sub_row, runs) in sub_row_runs.into_iter().enumerate() {
+                    // The row's padding belongs to its first and last lines.
+                    let top = if sub_row == 0 {
+                        line_y
+                    } else {
+                        line_y + table_vertical_padding + sub_row as f32 * table_line_height
+                    };
+                    let bottom = if sub_row == last {
+                        line_y + line_height
+                    } else {
+                        line_y + table_vertical_padding + (sub_row + 1) as f32 * table_line_height
+                    };
+                    layouts.push(NoteLineLayout {
+                        source: line.source.clone(),
+                        y: top,
+                        height: bottom - top,
+                        runs,
+                    });
+                }
+            } else {
+                layouts.push(NoteLineLayout {
+                    source: line.source.clone(),
+                    y: code_text_y.unwrap_or(line_y),
+                    height: if code_row.is_some() {
+                        code_line_height
+                    } else {
+                        line_height
+                    },
+                    runs: run_layouts,
+                });
+            }
         }
 
         self.right_sidebar_note.line_layouts = layouts;
@@ -17051,8 +17852,6 @@ impl crate::TermWindow {
         {
             self.paint_right_sidebar_markdown_preview(
                 layers,
-                ui_font,
-                ui_metrics,
                 chrome,
                 foreground,
                 muted_fg,
@@ -21641,29 +22440,30 @@ fn snippet_cursor_visible(now_ms: u128, blink_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        approximate_note_text_width, build_right_sidebar_file_index, clip_note_texture,
-        copy_entries_blocking, copy_file_chunked, dir_load_changes_cache, download_name_candidates,
+        build_right_sidebar_file_index, clip_note_texture, copy_entries_blocking,
+        copy_file_chunked, dir_load_changes_cache, download_name_candidates,
         encode_pasted_image_png, failed_folder_download, file_preview_close_requires_reflow,
         file_release_action, file_row_placement, full_line_colors_by_byte,
         image_pixels_within_preview_budget, load_dir_cache_for_test, load_file_preview,
         load_file_preview_image, naturalish_cmp, note_code_highlight_key,
         note_code_highlight_lines, note_code_row_height, note_image_display_size,
-        note_open_pending_for_vault, note_release_action, open_with_candidate_allowed,
-        pasted_image_file_name, path_key, pick_free_remote_name, preflight_local_copy,
-        preview_line_count, preview_lines_from_text, preview_plain_lines_from_text,
-        preview_text_range, preview_visible_colored, preview_visible_line_range,
-        problem_for_read_dir, remote_lease_failure_disposition, rescan_plan,
-        resolve_drop_destination, resolve_local_drop_target, resolve_remote_drop_target,
-        right_sidebar_file_browse_rows_from_dir_cache, right_sidebar_file_row_metrics,
-        right_sidebar_open_with_cache_key, sanitize_preview_text, scrollable_note_table_columns,
+        note_longest_word, note_open_pending_for_vault, note_release_action, note_run_pieces,
+        note_wrap_breaks, open_with_candidate_allowed, pasted_image_file_name, path_key,
+        pick_free_remote_name, preflight_local_copy, preview_line_count, preview_lines_from_text,
+        preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
+        preview_visible_line_range, problem_for_read_dir, remote_lease_failure_disposition,
+        rescan_plan, resolve_drop_destination, resolve_local_drop_target,
+        resolve_remote_drop_target, right_sidebar_file_browse_rows_from_dir_cache,
+        right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key, sanitize_preview_text,
         search_right_sidebar_file_index, sidebar_message_layout, sidebar_row_element_visible,
         snippet_cursor_visible, sorted_open_with_candidates, spawn_pasted_image_staging,
         stage_pasted_image, terminal_paste_snapshot_mismatch, virtual_note_line_range,
         visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
-        FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
-        NoteCodeHighlightState, NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
-        TerminalPasteSnapshotMismatch, TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES,
-        LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
+        wrapping_note_table_columns, FileReleaseAction, FileRowPlacement, NoteCodeHighlightEntry,
+        NoteCodeHighlightState, NoteGlyphWidthStore, NoteGlyphWidths, NoteReleaseAction,
+        NoteVaultProblem, RemoteLeaseFailureDisposition, TerminalPasteSnapshotMismatch,
+        TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES, LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS,
+        NOTE_CODE_HEADER_HEIGHT,
     };
     use super::{FolderProblem, RightSidebarFileDirCache, RightSidebarFileDirEntry};
     use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
@@ -21676,7 +22476,7 @@ mod tests {
         RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan, UIItem, UIItemType,
     };
     use crate::utilsprites::RenderMetrics;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
@@ -22583,19 +23383,15 @@ mod tests {
 
     #[test]
     fn background_note_width_does_not_double_count_cjk_or_emoji() {
-        let metrics = NoteApproximateTextMetrics {
-            latin: 5.0,
-            space: 3.0,
-            wide: 10.0,
-        };
-        assert_eq!(approximate_note_text_width("abc", metrics), 15.0);
-        assert_eq!(approximate_note_text_width("a b", metrics), 13.0);
-        assert_eq!(approximate_note_text_width("系统", metrics), 20.0);
-        assert_eq!(approximate_note_text_width("👨‍👩‍👧‍👦", metrics), 10.0);
+        let widths = test_glyph_widths();
+        let mut unknown = HashSet::new();
+        assert_eq!(widths.text_width("系统", &mut unknown), 40.0);
+        // A joined emoji family is one cluster, as wide as its first emoji.
+        assert_eq!(widths.text_width("👨‍👩‍👧‍👦", &mut unknown), 20.0);
 
         let mixed = "alpha：示例 beta";
-        let all_full_width = mixed.chars().count() as f32 * metrics.wide;
-        assert!(approximate_note_text_width(mixed, metrics) < all_full_width * 0.7);
+        let all_full_width = mixed.chars().count() as f32 * 20.0;
+        assert!(widths.text_width(mixed, &mut unknown) < all_full_width * 0.7);
     }
 
     #[test]
@@ -22609,15 +23405,118 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn wide_note_tables_keep_natural_width_for_horizontal_scrolling() {
-        let widths = scrollable_note_table_columns(&[260.0, 240.0, 220.0], 400.0, 120.0, 480.0);
-        assert_eq!(widths, vec![260.0, 240.0, 220.0]);
-        assert!(widths.iter().sum::<f32>() > 400.0);
+    /// Every ASCII character 10px, a wide one 20px, `narrow` for the rest.
+    fn test_glyph_widths() -> NoteGlyphWidths {
+        NoteGlyphWidths {
+            ascii: [10.0; 128],
+            other: HashMap::from([('é', 8.0)]),
+            narrow: 9.0,
+            wide: 20.0,
+        }
+    }
 
-        let narrow = scrollable_note_table_columns(&[20.0, 40.0], 400.0, 120.0, 480.0);
-        assert_eq!(narrow.iter().sum::<f32>(), 400.0);
-        assert!(narrow.iter().all(|width| *width >= 120.0));
+    #[test]
+    fn glyph_widths_measure_by_character_and_note_the_unknown() {
+        let widths = test_glyph_widths();
+        let mut unknown = HashSet::new();
+        assert_eq!(widths.text_width("ab c", &mut unknown), 40.0);
+        // Wide text is one stand-in width; a combining accent adds nothing.
+        assert_eq!(widths.text_width("中文", &mut unknown), 40.0);
+        assert_eq!(widths.text_width("e\u{301}", &mut unknown), 10.0);
+        assert_eq!(widths.text_width("é", &mut unknown), 8.0);
+        assert!(unknown.is_empty());
+        // Cyrillic was never measured: an average width, and noted.
+        assert_eq!(widths.text_width("я", &mut unknown), 9.0);
+        assert_eq!(unknown, HashSet::from(['я']));
+    }
+
+    #[test]
+    fn forgetting_a_late_fallback_character_drops_only_its_width() {
+        let mut store = NoteGlyphWidthStore::default();
+        store.fonts.insert(1, Arc::new(test_glyph_widths()));
+        let generation = store.generation;
+        store.forget(&['я']);
+        assert_eq!(
+            store.generation, generation,
+            "nothing measured, nothing changed"
+        );
+        store.forget(&['é']);
+        assert!(store.fonts[&1].other.is_empty());
+        assert_ne!(store.generation, generation);
+        // Another wide character takes the stand-in and changes nothing...
+        store.forget(&['中']);
+        assert!(!store.fonts.is_empty());
+        // ...but the stand-in was measured from these: start over.
+        store.forget(&['系']);
+        assert!(store.fonts.is_empty());
+    }
+
+    #[test]
+    fn table_cells_wrap_at_words_and_break_words_only_when_too_long() {
+        let widths = test_glyph_widths();
+        let mut unknown = HashSet::new();
+        // 10px a character, 60px a line: "abc de" fits, "fgh" goes on.
+        assert_eq!(
+            note_wrap_breaks("abc de fgh", 60.0, &widths, &mut unknown),
+            vec![7]
+        );
+        // A word longer than the line is broken inside.
+        assert_eq!(
+            note_wrap_breaks("abcdefghij", 40.0, &widths, &mut unknown),
+            vec![4, 8]
+        );
+        // Chinese may break between any two characters.
+        assert_eq!(
+            note_wrap_breaks("中文中文", 40.0, &widths, &mut unknown),
+            vec![6]
+        );
+        assert!(note_wrap_breaks("short", 100.0, &widths, &mut unknown).is_empty());
+        assert_eq!(note_longest_word("a bcd ef", &widths, &mut unknown), 30.0);
+    }
+
+    #[test]
+    fn run_pieces_follow_the_breaks() {
+        assert_eq!(note_run_pieces(5, None), vec![0..5]);
+        assert_eq!(note_run_pieces(5, Some(&vec![])), vec![0..5]);
+        assert_eq!(
+            note_run_pieces(10, Some(&vec![4, 8])),
+            vec![0..4, 4..8, 8..10]
+        );
+    }
+
+    #[test]
+    fn note_tables_wrap_before_they_scroll() {
+        // Fits: one-line widths, stretched when the table nearly fills.
+        let roomy =
+            wrapping_note_table_columns(&[150.0, 150.0], &[40.0, 40.0], 400.0, 64.0, 480.0, 160.0);
+        assert_eq!(roomy.iter().sum::<f32>(), 400.0);
+        let small =
+            wrapping_note_table_columns(&[80.0, 80.0], &[40.0, 40.0], 400.0, 64.0, 480.0, 160.0);
+        assert_eq!(small, vec![80.0, 80.0]);
+
+        // Too wide but its words fit: it fills the width, and the column
+        // with more to say gets more of it.
+        let wrapped =
+            wrapping_note_table_columns(&[100.0, 600.0], &[60.0, 90.0], 400.0, 64.0, 480.0, 160.0);
+        assert!((wrapped.iter().sum::<f32>() - 400.0).abs() < 0.01);
+        assert!(wrapped[1] > wrapped[0]);
+        assert!(wrapped[0] >= 64.0);
+
+        // A URL breaks rather than widen its column past the cap.
+        let url =
+            wrapping_note_table_columns(&[100.0, 900.0], &[60.0, 900.0], 400.0, 64.0, 480.0, 160.0);
+        assert!((url.iter().sum::<f32>() - 400.0).abs() < 0.01);
+
+        // Even the words kept whole do not fit: the table scrolls sideways.
+        let scrolling = wrapping_note_table_columns(
+            &[300.0, 300.0, 300.0],
+            &[150.0, 150.0, 150.0],
+            300.0,
+            64.0,
+            480.0,
+            160.0,
+        );
+        assert!(scrolling.iter().sum::<f32>() > 300.0);
     }
 
     #[test]

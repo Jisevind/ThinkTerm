@@ -3287,6 +3287,8 @@ pub struct TermWindow {
     right_sidebar_note_vault_tree_collapsed: bool,
     right_sidebar_note_wide_layout: bool,
     right_sidebar_note_table_horizontal_offsets: std::collections::BTreeMap<usize, f32>,
+    /// Note fonts' character widths, for wrapping off the UI thread.
+    note_glyph_widths: crate::termwindow::ui::right_sidebar::NoteGlyphWidthStore,
     right_sidebar_note_table_layouts: Vec<RightSidebarNoteTableLayout>,
     right_sidebar_note_images: HashMap<RightSidebarNoteImageSource, RightSidebarFilePreviewImage>,
     right_sidebar_note_images_loading: HashSet<RightSidebarNoteImageSource>,
@@ -4193,6 +4195,7 @@ impl TermWindow {
             caches.clear_note();
             caches.clear_file_preview();
         }
+        self.note_glyph_widths.clear();
         self.publish_ui_shape_cache_diagnostics();
         if let Some(render_state) = self.render_state.as_ref() {
             render_state.shrink_quads_now();
@@ -4842,6 +4845,7 @@ impl TermWindow {
             right_sidebar_note_vault_tree_collapsed: false,
             right_sidebar_note_wide_layout: false,
             right_sidebar_note_table_horizontal_offsets: std::collections::BTreeMap::new(),
+            note_glyph_widths: Default::default(),
             right_sidebar_note_table_layouts: Vec::new(),
             right_sidebar_note_images: HashMap::new(),
             right_sidebar_note_images_loading: HashSet::new(),
@@ -5695,6 +5699,7 @@ impl TermWindow {
                     .borrow_mut()
                     .retain(|key, _| !key.text.chars().any(|c| chars.contains(&c)));
                 self.ui_shape_caches.borrow_mut().evict_containing(&chars);
+                self.note_glyph_widths.forget(&chars);
                 self.publish_ui_shape_cache_diagnostics();
                 self.invalidate_modal();
                 window.invalidate();
