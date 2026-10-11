@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,7 +108,14 @@ struct EditRecord {
     inserted: String,
     before: SourceSelection,
     after: SourceSelection,
+    /// Typing or deleting a character at a time, which the next such edit
+    /// may join so that one undo takes back a word, not a letter.
+    joinable: bool,
+    at: Instant,
 }
+
+/// A pause longer than this ends a run of typing as an undo step.
+const UNDO_GROUP_PAUSE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 struct DocumentEdit {
@@ -352,6 +359,21 @@ impl MarkdownDocumentSession {
     }
 
     pub(crate) fn insert_text(&mut self, view: &mut EditorViewState, text: &str) -> bool {
+        self.insert_text_joining(view, text, false)
+    }
+
+    /// `insert_text` for what is typed: a run of it is undone a word at a
+    /// time, where a paste is undone whole.
+    pub(crate) fn type_text(&mut self, view: &mut EditorViewState, text: &str) -> bool {
+        self.insert_text_joining(view, text, true)
+    }
+
+    fn insert_text_joining(
+        &mut self,
+        view: &mut EditorViewState,
+        text: &str,
+        joinable: bool,
+    ) -> bool {
         if view.mode == EditorMode::ReadOnly {
             return false;
         }
@@ -368,7 +390,7 @@ impl MarkdownDocumentSession {
             return false;
         }
         let range = self.clamped_selection_range(view);
-        self.replace_range(view, range, &filtered)
+        self.replace_range_joining(view, range, &filtered, joinable)
     }
 
     pub(crate) fn delete_selection(&mut self, view: &mut EditorViewState) -> bool {
@@ -379,6 +401,11 @@ impl MarkdownDocumentSession {
         self.replace_range(view, range, "")
     }
 
+    /// What the platform's text input sends, against the text it was shown
+    /// at `revision`. On macOS every typed key arrives this way while the
+    /// editor has the keyboard: one character at the caret is typing, joined
+    /// into the run before it like a typed key, where a word an input method
+    /// commits is undone on its own.
     pub(crate) fn replace_range_at_revision(
         &mut self,
         view: &mut EditorViewState,
@@ -389,7 +416,10 @@ impl MarkdownDocumentSession {
         if self.revision != revision || view.mode == EditorMode::ReadOnly {
             return false;
         }
-        self.replace_range(view, range, replacement)
+        let mut chars = replacement.chars();
+        let typed = range.is_empty()
+            && matches!((chars.next(), chars.next()), (Some(ch), None) if ch != '\n');
+        self.replace_range_joining(view, range, replacement, typed)
     }
 
     pub(crate) fn surround_selection(
@@ -578,7 +608,7 @@ impl MarkdownDocumentSession {
         if previous == caret {
             return false;
         }
-        self.replace_range(view, previous..caret, "")
+        self.replace_range_joining(view, previous..caret, "", true)
     }
 
     pub(crate) fn delete_forward(&mut self, view: &mut EditorViewState) -> bool {
@@ -594,7 +624,7 @@ impl MarkdownDocumentSession {
         if next == caret {
             return false;
         }
-        self.replace_range(view, caret..next, "")
+        self.replace_range_joining(view, caret..next, "", true)
     }
 
     pub(crate) fn move_left(&self, view: &mut EditorViewState, extend: bool) {
@@ -638,6 +668,68 @@ impl MarkdownDocumentSession {
         self.replace_range(view, previous..caret, "")
     }
 
+    pub(crate) fn delete_word_forward(&mut self, view: &mut EditorViewState) -> bool {
+        if view.mode == EditorMode::ReadOnly {
+            return false;
+        }
+        let selection = self.clamped_selection_range(view);
+        if selection.start != selection.end {
+            return self.replace_range(view, selection, "");
+        }
+        let caret = clamp_char_boundary(&self.source, view.selection.focus.byte);
+        let next = next_word_boundary(&self.source, caret);
+        self.replace_range(view, caret..next, "")
+    }
+
+    /// Delete from `start`, where the caller's line begins, to the caret; at
+    /// that start, the line break before it.
+    pub(crate) fn delete_to(&mut self, view: &mut EditorViewState, start: usize) -> bool {
+        if view.mode == EditorMode::ReadOnly {
+            return false;
+        }
+        let selection = self.clamped_selection_range(view);
+        if selection.start != selection.end {
+            return self.replace_range(view, selection, "");
+        }
+        let caret = clamp_char_boundary(&self.source, view.selection.focus.byte);
+        let start = clamp_char_boundary(&self.source, start.min(caret));
+        if start == caret {
+            return self.backspace(view);
+        }
+        self.replace_range(view, start..caret, "")
+    }
+
+    /// Delete from the caret to `end`, where the caller's line ends; at that
+    /// end, the line break after it.
+    pub(crate) fn delete_until(&mut self, view: &mut EditorViewState, end: usize) -> bool {
+        if view.mode == EditorMode::ReadOnly {
+            return false;
+        }
+        let selection = self.clamped_selection_range(view);
+        if selection.start != selection.end {
+            return self.replace_range(view, selection, "");
+        }
+        let caret = clamp_char_boundary(&self.source, view.selection.focus.byte);
+        let end = clamp_char_boundary(&self.source, end.max(caret));
+        if end == caret {
+            return self.delete_forward(view);
+        }
+        self.replace_range(view, caret..end, "")
+    }
+
+    pub(crate) fn move_document_start(&self, view: &mut EditorViewState, extend: bool) {
+        self.set_caret(view, 0, extend);
+    }
+
+    pub(crate) fn move_document_end(&self, view: &mut EditorViewState, extend: bool) {
+        self.set_caret(view, self.source.len(), extend);
+    }
+
+    /// The source line holding `byte`, without its line break.
+    pub(crate) fn source_line_bounds(&self, byte: usize) -> (usize, usize) {
+        self.line_bounds(byte)
+    }
+
     pub(crate) fn move_line_start(&self, view: &mut EditorViewState, extend: bool) {
         let (start, _) = self.line_bounds(view.selection.focus.byte);
         self.set_caret(view, start, extend);
@@ -660,6 +752,17 @@ impl MarkdownDocumentSession {
             line.saturating_add(delta as usize)
                 .min(self.line_starts.len().saturating_sub(1))
         };
+        if target_line == line && delta != 0 {
+            // Up on the first line goes to its start and down on the last to
+            // its end, as Mac text views do.
+            let edge = if delta.is_negative() {
+                0
+            } else {
+                self.source.len()
+            };
+            self.set_caret(view, edge, extend);
+            return;
+        }
         let start = self.line_starts[target_line];
         let end = self.line_end(target_line);
         let target = byte_for_grapheme_column(&self.source[start..end], desired) + start;
@@ -685,6 +788,7 @@ impl MarkdownDocumentSession {
             return false;
         };
         self.undo_bytes = self.undo_bytes.saturating_sub(edit_record_bytes(&edit));
+        self.break_undo_group();
         let end = edit.start + edit.inserted.len();
         self.source.replace_range(edit.start..end, &edit.deleted);
         view.selection = edit.before;
@@ -711,6 +815,7 @@ impl MarkdownDocumentSession {
         view.preferred_column = None;
         let mutation = DocumentEdit::new(edit.start..end, edit.inserted.len());
         self.push_undo(edit);
+        self.break_undo_group();
         self.note_mutation(mutation);
         stage.finish(true);
         true
@@ -721,6 +826,16 @@ impl MarkdownDocumentSession {
         view: &mut EditorViewState,
         range: Range<usize>,
         inserted: &str,
+    ) -> bool {
+        self.replace_range_joining(view, range, inserted, false)
+    }
+
+    fn replace_range_joining(
+        &mut self,
+        view: &mut EditorViewState,
+        range: Range<usize>,
+        inserted: &str,
+        joinable: bool,
     ) -> bool {
         let stage = crate::input_diagnostics::StageTimer::begin("note_edit");
         let start = clamp_char_boundary(&self.source, range.start);
@@ -736,17 +851,71 @@ impl MarkdownDocumentSession {
         let after = SourceSelection::caret(start + inserted.len());
         view.selection = after;
         view.preferred_column = None;
-        self.push_undo(EditRecord {
+        let record = EditRecord {
             start,
             deleted,
             inserted: inserted.to_string(),
             before,
             after,
-        });
+            joinable: joinable && before.is_caret(),
+            at: Instant::now(),
+        };
+        if !self.join_undo(&record) {
+            self.push_undo(record);
+        }
         self.redo.clear();
         self.note_mutation(mutation);
         stage.finish(true);
         true
+    }
+
+    /// Fold `record` into the last undo step when it carries on the same run
+    /// of typing or deleting: the caret has not moved in between, nor has
+    /// the typist paused, and typing has not just begun a new word.
+    fn join_undo(&mut self, record: &EditRecord) -> bool {
+        if !record.joinable {
+            return false;
+        }
+        let Some(last) = self.undo.last_mut() else {
+            return false;
+        };
+        if !last.joinable
+            || last.after != record.before
+            || record.at.duration_since(last.at) > UNDO_GROUP_PAUSE
+        {
+            return false;
+        }
+        let typing = last.deleted.is_empty() && record.deleted.is_empty();
+        let deleting = last.inserted.is_empty() && record.inserted.is_empty();
+        if typing && record.start == last.start + last.inserted.len() {
+            let new_word = last.inserted.ends_with(char::is_whitespace)
+                && !record.inserted.starts_with(char::is_whitespace);
+            if new_word {
+                return false;
+            }
+            last.inserted.push_str(&record.inserted);
+        } else if deleting && record.start + record.deleted.len() == last.start {
+            // Backspace, walking back.
+            last.deleted.insert_str(0, &record.deleted);
+            last.start = record.start;
+        } else if deleting && record.start == last.start {
+            // Forward delete, the text closing in on the caret.
+            last.deleted.push_str(&record.deleted);
+        } else {
+            return false;
+        }
+        last.after = record.after;
+        last.at = record.at;
+        self.undo_bytes = self
+            .undo_bytes
+            .saturating_add(record.deleted.len() + record.inserted.len());
+        true
+    }
+
+    fn break_undo_group(&mut self) {
+        if let Some(last) = self.undo.last_mut() {
+            last.joinable = false;
+        }
     }
 
     fn push_undo(&mut self, record: EditRecord) {
@@ -1337,5 +1506,144 @@ mod tests {
         assert!(!session.is_dirty());
         assert!(!session.can_undo());
         assert!(!session.can_redo());
+    }
+
+    fn type_each(session: &mut MarkdownDocumentSession, view: &mut EditorViewState, text: &str) {
+        for ch in text.chars() {
+            assert!(session.type_text(view, &ch.to_string()));
+        }
+    }
+
+    #[test]
+    fn typing_is_undone_a_word_at_a_time() {
+        let (mut session, mut view) = session("");
+        type_each(&mut session, &mut view, "hello world");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "hello ");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "");
+        assert!(session.redo(&mut view));
+        assert_eq!(session.source(), "hello ");
+    }
+
+    #[test]
+    fn keys_from_native_text_input_are_undone_a_word_at_a_time() {
+        let (mut session, mut view) = session("");
+        for ch in "hello world".chars() {
+            let at = view.selection.focus.byte;
+            let revision = session.revision();
+            assert!(session.replace_range_at_revision(
+                &mut view,
+                revision,
+                at..at,
+                &ch.to_string()
+            ));
+        }
+        // A word committed whole by an input method is a step of its own.
+        let at = view.selection.focus.byte;
+        let revision = session.revision();
+        assert!(session.replace_range_at_revision(&mut view, revision, at..at, "你好"));
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "hello world");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "hello ");
+    }
+
+    #[test]
+    fn a_paste_or_a_moved_caret_starts_a_new_undo_step() {
+        let (mut session, mut view) = session("");
+        type_each(&mut session, &mut view, "ab");
+        assert!(session.insert_text(&mut view, "PASTED"));
+        type_each(&mut session, &mut view, "cd");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "abPASTED");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "ab");
+
+        session.set_caret(&mut view, 0, false);
+        type_each(&mut session, &mut view, "x");
+        session.set_caret(&mut view, session.source().len(), false);
+        type_each(&mut session, &mut view, "y");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "xab");
+    }
+
+    #[test]
+    fn typing_after_undo_or_redo_starts_a_new_group() {
+        let (mut session, mut view) = session("");
+        type_each(&mut session, &mut view, "a");
+        assert!(session.insert_text(&mut view, "PASTED"));
+        assert!(session.undo(&mut view));
+        type_each(&mut session, &mut view, "b");
+        assert_eq!(session.source(), "ab");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "a");
+
+        assert!(session.redo(&mut view));
+        type_each(&mut session, &mut view, "c");
+        assert_eq!(session.source(), "abc");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "ab");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "a");
+    }
+
+    #[test]
+    fn deleting_after_undo_starts_a_new_group() {
+        let (mut session, mut view) = session("abc");
+        session.set_caret(&mut view, 3, false);
+        assert!(session.backspace(&mut view));
+        assert!(session.insert_text(&mut view, "PASTED"));
+        assert!(session.undo(&mut view));
+        assert!(session.backspace(&mut view));
+        assert_eq!(session.source(), "a");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "ab");
+    }
+
+    #[test]
+    fn backspacing_and_forward_deleting_are_undone_as_one_step() {
+        let (mut session, mut view) = session("abcdef");
+        session.set_caret(&mut view, 6, false);
+        assert!(session.backspace(&mut view));
+        assert!(session.backspace(&mut view));
+        assert_eq!(session.source(), "abcd");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "abcdef");
+        assert_eq!(view.selection.focus.byte, 6);
+
+        session.set_caret(&mut view, 0, false);
+        assert!(session.delete_forward(&mut view));
+        assert!(session.delete_forward(&mut view));
+        assert_eq!(session.source(), "cdef");
+        assert!(session.undo(&mut view));
+        assert_eq!(session.source(), "abcdef");
+    }
+
+    #[test]
+    fn line_and_word_deletes_and_document_edges() {
+        let (mut session, mut view) = session("one two\nthree");
+        session.set_caret(&mut view, 7, false);
+        assert!(session.delete_to(&mut view, 0));
+        assert_eq!(session.source(), "\nthree");
+        // At the line's start it takes the line break before it.
+        session.set_caret(&mut view, 1, false);
+        assert!(session.delete_to(&mut view, 1));
+        assert_eq!(session.source(), "three");
+
+        session.set_caret(&mut view, 0, false);
+        assert!(session.delete_word_forward(&mut view));
+        assert_eq!(session.source(), "");
+
+        let (mut lines, mut view) = self::session("ab\ncd");
+        lines.set_caret(&mut view, 1, false);
+        assert!(lines.delete_until(&mut view, 2));
+        assert_eq!(lines.source(), "a\ncd");
+        // Up on the first line goes to the start, down on the last to the end.
+        lines.move_vertical(&mut view, -1, false);
+        assert_eq!(view.selection.focus.byte, 0);
+        lines.set_caret(&mut view, 3, false);
+        lines.move_vertical(&mut view, 1, false);
+        assert_eq!(view.selection.focus.byte, lines.source().len());
     }
 }

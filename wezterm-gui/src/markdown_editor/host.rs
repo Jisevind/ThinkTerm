@@ -9,6 +9,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone)]
 enum NoteDisplaySource {
@@ -1034,9 +1035,8 @@ impl NoteHostState {
     }
 
     /// Move between painted visual rows (including soft wraps) while retaining
-    /// the preferred horizontal pixel. The controller falls back to physical
-    /// source-line navigation when the target row is outside the current
-    /// viewport and therefore intentionally has no shaped layout.
+    /// the preferred horizontal pixel. A target row outside the viewport has
+    /// no shaped layout and is stepped onto by `offscreen_vertical_target`.
     pub(crate) fn visual_vertical_target(&self, delta: isize) -> Option<(SourcePosition, usize)> {
         let caret = self.view.selection.focus.byte;
         let current = self.line_layouts.iter().position(|line| {
@@ -1045,12 +1045,6 @@ impl NoteHostState {
                 .any(|run| run.source.start <= caret && caret <= run.source.end)
                 || (line.runs.is_empty() && line.source.start == caret)
         })?;
-        let target = if delta.is_negative() {
-            current.checked_sub(delta.unsigned_abs())?
-        } else {
-            current.checked_add(delta as usize)?
-        };
-        let target_line = self.line_layouts.get(target)?;
         let current_line = &self.line_layouts[current];
         let current_x = current_line
             .runs
@@ -1068,9 +1062,136 @@ impl NoteHostState {
             .view
             .preferred_column
             .unwrap_or(current_x.max(0.0) as usize);
-        let position = self
-            .source_position_for_point(preferred as f32, target_line.y + target_line.height / 2.0);
-        Some((position, preferred))
+        // A short table cell answers for the rows below its text with its
+        // last line, so a row can land where the caret already is: keep
+        // going until one does not.
+        let mut target = Some(current);
+        loop {
+            target = target.and_then(|target| target.checked_add_signed(delta));
+            let Some(target_line) = target.and_then(|target| self.line_layouts.get(target)) else {
+                return self
+                    .offscreen_vertical_target(delta)
+                    .map(|position| (position, preferred));
+            };
+            let position = self.source_position_for_point(
+                preferred as f32,
+                target_line.y + target_line.height / 2.0,
+            );
+            if position.byte != caret {
+                return Some((position, preferred));
+            }
+        }
+    }
+
+    /// Up or Down onto a row with no shaped layout, off screen: as many
+    /// characters into it as the caret is into its own row. Close enough
+    /// until the row shows and is laid out, and never more than a row away.
+    /// None past the first or last row.
+    pub(crate) fn offscreen_vertical_target(&self, delta: isize) -> Option<SourcePosition> {
+        let rows = &self.wrapped_visual.lines;
+        let caret = self.view.selection.focus.byte;
+        let holds = |line: &super::VisualLine| {
+            line.runs
+                .iter()
+                .any(|run| run.source.start <= caret && caret <= run.source.end)
+                || (line.runs.is_empty() && line.source.start == caret)
+        };
+        // At a wrap the byte ends one row and starts the next; the caret is
+        // drawn on the next.
+        let current = rows.iter().rposition(|line| holds(line))?;
+        let target = current.checked_add_signed(delta)?;
+        let row = rows.get(target)?;
+        let text_start = |line: &super::VisualLine| {
+            line.runs
+                .iter()
+                .find(|run| !run.atomic)
+                .map(|run| run.source.start)
+        };
+        let session = self.session.as_ref()?.lock();
+        let source = session.source();
+        let column = text_start(&rows[current])
+            .filter(|start| *start <= caret)
+            .and_then(|start| source.get(start..caret))
+            .map_or(0, |text| text.graphemes(true).count());
+        let Some(start) = text_start(row) else {
+            return Some(SourcePosition::new(row.source.start));
+        };
+        let end = row
+            .runs
+            .last()
+            .map_or(start, |run| run.source.end)
+            .max(start);
+        let text = source.get(start..end)?;
+        // A row the paragraph wraps on from ends before the space it wraps
+        // at, so the caret stays on it.
+        let wraps_on = rows
+            .get(target + 1)
+            .and_then(|next| next.runs.first())
+            .is_some_and(|run| run.source.start == end);
+        let text = if wraps_on { text.trim_end() } else { text };
+        let offset = text
+            .grapheme_indices(true)
+            .nth(column)
+            .map_or(text.len(), |(at, _)| at);
+        Some(SourcePosition::new(start + offset))
+    }
+
+    /// The source the painted row holding `byte` shows, when that row is on
+    /// screen: where ⌘← and ⌘→ go in a wrapped paragraph. A row starts after
+    /// a list marker, and one the paragraph wraps on from ends before the
+    /// space it wraps at, so the caret stays on the row.
+    pub(crate) fn visual_line_bounds(&self, byte: usize) -> Option<(usize, usize)> {
+        let contains = |line: &&NoteLineLayout| {
+            line.runs
+                .iter()
+                .any(|run| run.source.start <= byte && byte <= run.source.end)
+        };
+        // At a wrap the byte ends one row and starts the next; the caret is
+        // drawn on the next.
+        let index = self.line_layouts.iter().rposition(|line| contains(&line))?;
+        let line = &self.line_layouts[index];
+        let start = line
+            .runs
+            .iter()
+            .find(|run| !run.atomic || !self.is_list_marker_run(run))
+            .or_else(|| line.runs.first())?
+            .source
+            .start;
+        let mut end = line.runs.last()?.source.end;
+        let wraps_on = self
+            .line_layouts
+            .get(index + 1)
+            .and_then(|next| next.runs.first())
+            .is_some_and(|run| run.source.start == end);
+        if wraps_on {
+            if let Some(session) = self.session.as_ref() {
+                let session = session.lock();
+                if let Some(row) = session.source().get(start..end) {
+                    end = start + row.trim_end().len();
+                }
+            }
+        }
+        Some((start, end.max(start)))
+    }
+
+    /// Whether `run` is a list item's marker or task box, which a row's
+    /// start skips.
+    fn is_list_marker_run(&self, run: &NoteRunLayout) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        let session = session.lock();
+        let Some(source) = session.source().get(run.source.clone()) else {
+            return false;
+        };
+        let marker = source.trim();
+        matches!(marker, "-" | "*" | "+" | "[ ]" | "[x]" | "[X]")
+            || marker
+                .strip_suffix('.')
+                .or_else(|| marker.strip_suffix(')'))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+                })
     }
 
     pub(crate) fn atomic_source_for_point(&self, x: f32, y: f32) -> Option<Range<usize>> {
@@ -1216,6 +1337,37 @@ mod state_tests {
         ))));
         host.refresh_projection();
         host
+    }
+
+    #[test]
+    fn up_and_down_step_one_row_onto_rows_with_no_layout() {
+        // The document's one paragraph, wrapped over several rows, none of
+        // them on screen.
+        let mut host = host_with_source("aaaa bbb cccc ddd eeee fff gggg hhh");
+        host.wrapped_visual = Arc::new(
+            super::super::wrap_visual_document_by_width(&host.visual, 9.0, |_, _, text| {
+                Ok::<f32, ()>(text.chars().count() as f32)
+            })
+            .unwrap(),
+        );
+        let rows: Vec<usize> = host
+            .wrapped_visual
+            .lines
+            .iter()
+            .map(|line| line.runs.first().unwrap().source.start)
+            .collect();
+        assert!(rows.len() >= 3);
+        host.view.selection = SourceSelection::caret(rows[1] + 2);
+        assert_eq!(host.visual_vertical_target(1), None);
+        let target = |host: &NoteHostState, delta| {
+            host.offscreen_vertical_target(delta)
+                .map(|position| position.byte)
+        };
+        assert_eq!(target(&host, 1), Some(rows[2] + 2));
+        assert_eq!(target(&host, -1), Some(rows[0] + 2));
+        // None past the last row: the caret goes to the end from there.
+        host.view.selection = SourceSelection::caret(rows[rows.len() - 1] + 1);
+        assert_eq!(target(&host, 1), None);
     }
 
     #[test]
@@ -2090,6 +2242,36 @@ mod tests {
 
         assert_eq!(host.source_position_for_point(0.0, 5.0).byte, 0);
         assert_eq!(host.source_position_for_point(0.0, 65.0).byte, 2);
+    }
+
+    #[test]
+    fn down_leaves_a_table_row_whose_short_cell_repeats_below() {
+        // | a | bbbb/cccc wrapped |  then a row below.
+        let run = |source: std::ops::Range<usize>, x: f32| NoteRunLayout {
+            boundaries: vec![(x, source.start), (x + 10.0, source.end)],
+            source,
+            x,
+            width: 10.0,
+            hit_x: x,
+            hit_width: 50.0,
+            atomic: false,
+        };
+        let line = |y: f32, runs: Vec<NoteRunLayout>| NoteLineLayout {
+            source: 0..20,
+            y,
+            height: 20.0,
+            runs,
+        };
+        let mut host = NoteHostState::default();
+        host.line_layouts = vec![
+            line(0.0, vec![run(0..1, 0.0), run(4..8, 50.0)]),
+            // The short cell answers for the row's second line too.
+            line(20.0, vec![run(0..1, 0.0), run(8..12, 50.0)]),
+            line(40.0, vec![run(15..16, 0.0), run(17..18, 50.0)]),
+        ];
+        host.view.selection = SourceSelection::caret(1);
+        let (position, _) = host.visual_vertical_target(1).unwrap();
+        assert_eq!(position.byte, 16);
     }
 
     #[test]

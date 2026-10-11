@@ -5573,6 +5573,81 @@ impl crate::TermWindow {
         true
     }
 
+    /// The painted row holding `byte`, or its whole line when that row is
+    /// not on screen.
+    fn right_sidebar_note_row_bounds(&self, byte: usize) -> (usize, usize) {
+        self.right_sidebar_note
+            .visual_line_bounds(byte)
+            .or_else(|| {
+                self.right_sidebar_note
+                    .session
+                    .as_ref()
+                    .map(|session| session.lock().source_line_bounds(byte))
+            })
+            .unwrap_or((byte, byte))
+    }
+
+    /// ⌘← and ⌘→: to the start or end of the row the caret is on.
+    fn move_right_sidebar_note_to_row_edge(&mut self, end: bool, extend: bool) {
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return;
+        };
+        let caret = self.right_sidebar_note.view.selection.focus.byte;
+        let (row_start, row_end) = self.right_sidebar_note_row_bounds(caret);
+        session.lock().set_caret(
+            &mut self.right_sidebar_note.view,
+            if end { row_end } else { row_start },
+            extend,
+        );
+        self.right_sidebar_note.reveal_caret = true;
+        self.right_sidebar_note.refresh_projection();
+    }
+
+    /// Control-A, E, B, F, P, N, D, H and K, as in any Mac text field.
+    fn handle_right_sidebar_note_control_key(&mut self, letter: char) -> bool {
+        let key = match letter {
+            'a' | 'e' | 'k' => None,
+            'b' => Some(TermKeyCode::LeftArrow),
+            'f' => Some(TermKeyCode::RightArrow),
+            'p' => Some(TermKeyCode::UpArrow),
+            'n' => Some(TermKeyCode::DownArrow),
+            'd' => Some(TermKeyCode::Delete),
+            'h' => Some(TermKeyCode::Backspace),
+            _ => return false,
+        };
+        if let Some(key) = key {
+            return self.handle_right_sidebar_note_key(key, TermModifiers::NONE);
+        }
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return false;
+        };
+        self.right_sidebar_note.begin_live_editing();
+        // By paragraph, as Cocoa's moveToBeginningOfParagraph: and
+        // deleteToEndOfParagraph: do; ⌘← and ⌘→ go by row.
+        let caret = self.right_sidebar_note.view.selection.focus.byte;
+        let (start, end) = session.lock().source_line_bounds(caret);
+        match letter {
+            'a' | 'e' => {
+                session.lock().set_caret(
+                    &mut self.right_sidebar_note.view,
+                    if letter == 'a' { start } else { end },
+                    false,
+                );
+                self.right_sidebar_note.reveal_caret = true;
+                self.right_sidebar_note.refresh_projection();
+            }
+            _ => {
+                if session
+                    .lock()
+                    .delete_until(&mut self.right_sidebar_note.view, end)
+                {
+                    self.note_did_edit();
+                }
+            }
+        }
+        true
+    }
+
     fn handle_right_sidebar_note_key(&mut self, key: TermKeyCode, mods: TermModifiers) -> bool {
         // begin_live_editing() is deliberately deferred until a key is known
         // to be handled: an unrelated key must not flip the display source to
@@ -5593,7 +5668,10 @@ impl crate::TermWindow {
         if word_modifier
             && matches!(
                 key,
-                TermKeyCode::LeftArrow | TermKeyCode::RightArrow | TermKeyCode::Backspace
+                TermKeyCode::LeftArrow
+                    | TermKeyCode::RightArrow
+                    | TermKeyCode::Backspace
+                    | TermKeyCode::Delete
             )
         {
             let Some(session) = self.right_sidebar_note.session.clone() else {
@@ -5626,13 +5704,68 @@ impl crate::TermWindow {
                     }
                     return true;
                 }
+                TermKeyCode::Delete => {
+                    if session
+                        .lock()
+                        .delete_word_forward(&mut self.right_sidebar_note.view)
+                    {
+                        self.note_did_edit();
+                    }
+                    return true;
+                }
                 _ => {}
+            }
+        }
+
+        // Off macOS, Control with Home or End goes to the document's ends,
+        // and Control-Y redoes.
+        if !cfg!(target_os = "macos") && ctrl && !alt && !super_ {
+            match key {
+                TermKeyCode::Home | TermKeyCode::End => {
+                    let Some(session) = self.right_sidebar_note.session.clone() else {
+                        return false;
+                    };
+                    self.right_sidebar_note.begin_live_editing();
+                    let view = &mut self.right_sidebar_note.view;
+                    if key == TermKeyCode::Home {
+                        session.lock().move_document_start(view, shift);
+                    } else {
+                        session.lock().move_document_end(view, shift);
+                    }
+                    self.right_sidebar_note.reveal_caret = true;
+                    self.right_sidebar_note.refresh_projection();
+                    return true;
+                }
+                TermKeyCode::Char('y') | TermKeyCode::Char('Y') => {
+                    let Some(session) = self.right_sidebar_note.session.clone() else {
+                        return false;
+                    };
+                    self.right_sidebar_note.begin_live_editing();
+                    if session.lock().redo(&mut self.right_sidebar_note.view) {
+                        self.note_did_edit();
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        // The Control keys every Mac text field answers to.
+        if cfg!(target_os = "macos") && ctrl && !alt && !super_ && !shift {
+            if let TermKeyCode::Char(letter) = key {
+                if self.handle_right_sidebar_note_control_key(letter.to_ascii_lowercase()) {
+                    return true;
+                }
             }
         }
 
         if command && !alt {
             let command_handled = match key {
-                TermKeyCode::LeftArrow | TermKeyCode::RightArrow => super_,
+                TermKeyCode::LeftArrow
+                | TermKeyCode::RightArrow
+                | TermKeyCode::UpArrow
+                | TermKeyCode::DownArrow
+                | TermKeyCode::Backspace => super_,
                 TermKeyCode::Char(
                     'a' | 'A' | 'c' | 'C' | 'x' | 'X' | 'v' | 'V' | 'z' | 'Z' | 's' | 'S' | 'e'
                     | 'E' | 'b' | 'B' | 'i' | 'I',
@@ -5644,22 +5777,36 @@ impl crate::TermWindow {
             }
             match key {
                 TermKeyCode::LeftArrow if super_ => {
+                    self.move_right_sidebar_note_to_row_edge(false, shift);
+                    return true;
+                }
+                TermKeyCode::RightArrow if super_ => {
+                    self.move_right_sidebar_note_to_row_edge(true, shift);
+                    return true;
+                }
+                TermKeyCode::UpArrow | TermKeyCode::DownArrow if super_ => {
                     if let Some(session) = self.right_sidebar_note.session.clone() {
-                        session
-                            .lock()
-                            .move_line_start(&mut self.right_sidebar_note.view, shift);
+                        let view = &mut self.right_sidebar_note.view;
+                        if key == TermKeyCode::UpArrow {
+                            session.lock().move_document_start(view, shift);
+                        } else {
+                            session.lock().move_document_end(view, shift);
+                        }
                         self.right_sidebar_note.reveal_caret = true;
                         self.right_sidebar_note.refresh_projection();
                     }
                     return true;
                 }
-                TermKeyCode::RightArrow if super_ => {
+                TermKeyCode::Backspace if super_ => {
                     if let Some(session) = self.right_sidebar_note.session.clone() {
-                        session
+                        let caret = self.right_sidebar_note.view.selection.focus.byte;
+                        let start = self.right_sidebar_note_row_bounds(caret).0;
+                        if session
                             .lock()
-                            .move_line_end(&mut self.right_sidebar_note.view, shift);
-                        self.right_sidebar_note.reveal_caret = true;
-                        self.right_sidebar_note.refresh_projection();
+                            .delete_to(&mut self.right_sidebar_note.view, start)
+                        {
+                            self.note_did_edit();
+                        }
                     }
                     return true;
                 }
@@ -5736,6 +5883,21 @@ impl crate::TermWindow {
             return false;
         }
 
+        if matches!(key, TermKeyCode::PageUp | TermKeyCode::PageDown) {
+            // A page at a time, the caret left where it is, as on a Mac.
+            let padding = self.ui_f32(NOTE_BODY_PADDING as f32);
+            let host = &mut self.right_sidebar_note;
+            let page = (host.viewport_height - padding).max(1.0);
+            host.reveal_caret = false;
+            // As a wheel scroll is: the scrollbar shows it.
+            host.scroll_by(if key == TermKeyCode::PageUp {
+                -page
+            } else {
+                page
+            });
+            return true;
+        }
+
         let will_handle = matches!(
             key,
             TermKeyCode::Escape
@@ -5786,6 +5948,14 @@ impl crate::TermWindow {
                             SourceSelection::caret(position.byte);
                     }
                     self.right_sidebar_note.view.preferred_column = Some(preferred);
+                } else if let Some(position) = self.right_sidebar_note.offscreen_vertical_target(-1)
+                {
+                    if shift {
+                        self.right_sidebar_note.view.selection.focus = position;
+                    } else {
+                        self.right_sidebar_note.view.selection =
+                            SourceSelection::caret(position.byte);
+                    }
                 } else {
                     session
                         .lock()
@@ -5804,6 +5974,14 @@ impl crate::TermWindow {
                             SourceSelection::caret(position.byte);
                     }
                     self.right_sidebar_note.view.preferred_column = Some(preferred);
+                } else if let Some(position) = self.right_sidebar_note.offscreen_vertical_target(1)
+                {
+                    if shift {
+                        self.right_sidebar_note.view.selection.focus = position;
+                    } else {
+                        self.right_sidebar_note.view.selection =
+                            SourceSelection::caret(position.byte);
+                    }
                 } else {
                     session
                         .lock()
@@ -5871,7 +6049,7 @@ impl crate::TermWindow {
             TermKeyCode::Char(ch) if !ch.is_control() => {
                 changed = session
                     .lock()
-                    .insert_text(&mut self.right_sidebar_note.view, &ch.to_string());
+                    .type_text(&mut self.right_sidebar_note.view, &ch.to_string());
                 true
             }
             _ => false,
