@@ -135,6 +135,14 @@ thinkterm plugin list        # 列出可用插件
 thinkterm --help             # 查看所有命令
 ```
 
+### 让编程 Agent 使用 ThinkTerm
+
+仓库里附带一个 skill，教 Claude Code、Codex、Cursor 等编程 Agent 查看和操作其他窗格。安装：
+
+```sh
+npx skills add RoversX/ThinkTerm --skill thinkterm -g
+```
+
 ## 文档与开发
 
 - [浏览器访问](docs/thinkterm/web-access.md)

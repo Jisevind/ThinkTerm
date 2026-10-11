@@ -147,6 +147,14 @@ thinkterm plugin list        # List available plugins
 thinkterm --help             # Show all commands
 ```
 
+### Let your coding agent use ThinkTerm
+
+The repository includes a skill that teaches coding agents such as Claude Code, Codex and Cursor to see and work with the other panes. Install it with:
+
+```sh
+npx skills add RoversX/ThinkTerm --skill thinkterm -g
+```
+
 ## Documentation and development
 
 - [Browser access](docs/thinkterm/web-access.md)

@@ -135,6 +135,14 @@ thinkterm plugin list        # 利用可能なプラグインを一覧表示
 thinkterm --help             # すべてのコマンドを表示
 ```
 
+### コーディングエージェントに ThinkTerm を使わせる
+
+リポジトリには、Claude Code、Codex、Cursor などのコーディングエージェントがほかのペインを確認・操作できるようにするスキルが含まれています。次のコマンドでインストールします。
+
+```sh
+npx skills add RoversX/ThinkTerm --skill thinkterm -g
+```
+
 ## ドキュメントと開発
 
 - [ブラウザーからのアクセス](docs/thinkterm/web-access.md)

@@ -135,6 +135,14 @@ thinkterm plugin list        # Lister les plugins disponibles
 thinkterm --help             # Afficher toutes les commandes
 ```
 
+### Laisser votre agent de programmation utiliser ThinkTerm
+
+Le dépôt inclut un skill qui apprend aux agents de programmation comme Claude Code, Codex et Cursor à voir et à piloter les autres volets. Pour l’installer :
+
+```sh
+npx skills add RoversX/ThinkTerm --skill thinkterm -g
+```
+
 ## Documentation et développement
 
 - [Accès par navigateur](docs/thinkterm/web-access.md)

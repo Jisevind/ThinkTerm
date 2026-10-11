@@ -135,6 +135,14 @@ thinkterm plugin list        # Verfügbare Plugins auflisten
 thinkterm --help             # Alle Befehle anzeigen
 ```
 
+### Coding-Agenten ThinkTerm nutzen lassen
+
+Das Repository enthält einen Skill, mit dem Coding-Agenten wie Claude Code, Codex und Cursor die anderen Terminalbereiche sehen und bedienen können. Installation:
+
+```sh
+npx skills add RoversX/ThinkTerm --skill thinkterm -g
+```
+
 ## Dokumentation und Entwicklung
 
 - [Browserzugriff](docs/thinkterm/web-access.md)
