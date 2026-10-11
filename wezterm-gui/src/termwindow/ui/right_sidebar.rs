@@ -193,6 +193,21 @@ enum PreviewDiskState {
     Gone,
 }
 
+/// Bind an editable preview to the session it edits. A fresh one takes the
+/// file as it was when the text was read, so a change since shows as another
+/// writer's; a shared one, a Note's or another window's, knows its file
+/// already. Either way, edited here, a file that goes away stays gone.
+fn claim_markdown_preview_session(
+    session: &mut crate::markdown_editor::MarkdownDocumentSession,
+    fresh: bool,
+    read_stamp: Option<(std::time::SystemTime, u64)>,
+) {
+    if fresh {
+        session.set_disk_stamp(read_stamp);
+    }
+    session.keep_existing_file();
+}
+
 /// Look at an editable preview's file against the stamp its text was read
 /// or saved at. Off the GUI thread: it stats and reads the file.
 fn preview_disk_state(
@@ -2969,13 +2984,13 @@ impl crate::TermWindow {
         } else {
             EditorMode::ReadOnly
         };
-        if editable && fresh {
+        if editable {
             if let Some(session) = state.host.session.as_ref() {
-                let mut session = session.lock();
-                // The file as it was when the text was read: a change since
-                // shows as another writer's, not as this text.
-                session.set_disk_stamp(self.right_sidebar_file_preview_disk_stamp);
-                session.keep_existing_file();
+                claim_markdown_preview_session(
+                    &mut session.lock(),
+                    fresh,
+                    self.right_sidebar_file_preview_disk_stamp,
+                );
             }
         }
         // Native text input answers with the token it was given; the Note's
@@ -24994,6 +25009,38 @@ mod tests {
         if shut {
             assert!(matches!(state, super::PreviewDiskState::Unseen));
         }
+    }
+
+    #[test]
+    fn a_preview_sharing_a_notes_session_does_not_bring_a_deleted_file_back() {
+        use crate::markdown_editor::{
+            save_document_revision, share_document_session, EditorViewState,
+            MarkdownDocumentSession,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.md");
+        fs::write(&path, "before").unwrap();
+        let session = |id: &str| {
+            std::sync::Arc::new(parking_lot::Mutex::new(MarkdownDocumentSession::new(
+                id.to_string(),
+                path.clone(),
+                "before".to_string(),
+            )))
+        };
+        // A Note opened the file first, on a session that may create it; the
+        // preview shares that one rather than its own.
+        let (note, _) = share_document_session(session("note"));
+        let (shared, fresh) = share_document_session(session("preview"));
+        assert!(std::sync::Arc::ptr_eq(&note, &shared) && !fresh);
+        let known = shared.lock().disk_stamp();
+        super::claim_markdown_preview_session(&mut shared.lock(), fresh, None);
+        assert_eq!(shared.lock().disk_stamp(), known);
+
+        let mut view = EditorViewState::default();
+        assert!(shared.lock().insert_text(&mut view, "new "));
+        fs::remove_file(&path).unwrap();
+        assert!(save_document_revision(&shared).is_err());
+        assert!(!path.exists());
     }
 
     #[test]
