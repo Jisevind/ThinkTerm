@@ -6,11 +6,16 @@
 
 **[こちらからダウンロード](https://github.com/RoversX/ThinkTerm/releases)** - 最新リリースを入手
 
-🍺 **Homebrew**（macOS）：`brew install --cask roversx/tap/thinkterm`
+🍺 **Homebrew**（macOS）： 
+```
+brew install --cask roversx/tap/thinkterm
+```
 
 🌐 **公式サイト**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **ドキュメント**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
+
+⭐ よろしければ [ThinkTerm](https://github.com/RoversX/ThinkTerm) にスターをお願いします！
 
 **複数のマシンを、ひとつの作業環境に。**
 
@@ -42,6 +47,13 @@ ThinkTerm は [WezTerm](https://github.com/wezterm/wezterm) を基盤とした�
 </table>
 
 ## 中心にあるのはマルチプレクサー
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+    <img src="assets/architecture-light.svg" alt="ThinkTerm の簡略アーキテクチャ：デスクトップアプリ、TUI と CLI、ブラウザー、スマートフォンアプリが各マシンの mux サーバーに接続し、マシン同士も接続できます。デスクトップアプリは通常の SSH や Mosh のホストにも接続できます" width="100%">
+  </picture>
+</p>
 
 ターミナルマルチプレクサーは複数のターミナルセッションを管理し、クライアントからの接続を受け付けます。ThinkTerm では、**mux サーバーがセッション、タブ、分割ペインを保持**し、クライアントが表示と入力の送信を担当します。
 
@@ -175,3 +187,7 @@ ThinkTerm は Lua で設定し、既定では ThinkTerm 独自のパスを使用
 ThinkTerm のライセンスは **GPL-3.0-only** です。[LICENSE.md](LICENSE.md)をご覧ください。WezTerm 由来のコードは元の MIT ライセンスを維持し、[LICENSE-MIT](LICENSE-MIT)に記載しています。herdr 由来のエージェント検出マニフェストは **Apache-2.0** ライセンスです。
 
 第三者のコンポーネントと同梱リソースの完全なクレジットおよびライセンスは、[NOTICE](NOTICE) と [licenses/README.md](licenses/README.md)をご覧ください。
+
+
+
+![GitHub downloads](https://img.shields.io/github/downloads/RoversX/ThinkTerm/total)

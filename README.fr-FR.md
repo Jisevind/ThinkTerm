@@ -6,11 +6,16 @@
 
 **[Télécharger ici](https://github.com/RoversX/ThinkTerm/releases)** - Obtenir la dernière version
 
-🍺 **Homebrew** (macOS) : `brew install --cask roversx/tap/thinkterm`
+🍺 **Homebrew** (macOS) : 
+```
+brew install --cask roversx/tap/thinkterm
+```
 
 🌐 **Site web**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **Documentation**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
+
+⭐ Pensez à ajouter une étoile à [ThinkTerm](https://github.com/RoversX/ThinkTerm) !
 
 **Vos machines réunies dans un même espace de travail.**
 
@@ -42,6 +47,13 @@ ThinkTerm est un **terminal open source avec multiplexeur intégré, écrit en R
 </table>
 
 ## Le multiplexeur au cœur de ThinkTerm
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+    <img src="assets/architecture-light.svg" alt="Architecture simplifiée de ThinkTerm : l’application de bureau, la TUI et la CLI, le navigateur et les applications mobiles se connectent au serveur mux de chaque machine ; les machines peuvent se joindre entre elles, et l’application de bureau rejoint aussi des hôtes SSH et Mosh classiques" width="100%">
+  </picture>
+</p>
 
 Un multiplexeur de terminaux gère plusieurs sessions et permet aux clients de s’y connecter. Dans ThinkTerm, **le serveur mux conserve les sessions, les onglets et les volets divisés**. Le client les affiche et transmet vos entrées.
 
@@ -175,3 +187,7 @@ Les contributions sont les bienvenues. Lisez [CONTRIBUTING.md](CONTRIBUTING.md) 
 ThinkTerm est distribué sous **GPL-3.0-only** — voir [LICENSE.md](LICENSE.md). Le code provenant de WezTerm conserve sa licence MIT d’origine dans [LICENSE-MIT](LICENSE-MIT). Les manifestes de détection des agents provenant de herdr sont sous licence **Apache-2.0**.
 
 Consultez [NOTICE](NOTICE) et [licenses/README.md](licenses/README.md) pour les attributions complètes et les licences des composants tiers et des ressources incluses.
+
+
+
+![GitHub downloads](https://img.shields.io/github/downloads/RoversX/ThinkTerm/total)

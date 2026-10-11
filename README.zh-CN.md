@@ -6,11 +6,16 @@
 
 **[点击下载](https://github.com/RoversX/ThinkTerm/releases)** - 获取最新版本
 
-🍺 **Homebrew**（macOS）：`brew install --cask roversx/tap/thinkterm`
+🍺 **Homebrew**（macOS）： 
+```
+brew install --cask roversx/tap/thinkterm
+```
 
 🌐 **官网**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **文档**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
+
+⭐ 觉得有用的话，给 [ThinkTerm](https://github.com/RoversX/ThinkTerm) 点个 Star 吧！
 
 **让你的多台机器融为一体。**
 
@@ -42,6 +47,13 @@ ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**
 </table>
 
 ## 以终端复用器为核心
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+    <img src="assets/architecture-light.svg" alt="ThinkTerm 简化架构：桌面应用、TUI 和 CLI、浏览器以及手机应用连接到每台机器上的 mux 服务端；机器之间可以互相连接，桌面应用还能连接普通 SSH 和 Mosh 主机" width="100%">
+  </picture>
+</p>
 
 终端复用器负责管理多个终端会话，并允许客户端接入。在 ThinkTerm 中，**会话、标签页和分屏由 mux 服务端持有**，客户端负责显示内容和传递输入。
 
@@ -175,3 +187,7 @@ ThinkTerm 使用 Lua 配置，默认读取自己的 ThinkTerm 路径，并支持
 ThinkTerm 采用 **GPL-3.0-only** 许可证，见 [LICENSE.md](LICENSE.md)。来自 WezTerm 的代码保留其原有 MIT 许可证，见 [LICENSE-MIT](LICENSE-MIT)。来自 herdr 的 Agent 检测清单采用 **Apache-2.0** 许可证。
 
 第三方组件与附带资源的完整署名及许可证见 [NOTICE](NOTICE) 和 [licenses/README.md](licenses/README.md)。
+
+
+
+![GitHub downloads](https://img.shields.io/github/downloads/RoversX/ThinkTerm/total)

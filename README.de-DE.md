@@ -6,11 +6,16 @@
 
 **[Hier herunterladen](https://github.com/RoversX/ThinkTerm/releases)** - Die neueste Version erhalten
 
-🍺 **Homebrew** (macOS): `brew install --cask roversx/tap/thinkterm`
+🍺 **Homebrew** (macOS): 
+```
+brew install --cask roversx/tap/thinkterm
+```
 
 🌐 **Website**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **Dokumentation**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
+
+⭐ Gib [ThinkTerm](https://github.com/RoversX/ThinkTerm) gern einen Stern!
 
 **Deine Rechner werden zu einer gemeinsamen Arbeitsumgebung.**
 
@@ -42,6 +47,13 @@ ThinkTerm ist ein **in Rust geschriebenes Open-Source-Terminal mit integriertem 
 </table>
 
 ## Der Multiplexer als Kern
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+    <img src="assets/architecture-light.svg" alt="Vereinfachte Architektur von ThinkTerm: Desktop-App, TUI und CLI, Browser und Smartphone-Apps verbinden sich mit dem mux-Server auf jedem Rechner; die Rechner können einander erreichen, und die Desktop-App erreicht auch normale SSH- und Mosh-Hosts" width="100%">
+  </picture>
+</p>
 
 Ein Terminal-Multiplexer verwaltet mehrere Terminalsitzungen, mit denen sich Clients verbinden können. In ThinkTerm **hält der mux-Server die Sitzungen, Tabs und geteilten Terminalbereiche**. Der Client zeigt sie an und überträgt deine Eingaben.
 
@@ -175,3 +187,7 @@ Beiträge sind willkommen. Bitte lies [CONTRIBUTING.md](CONTRIBUTING.md), bevor 
 ThinkTerm steht unter **GPL-3.0-only** — siehe [LICENSE.md](LICENSE.md). Aus WezTerm übernommener Code behält seine ursprüngliche MIT-Lizenz in [LICENSE-MIT](LICENSE-MIT). Die Manifeste zur Agentenerkennung aus herdr stehen unter **Apache-2.0**.
 
 Die vollständigen Quellenangaben und Lizenzen der Drittanbieterkomponenten und mitgelieferten Ressourcen stehen in [NOTICE](NOTICE) und [licenses/README.md](licenses/README.md).
+
+
+
+![GitHub downloads](https://img.shields.io/github/downloads/RoversX/ThinkTerm/total)
