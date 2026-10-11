@@ -3202,13 +3202,18 @@ pub struct TermWindow {
     right_sidebar_mode: RightSidebarMode,
     right_sidebar_agents_scroll: f32,
     /// Agents whose sub-task list is open in the Agents panel; folded is
-    /// the default. Each paint of the panel drops the ones with no
-    /// sub-tasks left, so the next batch starts folded again.
+    /// the default. Each new status snapshot the panel paints drops the ones
+    /// with no sub-tasks left, so the next batch starts folded again.
     right_sidebar_agents_open_subtasks: HashSet<PaneId>,
     /// What each agent's description was cut to, so a description that does
-    /// not fit is cut and measured once rather than every frame. Each paint
-    /// of the panel drops the agents that have gone.
+    /// not fit is cut and measured once rather than every frame. Each new
+    /// status snapshot the panel paints drops the agents that have gone.
     right_sidebar_agents_fitted: HashMap<PaneId, ui::agent_panel::FittedDescription>,
+    /// The Agents panel's list as last arranged; see `AgentPanelList`.
+    right_sidebar_agents_list: Option<Rc<ui::agent_panel::AgentPanelList>>,
+    /// Whether the last paint pass painted the Agents panel. A pass after
+    /// one that did not lets the list go: it keeps a whole snapshot alive.
+    right_sidebar_agents_painted: bool,
     right_sidebar_snippet_view: RightSidebarSnippetView,
     right_sidebar_snippet_focus: Option<RightSidebarSnippetField>,
     right_sidebar_snippet_search: TextInputState,
@@ -4801,6 +4806,8 @@ impl TermWindow {
             right_sidebar_agents_scroll: 0.0,
             right_sidebar_agents_open_subtasks: HashSet::new(),
             right_sidebar_agents_fitted: HashMap::new(),
+            right_sidebar_agents_list: None,
+            right_sidebar_agents_painted: false,
             right_sidebar_snippet_view: RightSidebarSnippetView::List,
             right_sidebar_snippet_focus: None,
             right_sidebar_snippet_search: TextInputState::new(),

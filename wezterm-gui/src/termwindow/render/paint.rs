@@ -4033,6 +4033,10 @@ impl crate::TermWindow {
 
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
+        // The Agents panel's arranged list lives while the panel is painted.
+        if !std::mem::take(&mut self.right_sidebar_agents_painted) {
+            self.right_sidebar_agents_list = None;
+        }
 
         // The right sidebar is part of the local window geometry. A deferred
         // content-view resize or an asynchronous remote resync can leave the

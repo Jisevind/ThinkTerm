@@ -393,13 +393,16 @@ pub(crate) fn blocked_kind_key(kind: ProgramBlockedKind) -> &'static str {
 /// and rows trading places read as state changes. Group by the visible
 /// place name instead, then agent, then pane id as the final tiebreak.
 pub(crate) fn sort_for_display(agents: &mut [AgentPaneStatus]) {
-    agents.sort_by(|a, b| {
-        a.place
-            .to_lowercase()
-            .cmp(&b.place.to_lowercase())
-            .then_with(|| a.agent_id.cmp(&b.agent_id))
-            .then_with(|| a.pane_id.cmp(&b.pane_id))
-    });
+    agents.sort_by(display_order);
+}
+
+/// The comparison behind [`sort_for_display`].
+pub(crate) fn display_order(a: &AgentPaneStatus, b: &AgentPaneStatus) -> std::cmp::Ordering {
+    a.place
+        .to_lowercase()
+        .cmp(&b.place.to_lowercase())
+        .then_with(|| a.agent_id.cmp(&b.agent_id))
+        .then_with(|| a.pane_id.cmp(&b.pane_id))
 }
 
 pub(crate) fn display_name(agent_id: &str) -> String {

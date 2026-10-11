@@ -17,7 +17,10 @@ use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
 use mux::pane::PaneId;
 use mux::Mux;
+use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use wezterm_client::domain::FrontendRecoverySlot;
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
@@ -176,22 +179,15 @@ impl TermWindow {
         let list_top = content_top + toolbar_height;
         let inset = self.ui_px(SIDEBAR_INSET);
 
-        let mut agents = agent_status::list_agent_panes();
-        // An open list lasts as long as its sub-tasks: the next batch starts
-        // folded, and an agent that has gone leaves nothing behind.
-        self.right_sidebar_agents_fitted
-            .retain(|pane_id, _| agents.iter().any(|agent| agent.pane_id == *pane_id));
-        self.right_sidebar_agents_open_subtasks.retain(|pane_id| {
-            agents.iter().any(|agent| {
-                agent.pane_id == *pane_id
-                    && agent
-                        .report
-                        .as_ref()
-                        .is_some_and(|report| !report.children.is_empty())
-            })
-        });
-        let has_agents = !agents.is_empty();
-        if agents.is_empty() {
+        self.right_sidebar_agents_painted = true;
+        // The status snapshot itself, not a copy: the list below keeps
+        // positions in it.
+        let snapshot = agent_status::agent_panes();
+        let has_agents = !snapshot.is_empty();
+        if !has_agents {
+            self.right_sidebar_agents_list = None;
+            self.right_sidebar_agents_fitted.clear();
+            self.right_sidebar_agents_open_subtasks.clear();
             // Nothing but the toolbar: an empty-state card here is a large
             // bordered box explaining that a list is empty, which the
             // toolbar line already says in one row. The panel reads as
@@ -215,13 +211,6 @@ impl TermWindow {
         // grouped and ordered.
         // Borrowed from the shared settings, not copied: this runs per frame.
         let view = &settings.chrome.agents_panel_view;
-        agents.retain(|agent| {
-            !view.hides_status(agent.work_status().settings_key())
-                && !view.hides_machine(&agent.machine)
-        });
-        agent_status::sort_for_display(&mut agents);
-        order_for_view(&mut agents, view);
-        let entries = panel_entries(&agents, view.group_by());
 
         // Borrow the file tree's row chrome wholesale so the two lists read as
         // one control: same height, same icon size, same gaps, all derived from
@@ -298,20 +287,6 @@ impl TermWindow {
         // One clock reading for the whole panel, so its spinners and
         // shimmers step together.
         let frames = crate::termwindow::ui::status_icon::spinner_frames();
-        let layouts: Vec<AgentRowLayout> = agents
-            .iter()
-            .map(|agent| {
-                AgentRowLayout::of(
-                    agent,
-                    show,
-                    self.right_sidebar_agents_open_subtasks
-                        .contains(&agent.pane_id),
-                    row_height,
-                    cell_height + line_gap,
-                    bar_height + line_gap,
-                )
-            })
-            .collect();
         // Card titles and group headings: the rows' size, semibold. Shaped
         // once and cached like every sidebar line, so the second weight
         // costs nothing per frame. Headings take the grey, so a heading
@@ -322,29 +297,58 @@ impl TermWindow {
             .context("agents group heading font")?;
         let header_metrics = RenderMetrics::with_font_metrics(&header_font.metrics());
         let header_height = header_metrics.cell_size.height as usize;
-        // Where each entry starts: a row a gap below whatever came before it,
-        // a group's first row a little closer under its heading.
-        let header_gap = self.ui_px(4);
-        let mut tops = Vec::with_capacity(entries.len());
-        let mut total_height = 0usize;
-        for (index, entry) in entries.iter().enumerate() {
-            if index > 0 {
-                total_height += match entries[index - 1] {
-                    PanelEntry::Header { .. } => header_gap,
-                    PanelEntry::Agent(_) => row_gap,
-                };
+        // The list as the view arranges it. Arranging walks every agent, so
+        // it is done again only when the snapshot or something it was
+        // arranged for has changed; a frame only paints the rows in view.
+        let sizes = AgentRowSizes {
+            row: row_height,
+            line: cell_height + line_gap,
+            bar: bar_height + line_gap,
+            header: header_height,
+            // A group's first row sits a little closer under its heading
+            // than a row under the one before it.
+            header_gap: self.ui_px(4),
+            row_gap,
+        };
+        let kept = self
+            .right_sidebar_agents_list
+            .as_ref()
+            .filter(|list| {
+                list.is_for(
+                    &snapshot,
+                    view,
+                    show,
+                    &self.right_sidebar_agents_open_subtasks,
+                    sizes,
+                )
+            })
+            .cloned();
+        let list = match kept {
+            Some(list) => list,
+            None => {
+                let new_snapshot = self
+                    .right_sidebar_agents_list
+                    .as_ref()
+                    .map_or(true, |list| !Arc::ptr_eq(&list.snapshot, &snapshot));
+                if new_snapshot {
+                    self.forget_gone_agents(&snapshot);
+                }
+                let list = Rc::new(AgentPanelList::arrange(
+                    snapshot,
+                    view,
+                    show,
+                    &self.right_sidebar_agents_open_subtasks,
+                    sizes,
+                ));
+                self.right_sidebar_agents_list = Some(Rc::clone(&list));
+                list
             }
-            tops.push(total_height);
-            total_height += match *entry {
-                PanelEntry::Header { .. } => header_height,
-                PanelEntry::Agent(row) => layouts[row].height,
-            };
-        }
-        let max_scroll = total_height.saturating_sub(visible_height) as f32;
+        };
+        let max_scroll = list.height.saturating_sub(visible_height) as f32;
         self.right_sidebar_agents_scroll = self.right_sidebar_agents_scroll.clamp(0.0, max_scroll);
         let scroll = self.right_sidebar_agents_scroll;
 
-        if entries.is_empty() {
+        if list.entries.is_empty() {
             // Agents there are, but the view menu hides every one: say so
             // where the list would be, or the panel reads as broken.
             let line = crate::i18n::tr("right-agents-all-hidden");
@@ -359,8 +363,11 @@ impl TermWindow {
                 muted_fg,
             )?;
         }
-        for (index, entry) in entries.iter().enumerate() {
-            let row_top = list_top as f32 + tops[index] as f32 - scroll;
+        // The walk starts at the first entry that reaches into view and
+        // stops below it, so the rows above and below cost nothing.
+        let first = list.ends.partition_point(|&end| end as f32 <= scroll);
+        for (index, entry) in list.entries.iter().enumerate().skip(first) {
+            let row_top = list_top as f32 + list.tops[index] as f32 - scroll;
             if row_top >= viewport_bottom as f32 {
                 break;
             }
@@ -411,11 +418,11 @@ impl TermWindow {
                 }
                 PanelEntry::Agent(row) => *row,
             };
-            let (agent, layout) = (&agents[row], &layouts[row]);
+            let (agent, layout) = (list.agent(row), &list.layouts[row]);
             // A hairline in the gap above a row that follows another in its
             // group, in the separator colour: it parts the agents without
             // boxing them in. A heading parts the groups.
-            if index > 0 && matches!(entries[index - 1], PanelEntry::Agent(_)) {
+            if index > 0 && matches!(list.entries[index - 1], PanelEntry::Agent(_)) {
                 let y = (row_top - row_gap as f32 / 2.0).floor();
                 if y >= list_top as f32 && y < viewport_bottom as f32 {
                     self.fill_rounded_rectangle(
@@ -828,6 +835,27 @@ impl TermWindow {
         }
 
         Ok(())
+    }
+
+    /// An open sub-task list lasts as long as its sub-tasks, so the next
+    /// batch starts folded, and an agent that has gone leaves nothing
+    /// behind. Only a new snapshot can change either.
+    fn forget_gone_agents(&mut self, snapshot: &[agent_status::AgentPaneStatus]) {
+        let live: HashSet<PaneId> = snapshot.iter().map(|agent| agent.pane_id).collect();
+        self.right_sidebar_agents_fitted
+            .retain(|pane_id, _| live.contains(pane_id));
+        let with_subtasks: HashSet<PaneId> = snapshot
+            .iter()
+            .filter(|agent| {
+                agent
+                    .report
+                    .as_ref()
+                    .is_some_and(|report| !report.children.is_empty())
+            })
+            .map(|agent| agent.pane_id)
+            .collect();
+        self.right_sidebar_agents_open_subtasks
+            .retain(|pane_id| with_subtasks.contains(pane_id));
     }
 
     /// One line of the panel in one colour. See `paint_agent_text_with`.
@@ -1519,13 +1547,14 @@ fn group_label(
 /// Put agents already in `sort_for_display` order into the view's: by
 /// group, then -- when asked -- whatever changed state last first. The sort
 /// is stable, so the fixed order holds within a group otherwise.
-fn order_for_view(
-    agents: &mut [agent_status::AgentPaneStatus],
+fn order_for_view<A: Borrow<agent_status::AgentPaneStatus>>(
+    agents: &mut [A],
     view: &crate::native_settings::NativeAgentsPanelView,
 ) {
     let group_by = view.group_by();
     let recent = view.sort_by() == crate::native_settings::AgentsSortBy::Recent;
     agents.sort_by(|a, b| {
+        let (a, b) = (a.borrow(), b.borrow());
         group_order(a, group_by)
             .cmp(&group_order(b, group_by))
             .then_with(|| {
@@ -1540,22 +1569,22 @@ fn order_for_view(
 
 /// The list as it is drawn: a heading before each group's first agent,
 /// none when the view does not group.
-fn panel_entries(
-    agents: &[agent_status::AgentPaneStatus],
+fn panel_entries<A: Borrow<agent_status::AgentPaneStatus>>(
+    agents: &[A],
     group_by: crate::native_settings::AgentsGroupBy,
 ) -> Vec<PanelEntry> {
     let grouped = group_by != crate::native_settings::AgentsGroupBy::None;
     let mut entries = Vec::with_capacity(agents.len() + 4);
     let mut index = 0;
     while index < agents.len() {
-        let key = group_order(&agents[index], group_by);
+        let key = group_order(agents[index].borrow(), group_by);
         let end = agents[index..]
             .iter()
-            .position(|agent| group_order(agent, group_by) != key)
+            .position(|agent| group_order(agent.borrow(), group_by) != key)
             .map_or(agents.len(), |len| index + len);
         if grouped {
             entries.push(PanelEntry::Header {
-                label: group_label(&agents[index], group_by),
+                label: group_label(agents[index].borrow(), group_by),
                 count: end - index,
             });
         }
@@ -1563,6 +1592,144 @@ fn panel_entries(
         index = end;
     }
     entries
+}
+
+/// The sizes a list is arranged with: a row's base height, a line's, the
+/// progress bar's, a heading's, and the gaps under a heading and a row.
+#[derive(Clone, Copy, PartialEq)]
+struct AgentRowSizes {
+    row: usize,
+    line: usize,
+    bar: usize,
+    header: usize,
+    header_gap: usize,
+    row_gap: usize,
+}
+
+/// An agent of the status snapshot and its position there, so a list
+/// sorted by agent is kept as positions rather than copies.
+struct Indexed<'a> {
+    at: usize,
+    agent: &'a agent_status::AgentPaneStatus,
+}
+
+impl Borrow<agent_status::AgentPaneStatus> for Indexed<'_> {
+    fn borrow(&self) -> &agent_status::AgentPaneStatus {
+        self.agent
+    }
+}
+
+/// The Agents panel's list as last arranged: which agents of a status
+/// snapshot it shows, in what order and under which headings, how tall each
+/// row is and where each entry starts. Kept while the panel is painted, and
+/// arranged again only when the snapshot is replaced -- on a status change,
+/// and otherwise every 200ms -- or the view, the display toggles, the open
+/// sub-task lists or the sizes change.
+pub(crate) struct AgentPanelList {
+    snapshot: Arc<Vec<agent_status::AgentPaneStatus>>,
+    view: crate::native_settings::NativeAgentsPanelView,
+    show: crate::native_settings::NativeAgentStatusDisplay,
+    open: HashSet<PaneId>,
+    sizes: AgentRowSizes,
+    /// Positions in `snapshot`, in the view's order; a row's index is into
+    /// this and `layouts`.
+    order: Vec<usize>,
+    entries: Vec<PanelEntry>,
+    layouts: Vec<AgentRowLayout>,
+    /// Where each entry starts and ends below the list's top.
+    tops: Vec<usize>,
+    ends: Vec<usize>,
+    height: usize,
+}
+
+impl AgentPanelList {
+    fn arrange(
+        snapshot: Arc<Vec<agent_status::AgentPaneStatus>>,
+        view: &crate::native_settings::NativeAgentsPanelView,
+        show: crate::native_settings::NativeAgentStatusDisplay,
+        open: &HashSet<PaneId>,
+        sizes: AgentRowSizes,
+    ) -> Self {
+        let mut shown: Vec<Indexed> = snapshot
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| {
+                !view.hides_status(agent.work_status().settings_key())
+                    && !view.hides_machine(&agent.machine)
+            })
+            .map(|(at, agent)| Indexed { at, agent })
+            .collect();
+        shown.sort_by(|a, b| agent_status::display_order(a.agent, b.agent));
+        order_for_view(&mut shown, view);
+        let entries = panel_entries(&shown, view.group_by());
+        let layouts: Vec<AgentRowLayout> = shown
+            .iter()
+            .map(|row| {
+                AgentRowLayout::of(
+                    row.agent,
+                    show,
+                    open.contains(&row.agent.pane_id),
+                    sizes.row,
+                    sizes.line,
+                    sizes.bar,
+                )
+            })
+            .collect();
+        let order = shown.iter().map(|row| row.at).collect();
+        // A row a gap below whatever came before it, a group's first row a
+        // little closer under its heading.
+        let mut tops = Vec::with_capacity(entries.len());
+        let mut ends = Vec::with_capacity(entries.len());
+        let mut height = 0usize;
+        for (index, entry) in entries.iter().enumerate() {
+            if index > 0 {
+                height += match entries[index - 1] {
+                    PanelEntry::Header { .. } => sizes.header_gap,
+                    PanelEntry::Agent(_) => sizes.row_gap,
+                };
+            }
+            tops.push(height);
+            height += match *entry {
+                PanelEntry::Header { .. } => sizes.header,
+                PanelEntry::Agent(row) => layouts[row].height,
+            };
+            ends.push(height);
+        }
+        Self {
+            snapshot,
+            view: view.clone(),
+            show,
+            open: open.clone(),
+            sizes,
+            order,
+            entries,
+            layouts,
+            tops,
+            ends,
+            height,
+        }
+    }
+
+    /// Whether it was arranged from exactly these.
+    fn is_for(
+        &self,
+        snapshot: &Arc<Vec<agent_status::AgentPaneStatus>>,
+        view: &crate::native_settings::NativeAgentsPanelView,
+        show: crate::native_settings::NativeAgentStatusDisplay,
+        open: &HashSet<PaneId>,
+        sizes: AgentRowSizes,
+    ) -> bool {
+        Arc::ptr_eq(&self.snapshot, snapshot)
+            && self.view == *view
+            && self.show == show
+            && self.open == *open
+            && self.sizes == sizes
+    }
+
+    /// The agent of a row.
+    fn agent(&self, row: usize) -> &agent_status::AgentPaneStatus {
+        &self.snapshot[self.order[row]]
+    }
 }
 
 /// Which of a row's optional lines it has, and how tall that makes it.
@@ -2172,6 +2339,67 @@ mod tests {
         // No headings at all; a hand-edited key nobody knows falls back.
         assert_eq!(listed(&mut agents, "none", "fixed"), ["2", "3", "1", "4"]);
         assert_eq!(listed(&mut agents, "bogus", "bogus")[0], "#1");
+    }
+
+    /// The arranged list holds positions in the snapshot, in the order the
+    /// view lists the agents, and is reused only for exactly what it was
+    /// arranged from.
+    #[test]
+    fn the_arranged_list_is_reused_only_for_what_it_was_arranged_from() {
+        use super::{AgentPanelList, AgentRowSizes, PanelEntry};
+        use crate::agent_status::AgentState::{Blocked, Idle, Working};
+        use crate::native_settings::{NativeAgentStatusDisplay, NativeAgentsPanelView};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let agents = vec![
+            agent_at(1, Working, "a", 10),
+            agent_at(2, Idle, "a", 20),
+            agent_at(3, Blocked, "b", 30),
+            agent_at(4, Working, "b", 40),
+        ];
+        let expected = listed(&mut agents.clone(), "", "");
+        let snapshot = Arc::new(agents);
+        let view = NativeAgentsPanelView::default();
+        let show = NativeAgentStatusDisplay::default();
+        let open = HashSet::new();
+        let sizes = AgentRowSizes {
+            row: 40,
+            line: 10,
+            bar: 4,
+            header: 12,
+            header_gap: 2,
+            row_gap: 6,
+        };
+        let list = AgentPanelList::arrange(Arc::clone(&snapshot), &view, show, &open, sizes);
+        let rows: Vec<String> = list
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                PanelEntry::Header { count, .. } => format!("#{}", count),
+                PanelEntry::Agent(row) => list.agent(*row).pane_id.to_string(),
+            })
+            .collect();
+        assert_eq!(rows, expected);
+        assert_eq!(
+            (list.tops[0], list.ends.last().copied()),
+            (0, Some(list.height))
+        );
+
+        assert!(list.is_for(&snapshot, &view, show, &open, sizes));
+        // A new snapshot, even an equal one; an opened sub-task list;
+        // another view or other sizes: each is arranged again.
+        let copy = Arc::new(snapshot.as_ref().clone());
+        assert!(!list.is_for(&copy, &view, show, &open, sizes));
+        let opened: HashSet<_> = [1].iter().copied().collect();
+        assert!(!list.is_for(&snapshot, &view, show, &opened, sizes));
+        let by_thread = NativeAgentsPanelView {
+            group_by: "thread".to_string(),
+            ..Default::default()
+        };
+        assert!(!list.is_for(&snapshot, &by_thread, show, &open, sizes));
+        let taller = AgentRowSizes { row: 41, ..sizes };
+        assert!(!list.is_for(&snapshot, &view, show, &open, taller));
     }
 
 }
