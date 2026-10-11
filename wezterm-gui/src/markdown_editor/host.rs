@@ -130,6 +130,10 @@ pub(crate) struct NoteHostState {
     /// the keyboard. A Note's does; a file preview is read until clicked
     /// into, so it shows rendered.
     pub reveal_when_unfocused: bool,
+    /// A file preview's file changed into one that cannot be read, and why:
+    /// the edits on screen stay only to be copied out, and nothing saves
+    /// them over it.
+    pub file_unreadable: Option<String>,
     pub parse_requested_revision: Option<u64>,
     pub parse_in_flight_revision: Option<u64>,
     /// The current projection reused cached wiki-link data but at least one
@@ -221,6 +225,7 @@ impl Default for NoteHostState {
             last_scroll_change: None,
             native_text_input_token: 0,
             reveal_when_unfocused: true,
+            file_unreadable: None,
             parse_requested_revision: None,
             parse_in_flight_revision: None,
             links_resolution_pending: false,
@@ -266,6 +271,7 @@ impl NoteHostState {
         self.line_geometry = Arc::new(vec![]);
         self.content_height = 0.0;
         self.load_error = None;
+        self.file_unreadable = None;
         self.display_source = NoteDisplaySource::Published;
         self.autosave_deadline = None;
         self.autosave_timer_scheduled = false;

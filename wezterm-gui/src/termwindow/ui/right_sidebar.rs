@@ -182,10 +182,50 @@ const MARKDOWN_PREVIEW_READING_MAX_WIDTH: usize = 1500;
 /// What an editable preview's disk check found.
 enum PreviewDiskState {
     Unchanged,
+    /// The file could not be looked at (a folder's permissions, a passing
+    /// I/O error), which says nothing of it: the next check looks again.
+    Unseen,
     Changed(std::time::SystemTime, u64, String),
+    /// Changed into something that cannot be read as text, and why.
+    Unreadable(String),
     /// Grown past what a preview holds whole.
     Reload,
     Gone,
+}
+
+/// Look at an editable preview's file against the stamp its text was read
+/// or saved at. Off the GUI thread: it stats and reads the file.
+fn preview_disk_state(
+    path: &Path,
+    known_stamp: Option<(std::time::SystemTime, u64)>,
+) -> PreviewDiskState {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return PreviewDiskState::Gone;
+        }
+        Err(err) => {
+            log::debug!("cannot check {}: {err:#}", path.display());
+            return PreviewDiskState::Unseen;
+        }
+    };
+    let Ok(modified) = metadata.modified() else {
+        return PreviewDiskState::Unseen;
+    };
+    let stamp = (modified, metadata.len());
+    if known_stamp == Some(stamp) {
+        return PreviewDiskState::Unchanged;
+    }
+    // Grown past what a preview holds whole: load it again, read-only,
+    // rather than edit a part of it.
+    if metadata.len() > FILE_PREVIEW_MAX_BYTES as u64 {
+        return PreviewDiskState::Reload;
+    }
+    match fs::read_to_string(path) {
+        Ok(text) => PreviewDiskState::Changed(stamp.0, stamp.1, text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => PreviewDiskState::Gone,
+        Err(err) => PreviewDiskState::Unreadable(err.to_string()),
+    }
 }
 
 /// The line saying why a preview's save failed wraps to at most this many.
@@ -1268,6 +1308,15 @@ impl MarkdownPreviewSurface {
         if !self.unsaved() {
             return Ok(());
         }
+        // A file it cannot read is never saved over: the user leaving gives
+        // the edits up once the line saying so has been on screen.
+        if self.state.host.file_unreadable.is_some() {
+            return if by_user && self.failure_shown {
+                Ok(())
+            } else {
+                Err(PreviewKept::Unsaved)
+            };
+        }
         if !by_user && self.save_error().is_some() {
             return Err(PreviewKept::Unsaved);
         }
@@ -1292,6 +1341,9 @@ impl MarkdownPreviewSurface {
     /// Save before letting this surface go. On failure the caller keeps it,
     /// including its unsaved source and the save error.
     fn save(&self) -> anyhow::Result<()> {
+        if let Some(reason) = self.state.host.file_unreadable.as_ref() {
+            anyhow::bail!("its file changed and cannot be read: {reason}");
+        }
         if let Some(session) = self.state.host.session.as_ref() {
             if session.lock().is_dirty() {
                 save_document_revision(session)?;
@@ -2754,6 +2806,22 @@ impl crate::TermWindow {
 
     fn right_sidebar_markdown_preview_save_failed(&mut self, err: anyhow::Error) {
         log::error!("failed to save the edited Markdown preview: {err:#}");
+        self.stop_right_sidebar_markdown_preview_editing();
+    }
+
+    /// The file changed under an edited preview into one it cannot read:
+    /// the edits not yet saved stay on screen to be copied out, and are
+    /// never saved over it.
+    fn right_sidebar_markdown_preview_unreadable(&mut self, reason: String) {
+        log::warn!("an edited Markdown preview's file changed and cannot be read: {reason}");
+        if let Some(preview) = self.right_sidebar_markdown_preview.as_mut() {
+            preview.state.host.file_unreadable = Some(reason);
+        }
+        self.stop_right_sidebar_markdown_preview_editing();
+    }
+
+    /// Turn the preview read-only and let the keyboard go, its text kept.
+    fn stop_right_sidebar_markdown_preview_editing(&mut self) {
         if let Some(preview) = self.right_sidebar_markdown_preview.as_mut() {
             let host = &mut preview.state.host;
             host.freeze_live_source();
@@ -2973,19 +3041,25 @@ impl crate::TermWindow {
         let font_size = self.right_sidebar_file_preview_font_size();
         self.check_right_sidebar_markdown_preview_disk();
         let focused = self.right_sidebar_markdown_preview_focused();
-        // A save that failed has turned the preview read-only; a line above
-        // the text says so, and why.
-        let save_failure = self
+        // A save that failed, or a file changed into one that cannot be read,
+        // has turned the preview read-only; a line above the text says so,
+        // and why.
+        let stopped = self
             .right_sidebar_markdown_preview
             .as_ref()
             .filter(|preview| preview.state.host.view.mode == EditorMode::ReadOnly)
-            .and_then(|preview| preview.save_error());
+            .and_then(|preview| match &preview.state.host.file_unreadable {
+                Some(reason) => Some(("right-preview-unreadable", reason.clone())),
+                None => preview
+                    .save_error()
+                    .map(|reason| ("right-preview-save-failed", reason)),
+            });
         let mut top = top;
-        if let Some(reason) = save_failure {
+        if let Some((key, reason)) = stopped {
             let font = self.fonts.title_font_with_size(font_size)?;
             let metrics = RenderMetrics::with_font_metrics(&font.metrics());
             let inset = self.ui_px(NOTE_BODY_PADDING);
-            let message = right_sidebar_arg("right-preview-save-failed", "error", reason);
+            let message = right_sidebar_arg(key, "error", reason);
             let used = self.paint_sidebar_wrapped_text(
                 layers,
                 &font,
@@ -3027,7 +3101,8 @@ impl crate::TermWindow {
     /// as another editor or an agent writes it, or going away. A timer runs
     /// the checks, so an idle preview notices too. The last writer wins, as
     /// for a Note: their text replaces the preview's. An edit made while a
-    /// check was out is newer than what it read, though, and stays.
+    /// check was out is newer than what it read, though, and stays; so do
+    /// edits not yet saved when the file cannot be looked at or read.
     fn check_right_sidebar_markdown_preview_disk(&mut self) {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
@@ -3063,27 +3138,14 @@ impl crate::TermWindow {
         preview.last_disk_check = Some(Instant::now());
         let instance = preview.instance;
         promise::spawn::spawn(async move {
-            let result = promise::spawn::spawn_into_new_thread(move || {
-                let metadata = match fs::metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(PreviewDiskState::Gone);
-                    }
-                    Err(err) => return Err(err.into()),
-                };
-                let stamp = (metadata.modified()?, metadata.len());
-                if known_stamp == Some(stamp) {
-                    return Ok(PreviewDiskState::Unchanged);
-                }
-                // Grown past what a preview holds whole: load it again,
-                // read-only, rather than edit a part of it.
-                if metadata.len() > FILE_PREVIEW_MAX_BYTES as u64 {
-                    return Ok(PreviewDiskState::Reload);
-                }
-                let text = fs::read_to_string(&path)?;
-                Ok::<_, anyhow::Error>(PreviewDiskState::Changed(stamp.0, stamp.1, text))
+            let state = promise::spawn::spawn_into_new_thread(move || {
+                Ok(preview_disk_state(&path, known_stamp))
             })
-            .await;
+            .await
+            .unwrap_or_else(|err| {
+                log::warn!("checking a Markdown preview's file: {err:#}");
+                PreviewDiskState::Unseen
+            });
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let Some(preview) = term_window
                     .right_sidebar_markdown_preview
@@ -3096,15 +3158,24 @@ impl crate::TermWindow {
                 if preview.save_error().is_some() {
                     return;
                 }
-                match result {
-                    Ok(PreviewDiskState::Unchanged) => {}
-                    Ok(PreviewDiskState::Gone) | Ok(PreviewDiskState::Reload) | Err(_) => {
+                let unsaved = matches!(state, PreviewDiskState::Unreadable(_)) && preview.unsaved();
+                match state {
+                    PreviewDiskState::Unchanged | PreviewDiskState::Unseen => {}
+                    PreviewDiskState::Unreadable(reason) if unsaved => {
+                        // Theirs, but nothing to show: the edits not yet
+                        // saved stay to be copied out, never saved over it.
+                        term_window.right_sidebar_markdown_preview_unreadable(reason);
+                        return;
+                    }
+                    PreviewDiskState::Gone
+                    | PreviewDiskState::Reload
+                    | PreviewDiskState::Unreadable(_) => {
                         // Theirs was the last write: show what is there now.
                         // One that cannot be read as text is theirs too, and
                         // must not be saved over unseen.
-                        if let Err(err) = &result {
+                        if let PreviewDiskState::Unreadable(reason) = &state {
                             log::warn!(
-                                "reloading a Markdown preview after a failed check: {err:#}"
+                                "reloading a Markdown preview that cannot be read: {reason}"
                             );
                         }
                         term_window.discard_right_sidebar_markdown_preview();
@@ -3114,7 +3185,7 @@ impl crate::TermWindow {
                         term_window.invalidate_window();
                         return;
                     }
-                    Ok(PreviewDiskState::Changed(modified, len, text)) => {
+                    PreviewDiskState::Changed(modified, len, text) => {
                         let changed = term_window
                             .with_note_surface(NoteSurface::FilePreview, |term_window| {
                                 let host = &mut term_window.right_sidebar_note;
@@ -6822,6 +6893,11 @@ impl crate::TermWindow {
 
     pub(crate) fn save_right_sidebar_note_now(&mut self) {
         self.right_sidebar_note.cancel_autosave_deadline();
+        // A preview whose file it cannot read keeps its edits only to be
+        // copied out: not on blur, nor on any other save.
+        if self.right_sidebar_note.file_unreadable.is_some() {
+            return;
+        }
         let Some(session) = self.right_sidebar_note.session.clone() else {
             return;
         };
@@ -24835,6 +24911,89 @@ mod tests {
             .is_some());
         assert!(slot.is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_preview_whose_file_cannot_be_read_keeps_its_edits_and_never_saves_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.md");
+        fs::write(&path, "before").unwrap();
+        let mut preview = editable_preview(&path, "before");
+        let session = preview.state.host.session.clone().unwrap();
+        assert!(session
+            .lock()
+            .insert_text(&mut preview.state.host.view, "new "));
+        // Another writer's bytes, not text, replaced the file.
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        preview.state.host.file_unreadable = Some("not text".to_string());
+        let mut slot = Some(preview);
+
+        // Kept, to be copied out, until the reason has been on screen; then
+        // the user leaving gives the edits up. Nothing ever writes them over
+        // the file.
+        assert!(slot.as_ref().unwrap().save().is_err());
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, false).is_err());
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, true).is_err());
+        assert_eq!(
+            slot.as_ref().unwrap().text_for_copy().as_deref(),
+            Some("new before")
+        );
+        slot.as_mut().unwrap().failure_shown = true;
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, false).is_err());
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, true)
+            .unwrap()
+            .is_some());
+        assert_eq!(fs::read(&path).unwrap(), [0xff, 0xfe]);
+    }
+
+    #[test]
+    fn a_preview_disk_check_tells_what_became_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.md");
+        fs::write(&path, "before").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let stamp = Some((metadata.modified().unwrap(), metadata.len()));
+        assert!(matches!(
+            super::preview_disk_state(&path, stamp),
+            super::PreviewDiskState::Unchanged
+        ));
+
+        fs::write(&path, "after, longer").unwrap();
+        assert!(matches!(
+            super::preview_disk_state(&path, stamp),
+            super::PreviewDiskState::Changed(_, _, text) if text == "after, longer"
+        ));
+
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(matches!(
+            super::preview_disk_state(&path, stamp),
+            super::PreviewDiskState::Unreadable(_)
+        ));
+
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            super::preview_disk_state(&path, stamp),
+            super::PreviewDiskState::Gone
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_preview_disk_check_that_cannot_look_finds_nothing_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("closed");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("example.md");
+        fs::write(&path, "before").unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root looks anyway: then there is nothing to test.
+        let shut = fs::metadata(&path).is_err();
+        let state = super::preview_disk_state(&path, None);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        if shut {
+            assert!(matches!(state, super::PreviewDiskState::Unseen));
+        }
     }
 
     #[test]

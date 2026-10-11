@@ -404,6 +404,7 @@ right-loading-preview = Loading file preview…
 right-window-unavailable = Window is unavailable
 right-preview-error = Unable to load file preview: { $error }
 right-preview-save-failed = Couldn’t save, so editing stopped. Copy your changes out now: if saving still fails, leaving this file discards them. { $error }
+right-preview-unreadable = The file changed and can’t be read, so editing stopped. Copy your changes out now: leaving this file discards them. { $error }
 right-open = Open
 right-copy-path = Copy Path
 right-rename = Rename…

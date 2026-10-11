@@ -395,6 +395,7 @@ right-loading-preview = 正在加载文件预览…
 right-window-unavailable = 窗口不可用
 right-preview-error = 无法加载文件预览：{ $error }
 right-preview-save-failed = 没能保存，已停止编辑。请先把改动复制出去：如果还是存不了，离开这个文件时会放弃这些改动。{ $error }
+right-preview-unreadable = 文件被改过，现在读不出来，已停止编辑。请先把改动复制出去：离开这个文件时会放弃这些改动。{ $error }
 right-open = 打开
 right-copy-path = 复制路径
 right-rename = 重命名…
