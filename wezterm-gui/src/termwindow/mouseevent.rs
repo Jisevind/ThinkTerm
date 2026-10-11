@@ -1684,7 +1684,8 @@ impl super::TermWindow {
     ///
     /// Keyed by item *type*, not by the UIItem: the sidebar rebuilds its items
     /// every frame and a button's rect can shift by a pixel, which must not
-    /// restart the delay and leave the tag forever one frame away.
+    /// restart the delay and leave the tag forever one frame away. An Agents
+    /// panel row and its sub-task line count as one.
     ///
     /// Only records when the pointer arrived. The wakeup that makes the tag
     /// appear is registered by `paint_hover_tooltip`, because `paint_impl`
@@ -1694,25 +1695,65 @@ impl super::TermWindow {
             .filter(|item| {
                 crate::termwindow::tooltip_label_for(&item.item_type).is_some()
                     || crate::termwindow::thread_has_card(&item.item_type)
+                    || crate::termwindow::render::hover::agent_card_pane(&item.item_type).is_some()
             })
             // The dynamic half of the rule: no tag over a live rename
             // editor, and none for a file row whose label already reads in
             // full. `paint_hover_tooltip` re-checks the same predicate.
             .filter(|item| self.hover_tooltip_allowed(&item.item_type));
+        // A surface that was showing keeps the next one warm for a moment.
+        let was_visible = self
+            .hover_tooltip
+            .as_ref()
+            .is_some_and(|hover| hover.visible());
         match labelled {
-            None => self.hover_tooltip = None,
+            None => {
+                if was_visible {
+                    self.hover_tooltip_warm_until =
+                        Some(Instant::now() + crate::termwindow::TOOLTIP_WARM);
+                }
+                self.hover_tooltip = None;
+            }
             Some(item) => match self.hover_tooltip.as_mut() {
-                Some(hover) if hover.item.item_type == item.item_type => {
+                Some(hover)
+                    if crate::termwindow::render::hover::same_hover_target(
+                        &hover.item.item_type,
+                        &item.item_type,
+                    ) =>
+                {
                     hover.item = item.clone();
                 }
                 _ => {
+                    let warm = was_visible
+                        || self
+                            .hover_tooltip_warm_until
+                            .is_some_and(|until| Instant::now() < until);
+                    let shortcut = self.hover_shortcut(&item.item_type);
                     self.hover_tooltip = Some(crate::termwindow::HoverTooltip {
                         item: item.clone(),
                         since: Instant::now(),
+                        warm,
+                        shortcut,
+                        blank: false,
+                        machine: None,
+                        dismissed: false,
                     });
                 }
             },
         }
+    }
+
+    /// Puts away the hover surface the pointer rests on, as a click or a key
+    /// does; true when one was showing.
+    pub(crate) fn dismiss_hover_tooltip(&mut self) -> bool {
+        let Some(hover) = self.hover_tooltip.as_mut() else {
+            return false;
+        };
+        let was_visible = hover.visible();
+        hover.dismissed = true;
+        // Nor does the next one show at once: the user put this one away.
+        self.hover_tooltip_warm_until = None;
+        was_visible
     }
 
     fn enter_ui_item(&mut self, item: &UIItem) {
@@ -2415,6 +2456,9 @@ impl super::TermWindow {
         // Also clears while a drag holds the capture: a tag hovering next to
         // the pointer mid-drag is noise.
         self.update_hover_tooltip(ui_item.as_ref());
+        if matches!(event.kind, WMEK::Press(_)) && self.dismiss_hover_tooltip() {
+            context.invalidate();
+        }
 
         // A press anywhere other than the row being renamed commits a pending
         // inline rename (Enter semantics); otherwise the editor stays armed
@@ -2500,6 +2544,8 @@ impl super::TermWindow {
                 && event.coords.y as usize <= self.dimensions.pixel_height
         });
         self.current_mouse_event = None;
+        // No hover surface outlives the pointer leaving the window.
+        self.update_hover_tooltip(None);
         // The machine reads `Away` now: cancels an Arming, starts a grace.
         self.update_workspace_sidebar_hover(context);
         self.update_right_sidebar_hover(context);

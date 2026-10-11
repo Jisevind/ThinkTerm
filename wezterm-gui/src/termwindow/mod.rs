@@ -1931,6 +1931,34 @@ pub const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 pub struct HoverTooltip {
     pub item: UIItem,
     pub since: Instant,
+    /// Shown at once, with no pause: another surface was up a moment ago,
+    /// and someone moving from one to the next is reading them, as the Mac
+    /// does it.
+    pub warm: bool,
+    /// The keyboard shortcut for what the item does, looked up once when
+    /// the hover starts.
+    pub shortcut: Option<String>,
+    /// Its last paint found nothing to show -- no agents left, no label, or
+    /// the item gone -- so it keeps nothing warm for the next one.
+    pub blank: bool,
+    /// An agent card's machine fact -- `None` inside when unknown: read from
+    /// the host list the first time the card paints, and gone with the hover.
+    pub machine: Option<Option<String>>,
+    /// A click or a key went in while it was up: nothing shows again until
+    /// the pointer moves on to something else.
+    pub dismissed: bool,
+}
+
+/// How long after a hover surface goes that the next one still shows at
+/// once.
+pub const TOOLTIP_WARM: Duration = Duration::from_millis(800);
+
+impl HoverTooltip {
+    /// Whether it is showing: past its delay, or warm, and neither blank
+    /// nor dismissed.
+    pub fn visible(&self) -> bool {
+        !self.blank && !self.dismissed && (self.warm || self.since.elapsed() >= TOOLTIP_DELAY)
+    }
 }
 
 /// Where a hover tag's left edge goes, given the rect it names.
@@ -2038,6 +2066,17 @@ pub(crate) fn thread_has_card(item_type: &UIItemType) -> bool {
     })
 }
 
+/// The action a tagged button runs, so its tag can show the shortcut.
+pub fn tooltip_action_for(item_type: &UIItemType) -> Option<KeyAssignment> {
+    Some(match item_type {
+        UIItemType::WorkspaceSidebarSettings => KeyAssignment::OpenSettings,
+        UIItemType::WorkspaceSidebarThreadSearch => KeyAssignment::OpenThreadSearch,
+        UIItemType::WorkspaceSidebarSshHosts => KeyAssignment::OpenSshHosts,
+        UIItemType::WorkspaceSidebarLiveOverview => KeyAssignment::ToggleLiveOverview,
+        _ => return None,
+    })
+}
+
 /// The tag to show for an item whose own text cannot say enough: an icon-only
 /// button (no text at all) or a row whose label is cut to fit the sidebar.
 /// `None` for everything that already reads in full.
@@ -2074,6 +2113,9 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
         UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",
         UIItemType::WorkspaceSidebarNotifications => "tooltip-sidebar-notifications",
+        UIItemType::RightSidebarAgent(crate::agent_status::AgentPanelAction::ViewOptions) => {
+            "tooltip-sidebar-view-options"
+        }
         _ => return None,
     };
     Some(crate::i18n::tr(key))
@@ -2829,10 +2871,14 @@ pub struct TermWindow {
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
-    /// The icon-only button the pointer is resting on, and when it arrived.
-    /// The tag is only painted once it has been there for TOOLTIP_DELAY, so
-    /// that sweeping the pointer across the sidebar does not strobe labels.
+    /// The item with a hover surface the pointer is resting on, and when it
+    /// arrived. The surface is only painted once it has been there for
+    /// TOOLTIP_DELAY, so that sweeping the pointer across the sidebar does
+    /// not strobe labels -- unless another one was up a moment before.
     hover_tooltip: Option<HoverTooltip>,
+    /// Until when a new hover surface shows at once: one was up until just
+    /// before.
+    hover_tooltip_warm_until: Option<Instant>,
     /// Tracks whether the current mouse-down event is part of click-focus.
     /// If so, we ignore mouse events until released
     is_click_to_focus_window: bool,
@@ -4880,6 +4926,7 @@ impl TermWindow {
             right_sidebar_input_layouts: Vec::new(),
             last_ui_item: None,
             hover_tooltip: None,
+            hover_tooltip_warm_until: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),
             modal: RefCell::new(None),

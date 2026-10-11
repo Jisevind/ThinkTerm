@@ -156,8 +156,10 @@ pub(crate) fn list_agent_panes() -> Vec<AgentPaneStatus> {
 }
 
 /// The snapshot behind [`list_agent_panes`], shared rather than copied:
-/// for the callers that only look.
-fn agent_panes() -> std::sync::Arc<Vec<AgentPaneStatus>> {
+/// for the callers that only look. A new one replaces it on every status
+/// change and otherwise every [`AGENT_PANES_TTL`], so while it is the same
+/// `Arc` nothing in it has changed.
+pub(crate) fn agent_panes() -> std::sync::Arc<Vec<AgentPaneStatus>> {
     if let Ok(guard) = AGENT_PANES_CACHE.lock() {
         if let Some((at, cached)) = guard.as_ref() {
             if at.elapsed() < AGENT_PANES_TTL {
@@ -306,18 +308,43 @@ impl AgentPaneStatus {
 /// the reason the bell, a card and a notification give -- shaped by the
 /// user's choice of what to show. `None` when there is nothing to say.
 pub(crate) fn reason_line(agent: &AgentPaneStatus) -> Option<String> {
-    let report = agent.report.as_ref()?;
-    let show = crate::native_settings::agent_status_display();
-    let kind = report
-        .kind
-        .filter(|_| show.reason)
-        .map(|kind| crate::i18n::tr(blocked_kind_key(kind)));
-    let msg = report.msg.clone().filter(|_| show.description);
+    let (kind, msg) = report_said(agent, crate::native_settings::agent_status_display());
+    let kind = kind.map(|kind| crate::i18n::tr(blocked_kind_key(kind)));
     match (kind, msg) {
         (Some(kind), Some(msg)) => Some(format!("{kind} · {msg}")),
-        (Some(text), None) | (None, Some(text)) => Some(text),
+        (Some(kind), None) => Some(kind),
+        (None, Some(msg)) => Some(msg.to_string()),
         (None, None) => None,
     }
+}
+
+/// How far an agent's report says it has got, when the user chose to see it.
+pub(crate) fn report_progress(
+    agent: &AgentPaneStatus,
+    show: crate::native_settings::NativeAgentStatusDisplay,
+) -> Option<u8> {
+    agent
+        .report
+        .as_ref()
+        .and_then(|report| report.progress)
+        .filter(|_| show.progress)
+}
+
+/// What an agent's report says, as far as the user chose to see it: why it
+/// waits, and what it is doing.
+pub(crate) fn report_said(
+    agent: &AgentPaneStatus,
+    show: crate::native_settings::NativeAgentStatusDisplay,
+) -> (Option<ProgramBlockedKind>, Option<&str>) {
+    let report = agent.report.as_ref();
+    (
+        report
+            .and_then(|report| report.kind)
+            .filter(|_| show.reason),
+        report
+            .and_then(|report| report.msg.as_deref())
+            .filter(|_| show.description),
+    )
 }
 
 /// Why a thread wants a look, in its most pressing program's own words --

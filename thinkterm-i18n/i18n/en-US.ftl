@@ -729,6 +729,19 @@ right-agents-state-done = Done
 right-agents-none = No agents detected
 right-agents-group-other = Other
 right-agents-all-hidden = Every agent is hidden by the view options
+hover-card-agents = { $count ->
+    [one] 1 agent
+   *[other] { $count } agents
+}
+hover-card-thread = Thread
+hover-card-machine = Machine
+hover-card-duration = For
+hover-card-subtasks = Sub-tasks
+hover-card-more-agents = { $count } more
+hover-card-under-a-minute = under a minute
+hover-card-minutes = { $count } min
+hover-card-hours = { $count } h
+hover-card-days = { $count } d
 right-agents-detection-off = Agent detection is off — open settings
 right-agents-count-working = { $count } working
 right-agents-count-blocked = { $count ->

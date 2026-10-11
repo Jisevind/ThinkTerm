@@ -822,6 +822,10 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
+        // Typing puts away a hover card that would cover what is typed.
+        if key.key_is_down && !key.key.is_modifier() && self.dismiss_hover_tooltip() {
+            context.invalidate();
+        }
         let mut input_trace =
             crate::input_diagnostics::KeyEventTrace::begin(key.key_is_down, key.key.is_modifier());
         // The leader key is a kind of modal modifier key.

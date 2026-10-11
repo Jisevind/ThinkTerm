@@ -4,7 +4,7 @@
 //! snapshots — the paint path never triggers detection or filesystem
 //! probes.
 
-use crate::agent_status::{self, AgentIcon, AgentPanelAction, ProgramReportState};
+use crate::agent_status::{self, AgentIcon, AgentPanelAction, ProgramReport, ProgramReportState};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{
@@ -21,7 +21,7 @@ use std::rc::Rc;
 use wezterm_client::domain::FrontendRecoverySlot;
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
-use window::{MouseEvent, MouseEventKind as WMEK, MousePress, WindowOps};
+use window::{MouseEvent, MouseEventKind as WMEK, MousePress, RectF, WindowOps};
 
 /// An agent that is working, in the same blue the left sidebar uses for a
 /// live thread (`SESSION_STATUS_OPEN_COLOR`).
@@ -35,7 +35,7 @@ pub(crate) const AGENT_BLOCKED_COLOR: LinearRgba = LinearRgba::with_components(0
 pub(crate) const AGENT_DONE_COLOR: LinearRgba =
     crate::termwindow::ui::sidebar::SESSION_STATUS_DONE_COLOR;
 /// The progress bar under a row's description.
-const AGENT_PROGRESS_HEIGHT: usize = 6;
+pub(crate) const AGENT_PROGRESS_HEIGHT: usize = 6;
 /// Between two agent rows; a hairline sits in the middle of it.
 const AGENT_ROW_GAP: usize = 10;
 /// How much further in than the panel's inset agent rows start and end.
@@ -481,35 +481,9 @@ impl TermWindow {
             let title_y = top + (row_height.saturating_sub(cell_height * 2 + line_gap)) / 2;
             let title_mid = title_y + cell_height / 2;
             let icon_y = title_mid.saturating_sub(icon_size / 2);
+            let brand = brand_of(agent);
             if visible(icon_y, icon_size) {
-                match agent_status::brand_icon(
-                    &agent.agent_id,
-                    crate::native_settings::effective_appearance(),
-                ) {
-                    Some(AgentIcon::Color(brand)) => self.paint_sidebar_brand_icon(
-                        layers,
-                        brand,
-                        icon_x,
-                        icon_y,
-                        icon_size,
-                    )?,
-                    Some(AgentIcon::Mono(icon)) => self.paint_sidebar_icon(
-                        layers,
-                        icon,
-                        icon_x,
-                        icon_y,
-                        icon_size,
-                        muted_fg,
-                    )?,
-                    None => self.paint_sidebar_icon(
-                        layers,
-                        SvgIcon::Bot,
-                        icon_x,
-                        icon_y,
-                        icon_size,
-                        muted_fg,
-                    )?,
-                }
+                self.paint_agent_mark(layers, brand, icon_x, icon_y, icon_size, muted_fg)?;
             }
 
             let shown = agent.shown_state();
@@ -530,12 +504,7 @@ impl TermWindow {
 
             let text_right = text_right_for(has_state_icon);
             let text_width = text_right.saturating_sub(text_x);
-            let name = agent_status::display_name(&agent.agent_id);
-            let title_line = if agent.title.is_empty() {
-                name
-            } else {
-                format!("{name} · {}", agent.title)
-            };
+            let title_line = agent_row_title(agent, brand);
             if visible(title_y, cell_height) {
                 self.paint_agent_text(
                     layers,
@@ -639,31 +608,18 @@ impl TermWindow {
             };
             if let Some(progress) = layout.progress {
                 if visible(line_y, bar_height) {
-                    let radius = bar_height as f32 / 2.0;
-                    self.fill_rounded_rectangle(
+                    self.paint_agent_progress(
                         layers,
-                        1,
                         euclid::rect(
                             text_x as f32,
                             line_y as f32,
                             text_width as f32,
                             bar_height as f32,
                         ),
+                        progress,
                         chrome.separator,
-                        radius,
-                    )
-                    .context("agent progress track")?;
-                    let filled = (text_width as f32 * f32::from(progress) / 100.0).round();
-                    if filled >= bar_height as f32 {
-                        self.fill_rounded_rectangle(
-                            layers,
-                            1,
-                            euclid::rect(text_x as f32, line_y as f32, filled, bar_height as f32),
-                            chrome.accent,
-                            radius,
-                        )
-                        .context("agent progress")?;
-                    }
+                        chrome.accent,
+                    )?;
                 }
                 line_y += bar_height + line_gap;
             }
@@ -706,11 +662,7 @@ impl TermWindow {
                     let mut args = fluent_bundle::FluentArgs::new();
                     args.set("count", layout.subtask_count);
                     let mut line = crate::i18n::tr_args("right-agents-subtasks", &args);
-                    let working = report
-                        .children
-                        .iter()
-                        .filter(|child| matches!(child.state, ProgramReportState::Working))
-                        .count();
+                    let working = working_subtasks(report);
                     // Unless every sub-task has its dot in view, this line is
                     // all there is to say how many run: folded, or with some
                     // cut off below the list.
@@ -880,7 +832,7 @@ impl TermWindow {
 
     /// One line of the panel in one colour. See `paint_agent_text_with`.
     #[allow(clippy::too_many_arguments)]
-    fn paint_agent_text(
+    pub(crate) fn paint_agent_text(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         font: &Rc<LoadedFont>,
@@ -1030,11 +982,57 @@ impl TermWindow {
         Ok(fitted)
     }
 
-    /// The pill naming what a blocked program waits for. Returns where the
-    /// text after it starts.
+    /// An agent's mark: its brand's when it has one, a robot when not.
+    pub(crate) fn paint_agent_mark(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        brand: Option<AgentIcon>,
+        x: usize,
+        y: usize,
+        size: usize,
+        mono: LinearRgba,
+    ) -> anyhow::Result<()> {
+        match brand {
+            Some(AgentIcon::Color(brand)) => {
+                self.paint_sidebar_brand_icon(layers, brand, x, y, size)
+            }
+            Some(AgentIcon::Mono(icon)) => self.paint_sidebar_icon(layers, icon, x, y, size, mono),
+            None => self.paint_sidebar_icon(layers, SvgIcon::Bot, x, y, size, mono),
+        }
+    }
+
+    /// A progress bar: its track, and the share done over it once that is
+    /// wide enough to show its rounded ends.
+    pub(crate) fn paint_agent_progress(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        progress: u8,
+        track: LinearRgba,
+        fill: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let radius = rect.size.height / 2.0;
+        self.fill_rounded_rectangle(layers, 1, rect, track, radius)
+            .context("agent progress track")?;
+        let filled = (rect.size.width * f32::from(progress) / 100.0).round();
+        if filled >= rect.size.height {
+            self.fill_rounded_rectangle(
+                layers,
+                1,
+                euclid::rect(rect.origin.x, rect.origin.y, filled, rect.size.height),
+                fill,
+                radius,
+            )
+            .context("agent progress")?;
+        }
+        Ok(())
+    }
+
+    /// The pill naming what a blocked program waits for, no wider than the
+    /// room up to `right`. Returns where the text after it starts.
     #[allow(clippy::too_many_arguments)]
-    fn paint_agent_kind_pill(
-        &mut self,
+    pub(crate) fn paint_agent_kind_pill(
+        &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
         ui_metrics: RenderMetrics,
@@ -1602,7 +1600,7 @@ impl AgentRowLayout {
         };
         let message = (show.description && report.msg.is_some())
             || (show.reason && report.kind.is_some());
-        let progress = report.progress.filter(|_| show.progress);
+        let progress = agent_status::report_progress(agent, show);
         let subtask_count = if show.subtasks {
             report.children.len()
         } else {
@@ -1721,6 +1719,51 @@ impl ShimmerBand {
         let t = (1.0 - (x - self.centre).abs() / self.half_width).max(0.0);
         t * t * (3.0 - 2.0 * t)
     }
+}
+
+/// An agent's title beside its mark. Its own mark already says which agent
+/// it is, so the room is the pane's title; beside the generic robot the name
+/// has to say it.
+pub(crate) fn agent_row_title(
+    agent: &agent_status::AgentPaneStatus,
+    brand: Option<AgentIcon>,
+) -> String {
+    if brand.is_none() && !agent.title.is_empty() {
+        format!(
+            "{} \u{b7} {}",
+            agent_status::display_name(&agent.agent_id),
+            agent.title
+        )
+    } else {
+        agent_title(agent)
+    }
+}
+
+/// An agent's title as its cards show it: what its pane is called, or the
+/// agent's own name when the pane has none.
+pub(crate) fn agent_title(agent: &agent_status::AgentPaneStatus) -> String {
+    if agent.title.is_empty() {
+        agent_status::display_name(&agent.agent_id)
+    } else {
+        agent.title.clone()
+    }
+}
+
+/// The agent's brand mark for the current theme, if it has one.
+pub(crate) fn brand_of(agent: &agent_status::AgentPaneStatus) -> Option<AgentIcon> {
+    agent_status::brand_icon(
+        &agent.agent_id,
+        crate::native_settings::effective_appearance(),
+    )
+}
+
+/// How many of a report's sub-tasks are working.
+pub(crate) fn working_subtasks(report: &ProgramReport) -> usize {
+    report
+        .children
+        .iter()
+        .filter(|child| matches!(child.state, ProgramReportState::Working))
+        .count()
 }
 
 /// The icon a state is shown with: glyph, colour, and whether it spins.

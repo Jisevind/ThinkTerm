@@ -2201,10 +2201,16 @@ pub fn thread_place_and_machine_for_workspace(workspace: &str) -> Option<(String
 /// `origin_machine_for_project` names it; `None` for this device. Reads the
 /// host list, so it is for menus rather than painting.
 pub fn machine_label_for_workspace(workspace: &str) -> Option<String> {
+    thread_machine_label(workspace).flatten()
+}
+
+/// [`machine_label_for_workspace`], told apart from not knowing: `None`
+/// when no thread backs the workspace, `Some(None)` for this device.
+pub fn thread_machine_label(workspace: &str) -> Option<Option<String>> {
     let store = THREAD_STORE.lock();
     let (project, _) = project_and_thread_for_workspace(&store, workspace)?;
     let (label, local) = origin_machine_for_project(project, &store.spaces);
-    (!local).then_some(label)
+    Some((!local).then_some(label))
 }
 
 fn project_and_thread_for_workspace<'a>(
