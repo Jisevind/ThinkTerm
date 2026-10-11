@@ -2931,9 +2931,41 @@ impl crate::TermWindow {
             }
         }
         // The choice is every window's: one showing a Markdown file switches
-        // when it repaints.
+        // when it repaints, and one leaving an edited preview loads its file
+        // again as this one did.
         if let Some(front_end) = crate::frontend::try_front_end() {
+            if !rendered {
+                for gui_window in front_end.gui_windows() {
+                    gui_window
+                        .window
+                        .notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                            term_window.leave_right_sidebar_markdown_preview_for_source();
+                        })));
+                }
+            }
             front_end.invalidate_all_windows();
+        }
+    }
+
+    /// Another window chose Source: let go of the rendered preview here,
+    /// saved, and load an edited file again, or the source would show the
+    /// text from before the edits. Edits that cannot be saved stay, as
+    /// whenever the window leaves a preview on its own.
+    pub(crate) fn leave_right_sidebar_markdown_preview_for_source(&mut self) {
+        if self.right_sidebar_markdown_preview.is_none()
+            || crate::native_settings::right_sidebar_markdown_preview_rendered()
+        {
+            return;
+        }
+        if self.release_right_sidebar_markdown_preview(false) != Ok(true) {
+            return;
+        }
+        if let Some(path) = self.right_sidebar_file_selected.clone() {
+            self.right_sidebar_file_preview_restore_scroll = Some((
+                self.right_sidebar_file_preview_scroll_offset,
+                self.right_sidebar_file_preview_horizontal_offset,
+            ));
+            self.load_right_sidebar_file_preview(path);
         }
     }
 
@@ -3746,6 +3778,15 @@ impl crate::TermWindow {
                 .clamp(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH), max_tree_for_preview);
         }
         self.right_sidebar_file_selected = Some(path.clone());
+        self.right_sidebar_file_view = RightSidebarFileView::Preview;
+        self.prefetch_right_sidebar_file_open_with(&path);
+        self.load_right_sidebar_file_preview(path);
+    }
+
+    /// Read the selected file into the preview, the view left as it is: the
+    /// lines come in the background, and until then the preview says it is
+    /// loading.
+    fn load_right_sidebar_file_preview(&mut self, path: PathBuf) {
         self.right_sidebar_file_preview_generation =
             self.right_sidebar_file_preview_generation.wrapping_add(1);
         let generation = self.right_sidebar_file_preview_generation;
@@ -3763,8 +3804,6 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_selection = None;
         self.right_sidebar_file_preview_scroll_offset = 0.0;
         self.right_sidebar_file_preview_horizontal_offset = 0;
-        self.right_sidebar_file_view = RightSidebarFileView::Preview;
-        self.prefetch_right_sidebar_file_open_with(&path);
 
         let Some(window) = self.window.as_ref().cloned() else {
             self.right_sidebar_file_preview_message =
