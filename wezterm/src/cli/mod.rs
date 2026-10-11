@@ -127,7 +127,9 @@ Outputs the pane-id for the newly created pane on success"
 
     /// Send text to a pane as though it were pasted.
     /// If bracketed paste mode is enabled in the pane, then the
-    /// text will be sent as a bracketed paste.
+    /// text will be sent as a bracketed paste. No Enter is added:
+    /// to submit the text, send a carriage return separately with
+    /// `--no-paste`.
     #[command(name = "send-text", rename_all = "kebab")]
     SendText(send_text::SendText),
 

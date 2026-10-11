@@ -235,7 +235,10 @@ enum SubCommand {
     #[command(name = "show-keys", about = "Show key assignments")]
     ShowKeys(ShowKeysCommand),
 
-    #[command(name = "cli", about = "Interact with experimental mux server")]
+    #[command(
+        name = "cli",
+        about = "See and control panes, tabs and windows, and check on coding agents"
+    )]
     Cli(cli::CliCommand),
 
     #[command(name = "imgcat", about = "Output an image to the terminal")]
