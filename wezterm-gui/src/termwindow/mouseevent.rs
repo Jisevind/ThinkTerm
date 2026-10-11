@@ -4938,8 +4938,15 @@ impl super::TermWindow {
                 }
             }
             UIItemType::RightSidebarFilePreviewMarkdownBody => {
-                // As the Note body, read-only: links open, text selects.
+                // As the Note body: links open, text selects, and a whole
+                // local file is edited in place.
                 let (x, y) = (event.coords.x as f32, event.coords.y as f32);
+                let editable = self
+                    .with_note_surface(NoteSurface::FilePreview, |term_window| {
+                        term_window.right_sidebar_note.view.mode
+                            != crate::markdown_editor::EditorMode::ReadOnly
+                    })
+                    .unwrap_or(false);
                 let external_link = self
                     .with_note_surface(NoteSurface::FilePreview, |term_window| {
                         term_window
@@ -4957,6 +4964,41 @@ impl super::TermWindow {
                 } else {
                     MouseCursor::Text
                 }));
+                if event.kind == WMEK::Press(MousePress::Right) && editable {
+                    // The Note's editing menu, for the word under the
+                    // pointer unless it is inside the selection.
+                    self.right_sidebar_file_focus = Some(super::RightSidebarFileField::Preview);
+                    let mut items = self
+                        .with_note_surface(NoteSurface::FilePreview, |term_window| {
+                            let host = &mut term_window.right_sidebar_note;
+                            host.begin_live_editing();
+                            host.view.focused = true;
+                            let position = host.source_position_for_point(x, y);
+                            let selected = host.view.selection.range();
+                            if selected.is_empty()
+                                || position.byte < selected.start
+                                || position.byte >= selected.end
+                            {
+                                host.begin_selection(
+                                    position,
+                                    crate::markdown_editor::SelectionGranularity::Word,
+                                    false,
+                                );
+                            }
+                            host.reveal_caret = true;
+                            host.refresh_projection();
+                            term_window.right_sidebar_note_context_menu_items(event.coords)
+                        })
+                        .unwrap_or_default();
+                    // Then what the file offers, as the read-only preview does.
+                    if let Some(path) = self.right_sidebar_file_selected.clone() {
+                        items.push(ContextMenuItem::Separator);
+                        items.extend(self.right_sidebar_file_preview_file_menu_items(&path));
+                    }
+                    self.show_term_context_menu(context, event.coords, items);
+                    context.invalidate();
+                    return;
+                }
                 if event.kind == WMEK::Press(MousePress::Right) {
                     // The same menu the source view offers.
                     if self.right_sidebar_remote_files.selected.is_some() {
@@ -4995,8 +5037,48 @@ impl super::TermWindow {
                         return;
                     }
                 }
-                self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                if editable {
+                    self.right_sidebar_file_focus = Some(super::RightSidebarFileField::Preview);
+                }
+                let toggled = self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                    if editable && click_streak == 1 && !extend {
+                        // A task's box toggles, as in a Note.
+                        let toggled = term_window
+                            .right_sidebar_note
+                            .atomic_source_for_point(x, y)
+                            .and_then(|range| {
+                                let session = term_window.right_sidebar_note.session.clone()?;
+                                let source = session
+                                    .lock()
+                                    .source()
+                                    .get(range.clone())?
+                                    .trim()
+                                    .to_string();
+                                let replacement = if source.eq_ignore_ascii_case("[x]") {
+                                    "[ ]"
+                                } else if source == "[ ]" {
+                                    "[x]"
+                                } else {
+                                    return None;
+                                };
+                                Some((range, replacement))
+                            });
+                        if let Some((range, replacement)) = toggled {
+                            let host = &mut term_window.right_sidebar_note;
+                            host.view.focused = true;
+                            host.view.selection = crate::markdown_editor::SourceSelection {
+                                anchor: crate::markdown_editor::SourcePosition::new(range.start),
+                                focus: crate::markdown_editor::SourcePosition::new(range.end),
+                            };
+                            term_window.type_into_right_sidebar_note(replacement);
+                            return true;
+                        }
+                    }
                     let host = &mut term_window.right_sidebar_note;
+                    if editable {
+                        host.begin_live_editing();
+                        host.view.focused = true;
+                    }
                     let position = host.source_position_for_point(x, y);
                     let granularity = if click_streak >= 3 {
                         crate::markdown_editor::SelectionGranularity::MarkdownBlock
@@ -5017,12 +5099,17 @@ impl super::TermWindow {
                         }
                         _ => host.begin_selection(position, granularity, extend),
                     }
-                    // A preview has no caret to chase: selecting never scrolls.
-                    host.reveal_caret = false;
+                    // A preview being read has no caret to chase: selecting
+                    // never scrolls it.
+                    host.reveal_caret = editable;
                     host.drag_selection_active = false;
                     host.refresh_projection();
+                    false
                 });
-                self.dragging.replace((item.clone(), event.clone()));
+                // A toggled box is a click, not the start of a selection.
+                if toggled != Some(true) {
+                    self.dragging.replace((item.clone(), event.clone()));
+                }
                 context.invalidate();
             }
             _ => {}
@@ -5299,7 +5386,7 @@ impl super::TermWindow {
             }
             (UIItemType::RightSidebarFileBack, WMEK::Press(MousePress::Left)) => {
                 self.clear_right_sidebar_text_focus();
-                self.close_right_sidebar_file_preview();
+                self.leave_right_sidebar_file_preview();
             }
             (UIItemType::RightSidebarFileOpen, WMEK::Press(MousePress::Left)) => {
                 self.clear_right_sidebar_text_focus();

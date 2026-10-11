@@ -288,7 +288,15 @@ impl crate::TermWindow {
                 }
             }
             crate::termwindow::ContextMenuApplicationAction::Note(command) => {
-                self.perform_right_sidebar_note_command(command);
+                // The menu came from the preview being edited, or the Note.
+                if self.right_sidebar_markdown_preview_focused() {
+                    self.with_note_surface(
+                        crate::termwindow::ui::right_sidebar::NoteSurface::FilePreview,
+                        |term_window| term_window.perform_right_sidebar_note_command(command),
+                    );
+                } else {
+                    self.perform_right_sidebar_note_command(command);
+                }
             }
             crate::termwindow::ContextMenuApplicationAction::OpenFilePreview(path) => {
                 self.open_right_sidebar_file_path(path);

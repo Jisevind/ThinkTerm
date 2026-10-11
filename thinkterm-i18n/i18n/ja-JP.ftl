@@ -394,6 +394,7 @@ right-preview-truncated = プレビューは 256 KiB で切り詰められまし
 right-loading-preview = ファイルプレビューを読み込み中…
 right-window-unavailable = ウィンドウを利用できません
 right-preview-error = ファイルプレビューを読み込めません：{ $error }
+right-preview-save-failed = 保存できなかったため編集を止めました。変更を今コピーしてください。保存できないままこのファイルを離れると、変更は破棄されます。{ $error }
 right-open = 開く
 right-copy-path = パスをコピー
 right-rename = 名前を変更…

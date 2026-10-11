@@ -154,6 +154,13 @@ pub(crate) struct MarkdownDocumentSession {
     redo: Vec<EditRecord>,
     save_lock: Arc<Mutex<()>>,
     disk_stamp: Option<(SystemTime, u64)>,
+    /// The file breaks its lines with CRLF. They are edited as bare LF, as
+    /// every edit inserts, and written back as CRLF, so a Windows file keeps
+    /// its line endings whole.
+    crlf: bool,
+    /// A save only ever replaces the file: one gone (trashed, moved) is not
+    /// written back into being. A file preview's, unlike a Note's.
+    keeps_existing_file: bool,
 }
 
 const MAX_UNDO_RECORDS: usize = 512;
@@ -166,6 +173,7 @@ fn edit_record_bytes(record: &EditRecord) -> usize {
 impl MarkdownDocumentSession {
     pub(crate) fn new(document_id: String, path: PathBuf, source: String) -> Self {
         let disk_stamp = file_disk_stamp(&path);
+        let (source, crlf) = to_lf(source);
         let line_starts = line_starts(&source);
         let published = DocumentSnapshot {
             revision: 0,
@@ -186,6 +194,32 @@ impl MarkdownDocumentSession {
             redo: vec![],
             save_lock: Arc::new(Mutex::new(())),
             disk_stamp,
+            crlf,
+            keeps_existing_file: false,
+        }
+    }
+
+    /// Saves may only replace the file, never create it.
+    pub(crate) fn keep_existing_file(&mut self) {
+        self.keeps_existing_file = true;
+    }
+
+    pub(crate) fn keeps_existing_file(&self) -> bool {
+        self.keeps_existing_file
+    }
+
+    /// The file's state when the text was read, which may predate the
+    /// session: a later change then reads as another writer's.
+    pub(crate) fn set_disk_stamp(&mut self, stamp: Option<(SystemTime, u64)>) {
+        self.disk_stamp = stamp;
+    }
+
+    /// `source` as the file holds it.
+    pub(crate) fn file_text<'a>(&self, source: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.crlf {
+            std::borrow::Cow::Owned(source.replace('\n', "\r\n"))
+        } else {
+            std::borrow::Cow::Borrowed(source)
         }
     }
 
@@ -299,6 +333,8 @@ impl MarkdownDocumentSession {
             return false;
         }
         self.disk_stamp = Some(stamp);
+        let (source, crlf) = to_lf(source);
+        self.crlf = crlf;
         if self.source == source {
             return false;
         }
@@ -999,6 +1035,20 @@ impl MarkdownDocumentSession {
     fn line_bounds(&self, byte: usize) -> (usize, usize) {
         let line = self.line_index(byte);
         (self.line_starts[line], self.line_end(line))
+    }
+}
+
+/// `source` with CRLF line breaks made LF, and whether it broke its lines
+/// that way. Only a file that breaks every line so is: one mixing both is
+/// left as it is, or saving would rewrite lines nobody edited.
+fn to_lf(source: String) -> (String, bool) {
+    let bytes = source.as_bytes();
+    let mut breaks = source.match_indices('\n').map(|(at, _)| at).peekable();
+    let crlf = breaks.peek().is_some() && breaks.all(|at| at > 0 && bytes[at - 1] == b'\r');
+    if crlf {
+        (source.replace("\r\n", "\n"), true)
+    } else {
+        (source, false)
     }
 }
 

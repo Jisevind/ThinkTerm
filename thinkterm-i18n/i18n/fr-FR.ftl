@@ -403,6 +403,7 @@ right-preview-truncated = Aperçu limité à 256 Kio
 right-loading-preview = Chargement de l’aperçu du fichier…
 right-window-unavailable = La fenêtre n’est pas disponible
 right-preview-error = Impossible de charger l’aperçu : { $error }
+right-preview-save-failed = Enregistrement impossible, modification arrêtée. Copiez vos changements maintenant : si l’enregistrement échoue encore, ils seront perdus en quittant ce fichier. { $error }
 right-open = Ouvrir
 right-copy-path = Copier le chemin
 right-rename = Renommer…

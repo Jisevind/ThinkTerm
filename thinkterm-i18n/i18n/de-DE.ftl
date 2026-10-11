@@ -403,6 +403,7 @@ right-preview-truncated = Vorschau auf 256 KiB gekürzt
 right-loading-preview = Dateivorschau wird geladen…
 right-window-unavailable = Fenster ist nicht verfügbar
 right-preview-error = Dateivorschau konnte nicht geladen werden: { $error }
+right-preview-save-failed = Speichern fehlgeschlagen, Bearbeiten beendet. Kopiere deine Änderungen jetzt: Schlägt das Speichern weiter fehl, gehen sie beim Verlassen dieser Datei verloren. { $error }
 right-open = Öffnen
 right-copy-path = Pfad kopieren
 right-rename = Umbenennen…

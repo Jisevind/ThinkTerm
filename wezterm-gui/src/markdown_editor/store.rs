@@ -28,10 +28,12 @@ pub(crate) struct VaultDocument {
 }
 
 lazy_static::lazy_static! {
-    /// A document opened in two ThinkTerm windows must share one session, or
-    /// two independent autosave loops can silently overwrite each other. Weak
-    /// values let closed documents fall out without a separate eviction pass.
-    static ref DOCUMENT_SESSIONS: Mutex<HashMap<(PathBuf, String), Weak<Mutex<MarkdownDocumentSession>>>> =
+    /// A document open in two places -- two ThinkTerm windows, or a Note and
+    /// a file preview -- must share one session, or two independent autosave
+    /// loops can silently overwrite each other. Keyed by the file's resolved
+    /// path, which both reach it by. Weak values let closed documents fall
+    /// out without a separate eviction pass.
+    static ref DOCUMENT_SESSIONS: Mutex<HashMap<PathBuf, Weak<Mutex<MarkdownDocumentSession>>>> =
         Mutex::new(HashMap::new());
     static ref ATTACHMENT_IMPORT_LOCK: Mutex<()> = Mutex::new(());
 }
@@ -61,7 +63,7 @@ pub(crate) fn open_vault_document(
         document_path.display()
     );
 
-    let key = (vault_root.clone(), relative_path.clone());
+    let key = document_session_key(&document_path);
     let existing = {
         let mut sessions = DOCUMENT_SESSIONS.lock();
         sessions.retain(|_, session| session.strong_count() > 0);
@@ -72,8 +74,8 @@ pub(crate) fn open_vault_document(
     } else {
         // Reading a multi-megabyte Note and constructing its line index must not
         // hold the process-wide document registry lock.  Two windows may race
-        // here; the second registry check below selects one canonical session
-        // and lets the unused candidate fall out normally.
+        // here; the second registry check selects one canonical session and
+        // lets the unused candidate fall out normally.
         let source = fs::read_to_string(&document_path)
             .with_context(|| format!("read {}", document_path.display()))?;
         let candidate = Arc::new(Mutex::new(MarkdownDocumentSession::new(
@@ -81,14 +83,7 @@ pub(crate) fn open_vault_document(
             document_path.clone(),
             source,
         )));
-        let mut sessions = DOCUMENT_SESSIONS.lock();
-        sessions.retain(|_, session| session.strong_count() > 0);
-        if let Some(session) = sessions.get(&key).and_then(Weak::upgrade) {
-            session
-        } else {
-            sessions.insert(key, Arc::downgrade(&candidate));
-            candidate
-        }
+        adopt_document_session(key, candidate).0
     };
 
     Ok(VaultDocument {
@@ -97,6 +92,33 @@ pub(crate) fn open_vault_document(
         document_path,
         session,
     })
+}
+
+/// The session already open for `candidate`'s file, a Note's or another
+/// window's, in its place; else `candidate`, kept for the next to open the
+/// file. The flag says whether `candidate` was kept.
+pub(crate) fn share_document_session(
+    candidate: Arc<Mutex<MarkdownDocumentSession>>,
+) -> (Arc<Mutex<MarkdownDocumentSession>>, bool) {
+    let key = document_session_key(&candidate.lock().path);
+    adopt_document_session(key, candidate)
+}
+
+fn document_session_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn adopt_document_session(
+    key: PathBuf,
+    candidate: Arc<Mutex<MarkdownDocumentSession>>,
+) -> (Arc<Mutex<MarkdownDocumentSession>>, bool) {
+    let mut sessions = DOCUMENT_SESSIONS.lock();
+    sessions.retain(|_, session| session.strong_count() > 0);
+    if let Some(session) = sessions.get(&key).and_then(Weak::upgrade) {
+        return (session, false);
+    }
+    sessions.insert(key, Arc::downgrade(&candidate));
+    (candidate, true)
 }
 
 pub(crate) fn vault_markdown_paths(vault_root: &Path) -> Result<Vec<String>> {
@@ -144,8 +166,23 @@ pub(crate) fn save_document_revision(
 ) -> Result<SaveDocumentOutcome> {
     let save_lock = session.lock().save_lock();
     let _save_guard = save_lock.lock();
-    let (revision, path, source) = session.lock().snapshot_for_save();
-    let result = write_bytes_atomic(&path, source.as_bytes());
+    let (revision, path, source, file_text, keeps_existing_file) = {
+        let mut session = session.lock();
+        let (revision, path, source) = session.snapshot_for_save();
+        let file_text = session.file_text(&source).into_owned();
+        (
+            revision,
+            path,
+            source,
+            file_text,
+            session.keeps_existing_file(),
+        )
+    };
+    let result = if keeps_existing_file && !path.is_file() {
+        Err(anyhow::anyhow!("{} no longer exists", path.display()))
+    } else {
+        write_bytes_atomic(&path, file_text.as_bytes())
+    };
     let finish_result = result
         .as_ref()
         .map(|_| ())
@@ -320,8 +357,18 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let existing_permissions = fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions());
-    let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary file in {}", parent.display()))?;
+    let mut temporary = match NamedTempFile::new_in(parent) {
+        Ok(temporary) => temporary,
+        // A writable file in a folder that takes no new files: written in
+        // place, the one way it can be saved at all.
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && path.is_file() => {
+            return write_bytes_in_place(path, bytes);
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("create temporary file in {}", parent.display()));
+        }
+    };
     temporary
         .write_all(bytes)
         .with_context(|| format!("write {}", path.display()))?;
@@ -336,6 +383,19 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .persist(path)
         .with_context(|| format!("replace {}", path.display()))?;
     set_user_document_permissions(path, existing_permissions);
+    Ok(())
+}
+
+fn write_bytes_in_place(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", path.display()))?;
     Ok(())
 }
 
@@ -374,6 +434,94 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         write_bytes_atomic(&path, b"updated note").unwrap();
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn a_note_and_a_file_preview_of_one_file_share_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("todo.md"), "one").unwrap();
+        let path = dir.path().join("todo.md").canonicalize().unwrap();
+        let note = open_vault_document(dir.path(), "todo.md", false).unwrap();
+        let (preview, kept) = share_document_session(file_session(&path, "one"));
+        assert!(!kept);
+        assert!(Arc::ptr_eq(&preview, &note.session));
+        drop((note, preview));
+
+        // The other way round: a Note opened on a file a preview has open
+        // edits the preview's session.
+        let (preview, kept) = share_document_session(file_session(&path, "one"));
+        assert!(kept);
+        let note = open_vault_document(dir.path(), "todo.md", false).unwrap();
+        assert!(Arc::ptr_eq(&preview, &note.session));
+    }
+
+    fn file_session(path: &Path, text: &str) -> Arc<Mutex<MarkdownDocumentSession>> {
+        Arc::new(Mutex::new(MarkdownDocumentSession::new(
+            "file".to_string(),
+            path.to_path_buf(),
+            text.to_string(),
+        )))
+    }
+
+    #[test]
+    fn a_crlf_file_is_edited_as_lf_and_saved_as_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windows.md");
+        fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        let session = file_session(&path, "one\r\ntwo\r\n");
+        assert_eq!(session.lock().source(), "one\ntwo\n");
+        let mut view = crate::markdown_editor::EditorViewState::default();
+        session.lock().set_caret(&mut view, 3, false);
+        assert!(session.lock().insert_newline(&mut view));
+        save_document_revision(&session).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\r\n\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn a_file_mixing_line_breaks_is_saved_with_them_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.md");
+        fs::write(&path, "one\r\ntwo\nthree\r\n").unwrap();
+        let session = file_session(&path, "one\r\ntwo\nthree\r\n");
+        let mut view = crate::markdown_editor::EditorViewState::default();
+        session.lock().set_caret(&mut view, 0, false);
+        assert!(session.lock().insert_text(&mut view, "# "));
+        save_document_revision(&session).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# one\r\ntwo\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn a_file_that_must_exist_is_not_written_back_into_being() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.md");
+        fs::write(&path, "text").unwrap();
+        let session = file_session(&path, "text");
+        session.lock().keep_existing_file();
+        let mut view = crate::markdown_editor::EditorViewState::default();
+        session.lock().set_caret(&mut view, 4, false);
+        assert!(session.lock().insert_text(&mut view, " more"));
+        fs::remove_file(&path).unwrap();
+        assert!(save_document_revision(&session).is_err());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_file_in_a_closed_folder_is_saved_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("closed");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("doc.md");
+        fs::write(&path, "before").unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = write_bytes_atomic(&path, b"after");
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after");
     }
 
     #[test]

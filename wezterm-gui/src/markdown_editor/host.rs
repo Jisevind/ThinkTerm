@@ -126,6 +126,10 @@ pub(crate) struct NoteHostState {
     /// Last time the Note body scroll offset actually changed.
     pub last_scroll_change: Option<Instant>,
     pub native_text_input_token: u64,
+    /// Whether the syntax at the caret shows while the editor does not have
+    /// the keyboard. A Note's does; a file preview is read until clicked
+    /// into, so it shows rendered.
+    pub reveal_when_unfocused: bool,
     pub parse_requested_revision: Option<u64>,
     pub parse_in_flight_revision: Option<u64>,
     /// The current projection reused cached wiki-link data but at least one
@@ -216,6 +220,7 @@ impl Default for NoteHostState {
             native_text_input_snapshot_scroll: None,
             last_scroll_change: None,
             native_text_input_token: 0,
+            reveal_when_unfocused: true,
             parse_requested_revision: None,
             parse_in_flight_revision: None,
             links_resolution_pending: false,
@@ -564,7 +569,9 @@ impl NoteHostState {
     /// Where Live Preview reveals the Markdown under the caret. A read-only
     /// document is a reading view: selecting in it reveals nothing.
     fn reveal_caret(&self) -> usize {
-        if self.view.mode == super::EditorMode::ReadOnly {
+        if self.view.mode == super::EditorMode::ReadOnly
+            || (!self.view.focused && !self.reveal_when_unfocused)
+        {
             usize::MAX
         } else {
             self.view.selection.focus.byte

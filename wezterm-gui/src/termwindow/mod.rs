@@ -990,6 +990,8 @@ pub(crate) struct RightSidebarFileViewState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RightSidebarFileField {
     Filter,
+    /// The rendered Markdown preview, being edited.
+    Preview,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3312,6 +3314,9 @@ pub struct TermWindow {
     right_sidebar_note_memory_release_token: u64,
     right_sidebar_file_view: RightSidebarFileView,
     right_sidebar_file_focus: Option<RightSidebarFileField>,
+    /// The previewed file's modification time and length when its text was
+    /// read.
+    right_sidebar_file_preview_disk_stamp: Option<(std::time::SystemTime, u64)>,
     right_sidebar_file_filter: TextInputState,
     right_sidebar_file_applied_filter: String,
     right_sidebar_file_filter_debounce_until: Option<Instant>,
@@ -3843,6 +3848,9 @@ impl TermWindow {
     fn close_requested(&mut self, window: &Window) {
         self.cancel_remote_divider_resizes_except(None);
         self.flush_right_sidebar_note_blocking();
+        if !self.flush_right_sidebar_markdown_preview_blocking() {
+            return;
+        }
         self.persist_workspace_layout_after_mutation("window close requested");
 
         let mux = Mux::get();
@@ -4293,6 +4301,15 @@ impl TermWindow {
             self.plugin_panel_window_blurred();
             self.right_sidebar_note.freeze_live_source();
             self.save_right_sidebar_note_now();
+            self.with_note_surface(
+                crate::termwindow::ui::right_sidebar::NoteSurface::FilePreview,
+                |term_window| {
+                    term_window
+                        .right_sidebar_note
+                        .native_text_input_snapshot_key = None;
+                    term_window.save_right_sidebar_note_now();
+                },
+            );
             self.last_mouse_click = None;
             self.current_mouse_buttons.clear();
             self.current_mouse_capture = None;
@@ -4862,6 +4879,7 @@ impl TermWindow {
             right_sidebar_note_memory_release_token: 0,
             right_sidebar_file_view: RightSidebarFileView::Tree,
             right_sidebar_file_focus: None,
+            right_sidebar_file_preview_disk_stamp: None,
             right_sidebar_file_filter: TextInputState::new(),
             right_sidebar_file_applied_filter: String::new(),
             right_sidebar_file_filter_debounce_until: None,
@@ -5205,6 +5223,7 @@ impl TermWindow {
             WindowEvent::Destroyed => {
                 crate::main_window_placement::window_closed(self.mux_window_id);
                 self.flush_right_sidebar_note_blocking();
+                self.save_right_sidebar_markdown_preview_before_destroy();
                 self.clear_gui_recovery_intent();
                 // Ensure that we cancel any overlays we had running, so
                 // that the mux can empty out, otherwise the mux keeps
@@ -5396,7 +5415,28 @@ impl TermWindow {
                 source_range,
                 text,
             } => {
-                if self.right_sidebar_note.view.focused
+                if self.right_sidebar_markdown_preview_focused() {
+                    self.with_note_surface(
+                        crate::termwindow::ui::right_sidebar::NoteSurface::FilePreview,
+                        |term_window| {
+                            let host = &mut term_window.right_sidebar_note;
+                            if host.native_text_input_token != token {
+                                return;
+                            }
+                            let Some(session) = host.session.clone() else {
+                                return;
+                            };
+                            if session.lock().replace_range_at_revision(
+                                &mut host.view,
+                                revision,
+                                source_range.clone(),
+                                &text,
+                            ) {
+                                term_window.note_did_edit();
+                            }
+                        },
+                    );
+                } else if self.right_sidebar_note.view.focused
                     && self.right_sidebar_note.native_text_input_token == token
                 {
                     if let Some(session) = self.right_sidebar_note.session.clone() {
@@ -9662,13 +9702,14 @@ impl TermWindow {
             );
             return;
         }
+        if !self.save_right_sidebar_preview_before_rename(&old_path) {
+            return;
+        }
         if let Err(err) = std::fs::rename(&old_path, &new_path) {
             log::error!("failed to rename {}: {err:#}", old_path.display());
             return;
         }
-        if self.right_sidebar_file_selected.as_ref() == Some(&old_path) {
-            self.right_sidebar_file_selected = Some(new_path);
-        }
+        self.follow_right_sidebar_file_rename(&old_path, &new_path);
         self.force_right_sidebar_file_rescan();
     }
 

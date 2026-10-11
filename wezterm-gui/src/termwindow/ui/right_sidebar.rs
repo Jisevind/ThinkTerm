@@ -179,6 +179,20 @@ const NOTE_BODY_TOP_GAP: usize = 12;
 const NOTE_BODY_PADDING: usize = 24;
 /// The widest a rendered Markdown file preview's text runs.
 const MARKDOWN_PREVIEW_READING_MAX_WIDTH: usize = 1500;
+/// What an editable preview's disk check found.
+enum PreviewDiskState {
+    Unchanged,
+    Changed(std::time::SystemTime, u64, String),
+    /// Grown past what a preview holds whole.
+    Reload,
+    Gone,
+}
+
+/// The line saying why a preview's save failed wraps to at most this many.
+const MARKDOWN_PREVIEW_SAVE_FAILURE_MAX_LINES: usize = 4;
+/// How often an edited preview's file is checked for another writer.
+const MARKDOWN_PREVIEW_DISK_CHECK: Duration = Duration::from_secs(2);
+const MARKDOWN_PREVIEW_TEXT_INPUT_TOKEN_BASE: u64 = 1 << 48;
 const NOTE_LINE_GAP: usize = 5;
 /// A blank line's height, as a share of a line of text: after a heading, beside
 /// a rule, and anywhere else.
@@ -349,6 +363,7 @@ fn remote_lease_failure_disposition(
 }
 
 const FILE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
+const EMPTY_FILE_MESSAGE: &str = "Empty file";
 fn right_sidebar_arg(id: &'static str, name: &'static str, value: impl Into<String>) -> String {
     let mut args = FluentArgs::new();
     args.set(name, value.into());
@@ -1211,14 +1226,100 @@ pub(crate) struct NoteSurfaceState {
 }
 
 /// The file preview's rendered Markdown: which preview it renders and the
-/// read-only surface it renders into. Dropped when the preview closes, the
-/// file changes, the preview switches to source, or the panel's memory is
-/// released.
+/// surface it renders into, editable for a whole local file. Dropped, its
+/// edits saved first, when the preview closes, the file changes, the preview
+/// switches to source, or the panel's memory is released.
 pub(crate) struct MarkdownPreviewSurface {
     key: MarkdownPreviewKey,
     /// Unique per surface built; never 0, which is the Note's.
     instance: u64,
     state: NoteSurfaceState,
+    /// When the file was last checked for another writer's changes, and
+    /// whether a check is out now.
+    last_disk_check: Option<Instant>,
+    disk_check_in_flight: bool,
+    /// A timer will run the next check, so an idle preview checks too.
+    disk_check_scheduled: bool,
+    /// The line saying why a save failed has been on screen: leaving now
+    /// gives the unsaved edits up.
+    failure_shown: bool,
+}
+
+impl MarkdownPreviewSurface {
+    /// Save, then let the surface go. A failed save keeps it in `slot`, its
+    /// unsaved source and error with it; see `save_for_leaving`.
+    fn take_saved(
+        slot: &mut Option<Box<Self>>,
+        by_user: bool,
+    ) -> Result<Option<Box<Self>>, PreviewKept> {
+        if let Some(preview) = slot.as_ref() {
+            preview.save_for_leaving(by_user)?;
+        }
+        Ok(slot.take())
+    }
+
+    /// Save before letting this surface go. Edits that cannot be saved keep
+    /// it, so they can be copied out, except that the user leaving gives them
+    /// up once the line saying why has been on screen, rather than find every
+    /// way out shut. The window leaving on its own (a project followed, a
+    /// remote event, a repaint) never gives them up, nor tries a failed save
+    /// again.
+    fn save_for_leaving(&self, by_user: bool) -> Result<(), PreviewKept> {
+        if !self.unsaved() {
+            return Ok(());
+        }
+        if !by_user && self.save_error().is_some() {
+            return Err(PreviewKept::Unsaved);
+        }
+        match self.save() {
+            Ok(()) => Ok(()),
+            Err(err) if by_user && self.failure_shown => {
+                log::error!("leaving a Markdown preview that could not be saved: {err:#}");
+                Ok(())
+            }
+            Err(err) => Err(PreviewKept::Failed(err)),
+        }
+    }
+
+    fn unsaved(&self) -> bool {
+        self.state
+            .host
+            .session
+            .as_ref()
+            .is_some_and(|session| session.lock().is_dirty())
+    }
+
+    /// Save before letting this surface go. On failure the caller keeps it,
+    /// including its unsaved source and the save error.
+    fn save(&self) -> anyhow::Result<()> {
+        if let Some(session) = self.state.host.session.as_ref() {
+            if session.lock().is_dirty() {
+                save_document_revision(session)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn text_for_copy(&self) -> Option<String> {
+        let session = self.state.host.session.as_ref()?.lock();
+        Some(session.file_text(session.source()).into_owned())
+    }
+
+    fn save_error(&self) -> Option<String> {
+        match self.state.host.session.as_ref()?.lock().save_state() {
+            SaveState::Failed(reason) => Some(reason.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Why an edited preview was not let go.
+#[derive(Debug)]
+enum PreviewKept {
+    /// Its save failed just now: say why.
+    Failed(anyhow::Error),
+    /// Its save failed before; the user decides.
+    Unsaved,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1650,6 +1751,9 @@ struct RightSidebarLoadedFilePreview {
     /// (tab expansion, control stripping). Copying must reproduce this —
     /// spaces where a Makefile had tabs is a different file.
     raw_text: Option<String>,
+    /// The file's modification time and length as read, for an edited
+    /// preview to tell another writer's later change from its own text.
+    disk_stamp: Option<(std::time::SystemTime, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -2119,6 +2223,7 @@ impl crate::TermWindow {
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
                 self.clear_right_sidebar_text_focus();
             }
+            self.drop_hidden_right_sidebar_markdown_preview_focus();
             self.close_plugin_panel();
             self.schedule_right_sidebar_file_memory_release();
             self.release_right_sidebar_remote_files_if_hidden();
@@ -2314,6 +2419,15 @@ impl crate::TermWindow {
             }
             FileReleaseAction::Release => {}
         }
+        // Edits that could not be saved are the user's to give up, not a
+        // timer's.
+        if self
+            .right_sidebar_markdown_preview
+            .as_ref()
+            .is_some_and(|preview| preview.unsaved())
+        {
+            return;
+        }
 
         // Remember the view (paths/scroll/filter, a few KB) BEFORE the teardown
         // wipes selected/preview, so reopening this root restores where we were.
@@ -2322,8 +2436,10 @@ impl crate::TermWindow {
         if let Some(cancel) = self.right_sidebar_file_index_cancel.take() {
             cancel.store(true, AtomicOrdering::Relaxed);
         }
+        if !self.close_right_sidebar_file_preview() {
+            return;
+        }
         self.clear_right_sidebar_file_search();
-        self.close_right_sidebar_file_preview();
         // `close_right_sidebar_file_preview` only `.clear()`s the preview lines,
         // which keeps the (potentially large) capacity; drop it outright.
         self.right_sidebar_file_preview_lines = Vec::new();
@@ -2417,13 +2533,262 @@ impl crate::TermWindow {
         self.publish_ui_shape_cache_diagnostics();
     }
 
-    fn set_right_sidebar_file_preview_raw_text(&mut self, text: Option<String>) {
+    fn set_right_sidebar_file_preview_raw_text(&mut self, text: Option<String>) -> bool {
+        if self.release_right_sidebar_markdown_preview(false).is_err() {
+            return false;
+        }
         self.right_sidebar_file_preview_raw_text = text;
         self.right_sidebar_file_preview_text_generation = self
             .right_sidebar_file_preview_text_generation
             .wrapping_add(1);
-        // Rendered Markdown is only ever of the text it was built from.
-        self.right_sidebar_markdown_preview = None;
+        true
+    }
+
+    /// Save before dropping the rendered preview. Edits that cannot be saved
+    /// cancel the transition and the preview shows why, so the text can be
+    /// copied out; `by_user` is the user leaving, which gives them up once
+    /// that has been shown (see `save_for_leaving`).
+    /// Returns whether the released preview had been edited.
+    fn release_right_sidebar_markdown_preview(&mut self, by_user: bool) -> Result<bool, ()> {
+        let preview = match MarkdownPreviewSurface::take_saved(
+            &mut self.right_sidebar_markdown_preview,
+            by_user,
+        ) {
+            Ok(Some(preview)) => preview,
+            Ok(None) => return Ok(false),
+            Err(kept) => {
+                self.right_sidebar_markdown_preview_kept(kept);
+                return Err(());
+            }
+        };
+        let Some(session) = self.finish_right_sidebar_markdown_preview_release(preview) else {
+            return Ok(false);
+        };
+        let edited = session.lock().revision() != 0;
+        Ok(edited)
+    }
+
+    /// Before `old` is renamed: an edited preview of it, or of a file inside
+    /// it, saves first, while its session still has the old path. False when
+    /// that failed and the rename must wait.
+    pub(crate) fn save_right_sidebar_preview_before_rename(&mut self, old: &Path) -> bool {
+        let affected = self.right_sidebar_markdown_preview.is_some()
+            && self
+                .right_sidebar_file_selected
+                .as_deref()
+                .is_some_and(|selected| selected.starts_with(old));
+        !affected || self.flush_right_sidebar_markdown_preview_blocking()
+    }
+
+    /// After `old` was renamed to `new`, the preview follows its file. A
+    /// rendered Markdown preview opens it again where it is now, which also
+    /// shows it plainly if the new name is not Markdown.
+    pub(crate) fn follow_right_sidebar_file_rename(&mut self, old: &Path, new: &Path) {
+        let Some(rest) = self
+            .right_sidebar_file_selected
+            .as_deref()
+            .and_then(|selected| selected.strip_prefix(old).ok())
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let moved = if rest.as_os_str().is_empty() {
+            new.to_path_buf()
+        } else {
+            new.join(rest)
+        };
+        if self.right_sidebar_markdown_preview.is_some() {
+            let scroll = (
+                self.right_sidebar_file_preview_scroll_offset,
+                self.right_sidebar_file_preview_horizontal_offset,
+            );
+            self.open_right_sidebar_file_path_inner(moved, Some(scroll));
+        } else if moved == new {
+            self.right_sidebar_file_selected = Some(moved);
+        }
+    }
+
+    /// Drop the rendered preview without saving it, handing back its
+    /// session: for its file having changed or gone under it, where the
+    /// other writer is the last.
+    fn discard_right_sidebar_markdown_preview(
+        &mut self,
+    ) -> Option<Arc<parking_lot::Mutex<crate::markdown_editor::MarkdownDocumentSession>>> {
+        let preview = self.right_sidebar_markdown_preview.take()?;
+        self.finish_right_sidebar_markdown_preview_release(preview)
+    }
+
+    fn finish_right_sidebar_markdown_preview_release(
+        &mut self,
+        preview: Box<MarkdownPreviewSurface>,
+    ) -> Option<Arc<parking_lot::Mutex<crate::markdown_editor::MarkdownDocumentSession>>> {
+        if self.right_sidebar_file_focus == Some(RightSidebarFileField::Preview) {
+            self.right_sidebar_file_focus = None;
+        }
+        // Whatever has the keyboard now, the window's text input must not
+        // go on answering for a preview that is gone.
+        if preview.state.host.native_text_input_snapshot_key.is_some() {
+            if let Some(window) = self.window.as_ref() {
+                window.set_native_text_input_snapshot(None);
+            }
+        }
+        preview.state.host.session.clone()
+    }
+
+    /// Whether the rendered preview takes the keyboard: it is being edited,
+    /// and it is on screen.
+    pub(crate) fn right_sidebar_markdown_preview_focused(&self) -> bool {
+        self.right_sidebar_file_focus == Some(RightSidebarFileField::Preview)
+            && self.right_sidebar_markdown_preview.is_some()
+            && self.right_sidebar_markdown_preview_rendering()
+    }
+
+    /// Give the keyboard back from the preview: it is saved, and the window's
+    /// text input let go of.
+    fn unfocus_right_sidebar_markdown_preview(&mut self) {
+        if self.right_sidebar_file_focus != Some(RightSidebarFileField::Preview) {
+            return;
+        }
+        self.right_sidebar_file_focus = None;
+        self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+            term_window.right_sidebar_note.view.focused = false;
+            term_window
+                .right_sidebar_note
+                .native_text_input_snapshot_key = None;
+            term_window.right_sidebar_note.freeze_live_source();
+            term_window.save_right_sidebar_note_now();
+        });
+        if let Some(window) = self.window.as_ref() {
+            window.set_native_text_input_snapshot(None);
+        }
+    }
+
+    /// The preview kept the keyboard but is no longer shown (the panel
+    /// collapsed, its view or mode changed, another window chose Source):
+    /// keys must reach whatever is.
+    pub(crate) fn drop_hidden_right_sidebar_markdown_preview_focus(&mut self) {
+        if self.right_sidebar_file_focus == Some(RightSidebarFileField::Preview)
+            && !self.right_sidebar_markdown_preview_focused()
+        {
+            self.unfocus_right_sidebar_markdown_preview();
+        }
+    }
+
+    /// Save the preview's edits now, before the window closes. Like the user
+    /// leaving the preview, edits that cannot be saved keep the window open
+    /// and the preview shows why; once that has been shown, closing again
+    /// gives them up.
+    pub(crate) fn flush_right_sidebar_markdown_preview_blocking(&mut self) -> bool {
+        let Some(preview) = self.right_sidebar_markdown_preview.as_ref() else {
+            return true;
+        };
+        if let Err(kept) = preview.save_for_leaving(true) {
+            self.right_sidebar_markdown_preview_kept(kept);
+            return false;
+        }
+        true
+    }
+
+    /// The user closing the preview: `close_right_sidebar_file_preview`, but
+    /// edits that cannot be saved are given up once the preview has shown
+    /// why.
+    pub(crate) fn leave_right_sidebar_file_preview(&mut self) -> bool {
+        self.release_right_sidebar_markdown_preview(true).is_ok()
+            && self.close_right_sidebar_file_preview()
+    }
+
+    /// An edited preview stayed: show why.
+    fn right_sidebar_markdown_preview_kept(&mut self, kept: PreviewKept) {
+        if let PreviewKept::Failed(err) = kept {
+            self.right_sidebar_markdown_preview_save_failed(err);
+        }
+        self.reveal_right_sidebar_markdown_preview();
+    }
+
+    /// The window is going away whatever happens: save what can be saved.
+    pub(crate) fn save_right_sidebar_markdown_preview_before_destroy(&self) {
+        if let Some(preview) = self.right_sidebar_markdown_preview.as_ref() {
+            if let Err(err) = preview.save() {
+                log::error!("failed to save the edited Markdown preview: {err:#}");
+            }
+        }
+    }
+
+    /// Bring the preview into view after a refused close or switch, so the
+    /// line saying why shows instead of nothing seeming to happen. Where it
+    /// cannot be shown, the refusal stands this once and the user's next try
+    /// lets go.
+    fn reveal_right_sidebar_markdown_preview(&mut self) {
+        if self.right_sidebar_markdown_preview.is_none()
+            || self.right_sidebar_markdown_preview_rendering()
+        {
+            return;
+        }
+        if RightSidebarMode::Chat.panel_enabled()
+            && crate::native_settings::right_sidebar_markdown_preview_rendered()
+        {
+            let previous_width = self.right_sidebar_width();
+            if self.right_sidebar_mode == RightSidebarMode::Tasks {
+                self.clear_right_sidebar_text_focus();
+                self.schedule_right_sidebar_note_memory_release();
+            }
+            self.right_sidebar_mode = RightSidebarMode::Chat;
+            self.right_sidebar_file_view = RightSidebarFileView::Preview;
+            if self.right_sidebar_collapsed {
+                self.expand_right_sidebar();
+            } else {
+                self.kick_right_sidebar_file_rescan_cycle();
+                self.request_right_sidebar_remote_files_connect(false);
+            }
+            if self.right_sidebar_width() != previous_width {
+                self.schedule_right_sidebar_reflow();
+            }
+            self.invalidate_window();
+        }
+        if !self.right_sidebar_markdown_preview_rendering() {
+            if let Some(preview) = self.right_sidebar_markdown_preview.as_mut() {
+                preview.failure_shown = true;
+            }
+        }
+    }
+
+    fn right_sidebar_markdown_preview_save_failed(&mut self, err: anyhow::Error) {
+        log::error!("failed to save the edited Markdown preview: {err:#}");
+        if let Some(preview) = self.right_sidebar_markdown_preview.as_mut() {
+            let host = &mut preview.state.host;
+            host.freeze_live_source();
+            host.cancel_autosave_deadline();
+            host.view.mode = EditorMode::ReadOnly;
+            host.view.focused = false;
+            host.refresh_projection();
+            if host.native_text_input_snapshot_key.take().is_some() {
+                if let Some(window) = self.window.as_ref() {
+                    window.set_native_text_input_snapshot(None);
+                }
+            }
+            if self.right_sidebar_file_focus == Some(RightSidebarFileField::Preview) {
+                self.right_sidebar_file_focus = None;
+            }
+            self.invalidate_window();
+        }
+    }
+
+    /// Whether the previewed Markdown may be edited: a local, writable file
+    /// loaded whole. A remote file has nowhere here to be saved, and saving a
+    /// truncated one would cut the file short.
+    fn right_sidebar_markdown_preview_editable(&self) -> bool {
+        // A file nobody may write is plainly read-only. Whether this account
+        // may write one that someone can is learned by saving: a failed save
+        // turns the preview read-only and says so.
+        self.right_sidebar_remote_files.selected.is_none()
+            && !self.right_sidebar_file_preview_truncated
+            && self.right_sidebar_file_preview_raw_text.is_some()
+            && self
+                .right_sidebar_file_selected
+                .as_deref()
+                .is_some_and(|path| {
+                    fs::metadata(path).is_ok_and(|metadata| !metadata.permissions().readonly())
+                })
     }
 
     /// The previewed file when it is Markdown, as the key its rendering is
@@ -2459,14 +2824,28 @@ impl crate::TermWindow {
 
     pub(crate) fn toggle_right_sidebar_markdown_preview_rendered(&mut self) {
         let rendered = !crate::native_settings::right_sidebar_markdown_preview_rendered();
+        let edited = if !rendered {
+            match self.release_right_sidebar_markdown_preview(true) {
+                Ok(edited) => edited,
+                Err(()) => return,
+            }
+        } else {
+            false
+        };
         if let Err(err) =
             crate::native_settings::save_right_sidebar_markdown_preview_rendered(rendered)
         {
             log::warn!("failed to save the Markdown preview mode: {err:#}");
         }
-        if !rendered {
-            // Source keeps nothing of the rendering.
-            self.right_sidebar_markdown_preview = None;
+        if edited {
+            // Source shows the file as loaded: load it again, edits and all.
+            if let Some(path) = self.right_sidebar_file_selected.clone() {
+                let scroll = (
+                    self.right_sidebar_file_preview_scroll_offset,
+                    self.right_sidebar_file_preview_horizontal_offset,
+                );
+                self.open_right_sidebar_file_path_inner(path, Some(scroll));
+            }
         }
         // The choice is every window's: one showing a Markdown file switches
         // when it repaints.
@@ -2495,27 +2874,64 @@ impl crate::TermWindow {
         {
             return true;
         }
+        // Edits that could not be saved stay on screen, with the line saying
+        // why, until the user leaves them.
+        if self.release_right_sidebar_markdown_preview(false).is_err() {
+            return true;
+        }
         // Copied only to build: this runs every frame.
         let Some(text) = self.right_sidebar_file_preview_raw_text.clone() else {
             return false;
         };
-        let document = self.markdown_preview_document(&key.path, text);
+        let editable = self.right_sidebar_markdown_preview_editable();
+        let mut document = self.markdown_preview_document(&key.path, text);
+        // Edited, the file is the same text as wherever else it is open, a
+        // Note or another window's preview, or their saves would overwrite
+        // each other.
+        let (session, fresh) = if editable {
+            crate::markdown_editor::share_document_session(document.session)
+        } else {
+            (document.session, true)
+        };
+        document.session = session;
         let mut state = NoteSurfaceState::default();
         state.host.bind_document(document);
-        state.host.view.mode = EditorMode::ReadOnly;
+        state.host.view.mode = if editable {
+            EditorMode::LivePreview
+        } else {
+            EditorMode::ReadOnly
+        };
+        if editable && fresh {
+            if let Some(session) = state.host.session.as_ref() {
+                let mut session = session.lock();
+                // The file as it was when the text was read: a change since
+                // shows as another writer's, not as this text.
+                session.set_disk_stamp(self.right_sidebar_file_preview_disk_stamp);
+                session.keep_existing_file();
+            }
+        }
+        // Native text input answers with the token it was given; the Note's
+        // count from 0, so a preview's never meet them.
+        state.host.native_text_input_token = MARKDOWN_PREVIEW_TEXT_INPUT_TOKEN_BASE;
+        state.host.reveal_when_unfocused = false;
         self.right_sidebar_markdown_preview = Some(Box::new(MarkdownPreviewSurface {
             key,
             instance: NEXT_MARKDOWN_PREVIEW_INSTANCE
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             state,
+            last_disk_check: None,
+            disk_check_in_flight: false,
+            disk_check_scheduled: false,
+            failure_shown: false,
         }));
         true
     }
 
-    /// The document a previewed Markdown file renders as: a session of its
-    /// own, never registered with the Notebook's and never saved. A local
-    /// file's images resolve beside it and cannot leave the project; a remote
-    /// file has no local folder, so it shows none from relative paths.
+    /// The document a previewed Markdown file renders as, on a session of
+    /// its own; an editable preview then shares whatever session already has
+    /// the file open. A local file's images resolve beside it and cannot
+    /// leave the project; a remote file has no local folder, so it shows none
+    /// from relative paths.
     fn markdown_preview_document(
         &self,
         path: &str,
@@ -2541,7 +2957,8 @@ impl crate::TermWindow {
     }
 
     /// Paint the previewed Markdown rendered, with the Note's painter on the
-    /// preview's own read-only surface.
+    /// preview's own surface: editable for a whole local file, read-only
+    /// otherwise.
     fn paint_right_sidebar_markdown_preview(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -2554,7 +2971,41 @@ impl crate::TermWindow {
         bottom: usize,
     ) -> anyhow::Result<()> {
         let font_size = self.right_sidebar_file_preview_font_size();
+        self.check_right_sidebar_markdown_preview_disk();
+        let focused = self.right_sidebar_markdown_preview_focused();
+        // A save that failed has turned the preview read-only; a line above
+        // the text says so, and why.
+        let save_failure = self
+            .right_sidebar_markdown_preview
+            .as_ref()
+            .filter(|preview| preview.state.host.view.mode == EditorMode::ReadOnly)
+            .and_then(|preview| preview.save_error());
+        let mut top = top;
+        if let Some(reason) = save_failure {
+            let font = self.fonts.title_font_with_size(font_size)?;
+            let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+            let inset = self.ui_px(NOTE_BODY_PADDING);
+            let message = right_sidebar_arg("right-preview-save-failed", "error", reason);
+            let used = self.paint_sidebar_wrapped_text(
+                layers,
+                &font,
+                metrics,
+                &message,
+                x + inset,
+                top + self.ui_px(NOTE_BODY_TOP_GAP),
+                width.saturating_sub(inset * 2),
+                MARKDOWN_PREVIEW_SAVE_FAILURE_MAX_LINES,
+                chrome.spelling_error,
+            )?;
+            top = (top + used + self.ui_px(NOTE_BODY_TOP_GAP)).min(bottom);
+            if let Some(preview) = self.right_sidebar_markdown_preview.as_mut() {
+                preview.failure_shown = true;
+            }
+        }
         self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+            // The caret shows only while the preview has the keyboard: a
+            // click in the filter or the tree takes it without telling us.
+            term_window.right_sidebar_note.view.focused = focused;
             term_window.paint_note_editor_area(
                 layers,
                 chrome,
@@ -2570,6 +3021,150 @@ impl crate::TermWindow {
             )
         })
         .unwrap_or(Ok(()))
+    }
+
+    /// While an editable preview shows, notice its file changing under it,
+    /// as another editor or an agent writes it, or going away. A timer runs
+    /// the checks, so an idle preview notices too. The last writer wins, as
+    /// for a Note: their text replaces the preview's. An edit made while a
+    /// check was out is newer than what it read, though, and stays.
+    fn check_right_sidebar_markdown_preview_disk(&mut self) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let shown = self.right_sidebar_markdown_preview_rendering();
+        let Some(preview) = self.right_sidebar_markdown_preview.as_mut() else {
+            return;
+        };
+        if !shown
+            || preview.state.host.view.mode == EditorMode::ReadOnly
+            || preview.disk_check_in_flight
+            || preview
+                .last_disk_check
+                .is_some_and(|last| last.elapsed() < MARKDOWN_PREVIEW_DISK_CHECK)
+        {
+            return;
+        }
+        let Some(session) = preview.state.host.session.clone() else {
+            return;
+        };
+        let (path, known_stamp, revision) = {
+            let session = session.lock();
+            (
+                session.path.clone(),
+                session.disk_stamp(),
+                session.revision(),
+            )
+        };
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        preview.disk_check_in_flight = true;
+        preview.last_disk_check = Some(Instant::now());
+        let instance = preview.instance;
+        promise::spawn::spawn(async move {
+            let result = promise::spawn::spawn_into_new_thread(move || {
+                let metadata = match fs::metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(PreviewDiskState::Gone);
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                let stamp = (metadata.modified()?, metadata.len());
+                if known_stamp == Some(stamp) {
+                    return Ok(PreviewDiskState::Unchanged);
+                }
+                // Grown past what a preview holds whole: load it again,
+                // read-only, rather than edit a part of it.
+                if metadata.len() > FILE_PREVIEW_MAX_BYTES as u64 {
+                    return Ok(PreviewDiskState::Reload);
+                }
+                let text = fs::read_to_string(&path)?;
+                Ok::<_, anyhow::Error>(PreviewDiskState::Changed(stamp.0, stamp.1, text))
+            })
+            .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let Some(preview) = term_window
+                    .right_sidebar_markdown_preview
+                    .as_mut()
+                    .filter(|preview| preview.instance == instance)
+                else {
+                    return;
+                };
+                preview.disk_check_in_flight = false;
+                if preview.save_error().is_some() {
+                    return;
+                }
+                match result {
+                    Ok(PreviewDiskState::Unchanged) => {}
+                    Ok(PreviewDiskState::Gone) | Ok(PreviewDiskState::Reload) | Err(_) => {
+                        // Theirs was the last write: show what is there now.
+                        // One that cannot be read as text is theirs too, and
+                        // must not be saved over unseen.
+                        if let Err(err) = &result {
+                            log::warn!(
+                                "reloading a Markdown preview after a failed check: {err:#}"
+                            );
+                        }
+                        term_window.discard_right_sidebar_markdown_preview();
+                        if let Some(path) = term_window.right_sidebar_file_selected.clone() {
+                            term_window.open_right_sidebar_file_path_inner(path, None);
+                        }
+                        term_window.invalidate_window();
+                        return;
+                    }
+                    Ok(PreviewDiskState::Changed(modified, len, text)) => {
+                        let changed = term_window
+                            .with_note_surface(NoteSurface::FilePreview, |term_window| {
+                                let host = &mut term_window.right_sidebar_note;
+                                let edited_since = host
+                                    .session
+                                    .as_ref()
+                                    .is_some_and(|session| session.lock().revision() != revision);
+                                !edited_since && host.apply_external_snapshot(modified, len, text)
+                            })
+                            .unwrap_or(false);
+                        if changed {
+                            term_window.invalidate_window();
+                        }
+                    }
+                }
+                term_window.schedule_right_sidebar_markdown_preview_disk_check(instance);
+            })));
+        })
+        .detach();
+    }
+
+    /// Run the next disk check when it is due, if the preview is still the
+    /// one checked.
+    fn schedule_right_sidebar_markdown_preview_disk_check(&mut self, instance: u64) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let Some(preview) = self
+            .right_sidebar_markdown_preview
+            .as_mut()
+            .filter(|preview| preview.instance == instance && !preview.disk_check_scheduled)
+        else {
+            return;
+        };
+        preview.disk_check_scheduled = true;
+        promise::spawn::spawn(async move {
+            smol::Timer::after(MARKDOWN_PREVIEW_DISK_CHECK).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let Some(preview) = term_window
+                    .right_sidebar_markdown_preview
+                    .as_mut()
+                    .filter(|preview| preview.instance == instance)
+                else {
+                    return;
+                };
+                preview.disk_check_scheduled = false;
+                term_window.check_right_sidebar_markdown_preview_disk();
+            })));
+        })
+        .detach();
     }
 
     /// The rendered/source switch beside a Markdown preview's close button.
@@ -2710,7 +3305,13 @@ impl crate::TermWindow {
             return true;
         }
         match self.right_sidebar_mode {
-            RightSidebarMode::Chat => self.right_sidebar_file_focus.is_some(),
+            RightSidebarMode::Chat => match self.right_sidebar_file_focus {
+                Some(RightSidebarFileField::Filter) => true,
+                Some(RightSidebarFileField::Preview) => {
+                    self.right_sidebar_markdown_preview_focused()
+                }
+                None => false,
+            },
             RightSidebarMode::Snippets => self.right_sidebar_snippet_focus.is_some(),
             RightSidebarMode::Tasks => self.right_sidebar_note.view.focused,
             // Given only by the user: a press in one of its fields, or
@@ -2722,6 +3323,7 @@ impl crate::TermWindow {
 
     pub(crate) fn clear_right_sidebar_text_focus(&mut self) {
         self.release_plugin_panel_keyboard();
+        self.unfocus_right_sidebar_markdown_preview();
         let note_was_focused = self.right_sidebar_note.view.focused;
         self.right_sidebar_snippet_focus = None;
         self.right_sidebar_file_focus = None;
@@ -3028,6 +3630,9 @@ impl crate::TermWindow {
         path: PathBuf,
         restore_scroll: Option<(f32, usize)>,
     ) {
+        if !path.is_dir() && self.release_right_sidebar_markdown_preview(true).is_err() {
+            return;
+        }
         self.right_sidebar_file_preview_restore_scroll = restore_scroll;
         self.right_sidebar_file_focus = None;
         if path.is_dir() {
@@ -3104,6 +3709,7 @@ impl crate::TermWindow {
                 )),
                 truncated: false,
                 raw_text: None,
+                disk_stamp: None,
             });
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.apply_right_sidebar_file_preview_result(generation, path, result);
@@ -3116,6 +3722,14 @@ impl crate::TermWindow {
         if let Err(err) = trash::delete(path) {
             log::error!("failed to move {} to trash: {err:#}", path.display());
             return;
+        }
+        if self
+            .right_sidebar_file_selected
+            .as_deref()
+            .is_some_and(|selected| selected.starts_with(path))
+        {
+            // Trashing was the last write: unsaved edits go with the file.
+            self.discard_right_sidebar_markdown_preview();
         }
         if self.right_sidebar_file_selected.as_deref() == Some(path) {
             // `close_right_sidebar_file_preview` reflows for us.
@@ -3131,7 +3745,10 @@ impl crate::TermWindow {
     /// its old size so the reclaimed strip just sits empty. Of the nine callers
     /// only two remembered to do it, and the ones that forgot were exactly the
     /// remote paths — hence the pane's width surviving a workspace switch.
-    pub(crate) fn close_right_sidebar_file_preview(&mut self) {
+    pub(crate) fn close_right_sidebar_file_preview(&mut self) -> bool {
+        if self.release_right_sidebar_markdown_preview(false).is_err() {
+            return false;
+        }
         // RemoteFilesState::TargetChanged clears its selection before the
         // ReleaseLease effect reaches this method. In that interval
         // right_sidebar_width() already reports the narrow tree-only width,
@@ -3149,6 +3766,7 @@ impl crate::TermWindow {
         ) {
             self.schedule_right_sidebar_reflow();
         }
+        true
     }
 
     fn close_right_sidebar_file_preview_without_reflow(&mut self) {
@@ -3468,8 +4086,10 @@ impl crate::TermWindow {
             return;
         }
 
+        if !self.set_right_sidebar_file_preview_raw_text(result.raw_text) {
+            return;
+        }
         self.right_sidebar_file_preview_lines = result.lines;
-        self.set_right_sidebar_file_preview_raw_text(result.raw_text);
         self.right_sidebar_file_preview_max_columns = self
             .right_sidebar_file_preview_lines
             .iter()
@@ -3480,6 +4100,7 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_image = result.image;
         self.right_sidebar_file_preview_message = result.message;
         self.right_sidebar_file_preview_truncated = result.truncated;
+        self.right_sidebar_file_preview_disk_stamp = result.disk_stamp;
         self.right_sidebar_file_preview_selection = None;
         // When restoring a remembered preview, re-apply the saved scroll once the
         // lines arrive (clamped on paint); otherwise reset to the top.
@@ -3540,7 +4161,6 @@ impl crate::TermWindow {
         let has_selection = self.right_sidebar_file_preview_selected_text().is_some();
         let has_text = self.right_sidebar_file_preview_image.is_none()
             && !self.right_sidebar_file_preview_lines.is_empty();
-        let path_string = path.to_string_lossy().to_string();
         let open_with = self.right_sidebar_open_with_menu_items(&key, &path, true);
 
         self.begin_context_menu_application_actions();
@@ -3556,9 +4176,30 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewAll,
             has_text,
         );
-        let items = vec![
-            copy_selection,
-            copy_all,
+        let mut items = vec![copy_selection, copy_all];
+        items.extend(self.right_sidebar_file_preview_file_menu_items_with(&path, open_with));
+        self.show_term_context_menu(context, anchor, items);
+    }
+
+    /// The preview menu's items for the file itself: its path, its folder,
+    /// and the applications that open it.
+    pub(crate) fn right_sidebar_file_preview_file_menu_items(
+        &mut self,
+        path: &Path,
+    ) -> Vec<ContextMenuItem> {
+        let key = right_sidebar_open_with_cache_key(path);
+        self.start_right_sidebar_open_with_load_if_needed(&key, path);
+        let open_with = self.right_sidebar_open_with_menu_items(&key, path, true);
+        self.right_sidebar_file_preview_file_menu_items_with(path, open_with)
+    }
+
+    fn right_sidebar_file_preview_file_menu_items_with(
+        &self,
+        path: &Path,
+        open_with: Vec<ContextMenuItem>,
+    ) -> Vec<ContextMenuItem> {
+        let path_string = path.to_string_lossy().to_string();
+        vec![
             ContextMenuItem::item_with_icon(
                 crate::i18n::tr("right-copy-path"),
                 ContextMenuIcon::Copy,
@@ -3575,8 +4216,7 @@ impl crate::TermWindow {
                 ContextMenuIcon::Application,
                 open_with,
             ),
-        ];
-        self.show_term_context_menu(context, anchor, items);
+        ]
     }
 
     pub(crate) fn show_right_sidebar_file_context_menu(
@@ -3849,6 +4489,14 @@ impl crate::TermWindow {
     /// the context menu's "Copy" fall back to this when nothing is selected;
     /// the menu also offers it outright, so it is separated out.
     pub(crate) fn copy_right_sidebar_file_preview_all_text(&mut self) {
+        if let Some(text) = self
+            .right_sidebar_markdown_preview
+            .as_ref()
+            .and_then(|preview| preview.text_for_copy())
+        {
+            self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+            return;
+        }
         if self.right_sidebar_file_preview_lines.is_empty() {
             return;
         }
@@ -4104,7 +4752,9 @@ impl crate::TermWindow {
             // Remember the outgoing root's view, then restore the incoming one
             // (replaces the old blanket clear of expanded + preview).
             self.save_right_sidebar_file_view_state();
-            self.close_right_sidebar_file_preview();
+            if !self.close_right_sidebar_file_preview() {
+                return;
+            }
             self.right_sidebar_file_browse_rows.clear();
             self.right_sidebar_file_browse_cache_key = None;
             // Must precede the restore below: the reset bumps the generation, so
@@ -4181,7 +4831,9 @@ impl crate::TermWindow {
         if let Some(cancel) = self.right_sidebar_file_search_cancel.take() {
             cancel.store(true, AtomicOrdering::Relaxed);
         }
-        self.close_right_sidebar_file_preview();
+        if !self.close_right_sidebar_file_preview() {
+            return;
+        }
         self.clear_right_sidebar_file_search();
         self.right_sidebar_file_index_root = None;
         self.right_sidebar_file_index_project_name.clear();
@@ -4199,6 +4851,22 @@ impl crate::TermWindow {
     fn sync_right_sidebar_file_root_for_current_workspace(
         &mut self,
     ) -> Result<RightSidebarFileRoot, String> {
+        // Keep a failed preview with its tree. This runs on every paint;
+        // retry saving only when the user tries to leave it again.
+        if let Some(reason) = self
+            .right_sidebar_markdown_preview
+            .as_ref()
+            .and_then(|preview| preview.save_error())
+        {
+            return self
+                .right_sidebar_file_index_root
+                .clone()
+                .map(|path| RightSidebarFileRoot {
+                    path,
+                    project_name: self.right_sidebar_file_index_project_name.clone(),
+                })
+                .ok_or(reason);
+        }
         let root = match self.active_local_project_for_files() {
             Ok(root) => root,
             Err(err) => {
@@ -4207,7 +4875,13 @@ impl crate::TermWindow {
             }
         };
         self.track_right_sidebar_file_root(&root);
-        Ok(root)
+        Ok(RightSidebarFileRoot {
+            path: self
+                .right_sidebar_file_index_root
+                .clone()
+                .unwrap_or(root.path),
+            project_name: self.right_sidebar_file_index_project_name.clone(),
+        })
     }
 
     /// Build (or refresh) the file index on a background thread. `fresh` bypasses
@@ -4688,7 +5362,15 @@ impl crate::TermWindow {
         if let RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
             return self.plugin_panel_copy(destination);
         }
-        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+        if self.right_sidebar_markdown_preview_focused()
+            && self.note_surface_installed != NoteSurface::FilePreview
+        {
+            self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                term_window.copy_right_sidebar_focused_input(destination)
+            });
+            return;
+        }
+        if self.right_sidebar_note_editor_targeted() {
             let Some(session) = self.right_sidebar_note.session.as_ref() else {
                 return;
             };
@@ -5238,7 +5920,15 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn cut_right_sidebar_focused_input(&mut self) {
-        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+        if self.right_sidebar_markdown_preview_focused()
+            && self.note_surface_installed != NoteSurface::FilePreview
+        {
+            self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                term_window.cut_right_sidebar_focused_input()
+            });
+            return;
+        }
+        if self.right_sidebar_note_editor_targeted() {
             let Some(session) = self.right_sidebar_note.session.clone() else {
                 return;
             };
@@ -5295,7 +5985,15 @@ impl crate::TermWindow {
         if let RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
             return self.plugin_panel_clear_selection();
         }
-        if self.right_sidebar_mode == RightSidebarMode::Tasks {
+        if self.right_sidebar_markdown_preview_focused()
+            && self.note_surface_installed != NoteSurface::FilePreview
+        {
+            self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                term_window.clear_right_sidebar_focused_input_selection()
+            });
+            return;
+        }
+        if self.right_sidebar_note_editor_targeted() {
             let focus = self.right_sidebar_note.view.selection.focus;
             self.right_sidebar_note.view.selection = SourceSelection {
                 anchor: focus,
@@ -5330,6 +6028,9 @@ impl crate::TermWindow {
 
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             return self.handle_right_sidebar_note_key(key, mods);
+        }
+        if self.right_sidebar_markdown_preview_focused() {
+            return self.handle_right_sidebar_markdown_preview_key(key, mods);
         }
         if let RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
             return self.plugin_panel_key(key, mods);
@@ -5551,18 +6252,17 @@ impl crate::TermWindow {
         if let RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
             return self.plugin_panel_text(text);
         }
-        if self.right_sidebar_mode == RightSidebarMode::Tasks {
-            self.right_sidebar_note.begin_live_editing();
-            let Some(session) = self.right_sidebar_note.session.clone() else {
-                return false;
-            };
-            let changed = session
-                .lock()
-                .insert_text(&mut self.right_sidebar_note.view, text);
-            if changed {
-                self.note_did_edit();
-            }
-            return changed;
+        if self.right_sidebar_mode == RightSidebarMode::Tasks
+            || self.note_surface_installed == NoteSurface::FilePreview
+        {
+            return self.type_into_right_sidebar_note(text);
+        }
+        if self.right_sidebar_markdown_preview_focused() {
+            return self
+                .with_note_surface(NoteSurface::FilePreview, |term_window| {
+                    term_window.type_into_right_sidebar_note(text)
+                })
+                .unwrap_or(false);
         }
         let multiline = self.right_sidebar_focused_is_multiline();
         let Some(input) = self.right_sidebar_focused_input_mut() else {
@@ -5571,6 +6271,52 @@ impl crate::TermWindow {
         input.caret_insert(text, multiline);
         self.after_right_sidebar_text_edit();
         true
+    }
+
+    /// Insert typed (or pasted) text into the Note editor's surface.
+    pub(crate) fn type_into_right_sidebar_note(&mut self, text: &str) -> bool {
+        self.right_sidebar_note.begin_live_editing();
+        let Some(session) = self.right_sidebar_note.session.clone() else {
+            return false;
+        };
+        let changed = session
+            .lock()
+            .insert_text(&mut self.right_sidebar_note.view, text);
+        if changed {
+            self.note_did_edit();
+        }
+        changed
+    }
+
+    /// A key for the preview being edited: the Note editor's keys, on the
+    /// preview's surface. Escape there gives the keyboard back.
+    fn handle_right_sidebar_markdown_preview_key(
+        &mut self,
+        key: TermKeyCode,
+        mods: TermModifiers,
+    ) -> bool {
+        let outcome = self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+            let handled = term_window.handle_right_sidebar_note_key(key, mods);
+            (handled, term_window.right_sidebar_note.view.focused)
+        });
+        match outcome {
+            Some((handled, true)) => handled,
+            Some((handled, false)) => {
+                self.right_sidebar_file_focus = None;
+                handled
+            }
+            None => {
+                self.right_sidebar_file_focus = None;
+                false
+            }
+        }
+    }
+
+    /// Whether the Note editor's handlers act on `right_sidebar_note` now:
+    /// the Notes panel, or the preview's surface while it is installed there.
+    fn right_sidebar_note_editor_targeted(&self) -> bool {
+        self.right_sidebar_mode == RightSidebarMode::Tasks
+            || self.note_surface_installed == NoteSurface::FilePreview
     }
 
     /// The painted row holding `byte`, or its whole line when that row is
@@ -6086,6 +6832,7 @@ impl crate::TermWindow {
             return;
         };
         let origin_mux_window_id = self.mux_window_id;
+        let ticket = self.note_surface_ticket();
         let saved_session = Arc::clone(&session);
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
@@ -6097,6 +6844,8 @@ impl crate::TermWindow {
             .await;
             window.notify(TermWindowNotif::Apply(Box::new(
                 move |term_window| match result {
+                    // A Note and a preview of one file share the session:
+                    // either's save reaches both, in every window.
                     Ok(outcome) => {
                         term_window.publish_right_sidebar_note_revision(
                             origin_mux_window_id,
@@ -6104,10 +6853,25 @@ impl crate::TermWindow {
                             outcome.saved_revision,
                         );
                     }
-                    Err(err) => {
+                    Err(err) if ticket.surface == NoteSurface::Note => {
                         log::error!("failed to save Note: {err:#}");
                         if term_window.right_sidebar_note_visible() {
                             term_window.invalidate_window();
+                        }
+                    }
+                    // A file this account may not write, or one gone: stop
+                    // taking edits that cannot be kept. The text stays on
+                    // screen to copy, under a line saying why.
+                    Err(err) => {
+                        // Only the preview that failed: another may have the
+                        // keyboard by now.
+                        if term_window
+                            .with_note_surface_ticket(ticket, |_| ())
+                            .is_some()
+                        {
+                            term_window.right_sidebar_markdown_preview_save_failed(err);
+                        } else {
+                            log::error!("failed to save an edited Markdown preview: {err:#}");
                         }
                     }
                 },
@@ -6142,6 +6906,7 @@ impl crate::TermWindow {
             if let Some(window) = self.window.as_ref().cloned() {
                 Self::schedule_right_sidebar_note_autosave_wakeup(
                     window,
+                    self.note_surface_ticket(),
                     Duration::from_millis(NOTE_AUTOSAVE_MS),
                 );
             }
@@ -6827,8 +7592,21 @@ impl crate::TermWindow {
     }
 
     fn sync_right_sidebar_note_native_text_input_snapshot(&mut self, wrap_key: usize) {
-        // Only the Note takes text input.
-        if self.note_surface_installed != NoteSurface::Note {
+        // Only an editor with the keyboard takes text input: the Note, or the
+        // preview while it is being edited.
+        if self.note_surface_installed == NoteSurface::FilePreview
+            && self.right_sidebar_file_focus != Some(RightSidebarFileField::Preview)
+        {
+            if self
+                .right_sidebar_note
+                .native_text_input_snapshot_key
+                .take()
+                .is_some()
+            {
+                if let Some(window) = self.window.as_ref() {
+                    window.set_native_text_input_snapshot(None);
+                }
+            }
             return;
         }
         let active = self.right_sidebar_note.view.focused
@@ -6953,22 +7731,31 @@ impl crate::TermWindow {
         self.right_sidebar_note.native_text_input_snapshot_scroll = Some(scroll_bits);
     }
 
-    fn schedule_right_sidebar_note_autosave_wakeup(window: window::Window, delay: Duration) {
+    /// Wake the surface `ticket` names when its autosave is due: a preview
+    /// being edited saves on its own surface, never on the Note's.
+    fn schedule_right_sidebar_note_autosave_wakeup(
+        window: window::Window,
+        ticket: NoteSurfaceTicket,
+        delay: Duration,
+    ) {
         promise::spawn::spawn(async move {
             smol::Timer::after(delay).await;
             let notify_window = window.clone();
-            window.notify(TermWindowNotif::Apply(Box::new(
-                move |term_window| match term_window
-                    .right_sidebar_note
-                    .autosave_woke(Instant::now())
-                {
-                    AutosaveWakeAction::Idle => {}
-                    AutosaveWakeAction::SaveNow => term_window.save_right_sidebar_note_now(),
-                    AutosaveWakeAction::Reschedule(remaining) => {
-                        Self::schedule_right_sidebar_note_autosave_wakeup(notify_window, remaining);
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.with_note_surface_ticket(ticket, |term_window| {
+                    match term_window.right_sidebar_note.autosave_woke(Instant::now()) {
+                        AutosaveWakeAction::Idle => {}
+                        AutosaveWakeAction::SaveNow => term_window.save_right_sidebar_note_now(),
+                        AutosaveWakeAction::Reschedule(remaining) => {
+                            Self::schedule_right_sidebar_note_autosave_wakeup(
+                                notify_window,
+                                ticket,
+                                remaining,
+                            );
+                        }
                     }
-                },
-            )));
+                });
+            })));
         })
         .detach();
     }
@@ -6982,19 +7769,32 @@ impl crate::TermWindow {
         session: &Arc<parking_lot::Mutex<crate::markdown_editor::MarkdownDocumentSession>>,
         saved_revision: u64,
     ) {
-        if self
-            .right_sidebar_note
-            .session
-            .as_ref()
-            .is_none_or(|current| !Arc::ptr_eq(current, session))
-        {
-            return;
+        let shows = |host: &crate::markdown_editor::NoteHostState| {
+            host.session
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, session))
+        };
+        if shows(&self.right_sidebar_note) {
+            self.right_sidebar_note
+                .apply_published_snapshot(saved_revision);
+            // Live hosts remain Live, but still repaint the Saving/Saved badge.
+            if self.right_sidebar_note_visible() {
+                self.invalidate_window();
+            }
         }
-        self.right_sidebar_note
-            .apply_published_snapshot(saved_revision);
-        // Live hosts remain Live, but still repaint the Saving/Saved badge.
-        if self.right_sidebar_note_visible() {
-            self.invalidate_window();
+        if self
+            .right_sidebar_markdown_preview
+            .as_ref()
+            .is_some_and(|preview| shows(&preview.state.host))
+        {
+            self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                term_window
+                    .right_sidebar_note
+                    .apply_published_snapshot(saved_revision);
+            });
+            if self.right_sidebar_markdown_preview_rendering() {
+                self.invalidate_window();
+            }
         }
     }
 
@@ -7139,6 +7939,7 @@ impl crate::TermWindow {
         match self.right_sidebar_mode {
             RightSidebarMode::Chat => match self.right_sidebar_file_focus {
                 Some(RightSidebarFileField::Filter) => Some(&self.right_sidebar_file_filter),
+                Some(RightSidebarFileField::Preview) => None,
                 None => None,
             },
             RightSidebarMode::Snippets => match self.right_sidebar_snippet_focus {
@@ -7157,6 +7958,7 @@ impl crate::TermWindow {
         match self.right_sidebar_mode {
             RightSidebarMode::Chat => match self.right_sidebar_file_focus {
                 Some(RightSidebarFileField::Filter) => Some(&mut self.right_sidebar_file_filter),
+                Some(RightSidebarFileField::Preview) => None,
                 None => None,
             },
             RightSidebarMode::Snippets => match self.right_sidebar_snippet_focus {
@@ -7897,6 +8699,7 @@ impl crate::TermWindow {
         let ui_cell_height = ui_metrics.cell_size.height as usize;
         let icon_size = (ui_cell_height + self.ui_px(6)).clamp(self.ui_px(20), self.ui_px(24));
 
+        self.drop_hidden_right_sidebar_markdown_preview_focus();
         if self.right_sidebar_mode == RightSidebarMode::Chat {
             if !matches!(self.active_remote_project_for_files(), Ok(Some(_))) {
                 let _ = self.sync_right_sidebar_file_root_for_current_workspace();
@@ -16276,7 +17079,9 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn refresh_right_sidebar_remote_files(&mut self) {
-        self.close_right_sidebar_file_preview();
+        if !self.leave_right_sidebar_file_preview() {
+            return;
+        }
         self.right_sidebar_remote_file_search.release();
         let effects = self
             .right_sidebar_remote_files
@@ -16314,7 +17119,9 @@ impl crate::TermWindow {
                 .right_sidebar_width
                 .clamp(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH), max_tree_for_preview);
         }
-        self.close_right_sidebar_file_preview();
+        if !self.leave_right_sidebar_file_preview() {
+            return;
+        }
         self.right_sidebar_file_view = RightSidebarFileView::Preview;
         self.right_sidebar_file_preview_message =
             Some("Loading remote file preview...".to_string());
@@ -16652,6 +17459,7 @@ impl crate::TermWindow {
                     message: Some(format!("Unable to prepare remote preview: {err}")),
                     truncated: false,
                     raw_text: None,
+                    disk_stamp: None,
                 }),
                 Err(err) => RightSidebarLoadedFilePreview {
                     lines: Vec::new(),
@@ -16659,6 +17467,7 @@ impl crate::TermWindow {
                     message: Some(err),
                     truncated: false,
                     raw_text: None,
+                    disk_stamp: None,
                 },
             };
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -16708,8 +17517,10 @@ impl crate::TermWindow {
                     term_window.invalidate_window();
                     return;
                 }
+                if !term_window.set_right_sidebar_file_preview_raw_text(result.raw_text) {
+                    return;
+                }
                 term_window.right_sidebar_file_preview_lines = result.lines;
-                term_window.set_right_sidebar_file_preview_raw_text(result.raw_text);
                 term_window.right_sidebar_file_preview_max_columns = term_window
                     .right_sidebar_file_preview_lines
                     .iter()
@@ -21296,6 +22107,7 @@ fn load_right_sidebar_file_preview_with_cancellation(
                 message: None,
                 truncated: false,
                 raw_text: None,
+                disk_stamp: None,
             },
             Err(err) => RightSidebarLoadedFilePreview {
                 lines: Vec::new(),
@@ -21303,11 +22115,22 @@ fn load_right_sidebar_file_preview_with_cancellation(
                 message: Some(format!("Unable to load image preview: {err}")),
                 truncated: false,
                 raw_text: None,
+                disk_stamp: None,
             },
         };
     }
 
-    let (text, message, truncated) = load_file_preview(path);
+    let (text, mut message, truncated, disk_stamp) = load_file_preview_stamped(path);
+    // An empty Markdown file is a document yet to be written: render it, so
+    // it can be.
+    if message.as_deref() == Some(EMPTY_FILE_MESSAGE)
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(is_markdown_extension)
+    {
+        message = None;
+    }
     let lines = if message.is_none() {
         preview_lines_from_text_with_cancellation(path, &text, use_dark_syntax_theme, cancellation)
     } else {
@@ -21320,6 +22143,7 @@ fn load_right_sidebar_file_preview_with_cancellation(
         message,
         truncated,
         raw_text,
+        disk_stamp,
     }
 }
 
@@ -21356,6 +22180,7 @@ fn remote_preview_from_bytes(
                 )),
                 truncated: true,
                 raw_text: None,
+                disk_stamp: None,
             };
         }
         let encoded_bytes = remote.bytes.len();
@@ -21375,6 +22200,7 @@ fn remote_preview_from_bytes(
                     message: None,
                     truncated: false,
                     raw_text: None,
+                    disk_stamp: None,
                 }
             }
             Ok((width, height)) => RightSidebarLoadedFilePreview {
@@ -21386,6 +22212,7 @@ fn remote_preview_from_bytes(
                 )),
                 truncated: false,
                 raw_text: None,
+                disk_stamp: None,
             },
             Err(err) => RightSidebarLoadedFilePreview {
                 lines: Vec::new(),
@@ -21393,6 +22220,7 @@ fn remote_preview_from_bytes(
                 message: Some(format!("Unable to decode image dimensions: {err:#}")),
                 truncated: false,
                 raw_text: None,
+                disk_stamp: None,
             },
         };
     }
@@ -21407,7 +22235,7 @@ fn remote_preview_from_bytes(
         )
     } else {
         match String::from_utf8(remote.bytes) {
-            Ok(text) if text.is_empty() => (String::new(), Some("Empty file".to_string())),
+            Ok(text) if text.is_empty() => (String::new(), Some(EMPTY_FILE_MESSAGE.to_string())),
             Ok(text) => (text, None),
             Err(_) => (
                 String::new(),
@@ -21434,6 +22262,7 @@ fn remote_preview_from_bytes(
         message,
         truncated: remote.truncated,
         raw_text,
+        disk_stamp: None,
     }
 }
 
@@ -21467,7 +22296,22 @@ fn image_pixels_within_preview_budget(width: u32, height: u32) -> bool {
     (width as u64).saturating_mul(height as u64) <= FILE_PREVIEW_IMAGE_MAX_PIXELS
 }
 
+#[cfg(test)]
 fn load_file_preview(path: &Path) -> (String, Option<String>, bool) {
+    let (text, message, truncated, _) = load_file_preview_stamped(path);
+    (text, message, truncated)
+}
+
+/// `load_file_preview`, with the file's modification time and length taken
+/// from the handle the text is read through, so they describe that text.
+fn load_file_preview_stamped(
+    path: &Path,
+) -> (
+    String,
+    Option<String>,
+    bool,
+    Option<(std::time::SystemTime, u64)>,
+) {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(err) => {
@@ -21475,9 +22319,19 @@ fn load_file_preview(path: &Path) -> (String, Option<String>, bool) {
                 String::new(),
                 Some(format!("Unable to open file: {err}")),
                 false,
+                None,
             );
         }
     };
+    let disk_stamp = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+    let (text, message, truncated) = read_file_preview(file);
+    (text, message, truncated, disk_stamp)
+}
+
+fn read_file_preview(file: fs::File) -> (String, Option<String>, bool) {
     let mut bytes = Vec::with_capacity(FILE_PREVIEW_MAX_BYTES + 1);
     let mut limited = file.take((FILE_PREVIEW_MAX_BYTES + 1) as u64);
     if let Err(err) = limited.read_to_end(&mut bytes) {
@@ -21501,7 +22355,7 @@ fn load_file_preview(path: &Path) -> (String, Option<String>, bool) {
         );
     }
     match String::from_utf8(bytes) {
-        Ok(text) if text.is_empty() => (String::new(), Some("Empty file".to_string()), false),
+        Ok(text) if text.is_empty() => (String::new(), Some(EMPTY_FILE_MESSAGE.to_string()), false),
         Ok(text) => (text, None, truncated),
         Err(_) => (
             String::new(),
@@ -22103,10 +22957,11 @@ fn markdown_preview_document(
 ) -> crate::markdown_editor::VaultDocument {
     // A session stats its path; a remote path means nothing on this machine,
     // so a remote preview's session has none.
+    // A local file is saved where a link to it points, so the link stays.
     let session_path = if remote_relative.is_some() {
         PathBuf::new()
     } else {
-        PathBuf::from(path)
+        fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
     };
     let session = Arc::new(parking_lot::Mutex::new(
         crate::markdown_editor::MarkdownDocumentSession::new(
@@ -23826,6 +24681,125 @@ mod tests {
         remote_file_index_from_listing, remote_file_search_rows, remote_path_under,
         right_sidebar_hover_zone, RemoteFileSearchState, RemoteFileSearchStatus,
     };
+
+    fn editable_preview(path: &Path, text: &str) -> Box<super::MarkdownPreviewSurface> {
+        let document = super::markdown_preview_document(
+            path.to_str().unwrap(),
+            text.to_string(),
+            None,
+            path.parent(),
+        );
+        let mut state = super::NoteSurfaceState::default();
+        state.host.bind_document(document);
+        state.host.view.mode = crate::markdown_editor::EditorMode::LivePreview;
+        state
+            .host
+            .session
+            .as_ref()
+            .unwrap()
+            .lock()
+            .keep_existing_file();
+        Box::new(super::MarkdownPreviewSurface {
+            key: super::MarkdownPreviewKey {
+                path: path.to_string_lossy().into_owned(),
+                generation: 0,
+            },
+            instance: 1,
+            state,
+            last_disk_check: None,
+            disk_check_in_flight: false,
+            disk_check_scheduled: false,
+            failure_shown: false,
+        })
+    }
+
+    #[test]
+    fn a_failed_preview_release_keeps_the_text_until_a_save_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.md");
+        fs::write(&path, "before").unwrap();
+        let mut preview = editable_preview(&path, "before");
+        let session = preview.state.host.session.clone().unwrap();
+        assert!(session
+            .lock()
+            .insert_text(&mut preview.state.host.view, "new "));
+        let mut slot = Some(preview);
+
+        // A failed save must leave the surface, its edits and its error
+        // available. Restoring the file lets the user's next try save it; the
+        // window on its own does not try again.
+        fs::remove_file(&path).unwrap();
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, false).is_err());
+        let kept = slot.as_ref().unwrap();
+        assert!(kept.save_error().is_some());
+        assert_eq!(kept.text_for_copy().as_deref(), Some("new before"));
+        assert!(session.lock().is_dirty());
+        assert!(!path.exists());
+
+        fs::write(&path, "before").unwrap();
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, false).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, true)
+            .unwrap()
+            .is_some());
+        assert!(slot.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new before");
+        assert!(!session.lock().is_dirty());
+    }
+
+    #[test]
+    fn a_failed_preview_release_lets_go_once_the_failure_was_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.md");
+        fs::write(&path, "before").unwrap();
+        let mut preview = editable_preview(&path, "before");
+        let session = preview.state.host.session.clone().unwrap();
+        assert!(session
+            .lock()
+            .insert_text(&mut preview.state.host.view, "new "));
+        let mut slot = Some(preview);
+
+        // Refused for as long as the reason has not been on screen; after
+        // that, the user leaving gives the edits up instead of finding every
+        // way out shut. The window on its own never does.
+        fs::remove_file(&path).unwrap();
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, true).is_err());
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, true).is_err());
+        slot.as_mut().unwrap().failure_shown = true;
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, false).is_err());
+        assert!(super::MarkdownPreviewSurface::take_saved(&mut slot, true)
+            .unwrap()
+            .is_some());
+        assert!(slot.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn preview_copy_uses_current_edits_before_and_after_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.md");
+        fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        let mut preview = editable_preview(&path, "one\r\ntwo\r\n");
+        let session = preview.state.host.session.clone().unwrap();
+        assert!(session
+            .lock()
+            .insert_text(&mut preview.state.host.view, "new "));
+        assert_eq!(
+            preview.text_for_copy().as_deref(),
+            Some("new one\r\ntwo\r\n")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\r\ntwo\r\n");
+        preview.save().unwrap();
+        assert_eq!(
+            preview.text_for_copy().as_deref(),
+            Some("new one\r\ntwo\r\n")
+        );
+        session.lock().select_all(&mut preview.state.host.view);
+        assert!(session
+            .lock()
+            .delete_selection(&mut preview.state.host.view));
+        assert_eq!(preview.text_for_copy().as_deref(), Some(""));
+    }
 
     #[test]
     fn markdown_previews_render_read_only_from_their_own_session() {
