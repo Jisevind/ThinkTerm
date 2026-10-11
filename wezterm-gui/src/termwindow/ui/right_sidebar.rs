@@ -11357,7 +11357,16 @@ impl crate::TermWindow {
         let mut table_layouts = std::mem::take(&mut self.right_sidebar_note_table_layouts);
         table_layouts.clear();
         let mut caret_rect: Option<(f32, f32, f32)> = None;
+        // The font of the text at the caret: what is being composed there is
+        // set in it, a heading's size in a heading.
+        let mut caret_font: Option<(Rc<LoadedFont>, RenderMetrics)> = None;
         let selected = selection.range();
+        // What an input method is composing, and where: the text after it on
+        // its row makes room for it.
+        let composing_at = preedit
+            .as_deref()
+            .filter(|_| focused && selection.is_caret())
+            .map(|text| (selection.focus.byte, text));
 
         note_profile.total_lines = visual.lines.len();
         let paint_range = virtual_note_line_range(&line_geometry, scroll, body_height as f32);
@@ -11880,16 +11889,40 @@ impl crate::TermWindow {
                     // not drawn (see the row's frame above).
                     let piece_shown = table_row.is_none()
                         || (run_y + run_height > viewport_top && run_y < viewport_bottom);
+                    // Composing inside this run: the glyphs from the caret on
+                    // move along by what is composed, which is drawn in the
+                    // room left (below), set in this run's font.
+                    let (composing_split, composing_gap) = match composing_at {
+                        Some((at, composing))
+                            if !run.atomic && piece_source.start <= at && at < piece_source.end =>
+                        {
+                            (
+                                Some((
+                                    at,
+                                    shaped.partition_point(|info| {
+                                        run.source.start + info.cluster < at
+                                    }),
+                                )),
+                                self.cached_ui_text_advance(font, &metrics, composing)?,
+                            )
+                        }
+                        _ => (None, 0.0),
+                    };
+                    let advance = advance + composing_gap;
                     let mut boundaries = Vec::with_capacity(shaped.len() + 2);
                     if run.atomic {
                         boundaries.push((run_x, piece_source.start));
                     } else {
                         let mut boundary_advance = 0.0f32;
                         for info in shaped.iter() {
-                            boundaries.push((
-                                run_x + boundary_advance,
-                                (run.source.start + info.cluster).min(piece_source.end),
-                            ));
+                            let source = (run.source.start + info.cluster).min(piece_source.end);
+                            // The caret's own boundary stays where the
+                            // composed text starts.
+                            let moved = composing_split
+                                .is_some_and(|(at, _)| source > at)
+                                .then_some(composing_gap)
+                                .unwrap_or(0.0);
+                            boundaries.push((run_x + boundary_advance + moved, source));
                             boundary_advance += info.glyph.x_advance.get() as f32;
                         }
                     }
@@ -11994,23 +12027,41 @@ impl crate::TermWindow {
                                 self.cached_note_code_highlights(&row.code, use_dark_syntax_theme),
                             )
                         });
+                        let glyph_color = |info: &crate::shapecache::ShapedInfo| {
+                            code_colors
+                                .as_ref()
+                                .and_then(|(row_index, lines)| lines.get(*row_index))
+                                .and_then(|colors| colors.get(info.cluster))
+                                .copied()
+                                .unwrap_or(color)
+                        };
+                        let split = composing_split.map_or(shaped.len(), |(_, split)| split);
                         self.paint_cached_ui_shape_pixel_clipped(
                             layers,
                             &metrics,
-                            &shaped,
+                            &shaped[..split],
                             run_x,
                             run_y,
                             run_clip_left,
                             run_clip_right,
-                            |info| {
-                                code_colors
-                                    .as_ref()
-                                    .and_then(|(row_index, lines)| lines.get(*row_index))
-                                    .and_then(|colors| colors.get(info.cluster))
-                                    .copied()
-                                    .unwrap_or(color)
-                            },
+                            glyph_color,
                         )?;
+                        if split < shaped.len() {
+                            let before = shaped[..split]
+                                .iter()
+                                .map(|info| info.glyph.x_advance.get() as f32)
+                                .sum::<f32>();
+                            self.paint_cached_ui_shape_pixel_clipped(
+                                layers,
+                                &metrics,
+                                &shaped[split..],
+                                run_x + before + composing_gap,
+                                run_y,
+                                run_clip_left,
+                                run_clip_right,
+                                glyph_color,
+                            )?;
+                        }
                         if run.style.strikethrough && advance > 0.0 {
                             self.filled_rectangle(
                                 layers,
@@ -12080,6 +12131,7 @@ impl crate::TermWindow {
                             run_y,
                             run_height,
                         ));
+                        caret_font = Some((Rc::clone(font), metrics));
                     }
                     let run_layout = NoteRunLayout {
                         source: piece_source.clone(),
@@ -12146,12 +12198,14 @@ impl crate::TermWindow {
                     caret_y,
                     caret_height,
                 ));
+                caret_font = Some((Rc::clone(line_font), line_metrics));
             } else if focused
                 && selection.is_caret()
                 && selection.focus.byte == line.source.end
                 && caret_rect.is_none()
             {
                 caret_rect = Some((x, line_y, line_height));
+                caret_font = Some((Rc::clone(line_font), line_metrics));
             }
             if sub_rows > 1 {
                 let last = sub_row_runs.len().saturating_sub(1);
@@ -12198,12 +12252,45 @@ impl crate::TermWindow {
 
         if let Some((caret_x, caret_y, caret_height)) = caret_rect {
             if caret_y + caret_height >= viewport_top && caret_y <= viewport_bottom {
+                // The text being composed sits at the caret, in the room the
+                // rest of its row made for it, underlined until it is
+                // committed, and the caret after it, as in a Mac text view.
+                let (caret_font, caret_metrics) = caret_font
+                    .as_ref()
+                    .map(|(font, metrics)| (font, *metrics))
+                    .unwrap_or((ui_font, ui_metrics));
+                let mut composed_width = 0.0;
+                if let Some(composing) = preedit.as_ref() {
+                    composed_width = self
+                        .cached_ui_text_advance(caret_font, &caret_metrics, composing)?
+                        .min((clip_right - caret_x).max(0.0));
+                    let left = caret_x.max(clip_left);
+                    let top = caret_y.max(viewport_top);
+                    self.paint_ui_title_text_cached(
+                        layers,
+                        caret_font,
+                        &caret_metrics,
+                        composing,
+                        left as usize,
+                        top as usize,
+                        (clip_right - caret_x).max(0.0) as usize,
+                        foreground,
+                    )?;
+                    if composed_width > 0.0 {
+                        self.filled_rectangle(
+                            layers,
+                            2,
+                            euclid::rect(left, caret_y + caret_height - 1.0, composed_width, 1.0),
+                            foreground,
+                        )?;
+                    }
+                }
                 if self.right_sidebar_snippet_cursor_on() {
                     self.filled_rectangle(
                         layers,
                         2,
                         euclid::rect(
-                            caret_x.clamp(clip_left, clip_right),
+                            (caret_x + composed_width).clamp(clip_left, clip_right),
                             caret_y,
                             self.ui_f32(NOTE_CARET_WIDTH).max(1.0),
                             caret_height,
@@ -12211,38 +12298,14 @@ impl crate::TermWindow {
                         foreground,
                     )?;
                 }
-                if let Some(composing) = preedit.as_ref() {
-                    self.paint_ui_title_text_cached(
-                        layers,
-                        ui_font,
-                        &ui_metrics,
-                        composing,
-                        caret_x.max(clip_left) as usize,
-                        caret_y.max(viewport_top) as usize,
-                        (clip_right - caret_x).max(0.0) as usize,
-                        foreground,
-                    )?;
-                    let preedit_width = self
-                        .cached_ui_text_advance(ui_font, &ui_metrics, composing)?
-                        .min((clip_right - caret_x).max(0.0));
-                    if preedit_width > 0.0 {
-                        self.filled_rectangle(
-                            layers,
-                            2,
-                            euclid::rect(
-                                caret_x.max(clip_left),
-                                caret_y + caret_height - 1.0,
-                                preedit_width,
-                                1.0,
-                            ),
-                            foreground,
-                        )?;
-                    }
-                }
                 if let Some(window) = self.window.as_ref() {
+                    // The candidates open below the line the caret is on.
                     window.set_text_cursor_position(Rect::new(
                         Point::new(caret_x as isize, caret_y as isize),
-                        ui_metrics.cell_size,
+                        window::Size::new(
+                            caret_metrics.cell_size.width,
+                            (caret_height as isize).max(caret_metrics.cell_size.height),
+                        ),
                     ));
                 }
             }

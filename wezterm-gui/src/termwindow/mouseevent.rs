@@ -4211,6 +4211,12 @@ impl super::TermWindow {
                 } else {
                     MouseCursor::Text
                 }));
+                if self.editor_click_waits_for_composition(
+                    self.right_sidebar_note.view.focused,
+                    &event,
+                ) {
+                    return;
+                }
                 if event.kind == WMEK::Press(MousePress::Right) {
                     self.right_sidebar_note.begin_live_editing();
                     let position = self
@@ -4964,6 +4970,12 @@ impl super::TermWindow {
                 } else {
                     MouseCursor::Text
                 }));
+                if self.editor_click_waits_for_composition(
+                    self.right_sidebar_markdown_preview_focused(),
+                    &event,
+                ) {
+                    return;
+                }
                 if event.kind == WMEK::Press(MousePress::Right) && editable {
                     // The Note's editing menu, for the word under the
                     // pointer unless it is inside the selection.
@@ -5114,6 +5126,17 @@ impl super::TermWindow {
             }
             _ => {}
         }
+    }
+
+    /// An input method is composing text at the focused editor's caret.
+    /// Until that text is committed or cancelled (Escape), a press there does
+    /// nothing: the unfinished text follows the caret, so moving the caret
+    /// would carry it elsewhere. Ending the composition on a click would mean
+    /// a call into the system's input method that this code does not make.
+    fn editor_click_waits_for_composition(&self, editor_focused: bool, event: &MouseEvent) -> bool {
+        editor_focused
+            && matches!(event.kind, WMEK::Press(_))
+            && matches!(self.dead_key_status, ::window::DeadKeyStatus::Composing(_))
     }
 
     /// Extend the rendered Markdown preview's selection to where the pointer
