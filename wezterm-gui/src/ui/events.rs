@@ -5,7 +5,12 @@ use window::{MouseEvent, MouseEventKind};
 /// ([`DrawContext::scale`]): rows shrink with the UI, so the scroll step has to
 /// shrink with them or one notch jumps a different number of rows per display.
 pub(crate) fn wheel_delta_pixels(amount: i16, scale: f32) -> f32 {
-    -(amount as f32) * WHEEL_NOTCH_PIXELS * scale
+    wheel_travel_pixels(amount.into(), scale)
+}
+
+/// `wheel_delta_pixels` for travel measured to the fraction of a notch.
+pub(crate) fn wheel_travel_pixels(notches: f32, scale: f32) -> f32 {
+    -notches * WHEEL_NOTCH_PIXELS * scale
 }
 
 /// Distance a single wheel notch scrolls, in design pixels.
@@ -75,6 +80,17 @@ mod test {
             (wheel_delta_pixels(-1, ui_scale_for_dpi(96)) + at_96).abs() < f32::EPSILON,
             "reversing the wheel must reverse the distance exactly"
         );
+    }
+
+    /// A precision touchpad on Windows reports a fraction of a notch at a
+    /// time; it has to move the same distance in all as whole notches do.
+    #[test]
+    fn a_fraction_of_a_notch_moves_that_fraction_of_the_distance() {
+        let scale = ui_scale_for_dpi(144);
+        let notch = wheel_delta_pixels(1, scale);
+        assert!((wheel_travel_pixels(1.0, scale) - notch).abs() < f32::EPSILON);
+        assert!((wheel_travel_pixels(0.25, scale) * 4.0 - notch).abs() < 0.001);
+        assert!((wheel_travel_pixels(-0.5, scale) * 2.0 + notch).abs() < 0.001);
     }
 
     /// The old sidebar helper clamped a whole event to 42px, which at its 6px

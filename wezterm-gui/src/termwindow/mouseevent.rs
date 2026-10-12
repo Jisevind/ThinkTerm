@@ -356,6 +356,10 @@ impl super::TermWindow {
     }
 
     fn tab_scroll_pixels(amount: i16) -> f32 {
+        // Less than a notch (a precision touchpad on Windows) moves no tab.
+        if amount == 0 {
+            return 0.0;
+        }
         let steps = amount.unsigned_abs().max(1) as f32;
         let delta = (steps * 56.0).min(280.0);
         if amount < 0 {
@@ -375,8 +379,17 @@ impl super::TermWindow {
     /// much ground on a 200% display as on a 100% one - on Windows at 200% a
     /// notch moved less than half a row while the same notch in settings moved
     /// three rows.
-    fn sidebar_scroll_pixels(&self, amount: i16) -> f32 {
-        crate::ui::wheel_delta_pixels(amount, crate::ui::ui_scale_for_dpi(self.dimensions.dpi))
+    fn sidebar_scroll_pixels(&self, notches: f32) -> f32 {
+        crate::ui::wheel_travel_pixels(notches, crate::ui::ui_scale_for_dpi(self.dimensions.dpi))
+    }
+
+    /// How many notches the wheel went: to the fraction where the device
+    /// says (a precision touchpad on Windows), so the sidebar follows it
+    /// rather than standing still until a whole notch is in.
+    fn sidebar_wheel_notches(event: &MouseEvent, amount: i16) -> f32 {
+        event
+            .precise_wheel_lines
+            .unwrap_or_else(|| f32::from(amount))
     }
 
     fn sidebar_vertical_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
@@ -389,8 +402,9 @@ impl super::TermWindow {
             }
         }
         match event.kind {
-            WMEK::VertWheel(amount) if amount != 0 => Some(self.sidebar_scroll_pixels(amount)),
-            WMEK::VertWheel(_) => Some(0.0),
+            WMEK::VertWheel(amount) => {
+                Some(self.sidebar_scroll_pixels(Self::sidebar_wheel_notches(event, amount)))
+            }
             _ => None,
         }
     }
@@ -405,10 +419,9 @@ impl super::TermWindow {
             }
         }
         match event.kind {
-            WMEK::HorzWheel(amount) if amount != 0 => {
-                Some(self.sidebar_scroll_pixels(amount) * 2.0)
+            WMEK::HorzWheel(amount) => {
+                Some(self.sidebar_scroll_pixels(Self::sidebar_wheel_notches(event, amount)) * 2.0)
             }
-            WMEK::HorzWheel(_) => Some(0.0),
             _ => None,
         }
     }
@@ -783,6 +796,10 @@ impl super::TermWindow {
         amount: i16,
         context: &dyn WindowOps,
     ) {
+        // Less than a notch changes nothing, so it repaints nothing either.
+        if amount == 0 {
+            return;
+        }
         if self.should_ignore_tab_wheel_amount(surface, amount) {
             context.invalidate();
             return;

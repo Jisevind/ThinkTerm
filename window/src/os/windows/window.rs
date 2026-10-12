@@ -2750,7 +2750,15 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
     let coords = mouse_coords(lparam);
     let screen_coords = ScreenPoint::new(coords.x, coords.y);
     let coords = screen_to_client(hwnd, screen_coords);
-    let delta = GET_WHEEL_DELTA_WPARAM(wparam);
+    // Windows counts a horizontal wheel turned (or two fingers swiped) to
+    // the right as positive; `HorzWheel` counts left as positive, as macOS
+    // and Wayland deliver it and as `WheelLeft` reads it. Chromium and WebKit
+    // flip it the same way.
+    let delta = if msg == WM_MOUSEHWHEEL {
+        GET_WHEEL_DELTA_WPARAM(wparam).saturating_neg()
+    } else {
+        GET_WHEEL_DELTA_WPARAM(wparam)
+    };
     let scaled_delta = if msg == WM_MOUSEWHEEL {
         delta * (*WHEEL_SCROLL_LINES)
     } else {
@@ -2775,7 +2783,10 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
                 inner.hscroll_remainder,
                 position
             );
-            if position == 0 {
+            // As for the vertical wheel below: sub-column travel goes out as
+            // HorzWheel(0) with its fraction, for a surface that pans by
+            // pixels.
+            if position == 0 && delta == 0 {
                 return Some(0);
             }
             MouseEventKind::HorzWheel(position)
@@ -2811,13 +2822,9 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         precise_scroll_delta: None,
         scroll_phase: None,
         momentum_phase: None,
-        // The travel in lines before it was rounded to notches, so a
-        // sub-line step is not lost; horizontal wheels keep the old path.
-        precise_wheel_lines: if msg == WM_MOUSEWHEEL {
-            Some(scaled_delta as f32 / WHEEL_DELTA as f32)
-        } else {
-            None
-        },
+        // The travel in lines (columns, for the horizontal wheel) before it
+        // was rounded to notches, so a sub-line step is not lost.
+        precise_wheel_lines: Some(scaled_delta as f32 / WHEEL_DELTA as f32),
     };
     inner
         .borrow_mut()

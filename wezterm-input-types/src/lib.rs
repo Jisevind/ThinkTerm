@@ -1308,10 +1308,11 @@ pub struct MouseEvent {
     pub scroll_phase: Option<ScrollPhase>,
     /// Native momentum scroll phase when available.
     pub momentum_phase: Option<ScrollPhase>,
-    /// Wheel travel in lines with the fraction kept, for devices that
-    /// report finer steps than a line (a precision touchpad on Windows)
-    /// without a pixel-precise delta. Same sign as `VertWheel`. Only the
-    /// terminal grid reads it; chrome keeps using the integer kind.
+    /// Wheel travel in lines (columns, for `HorzWheel`) with the fraction
+    /// kept, for devices that report finer steps than a line (a precision
+    /// touchpad on Windows) without a pixel-precise delta. Same sign as the
+    /// wheel amount it comes with. The terminal grid and the sidebars read
+    /// it; the rest of the chrome keeps using the integer kind.
     pub precise_wheel_lines: Option<f32>,
 }
 
