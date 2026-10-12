@@ -1423,13 +1423,21 @@ impl super::TermWindow {
                     if self.right_sidebar_markdown_preview_rendering() {
                         return self.mouse_wheel_right_sidebar_markdown_preview(event, context);
                     }
-                    let vert_delta = self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0);
+                    // Both ways by the trackpad's own pixels, and sideways
+                    // with Shift, as the rendered Markdown does.
+                    let shift_vertical = matches!(event.kind, WMEK::VertWheel(_))
+                        && event.modifiers.contains(::window::Modifiers::SHIFT);
                     let changed = match event.kind {
-                        WMEK::VertWheel(_) => self.scroll_right_sidebar_file_preview_by(vert_delta),
-                        WMEK::HorzWheel(amount) if amount != 0 => {
-                            self.scroll_right_sidebar_file_preview_horizontal(amount)
-                        }
-                        WMEK::HorzWheel(_) => false,
+                        WMEK::VertWheel(_) if shift_vertical => self
+                            .scroll_right_sidebar_file_preview_horizontal(
+                                self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
+                            ),
+                        WMEK::VertWheel(_) => self.scroll_right_sidebar_file_preview_by(
+                            self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
+                        ),
+                        WMEK::HorzWheel(_) => self.scroll_right_sidebar_file_preview_horizontal(
+                            self.sidebar_horizontal_scroll_delta(event).unwrap_or(0.0),
+                        ),
                         _ => return false,
                     };
                     if changed {
@@ -2753,10 +2761,8 @@ impl super::TermWindow {
         };
         let travel = (scroll.track_width as f32 - scroll.thumb_width).max(1.0);
         let relative_left = (thumb_left - scroll.track_x as f32).clamp(0.0, travel);
-        let offset = (relative_left / travel * scroll.max_scroll as f32)
-            .round()
-            .clamp(0.0, scroll.max_scroll as f32) as usize;
-        if offset != self.right_sidebar_file_preview_horizontal_offset {
+        let offset = (relative_left / travel * scroll.max_scroll).clamp(0.0, scroll.max_scroll);
+        if (offset - self.right_sidebar_file_preview_horizontal_offset).abs() > f32::EPSILON {
             self.right_sidebar_file_preview_horizontal_offset = offset;
         }
         context.invalidate();

@@ -1413,46 +1413,6 @@ impl crate::TermWindow {
         Ok((advance, lookup))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn paint_ui_colored_text_cached(
-        &self,
-        layers: &mut TripleLayerQuadAllocator,
-        font: &Rc<LoadedFont>,
-        metrics: &RenderMetrics,
-        text: &str,
-        char_colors: &[LinearRgba],
-        default_color: LinearRgba,
-        x: usize,
-        y: usize,
-        width: usize,
-    ) -> anyhow::Result<UiShapeCacheLookup> {
-        if text.is_empty() || width == 0 {
-            return Ok(UiShapeCacheLookup::Skipped);
-        }
-
-        let (shaped, lookup) = self.cached_ui_shape(font, metrics, text)?;
-
-        // Map each byte offset to its char index so a glyph's cluster can look
-        // up the colour of the character it came from. This stays outside the
-        // shape cache because colours are applied at paint time.
-        let mut byte_to_char = vec![0usize; text.len() + 1];
-        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
-            for byte in byte_idx..byte_idx + ch.len_utf8() {
-                byte_to_char[byte] = char_idx;
-            }
-        }
-        if let Some(last) = byte_to_char.last_mut() {
-            *last = char_colors.len().saturating_sub(1);
-        }
-
-        self.paint_cached_ui_shape(layers, metrics, &shaped, x, y, width, |info| {
-            let char_idx = byte_to_char.get(info.cluster).copied().unwrap_or(0);
-            char_colors.get(char_idx).copied().unwrap_or(default_color)
-        })?;
-
-        Ok(lookup)
-    }
-
     pub(crate) fn cached_ui_shape(
         &self,
         font: &Rc<LoadedFont>,
@@ -1689,6 +1649,30 @@ impl crate::TermWindow {
         y: f32,
         clip_left: f32,
         clip_right: f32,
+        color_for: F,
+    ) -> anyhow::Result<f32>
+    where
+        F: FnMut(&ShapedInfo) -> LinearRgba,
+    {
+        self.paint_cached_ui_shape_pixel_clipped_scaled(
+            layers, metrics, shaped, start_x, y, clip_left, clip_right, 1.0, color_for,
+        )
+    }
+
+    /// `paint_cached_ui_shape_pixel_clipped` with every advance times
+    /// `advance_scale`: a run spread out or drawn in to a width worked out
+    /// without shaping it. The glyphs keep their size.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_cached_ui_shape_pixel_clipped_scaled<F>(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        metrics: &RenderMetrics,
+        shaped: &[ShapedInfo],
+        start_x: f32,
+        y: f32,
+        clip_left: f32,
+        clip_right: f32,
+        advance_scale: f32,
         mut color_for: F,
     ) -> anyhow::Result<f32>
     where
@@ -1708,7 +1692,7 @@ impl crate::TermWindow {
         let mut x_pos = start_x;
 
         for info in shaped {
-            let advance = info.glyph.x_advance.get() as f32;
+            let advance = info.glyph.x_advance.get() as f32 * advance_scale;
 
             if let Some(key) = info.block_key {
                 let sprite = glyph_cache.cached_block(key, metrics)?;

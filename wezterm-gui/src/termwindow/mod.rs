@@ -983,7 +983,7 @@ pub(crate) struct RightSidebarFileViewState {
     pub expanded: HashSet<String>,
     pub tree_scroll: f32,
     pub preview_scroll: f32,
-    pub preview_horizontal: usize,
+    pub preview_horizontal: f32,
     pub filter: String,
 }
 
@@ -1155,15 +1155,8 @@ pub(crate) struct RightSidebarFilePreviewLine {
 pub(crate) struct RightSidebarFilePreviewSliceCacheKey {
     pub generation: u64,
     pub line_index: usize,
-    pub horizontal_offset: usize,
-    pub paint_columns: usize,
-    pub highlighted: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct RightSidebarFilePreviewSliceCacheValue {
-    pub text: String,
-    pub colors: Vec<LinearRgba>,
+    pub start_column: usize,
+    pub columns: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3374,14 +3367,18 @@ pub struct TermWindow {
     /// Bumped whenever the preview's text changes, so rendered Markdown knows
     /// to rebuild.
     right_sidebar_file_preview_text_generation: u64,
-    right_sidebar_file_preview_max_columns: usize,
+    /// The preview font's character widths and the widest line by them,
+    /// worked out on the first paint after the lines or the font change.
+    right_sidebar_file_preview_widths:
+        Option<crate::termwindow::ui::right_sidebar::RightSidebarFilePreviewWidths>,
     right_sidebar_file_preview_image: Option<RightSidebarFilePreviewImage>,
     right_sidebar_file_preview_message: Option<String>,
     right_sidebar_file_preview_truncated: bool,
     right_sidebar_file_preview_selection: Option<RightSidebarFilePreviewSelection>,
-    right_sidebar_file_preview_slice_cache: RefCell<
-        HashMap<RightSidebarFilePreviewSliceCacheKey, RightSidebarFilePreviewSliceCacheValue>,
-    >,
+    /// Per-byte colours of the chunks of highlighted lines too long to
+    /// colour whole.
+    right_sidebar_file_preview_slice_cache:
+        RefCell<HashMap<RightSidebarFilePreviewSliceCacheKey, Rc<Vec<LinearRgba>>>>,
     right_sidebar_file_preview_slice_cache_order:
         RefCell<VecDeque<RightSidebarFilePreviewSliceCacheKey>>,
     // Full-line per-character colours for the horizontal-scroll fast path, keyed
@@ -3392,10 +3389,11 @@ pub struct TermWindow {
     right_sidebar_file_preview_line_color_cache_order: RefCell<VecDeque<(u64, usize)>>,
     right_sidebar_file_tree_scroll_offset: f32,
     right_sidebar_file_preview_scroll_offset: f32,
-    right_sidebar_file_preview_horizontal_offset: usize,
+    /// In pixels, so every line moves by the same distance.
+    right_sidebar_file_preview_horizontal_offset: f32,
     // When restoring a remembered preview, the async load result resets the
     // scroll to 0; this carries the offsets to re-apply once the lines arrive.
-    right_sidebar_file_preview_restore_scroll: Option<(f32, usize)>,
+    right_sidebar_file_preview_restore_scroll: Option<(f32, f32)>,
     // Per-(root, project) remembered Files-panel view state (expanded folders,
     // selected/preview, scroll, filter) so switching workspaces / idle-release /
     // re-scan don't lose where you were. Only a few KB of paths each; LRU-bounded.
@@ -4919,7 +4917,7 @@ impl TermWindow {
             right_sidebar_file_preview_lines: Vec::new(),
             right_sidebar_file_preview_raw_text: None,
             right_sidebar_file_preview_text_generation: 0,
-            right_sidebar_file_preview_max_columns: 0,
+            right_sidebar_file_preview_widths: None,
             right_sidebar_file_preview_image: None,
             right_sidebar_file_preview_message: None,
             right_sidebar_file_preview_truncated: false,
@@ -4930,7 +4928,7 @@ impl TermWindow {
             right_sidebar_file_preview_line_color_cache_order: RefCell::new(VecDeque::new()),
             right_sidebar_file_tree_scroll_offset: 0.0,
             right_sidebar_file_preview_scroll_offset: 0.0,
-            right_sidebar_file_preview_horizontal_offset: 0,
+            right_sidebar_file_preview_horizontal_offset: 0.0,
             right_sidebar_file_preview_restore_scroll: None,
             right_sidebar_file_view_state_by_root: HashMap::new(),
             right_sidebar_file_view_state_order: VecDeque::new(),

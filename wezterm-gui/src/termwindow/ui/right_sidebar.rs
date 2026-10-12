@@ -42,8 +42,8 @@ use crate::termwindow::{
     RightSidebarFileIndex, RightSidebarFileIndexEntry, RightSidebarFileIndexStatus,
     RightSidebarFilePreviewImage, RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
     RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSliceCacheKey,
-    RightSidebarFilePreviewSliceCacheValue, RightSidebarFilePreviewSpan, RightSidebarFileTreeRow,
-    RightSidebarFileView, RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
+    RightSidebarFilePreviewSpan, RightSidebarFileTreeRow, RightSidebarFileView,
+    RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
     RightSidebarNoteImageSource, RightSidebarNoteTableLayout, RightSidebarNoteView,
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
     TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup,
@@ -443,9 +443,12 @@ const PLUGIN_EXTENDED_DEFAULT_WIDTH: usize = FILE_PREVIEW_PANE_DEFAULT_WIDTH * 2
 const FILE_PREVIEW_SLICE_CACHE_CAPACITY: usize = 256;
 // Lines up to this many columns are shaped whole (once, cached) so horizontal
 // scrolling is pure translation of the cached glyph run instead of re-shaping a
-// new substring per step. Longer lines fall back to the per-window slice path to
-// keep the one-time shaping cost bounded.
+// new substring per step. Longer lines are shaped a chunk at a time, only the
+// chunks on screen, to keep the one-time shaping cost bounded.
 const FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS: usize = 4096;
+// About how many columns a longer line's chunk holds: panning moves the same
+// shaped chunks, and only one coming on screen is shaped anew.
+const FILE_PREVIEW_LONG_LINE_CHUNK: usize = 256;
 const FILE_PREVIEW_SCROLLBAR_THICKNESS: usize = 4;
 const FILE_PREVIEW_SCROLLBAR_HIT_SLOP: usize = 6;
 const FILE_TREE_ROW_LIMIT: usize = 2000;
@@ -700,24 +703,36 @@ impl NoteGlyphWidths {
     /// `text`'s width. A character not measured yet counts as an average
     /// one and is noted in `unknown`, to be measured before the next wrap.
     fn text_width(&self, text: &str, unknown: &mut HashSet<char>) -> f32 {
+        if text.is_ascii() {
+            // Every character measured, and (CR LF aside, which has no width)
+            // a grapheme of its own: no need to find the graphemes.
+            return text
+                .bytes()
+                .fold(0.0, |width, byte| width + self.ascii[byte as usize]);
+        }
         let mut width = 0.0;
         for grapheme in text.graphemes(true) {
-            // A cluster is as wide as its base: what follows combines with
-            // it (accents, joined emoji, conjoining jamo).
-            let Some(base) = grapheme.chars().next() else {
-                continue;
-            };
-            width += match self.char_width(base) {
-                Some(advance) => advance,
-                None => {
-                    if unknown.len() < NOTE_GLYPH_WIDTHS_MAX_PENDING {
-                        unknown.insert(base);
-                    }
-                    self.narrow
-                }
-            };
+            width += self.grapheme_width(grapheme, unknown);
         }
         width
+    }
+
+    /// One grapheme's width, as `text_width` counts it.
+    fn grapheme_width(&self, grapheme: &str, unknown: &mut HashSet<char>) -> f32 {
+        // A cluster is as wide as its base: what follows combines with it
+        // (accents, joined emoji, conjoining jamo).
+        let Some(base) = grapheme.chars().next() else {
+            return 0.0;
+        };
+        match self.char_width(base) {
+            Some(advance) => advance,
+            None => {
+                if unknown.len() < NOTE_GLYPH_WIDTHS_MAX_PENDING {
+                    unknown.insert(base);
+                }
+                self.narrow
+            }
+        }
     }
 }
 
@@ -1594,7 +1609,146 @@ pub(crate) struct RightSidebarFilePreviewHorizontalScrollGeometry {
     pub track_height: usize,
     pub thumb_x: f32,
     pub thumb_width: f32,
-    pub max_scroll: usize,
+    pub max_scroll: f32,
+}
+
+/// The preview font's character widths and what they make of the lines: how
+/// far the preview scrolls sideways, and where each piece of a line too long
+/// to shape whole goes. Worked out once per lines and width table, never per
+/// frame.
+pub(crate) struct RightSidebarFilePreviewWidths {
+    font: LoadedFontId,
+    /// The table it was worked out with. Once the store holds another one for
+    /// the font (a character measured, a fallback font arrived), it is worked
+    /// out again.
+    widths: Arc<NoteGlyphWidths>,
+    widest_line: f32,
+    /// Each line too long to shape whole, by index.
+    long_lines: HashMap<usize, FilePreviewLongLine>,
+}
+
+/// A line too long to shape whole, cut into chunks of about
+/// `FILE_PREVIEW_LONG_LINE_CHUNK` columns, each shaped on its own. A chunk sits
+/// where the width table puts it and is drawn to the width the table gives it.
+/// Kerning may make its glyphs a hair narrower or wider than the table says,
+/// but no chunk moves as the view pans, and no two part or overlap.
+#[derive(Debug, PartialEq)]
+struct FilePreviewLongLine {
+    /// Each chunk's first column and byte, then the line's end.
+    bounds: Vec<(usize, usize)>,
+    /// Where each chunk starts, then the line's width.
+    starts: Vec<f32>,
+}
+
+impl FilePreviewLongLine {
+    /// `text` cut on grapheme boundaries and placed by `widths`.
+    fn new(widths: &NoteGlyphWidths, text: &str) -> Self {
+        let mut bounds = vec![(0, 0)];
+        let mut starts = vec![0.0];
+        let mut unknown = HashSet::new();
+        let mut column = 0;
+        // Summed in f64: a line of a million characters runs to millions of
+        // pixels, where f32 would round every character's width.
+        let mut x = 0.0f64;
+        for (byte, grapheme) in text.grapheme_indices(true) {
+            if column >= bounds.len() * FILE_PREVIEW_LONG_LINE_CHUNK {
+                bounds.push((column, byte));
+                starts.push(x as f32);
+            }
+            x += f64::from(widths.grapheme_width(grapheme, &mut unknown));
+            column += grapheme.chars().count();
+        }
+        bounds.push((column, text.len()));
+        starts.push(x as f32);
+        Self { bounds, starts }
+    }
+
+    fn width(&self) -> f32 {
+        self.starts.last().copied().unwrap_or(0.0)
+    }
+
+    /// The chunks a view `width` wide, `left` pixels into the line, shows.
+    fn visible_chunks(&self, left: f32, width: f32) -> std::ops::Range<usize> {
+        let chunks = self.starts.len().saturating_sub(1);
+        if chunks == 0 {
+            return 0..0;
+        }
+        let first = self.starts[1..].partition_point(|&end| end <= left);
+        let end = self.starts[..chunks].partition_point(|&start| start < left + width);
+        first..end.max(first)
+    }
+}
+
+/// A preview line, or one chunk of a long one, as it is painted: its text
+/// shaped, and where it starts.
+struct FilePreviewLineRun<'a> {
+    text: &'a str,
+    shaped: Rc<Vec<crate::shapecache::ShapedInfo>>,
+    /// One colour per byte of `text`; none for a plain line, or when only
+    /// the positions are wanted.
+    colors: Option<Rc<Vec<LinearRgba>>>,
+    /// The line column `text` starts at.
+    first_column: usize,
+    /// Where `text`'s first glyph starts.
+    x: f32,
+    /// What every advance is drawn times: 1 but for a long line's chunk,
+    /// drawn to the width the table gives it.
+    scale: f32,
+    lookup: UiShapeCacheLookup,
+}
+
+impl FilePreviewLineRun<'_> {
+    fn advances(&self) -> impl Iterator<Item = (usize, f32)> + '_ {
+        let scale = self.scale;
+        self.shaped
+            .iter()
+            .map(move |info| (info.cluster, info.glyph.x_advance.get() as f32 * scale))
+    }
+
+    /// Where line column `column` starts: off to the left for one before the
+    /// run, at its end for one past it.
+    fn column_x(&self, column: usize) -> f32 {
+        let Some(column) = column.checked_sub(self.first_column) else {
+            return f32::NEG_INFINITY;
+        };
+        let byte = self
+            .text
+            .char_indices()
+            .nth(column)
+            .map(|(byte, _)| byte)
+            .unwrap_or(self.text.len());
+        self.x + shaped_run_x_at_byte(self.advances(), byte)
+    }
+
+    /// The line column a caret at `x` goes to.
+    fn column_at(&self, x: f32) -> usize {
+        let byte = shaped_run_byte_at_x(self.advances(), self.text.len(), x - self.x);
+        self.first_column
+            + self
+                .text
+                .get(..byte)
+                .map(|before| before.chars().count())
+                .unwrap_or(0)
+    }
+}
+
+/// Where line column `column` starts among a line's runs (left to right):
+/// off to the left for one before them all.
+fn file_preview_runs_column_x(runs: &[FilePreviewLineRun], column: usize) -> f32 {
+    runs.iter()
+        .rev()
+        .find(|run| run.first_column <= column)
+        .map_or(f32::NEG_INFINITY, |run| run.column_x(column))
+}
+
+/// The line column a caret at `x` goes to among a line's runs (left to
+/// right); none when no run is on screen.
+fn file_preview_runs_column_at(runs: &[FilePreviewLineRun], x: f32) -> Option<usize> {
+    runs.iter()
+        .rev()
+        .find(|run| run.x <= x)
+        .or_else(|| runs.first())
+        .map(|run| run.column_at(x))
 }
 
 struct FilePreviewPaintProfile {
@@ -1641,7 +1795,7 @@ impl FilePreviewPaintProfile {
         }
     }
 
-    fn finish(&self, scroll_offset: f32, horizontal_offset: usize) {
+    fn finish(&self, scroll_offset: f32, horizontal_offset: f32) {
         if !self.enabled {
             return;
         }
@@ -1653,7 +1807,7 @@ impl FilePreviewPaintProfile {
             return;
         }
         log::info!(
-            "file preview paint: {:?}, lines={}, visible={}, plain={}, highlighted={}, slices={}, shape_requests={}, shape_hits={}, shape_misses={}, scroll={:.1}, hscroll={}",
+            "file preview paint: {:?}, lines={}, visible={}, plain={}, highlighted={}, slices={}, shape_requests={}, shape_hits={}, shape_misses={}, scroll={:.1}, hscroll={:.1}",
             elapsed,
             self.line_count,
             self.visible_lines,
@@ -3706,34 +3860,26 @@ impl crate::TermWindow {
         (old - self.right_sidebar_file_preview_scroll_offset).abs() > f32::EPSILON
     }
 
-    pub(crate) fn scroll_right_sidebar_file_preview_horizontal(&mut self, amount: i16) -> bool {
+    /// Scroll the preview sideways by `delta` pixels, as far as the widest
+    /// line goes.
+    pub(crate) fn scroll_right_sidebar_file_preview_horizontal(&mut self, delta: f32) -> bool {
         if !self.right_sidebar_presented()
             || self.right_sidebar_mode != RightSidebarMode::Chat
             || self.right_sidebar_file_view != RightSidebarFileView::Preview
             || (self.right_sidebar_file_selected.is_none()
                 && self.right_sidebar_remote_files.selected.is_none())
-            || amount == 0
+            || delta.abs() <= f32::EPSILON
+            // How far the lines reach is worked out on the next paint; until
+            // then a limit of nothing would undo a remembered offset.
+            || self.right_sidebar_file_preview_widths.is_none()
         {
             return false;
         }
 
         let old = self.right_sidebar_file_preview_horizontal_offset;
         let max = self.right_sidebar_file_preview_horizontal_scroll_max();
-        let steps = amount.unsigned_abs().max(1) as usize;
-        // The horizontal offset is measured in character columns (the cell
-        // width already tracks DPI), so the step stays unscaled.
-        let delta = steps.saturating_mul(4).min(32);
-        if amount < 0 {
-            self.right_sidebar_file_preview_horizontal_offset = self
-                .right_sidebar_file_preview_horizontal_offset
-                .saturating_add(delta)
-                .min(max);
-        } else {
-            self.right_sidebar_file_preview_horizontal_offset = self
-                .right_sidebar_file_preview_horizontal_offset
-                .saturating_sub(delta);
-        }
-        old != self.right_sidebar_file_preview_horizontal_offset
+        self.right_sidebar_file_preview_horizontal_offset = (old + delta).clamp(0.0, max);
+        (old - self.right_sidebar_file_preview_horizontal_offset).abs() > f32::EPSILON
     }
 
     pub(crate) fn open_right_sidebar_file_path(&mut self, path: PathBuf) {
@@ -3746,7 +3892,7 @@ impl crate::TermWindow {
     fn open_right_sidebar_file_path_inner(
         &mut self,
         path: PathBuf,
-        restore_scroll: Option<(f32, usize)>,
+        restore_scroll: Option<(f32, f32)>,
     ) {
         if !path.is_dir() && self.release_right_sidebar_markdown_preview(true).is_err() {
             return;
@@ -3796,14 +3942,14 @@ impl crate::TermWindow {
         let highlight_cancel = Arc::clone(&self.right_sidebar_file_preview_highlight_cancel);
         self.right_sidebar_file_preview_lines.clear();
         self.set_right_sidebar_file_preview_raw_text(None);
-        self.right_sidebar_file_preview_max_columns = 0;
+        self.right_sidebar_file_preview_widths = None;
         self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
         self.right_sidebar_file_preview_message = Some(crate::i18n::tr("right-loading-preview"));
         self.right_sidebar_file_preview_truncated = false;
         self.right_sidebar_file_preview_selection = None;
         self.right_sidebar_file_preview_scroll_offset = 0.0;
-        self.right_sidebar_file_preview_horizontal_offset = 0;
+        self.right_sidebar_file_preview_horizontal_offset = 0.0;
 
         let Some(window) = self.window.as_ref().cloned() else {
             self.right_sidebar_file_preview_message =
@@ -3907,14 +4053,14 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
         self.right_sidebar_file_preview_lines.clear();
         self.set_right_sidebar_file_preview_raw_text(None);
-        self.right_sidebar_file_preview_max_columns = 0;
+        self.right_sidebar_file_preview_widths = None;
         self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
         self.right_sidebar_file_preview_message = None;
         self.right_sidebar_file_preview_truncated = false;
         self.right_sidebar_file_preview_selection = None;
         self.right_sidebar_file_preview_scroll_offset = 0.0;
-        self.right_sidebar_file_preview_horizontal_offset = 0;
+        self.right_sidebar_file_preview_horizontal_offset = 0.0;
     }
 
     fn clear_right_sidebar_file_preview_slice_cache(&self) {
@@ -4167,9 +4313,9 @@ impl crate::TermWindow {
         &self,
         key: RightSidebarFilePreviewSliceCacheKey,
         build: F,
-    ) -> RightSidebarFilePreviewSliceCacheValue
+    ) -> Rc<Vec<LinearRgba>>
     where
-        F: FnOnce() -> RightSidebarFilePreviewSliceCacheValue,
+        F: FnOnce() -> Rc<Vec<LinearRgba>>,
     {
         if let Some(value) = self
             .right_sidebar_file_preview_slice_cache
@@ -4189,7 +4335,7 @@ impl crate::TermWindow {
             if !cache.contains_key(&key) {
                 order.push_back(key.clone());
             }
-            cache.insert(key, value.clone());
+            cache.insert(key, Rc::clone(&value));
             while order.len() > FILE_PREVIEW_SLICE_CACHE_CAPACITY {
                 if let Some(old_key) = order.pop_front() {
                     cache.remove(&old_key);
@@ -4215,12 +4361,7 @@ impl crate::TermWindow {
             return;
         }
         self.right_sidebar_file_preview_lines = result.lines;
-        self.right_sidebar_file_preview_max_columns = self
-            .right_sidebar_file_preview_lines
-            .iter()
-            .map(|line| line.char_count)
-            .max()
-            .unwrap_or(0);
+        self.right_sidebar_file_preview_widths = None;
         self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = result.image;
         self.right_sidebar_file_preview_message = result.message;
@@ -4232,7 +4373,7 @@ impl crate::TermWindow {
         let (scroll, horizontal) = self
             .right_sidebar_file_preview_restore_scroll
             .take()
-            .unwrap_or((0.0, 0));
+            .unwrap_or((0.0, 0.0));
         self.right_sidebar_file_preview_scroll_offset = scroll;
         self.right_sidebar_file_preview_horizontal_offset = horizontal;
         self.invalidate_window();
@@ -4721,7 +4862,13 @@ impl crate::TermWindow {
         {
             return None;
         }
-        let preview_metrics = self.right_sidebar_file_preview_render_metrics();
+        // The font the preview is painted in: the columns are found among
+        // its glyphs as painted, from the same shapes the paint cached.
+        let font = self
+            .fonts
+            .title_font_with_size(self.right_sidebar_file_preview_font_size())
+            .ok()?;
+        let preview_metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let metrics = self.right_sidebar_file_preview_body_metrics(preview_metrics)?;
         let visible_height =
             self.right_sidebar_file_preview_effective_visible_height(metrics, preview_metrics);
@@ -4746,20 +4893,38 @@ impl crate::TermWindow {
 
         let (_, _, text_x, text_width) =
             self.right_sidebar_file_preview_text_layout(metrics, preview_metrics);
-        let cell_width = preview_metrics.cell_size.width.max(1) as f32;
-        let relative_x = (x as f32 - text_x as f32).max(0.0);
-        let visible_column = (relative_x / cell_width).round().max(0.0) as usize;
-        let column = self
-            .right_sidebar_file_preview_horizontal_offset
-            .saturating_add(visible_column)
-            .min(line_len);
-
         if x >= text_x.saturating_add(text_width) as isize {
             return Some(RightSidebarFilePreviewSelectionPoint {
                 line,
                 column: line_len,
             });
         }
+        let Some(preview_line) = self.right_sidebar_file_preview_lines.get(line) else {
+            return Some(RightSidebarFilePreviewSelectionPoint { line, column: 0 });
+        };
+
+        let horizontal_offset = self.right_sidebar_file_preview_horizontal_offset.clamp(
+            0.0,
+            self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(preview_metrics),
+        );
+        let previous_domain = self
+            .ui_text_domain
+            .replace(crate::shapecache::UiTextDomain::FilePreview);
+        let runs = self.right_sidebar_file_preview_line_runs(
+            &font,
+            &preview_metrics,
+            line,
+            preview_line,
+            text_x,
+            text_width,
+            horizontal_offset,
+            false,
+        );
+        self.ui_text_domain.set(previous_domain);
+        // No run on screen: the line ends left of the view.
+        let column = file_preview_runs_column_at(&runs.ok()?, (x as f32).max(text_x as f32))
+            .unwrap_or(line_len)
+            .min(line_len);
         Some(RightSidebarFilePreviewSelectionPoint { line, column })
     }
 
@@ -7393,7 +7558,17 @@ impl crate::TermWindow {
         let pending = std::mem::take(&mut self.note_glyph_widths.pending)
             .into_iter()
             .collect::<Vec<_>>();
-        let sample = spaced_sample(pending.iter().copied());
+        self.measure_note_glyph_widths(fonts, &pending)
+    }
+
+    /// Measure `chars` in each of `fonts` that has a table, adding the ones
+    /// it lacks. A table gains no new copy unless something was added.
+    fn measure_note_glyph_widths(
+        &mut self,
+        fonts: &[(&Rc<LoadedFont>, RenderMetrics)],
+        chars: &[char],
+    ) -> anyhow::Result<()> {
+        let sample = spaced_sample(chars.iter().copied());
         let mut changed = false;
         for (font, metrics) in fonts {
             let Some(current) = self.note_glyph_widths.fonts.get(&font.id()).cloned() else {
@@ -7402,7 +7577,8 @@ impl crate::TermWindow {
             let (shaped, _) = self.cached_ui_shape(font, metrics, &sample)?;
             let advances = note_glyph_advances(&sample, &shaped);
             let mut widths = (*current).clone();
-            for ch in &pending {
+            let mut added = false;
+            for ch in chars {
                 if widths.other.len() >= NOTE_GLYPH_WIDTHS_MAX_CHARS {
                     break;
                 }
@@ -7410,12 +7586,15 @@ impl crate::TermWindow {
                     widths
                         .other
                         .insert(*ch, advances.get(ch).copied().unwrap_or(widths.narrow));
-                    changed = true;
+                    added = true;
                 }
             }
-            self.note_glyph_widths
-                .fonts
-                .insert(font.id(), Arc::new(widths));
+            if added {
+                self.note_glyph_widths
+                    .fonts
+                    .insert(font.id(), Arc::new(widths));
+                changed = true;
+            }
         }
         if changed {
             self.note_glyph_widths.generation = self.note_glyph_widths.generation.wrapping_add(1);
@@ -8508,28 +8687,7 @@ impl crate::TermWindow {
         Some(text_width)
     }
 
-    fn right_sidebar_file_preview_visible_columns(&self, preview_metrics: RenderMetrics) -> usize {
-        let Some(text_width) = self.right_sidebar_file_preview_text_width(preview_metrics) else {
-            return 0;
-        };
-        let cell_width = preview_metrics.cell_size.width.max(1) as usize;
-        estimated_file_preview_visible_columns(text_width, cell_width)
-    }
-
-    fn right_sidebar_file_preview_max_line_columns(&self) -> usize {
-        // `right_sidebar_file_preview_max_columns` is the cached max over all
-        // preview lines, recomputed only when the lines change (see
-        // `apply_right_sidebar_file_preview_result`). This getter is called
-        // several times per frame, so it must stay O(1).
-        let max_line_columns = self.right_sidebar_file_preview_max_columns;
-        if self.right_sidebar_file_preview_truncated {
-            max_line_columns.max(crate::i18n::tr("right-preview-truncated").chars().count())
-        } else {
-            max_line_columns
-        }
-    }
-
-    pub(crate) fn right_sidebar_file_preview_horizontal_scroll_max(&self) -> usize {
+    pub(crate) fn right_sidebar_file_preview_horizontal_scroll_max(&self) -> f32 {
         let preview_metrics = self.right_sidebar_file_preview_render_metrics();
         self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(preview_metrics)
     }
@@ -8537,16 +8695,30 @@ impl crate::TermWindow {
     fn right_sidebar_file_preview_horizontal_scroll_max_with_metrics(
         &self,
         preview_metrics: RenderMetrics,
-    ) -> usize {
-        self.right_sidebar_file_preview_max_line_columns()
-            .saturating_sub(self.right_sidebar_file_preview_visible_columns(preview_metrics))
+    ) -> f32 {
+        // Called several times per frame: it reads only what the paint worked
+        // out when the lines or the font changed.
+        let Some(known) = self.right_sidebar_file_preview_widths.as_ref() else {
+            return 0.0;
+        };
+        let Some(text_width) = self.right_sidebar_file_preview_text_width(preview_metrics) else {
+            return 0.0;
+        };
+        // The table can count a line a little short (kerning aside, an emoji
+        // drawn wider than its square): two letters' room past the end keeps
+        // the last character in view.
+        file_preview_horizontal_scroll_max(
+            known.widest_line,
+            text_width as f32,
+            known.widths.narrow * 2.0,
+        )
     }
 
     fn right_sidebar_file_preview_horizontal_scroll_active(
         &self,
         preview_metrics: RenderMetrics,
     ) -> bool {
-        self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(preview_metrics) > 0
+        self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(preview_metrics) > 0.0
     }
 
     fn right_sidebar_file_preview_effective_visible_height(
@@ -8625,7 +8797,7 @@ impl crate::TermWindow {
         let metrics = self.right_sidebar_file_preview_body_metrics(preview_metrics)?;
         let max_scroll =
             self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(preview_metrics);
-        if max_scroll == 0 {
+        if max_scroll <= 0.0 {
             return None;
         }
 
@@ -8635,19 +8807,17 @@ impl crate::TermWindow {
             return None;
         }
 
-        let max_columns = self.right_sidebar_file_preview_max_line_columns().max(1);
-        let visible_columns = self
-            .right_sidebar_file_preview_visible_columns(preview_metrics)
-            .max(1);
+        // What scrolls past: the view plus how far it travels.
+        let content_width = text_width as f32 + max_scroll;
         let track_width = text_width.max(1);
         let track_height = self.ui_px(FILE_PREVIEW_SCROLLBAR_THICKNESS);
-        let thumb_width = ((visible_columns as f32 / max_columns as f32) * track_width as f32)
+        let thumb_width = ((text_width as f32 / content_width) * track_width as f32)
             .clamp(self.ui_f32(28.0), track_width as f32);
         let travel = (track_width as f32 - thumb_width).max(1.0);
         let scroll_offset = self
             .right_sidebar_file_preview_horizontal_offset
-            .min(max_scroll);
-        let thumb_x = text_x as f32 + (scroll_offset as f32 / max_scroll as f32) * travel;
+            .clamp(0.0, max_scroll);
+        let thumb_x = text_x as f32 + (scroll_offset / max_scroll) * travel;
         let track_y = metrics.bottom.saturating_sub(track_height);
 
         Some(RightSidebarFilePreviewHorizontalScrollGeometry {
@@ -17714,12 +17884,7 @@ impl crate::TermWindow {
                     return;
                 }
                 term_window.right_sidebar_file_preview_lines = result.lines;
-                term_window.right_sidebar_file_preview_max_columns = term_window
-                    .right_sidebar_file_preview_lines
-                    .iter()
-                    .map(|line| line.char_count)
-                    .max()
-                    .unwrap_or(0);
+                term_window.right_sidebar_file_preview_widths = None;
                 term_window.right_sidebar_file_preview_image = result.image;
                 term_window.right_sidebar_file_preview_message = result.message;
                 term_window.right_sidebar_file_preview_truncated = result.truncated;
@@ -18979,6 +19144,73 @@ impl crate::TermWindow {
         )
     }
 
+    /// Work out the preview font's widths and what they make of the lines,
+    /// unless that is known for these lines and this table already.
+    fn refresh_right_sidebar_file_preview_widths(
+        &mut self,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+    ) -> anyhow::Result<()> {
+        let store = &self.note_glyph_widths;
+        if self
+            .right_sidebar_file_preview_widths
+            .as_ref()
+            .is_some_and(|known| {
+                known.font == font.id()
+                    // A table that was only a stand-in was never kept.
+                    && store
+                        .fonts
+                        .get(&known.font)
+                        .is_some_and(|widths| Arc::ptr_eq(widths, &known.widths))
+            })
+        {
+            return Ok(());
+        }
+        self.right_sidebar_file_preview_widths = None;
+        let truncated_label = self
+            .right_sidebar_file_preview_truncated
+            .then(|| crate::i18n::tr("right-preview-truncated"));
+        let mut widths = self.note_glyph_widths(font, metrics, None)?;
+        // Every character the table lacks is measured first, found in one
+        // pass and shaped `NOTE_GLYPH_WIDTHS_MAX_PENDING` at a time: counted at
+        // a stand-in width, a line of them would scroll short of its end or on
+        // past it.
+        let unmeasured = file_preview_unmeasured_chars(
+            &widths,
+            &self.right_sidebar_file_preview_lines,
+            truncated_label.as_deref(),
+        );
+        for batch in unmeasured.chunks(NOTE_GLYPH_WIDTHS_MAX_PENDING) {
+            self.measure_note_glyph_widths(&[(font, *metrics)], batch)?;
+        }
+        // A stand-in table is not kept, so there is nothing newer for it.
+        if let Some(measured) = self.note_glyph_widths.fonts.get(&font.id()) {
+            widths = Arc::clone(measured);
+        }
+        let mut unknown = HashSet::new();
+        let mut widest_line =
+            truncated_label.map_or(0.0, |label| widths.text_width(&label, &mut unknown));
+        let mut long_lines = HashMap::new();
+        for (index, line) in self.right_sidebar_file_preview_lines.iter().enumerate() {
+            let width = if line.char_count <= FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS {
+                widths.text_width(&line.plain, &mut unknown)
+            } else {
+                let long_line = FilePreviewLongLine::new(&widths, &line.plain);
+                let width = long_line.width();
+                long_lines.insert(index, long_line);
+                width
+            };
+            widest_line = widest_line.max(width);
+        }
+        self.right_sidebar_file_preview_widths = Some(RightSidebarFilePreviewWidths {
+            font: font.id(),
+            widths,
+            widest_line,
+            long_lines,
+        });
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint_files_preview(
         &mut self,
@@ -19000,7 +19232,20 @@ impl crate::TermWindow {
         }
         let mut profile = FilePreviewPaintProfile::new();
         let mut profile_scroll_offset = 0.0;
-        let mut profile_horizontal_offset = 0usize;
+        let mut profile_horizontal_offset = 0.0;
+        let markdown_rendering = self.right_sidebar_markdown_preview_rendering();
+        // Before anything is laid out: whether the lines scroll sideways
+        // decides how much height is left for them. Only lines that show need
+        // it (rendered Markdown, a message or an image shows none); without
+        // the widths they only do not scroll.
+        if !markdown_rendering
+            && self.right_sidebar_file_preview_message.is_none()
+            && self.right_sidebar_file_preview_image.is_none()
+        {
+            if let Err(err) = self.refresh_right_sidebar_file_preview_widths(ui_font, &ui_metrics) {
+                log::debug!("right sidebar file preview widths: {err:#}");
+            }
+        }
 
         let Some(metrics) = self.right_sidebar_file_preview_body_metrics(ui_metrics) else {
             self.paint_current_files_preview_header(
@@ -19029,9 +19274,7 @@ impl crate::TermWindow {
         let mut show_top_fade = false;
         let mut show_scrollbars = false;
 
-        if self.right_sidebar_markdown_preview_rendering()
-            && self.ensure_right_sidebar_markdown_preview()
-        {
+        if markdown_rendering && self.ensure_right_sidebar_markdown_preview() {
             self.paint_right_sidebar_markdown_preview(
                 layers,
                 chrome,
@@ -19063,21 +19306,13 @@ impl crate::TermWindow {
             show_top_fade = max_scroll > 0.0 && scroll_offset > 0.0;
             show_scrollbars = true;
 
-            let cell_width = ui_metrics.cell_size.width.max(1) as usize;
-            let visible_columns =
-                estimated_file_preview_visible_columns(text_width, cell_width).max(1);
             self.right_sidebar_file_preview_horizontal_offset =
-                self.right_sidebar_file_preview_horizontal_offset.min(
+                self.right_sidebar_file_preview_horizontal_offset.clamp(
+                    0.0,
                     self.right_sidebar_file_preview_horizontal_scroll_max_with_metrics(ui_metrics),
                 );
             let horizontal_offset = self.right_sidebar_file_preview_horizontal_offset;
             profile_horizontal_offset = horizontal_offset;
-            // Render only the visible horizontal window, never the whole line
-            // (lines can be tens of thousands of columns wide). The preview font
-            // is proportional, so `visible_columns` (text_width / cell_width)
-            // under-counts how many glyphs actually fit; over-slice generously
-            // and let the per-glyph pixel clip in the painter stop at the edge.
-            let paint_columns = visible_columns.saturating_mul(3).saturating_add(8);
             self.ui_items.push(UIItem {
                 x: body_x,
                 y: body_y,
@@ -19112,9 +19347,6 @@ impl crate::TermWindow {
                     line_height,
                     scroll_offset,
                     horizontal_offset,
-                    visible_columns,
-                    paint_columns,
-                    cell_width,
                     Some(&mut profile),
                 )?;
             } else {
@@ -19140,9 +19372,6 @@ impl crate::TermWindow {
                         line_height,
                         scroll_offset,
                         horizontal_offset,
-                        visible_columns,
-                        paint_columns,
-                        cell_width,
                         Some(&mut profile),
                     )?;
                     if should_break {
@@ -19155,17 +19384,18 @@ impl crate::TermWindow {
                 let truncated_label = crate::i18n::tr("right-preview-truncated");
                 let line_top = body_y as f32 + (line_count * line_height) as f32 - scroll_offset;
                 if line_top < body_bottom as f32 {
-                    let visible_text =
-                        preview_text_slice(&truncated_label, horizontal_offset, paint_columns);
-                    self.paint_sidebar_text(
+                    // Sideways with the lines above it.
+                    let (shaped, _) =
+                        self.cached_ui_shape(ui_font, &ui_metrics, &truncated_label)?;
+                    self.paint_cached_ui_shape_pixel_clipped(
                         layers,
-                        ui_font,
-                        ui_metrics,
-                        &visible_text,
-                        text_x,
-                        line_top.floor().max(0.0) as usize,
-                        text_width,
-                        muted_fg,
+                        &ui_metrics,
+                        &shaped,
+                        file_preview_line_origin(text_x, horizontal_offset),
+                        line_top.floor().max(0.0),
+                        text_x as f32,
+                        text_x.saturating_add(text_width) as f32,
+                        |_| muted_fg,
                     )?;
                 }
             }
@@ -19179,6 +19409,18 @@ impl crate::TermWindow {
             content_width,
             metrics.y.saturating_sub(content_top),
         )?;
+        // Likewise below the lines when the horizontal scrollbar has its strip
+        // there: a last line cut short must not run under the scrollbar.
+        if show_scrollbars && body_bottom < metrics.bottom {
+            self.paint_right_sidebar_file_mask(
+                layers,
+                chrome,
+                content_x,
+                body_bottom,
+                content_width,
+                content_bottom.saturating_sub(body_bottom),
+            )?;
+        }
         if show_top_fade {
             self.paint_right_sidebar_file_top_fade(
                 layers,
@@ -19230,10 +19472,7 @@ impl crate::TermWindow {
         text_width: usize,
         line_height: usize,
         scroll_offset: f32,
-        horizontal_offset: usize,
-        visible_columns: usize,
-        paint_columns: usize,
-        cell_width: usize,
+        horizontal_offset: f32,
         mut profile: Option<&mut FilePreviewPaintProfile>,
     ) -> anyhow::Result<bool> {
         let line_top = body_y as f32 + (idx * line_height) as f32 - scroll_offset;
@@ -19255,17 +19494,30 @@ impl crate::TermWindow {
         }
 
         let line_y = line_top.floor().max(0.0) as usize;
+        let runs = self.right_sidebar_file_preview_line_runs(
+            ui_font,
+            &ui_metrics,
+            idx,
+            line,
+            text_x,
+            text_width,
+            horizontal_offset,
+            true,
+        )?;
+        // Clip at the text column's edges (no "..."); the horizontal
+        // scrollbar shows there is more.
+        let clip_left = text_x as f32;
+        let clip_right = text_x.saturating_add(text_width) as f32;
         self.paint_right_sidebar_file_preview_selection_for_line(
             layers,
             chrome,
             line,
             idx,
-            horizontal_offset,
-            visible_columns,
-            text_x,
+            &runs,
+            clip_left,
+            clip_right,
             line_y,
             line_height,
-            cell_width,
         )?;
         let line_number_lookup = self.paint_ui_title_text_cached(
             layers,
@@ -19281,57 +19533,127 @@ impl crate::TermWindow {
             profile.record_shape_lookup(line_number_lookup);
         }
 
-        let text_lookup = if line.char_count <= FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS {
-            // Fast path: shape the whole line once (cached) and translate/clip it
-            // for the current horizontal offset, so panning never re-shapes.
-            self.paint_full_line_preview_text(
+        for run in &runs {
+            let colors = run.colors.as_deref();
+            self.paint_cached_ui_shape_pixel_clipped_scaled(
                 layers,
-                ui_font,
-                ui_metrics,
-                idx,
-                line,
-                horizontal_offset,
-                text_x,
-                line_y,
-                text_width,
-                foreground,
-            )?
-        } else if line.spans.is_empty() {
-            // Fallback for pathological ultra-long lines: render only the visible
-            // window (horizontal scroll re-shapes, but such lines are rare). Clip
-            // at the edge (no "..."); the horizontal scrollbar shows there's more.
-            let visible_text =
-                self.cached_plain_preview_slice(idx, line, horizontal_offset, paint_columns);
-            self.paint_ui_title_text_cached(
-                layers,
-                ui_font,
                 &ui_metrics,
-                &visible_text,
-                text_x,
-                line_y,
-                text_width,
-                foreground,
-            )?
-        } else {
-            self.paint_highlighted_preview_line(
-                layers,
-                ui_font,
-                ui_metrics,
-                idx,
-                line,
-                horizontal_offset,
-                paint_columns,
-                text_x,
-                line_y,
-                text_width,
-                foreground,
-            )?
-        };
-        if let Some(profile) = profile.as_deref_mut() {
-            profile.record_shape_lookup(text_lookup);
+                &run.shaped,
+                run.x,
+                line_y as f32,
+                clip_left,
+                clip_right,
+                run.scale,
+                |info| {
+                    colors
+                        .and_then(|colors| colors.get(info.cluster))
+                        .copied()
+                        .unwrap_or(foreground)
+                },
+            )?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record_shape_lookup(run.lookup);
+            }
         }
 
         Ok(false)
+    }
+
+    /// `line` shaped and placed as the preview paints it, left to right. A
+    /// line up to `FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS` is one run, shaped
+    /// whole once (cached), so panning only moves it. A longer one is the
+    /// chunks of its `FilePreviewLongLine` that are on screen. `colors`:
+    /// whether the runs carry their colours, which only painting needs.
+    #[allow(clippy::too_many_arguments)]
+    fn right_sidebar_file_preview_line_runs<'a>(
+        &self,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: &RenderMetrics,
+        line_index: usize,
+        line: &'a RightSidebarFilePreviewLine,
+        text_x: usize,
+        text_width: usize,
+        horizontal_offset: f32,
+        colors: bool,
+    ) -> anyhow::Result<Vec<FilePreviewLineRun<'a>>> {
+        let origin = file_preview_line_origin(text_x, horizontal_offset);
+        let colors = colors && !line.spans.is_empty();
+        let long_line = self
+            .right_sidebar_file_preview_widths
+            .as_ref()
+            .filter(|_| line.char_count > FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS)
+            .and_then(|known| known.long_lines.get(&line_index))
+            // Cut from this very line.
+            .filter(|long_line| {
+                long_line.bounds.last() == Some(&(line.char_count, line.plain.len()))
+            });
+        let Some(long_line) = long_line else {
+            // Whole; or for a long line not cut yet (its widths could not be
+            // worked out, so it does not scroll either), as far as any view
+            // reaches.
+            let (text, colors) = if line.char_count <= FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS {
+                let colors = colors.then(|| self.cached_full_line_colors(line_index, line));
+                (line.plain.as_str(), colors)
+            } else {
+                let end = line
+                    .plain
+                    .char_indices()
+                    .nth(FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS)
+                    .map_or(line.plain.len(), |(byte, _)| byte);
+                (&line.plain[..end], None)
+            };
+            let (shaped, lookup) = if text.is_empty() {
+                (Rc::new(Vec::new()), UiShapeCacheLookup::Skipped)
+            } else {
+                self.cached_ui_shape(ui_font, ui_metrics, text)?
+            };
+            return Ok(vec![FilePreviewLineRun {
+                text,
+                shaped,
+                colors,
+                first_column: 0,
+                x: origin,
+                scale: 1.0,
+                lookup,
+            }]);
+        };
+
+        let left = text_x as f32 - origin;
+        let mut runs = Vec::new();
+        for chunk in long_line.visible_chunks(left, text_width as f32) {
+            let (first_column, start) = long_line.bounds[chunk];
+            let (next_column, end) = long_line.bounds[chunk + 1];
+            let Some(text) = line.plain.get(start..end) else {
+                continue;
+            };
+            let (shaped, lookup) = self.cached_ui_shape(ui_font, ui_metrics, text)?;
+            let shaped_width: f32 = shaped
+                .iter()
+                .map(|info| info.glyph.x_advance.get() as f32)
+                .sum();
+            let width = long_line.starts[chunk + 1] - long_line.starts[chunk];
+            runs.push(FilePreviewLineRun {
+                text,
+                shaped,
+                colors: colors.then(|| {
+                    self.cached_colored_preview_slice(
+                        line_index,
+                        line,
+                        first_column,
+                        next_column - first_column,
+                    )
+                }),
+                first_column,
+                x: origin + long_line.starts[chunk],
+                scale: if shaped_width > 0.0 {
+                    width / shaped_width
+                } else {
+                    1.0
+                },
+                lookup,
+            });
+        }
+        Ok(runs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -19341,17 +19663,16 @@ impl crate::TermWindow {
         chrome: UiPalette,
         line: &RightSidebarFilePreviewLine,
         line_idx: usize,
-        horizontal_offset: usize,
-        visible_columns: usize,
-        text_x: usize,
+        runs: &[FilePreviewLineRun],
+        clip_left: f32,
+        clip_right: f32,
         line_y: usize,
         line_height: usize,
-        cell_width: usize,
     ) -> anyhow::Result<()> {
         let Some((start, end)) = self.right_sidebar_file_preview_selection_range() else {
             return Ok(());
         };
-        if line_idx < start.line || line_idx > end.line || visible_columns == 0 {
+        if line_idx < start.line || line_idx > end.line {
             return Ok(());
         }
 
@@ -19370,26 +19691,17 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let visible_start = horizontal_offset;
-        let visible_end = horizontal_offset.saturating_add(visible_columns);
-        let paint_start = selection_start.max(visible_start);
-        let paint_end = selection_end.min(visible_end);
-        if paint_end <= paint_start {
-            return Ok(());
-        }
-
-        let x = text_x.saturating_add(paint_start.saturating_sub(horizontal_offset) * cell_width);
-        let width = paint_end
-            .saturating_sub(paint_start)
-            .saturating_mul(cell_width);
-        if width == 0 {
+        // Under the glyphs as they are painted, not by an average width.
+        let left = file_preview_runs_column_x(runs, selection_start).max(clip_left);
+        let right = file_preview_runs_column_x(runs, selection_end).min(clip_right);
+        if right <= left {
             return Ok(());
         }
 
         self.filled_rectangle(
             layers,
             1,
-            euclid::rect(x as f32, line_y as f32, width as f32, line_height as f32),
+            euclid::rect(left, line_y as f32, right - left, line_height as f32),
             chrome.selected_bg.mul_alpha(0.48),
         )
         .context("right sidebar file preview selection")?;
@@ -19567,164 +19879,29 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn paint_highlighted_preview_line(
-        &self,
-        layers: &mut TripleLayerQuadAllocator,
-        ui_font: &Rc<LoadedFont>,
-        ui_metrics: RenderMetrics,
-        line_index: usize,
-        line: &RightSidebarFilePreviewLine,
-        horizontal_offset: usize,
-        visible_columns: usize,
-        x: usize,
-        y: usize,
-        width: usize,
-        fallback: LinearRgba,
-    ) -> anyhow::Result<UiShapeCacheLookup> {
-        if width == 0 || visible_columns == 0 {
-            return Ok(UiShapeCacheLookup::Skipped);
-        }
-
-        // Build the visible window's text + a per-character colour list from the
-        // spans, then shape it in a single call. Shaping once per line (instead
-        // of once per coloured span) is what keeps scrolling smooth.
-        let visible =
-            self.cached_colored_preview_slice(line_index, line, horizontal_offset, visible_columns);
-        if visible.text.is_empty() {
-            return Ok(UiShapeCacheLookup::Skipped);
-        }
-        self.paint_ui_colored_text_cached(
-            layers,
-            ui_font,
-            &ui_metrics,
-            &visible.text,
-            &visible.colors,
-            fallback,
-            x,
-            y,
-            width,
-        )
-    }
-
-    /// Horizontal-scroll fast path: shape the whole line once (shared shape
-    /// cache, keyed on the full line text so it is stable across every
-    /// horizontal offset), then translate the cached glyph run left by the pixel
-    /// width of the scrolled-past columns and clip it to the text column. Panning
-    /// only recomputes the translation; it never re-shapes or re-slices.
-    #[allow(clippy::too_many_arguments)]
-    fn paint_full_line_preview_text(
-        &self,
-        layers: &mut TripleLayerQuadAllocator,
-        ui_font: &Rc<LoadedFont>,
-        ui_metrics: RenderMetrics,
-        line_index: usize,
-        line: &RightSidebarFilePreviewLine,
-        horizontal_offset: usize,
-        text_x: usize,
-        line_y: usize,
-        text_width: usize,
-        foreground: LinearRgba,
-    ) -> anyhow::Result<UiShapeCacheLookup> {
-        if line.plain.is_empty() || text_width == 0 {
-            return Ok(UiShapeCacheLookup::Skipped);
-        }
-        let (shaped, lookup) = self.cached_ui_shape(ui_font, &ui_metrics, &line.plain)?;
-        if shaped.is_empty() {
-            return Ok(lookup);
-        }
-
-        // Pixel offset of the first visible column within the cached run. The
-        // glyph at `horizontal_offset` lands exactly on `text_x`, so columns to
-        // its left are fully clipped (no partial glyph bleeds into the gutter).
-        let start_byte = line
-            .plain
-            .char_indices()
-            .nth(horizontal_offset)
-            .map(|(byte, _)| byte)
-            .unwrap_or(line.plain.len());
-        let mut start_px = 0.0f32;
-        for info in shaped.iter() {
-            if info.cluster >= start_byte {
-                break;
-            }
-            start_px += info.glyph.x_advance.get() as f32;
-        }
-
-        let start_x = text_x as f32 - start_px;
-        let clip_left = text_x as f32;
-        let clip_right = (text_x + text_width) as f32;
-        let y = line_y as f32;
-
-        if line.spans.is_empty() {
-            self.paint_cached_ui_shape_pixel_clipped(
-                layers,
-                &ui_metrics,
-                &shaped,
-                start_x,
-                y,
-                clip_left,
-                clip_right,
-                |_| foreground,
-            )?;
-        } else {
-            let colors = self.cached_full_line_colors(line_index, line);
-            self.paint_cached_ui_shape_pixel_clipped(
-                layers,
-                &ui_metrics,
-                &shaped,
-                start_x,
-                y,
-                clip_left,
-                clip_right,
-                |info| colors.get(info.cluster).copied().unwrap_or(foreground),
-            )?;
-        }
-
-        Ok(lookup)
-    }
-
-    fn cached_plain_preview_slice(
-        &self,
-        line_index: usize,
-        line: &RightSidebarFilePreviewLine,
-        horizontal_offset: usize,
-        paint_columns: usize,
-    ) -> String {
-        let key = RightSidebarFilePreviewSliceCacheKey {
-            generation: self.right_sidebar_file_preview_generation,
-            line_index,
-            horizontal_offset,
-            paint_columns,
-            highlighted: false,
-        };
-        self.cached_right_sidebar_file_preview_slice(key, || {
-            RightSidebarFilePreviewSliceCacheValue {
-                text: preview_text_slice(&line.plain, horizontal_offset, paint_columns)
-                    .into_owned(),
-                colors: Vec::new(),
-            }
-        })
-        .text
-    }
-
+    /// The colours of a chunk of a highlighted line too long to colour whole,
+    /// one per byte, so a glyph's cluster finds its own.
     fn cached_colored_preview_slice(
         &self,
         line_index: usize,
         line: &RightSidebarFilePreviewLine,
-        horizontal_offset: usize,
-        paint_columns: usize,
-    ) -> RightSidebarFilePreviewSliceCacheValue {
+        start_column: usize,
+        columns: usize,
+    ) -> Rc<Vec<LinearRgba>> {
         let key = RightSidebarFilePreviewSliceCacheKey {
             generation: self.right_sidebar_file_preview_generation,
             line_index,
-            horizontal_offset,
-            paint_columns,
-            highlighted: true,
+            start_column,
+            columns,
         };
         self.cached_right_sidebar_file_preview_slice(key, || {
-            let (text, colors) = preview_visible_colored(line, horizontal_offset, paint_columns);
-            RightSidebarFilePreviewSliceCacheValue { text, colors }
+            let (text, colors) = preview_visible_colored(line, start_column, columns);
+            Rc::new(
+                text.chars()
+                    .zip(colors)
+                    .flat_map(|(ch, color)| std::iter::repeat_n(color, ch.len_utf8()))
+                    .collect(),
+            )
         })
     }
 
@@ -21200,8 +21377,90 @@ fn file_preview_line_number_width(
         .min(body_width / 2)
 }
 
-fn estimated_file_preview_visible_columns(text_width: usize, cell_width: usize) -> usize {
-    text_width / cell_width.max(1)
+/// Where a preview line's first character sits, scrolled sideways: on a whole
+/// pixel, as the rows are, so glyphs keep their look while panning.
+fn file_preview_line_origin(text_x: usize, horizontal_offset: f32) -> f32 {
+    (text_x as f32 - horizontal_offset).round()
+}
+
+/// How far the preview scrolls sideways: until the widest line's end is in
+/// view, and `margin` past it. Less than a pixel over is nothing to scroll
+/// for, so a file that fits never gains a scrollbar for the margin alone.
+fn file_preview_horizontal_scroll_max(widest_line: f32, text_width: f32, margin: f32) -> f32 {
+    let overflow = widest_line - text_width;
+    if overflow < 1.0 {
+        0.0
+    } else {
+        overflow + margin
+    }
+}
+
+/// The characters of `lines` (and `extra`) that `widths` has not measured, at
+/// most as many as a table holds.
+fn file_preview_unmeasured_chars(
+    widths: &NoteGlyphWidths,
+    lines: &[RightSidebarFilePreviewLine],
+    extra: Option<&str>,
+) -> Vec<char> {
+    let mut unmeasured = HashSet::new();
+    let texts = lines.iter().map(|line| line.plain.as_str()).chain(extra);
+    // ASCII is always measured.
+    'texts: for text in texts.filter(|text| !text.is_ascii()) {
+        for ch in text.chars() {
+            if widths.char_width(ch).is_none()
+                && unmeasured.insert(ch)
+                && unmeasured.len() >= NOTE_GLYPH_WIDTHS_MAX_CHARS
+            {
+                break 'texts;
+            }
+        }
+    }
+    unmeasured.into_iter().collect()
+}
+
+/// How far into a shaped run (`(cluster, advance)` per glyph) the character at
+/// byte `byte` starts: the advances of the glyphs before its cluster.
+fn shaped_run_x_at_byte(glyphs: impl Iterator<Item = (usize, f32)>, byte: usize) -> f32 {
+    let mut x = 0.0;
+    for (cluster, advance) in glyphs {
+        if cluster >= byte {
+            break;
+        }
+        x += advance;
+    }
+    x
+}
+
+/// The byte, in a shaped run of `text_len` bytes, a caret `x` pixels into it
+/// goes to: before a cluster up to its middle, after it past that. A cluster's
+/// glyphs (a base and its marks) count as one.
+fn shaped_run_byte_at_x(
+    glyphs: impl Iterator<Item = (usize, f32)>,
+    text_len: usize,
+    x: f32,
+) -> usize {
+    let mut left = 0.0;
+    let mut current: Option<(usize, f32)> = None;
+    for (cluster, advance) in glyphs {
+        match current.as_mut() {
+            Some((current_cluster, width)) if *current_cluster == cluster => {
+                *width += advance;
+                continue;
+            }
+            Some((current_cluster, width)) => {
+                if x < left + *width / 2.0 {
+                    return *current_cluster;
+                }
+                left += *width;
+            }
+            None => {}
+        }
+        current = Some((cluster, advance));
+    }
+    match current {
+        Some((cluster, width)) if x < left + width / 2.0 => cluster,
+        _ => text_len,
+    }
 }
 
 /// Per-byte colours for a whole highlighted line: `colors[b]` is the colour of
@@ -23669,9 +23928,10 @@ mod tests {
         build_right_sidebar_file_index, clip_note_texture, copy_entries_blocking,
         copy_file_chunked, dir_load_changes_cache, download_name_candidates,
         encode_pasted_image_png, failed_folder_download, file_preview_close_requires_reflow,
-        file_release_action, file_row_placement, full_line_colors_by_byte,
-        image_pixels_within_preview_budget, load_dir_cache_for_test, load_file_preview,
-        load_file_preview_image, naturalish_cmp, note_code_highlight_key,
+        file_preview_horizontal_scroll_max, file_preview_line_origin,
+        file_preview_unmeasured_chars, file_release_action, file_row_placement,
+        full_line_colors_by_byte, image_pixels_within_preview_budget, load_dir_cache_for_test,
+        load_file_preview, load_file_preview_image, naturalish_cmp, note_code_highlight_key,
         note_code_highlight_lines, note_code_row_height, note_image_display_size,
         note_longest_word, note_open_pending_for_vault, note_release_action, note_run_pieces,
         note_wrap_breaks, open_with_candidate_allowed, pasted_image_file_name, path_key,
@@ -23681,15 +23941,17 @@ mod tests {
         rescan_plan, resolve_drop_destination, resolve_local_drop_target,
         resolve_remote_drop_target, right_sidebar_file_browse_rows_from_dir_cache,
         right_sidebar_file_row_metrics, right_sidebar_open_with_cache_key, sanitize_preview_text,
-        search_right_sidebar_file_index, sidebar_message_layout, sidebar_row_element_visible,
-        snippet_cursor_visible, sorted_open_with_candidates, spawn_pasted_image_staging,
-        stage_pasted_image, terminal_paste_snapshot_mismatch, virtual_note_line_range,
+        search_right_sidebar_file_index, shaped_run_byte_at_x, shaped_run_x_at_byte,
+        sidebar_message_layout, sidebar_row_element_visible, snippet_cursor_visible,
+        sorted_open_with_candidates, spawn_pasted_image_staging, stage_pasted_image,
+        terminal_paste_snapshot_mismatch, virtual_note_line_range,
         visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
-        wrapping_note_table_columns, FileReleaseAction, FileRowPlacement, NoteCodeHighlightEntry,
-        NoteCodeHighlightState, NoteGlyphWidthStore, NoteGlyphWidths, NoteReleaseAction,
-        NoteVaultProblem, RemoteLeaseFailureDisposition, TerminalPasteSnapshotMismatch,
-        TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES, LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS,
-        NOTE_CODE_HEADER_HEIGHT,
+        wrapping_note_table_columns, FilePreviewLongLine, FileReleaseAction, FileRowPlacement,
+        NoteCodeHighlightEntry, NoteCodeHighlightState, NoteGlyphWidthStore, NoteGlyphWidths,
+        NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
+        TerminalPasteSnapshotMismatch, TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES,
+        LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
+        NOTE_GLYPH_WIDTHS_MAX_CHARS,
     };
     use super::{FolderProblem, RightSidebarFileDirCache, RightSidebarFileDirEntry};
     use crate::markdown_editor::{NoteLineGeometry, ProjectedCodeBlock};
@@ -26053,6 +26315,109 @@ mod tests {
         // 好 at byte 5.
         assert_eq!(colors[2], green);
         assert_eq!(colors[5], blue);
+    }
+
+    #[test]
+    fn file_preview_scrolls_sideways_by_whole_pixels_to_the_widest_line() {
+        // Every line starts at the same pixel, whatever its characters.
+        assert_eq!(file_preview_line_origin(100, 0.0), 100.0);
+        assert_eq!(file_preview_line_origin(100, 10.4), 90.0);
+        assert_eq!(file_preview_line_origin(100, 10.6), 89.0);
+        assert_eq!(file_preview_horizontal_scroll_max(300.0, 200.0, 0.0), 100.0);
+        assert_eq!(file_preview_horizontal_scroll_max(150.0, 200.0, 0.0), 0.0);
+        // Room past the end, but only for a file that scrolls at all.
+        assert_eq!(
+            file_preview_horizontal_scroll_max(300.0, 200.0, 20.0),
+            120.0
+        );
+        assert_eq!(file_preview_horizontal_scroll_max(195.0, 200.0, 20.0), 0.0);
+        // Under a pixel over the edge is nothing to scroll for.
+        assert_eq!(file_preview_horizontal_scroll_max(200.5, 200.0, 20.0), 0.0);
+    }
+
+    #[test]
+    fn a_long_preview_line_is_cut_on_graphemes_and_placed_by_the_width_table() {
+        // 10px an ASCII character, 20px a wide one.
+        let widths = test_glyph_widths();
+        let long_line = FilePreviewLongLine::new(&widths, &"a".repeat(600));
+        assert_eq!(
+            long_line.bounds,
+            vec![(0, 0), (256, 256), (512, 512), (600, 600)]
+        );
+        assert_eq!(long_line.starts, vec![0.0, 2560.0, 5120.0, 6000.0]);
+        assert_eq!(long_line.width(), 6000.0);
+
+        // An accent due at the boundary stays with its letter.
+        let text = format!("{}e\u{301}{}", "a".repeat(255), "b".repeat(300));
+        let long_line = FilePreviewLongLine::new(&widths, &text);
+        assert_eq!(long_line.bounds[1], (257, 258));
+        assert_eq!(long_line.starts[1], 2560.0);
+
+        // A Chinese character is one column, three bytes and a wide width.
+        let text = format!("{}中{}", "a".repeat(255), "b".repeat(300));
+        let long_line = FilePreviewLongLine::new(&widths, &text);
+        assert_eq!(long_line.bounds[1], (256, 258));
+        assert_eq!(long_line.starts[1], 2570.0);
+        assert_eq!(long_line.width(), 5570.0);
+    }
+
+    #[test]
+    fn a_long_preview_line_shows_only_the_chunks_in_view() {
+        // Chunks 2560px wide, starting at 0, 2560, 5120 and 7680.
+        let long_line = FilePreviewLongLine::new(&test_glyph_widths(), &"a".repeat(1000));
+        assert_eq!(long_line.visible_chunks(0.0, 400.0), 0..1);
+        assert_eq!(long_line.visible_chunks(2400.0, 400.0), 0..2);
+        // A chunk ending where the view starts is not in it.
+        assert_eq!(long_line.visible_chunks(2560.0, 400.0), 1..2);
+        assert_eq!(long_line.visible_chunks(7600.0, 400.0), 2..4);
+        assert_eq!(long_line.visible_chunks(9800.0, 400.0), 3..4);
+        // Past the line's end, nothing.
+        assert!(long_line.visible_chunks(10000.0, 400.0).is_empty());
+    }
+
+    #[test]
+    fn file_preview_measures_only_the_characters_the_table_lacks() {
+        let widths = test_glyph_widths();
+        let lines = preview_plain_lines_from_text("abc é 中文\nпривет");
+        let mut unmeasured = file_preview_unmeasured_chars(&widths, &lines, Some("ü"));
+        unmeasured.sort_unstable();
+        assert_eq!(unmeasured, vec!['ü', 'в', 'е', 'и', 'п', 'р', 'т']);
+
+        // All of them in one pass, up to what a table holds: more than one
+        // measuring's worth of private-use characters, and more than a table.
+        let many: String = (0xE000u32..0xF900).filter_map(char::from_u32).collect();
+        let lines = preview_plain_lines_from_text(&many);
+        assert_eq!(
+            file_preview_unmeasured_chars(&widths, &lines, None).len(),
+            NOTE_GLYPH_WIDTHS_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn shaped_run_maps_columns_and_carets_through_glyph_advances() {
+        // "abc" with uneven advances.
+        let glyphs = [(0, 5.0), (1, 10.0), (2, 5.0)];
+        assert_eq!(shaped_run_x_at_byte(glyphs.iter().copied(), 0), 0.0);
+        assert_eq!(shaped_run_x_at_byte(glyphs.iter().copied(), 1), 5.0);
+        assert_eq!(shaped_run_x_at_byte(glyphs.iter().copied(), 2), 15.0);
+        assert_eq!(shaped_run_x_at_byte(glyphs.iter().copied(), 3), 20.0);
+        // A caret goes before a glyph up to its middle and after it past.
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 3, -5.0), 0);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 3, 2.4), 0);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 3, 2.6), 1);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 3, 9.9), 1);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 3, 10.1), 2);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 3, 19.0), 3);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 3, 100.0), 3);
+        assert_eq!(shaped_run_byte_at_x(std::iter::empty(), 0, 4.0), 0);
+
+        // "e" + U+0301 + "x": the accent is shaped into the e's cluster and the
+        // two glyphs count as one.
+        let glyphs = [(0, 6.0), (0, 0.0), (3, 6.0)];
+        assert_eq!(shaped_run_x_at_byte(glyphs.iter().copied(), 3), 6.0);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 4, 2.9), 0);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 4, 3.1), 3);
+        assert_eq!(shaped_run_byte_at_x(glyphs.iter().copied(), 4, 9.1), 4);
     }
 
     #[test]
