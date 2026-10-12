@@ -17,8 +17,9 @@ use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter}
 
 /// Maximum source size that GUI consumers should submit for highlighting.
 ///
-/// The engine itself accepts larger inputs so future editors can choose their
-/// own policy, but the current Preview and Note integrations use this bound.
+/// The engine itself accepts larger inputs so editors can choose their own
+/// policy: the Note's code blocks keep to this bound, while the file preview
+/// colours all it reads, in the background.
 pub const DEFAULT_HIGHLIGHT_BYTE_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

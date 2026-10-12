@@ -1137,26 +1137,31 @@ pub(crate) enum RightSidebarFileIndexStatus {
     Failed(String),
 }
 
-#[derive(Clone)]
-pub(crate) struct RightSidebarFilePreviewSpan {
-    pub text: String,
-    pub char_count: usize,
-    pub color: LinearRgba,
+/// Where a stretch of one colour in a preview line ends, as a byte offset in
+/// the line, and its syntax class; none for plain text. Eight bytes, where a
+/// copy of the text with its colour took several times the text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RightSidebarFilePreviewRun {
+    pub end: u32,
+    pub kind: Option<thinkterm_syntax::HighlightKind>,
 }
 
 #[derive(Clone)]
 pub(crate) struct RightSidebarFilePreviewLine {
     pub plain: String,
     pub char_count: usize,
-    pub spans: Vec<RightSidebarFilePreviewSpan>,
+    /// The line's colours, left to right. Empty for plain text: a plain
+    /// file, a line holding nothing to colour, or one not coloured yet.
+    pub runs: Vec<RightSidebarFilePreviewRun>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RightSidebarFilePreviewSliceCacheKey {
     pub generation: u64,
     pub line_index: usize,
-    pub start_column: usize,
-    pub columns: usize,
+    /// The chunk's byte range in the line.
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3365,8 +3370,15 @@ pub struct TermWindow {
     /// stripping): the display lines are wrong for the clipboard.
     right_sidebar_file_preview_raw_text: Option<String>,
     /// Bumped whenever the preview's text changes, so rendered Markdown knows
-    /// to rebuild.
+    /// to rebuild and colours worked out for an older text are dropped.
     right_sidebar_file_preview_text_generation: u64,
+    /// Whether the preview's lines are coloured, and for a dark theme or a
+    /// light one; none for a file shown plain.
+    right_sidebar_file_preview_syntax_dark: Option<bool>,
+    /// Colours put off while the file shows as rendered Markdown: the text
+    /// generation and text they are for, and its language. Worked out once
+    /// its source shows.
+    right_sidebar_file_preview_pending_colours: Option<(u64, thinkterm_syntax::LanguageId, String)>,
     /// The preview font's character widths and the widest line by them,
     /// worked out on the first paint after the lines or the font change.
     right_sidebar_file_preview_widths:
@@ -4917,6 +4929,8 @@ impl TermWindow {
             right_sidebar_file_preview_lines: Vec::new(),
             right_sidebar_file_preview_raw_text: None,
             right_sidebar_file_preview_text_generation: 0,
+            right_sidebar_file_preview_syntax_dark: None,
+            right_sidebar_file_preview_pending_colours: None,
             right_sidebar_file_preview_widths: None,
             right_sidebar_file_preview_image: None,
             right_sidebar_file_preview_message: None,

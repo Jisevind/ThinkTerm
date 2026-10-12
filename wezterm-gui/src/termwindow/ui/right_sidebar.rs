@@ -40,9 +40,9 @@ use crate::termwindow::{
     NoteEditorCommand, PanelId, PendingLocalCopy, PendingRemoteConfirm, RightSidebarFileCharBag,
     RightSidebarFileDirCache, RightSidebarFileDirEntry, RightSidebarFileField,
     RightSidebarFileIndex, RightSidebarFileIndexEntry, RightSidebarFileIndexStatus,
-    RightSidebarFilePreviewImage, RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
-    RightSidebarFilePreviewSelectionPoint, RightSidebarFilePreviewSliceCacheKey,
-    RightSidebarFilePreviewSpan, RightSidebarFileTreeRow, RightSidebarFileView,
+    RightSidebarFilePreviewImage, RightSidebarFilePreviewLine, RightSidebarFilePreviewRun,
+    RightSidebarFilePreviewSelection, RightSidebarFilePreviewSelectionPoint,
+    RightSidebarFilePreviewSliceCacheKey, RightSidebarFileTreeRow, RightSidebarFileView,
     RightSidebarFileViewState, RightSidebarInputLayout, RightSidebarMode,
     RightSidebarNoteImageSource, RightSidebarNoteTableLayout, RightSidebarNoteView,
     RightSidebarOpenWithCacheEntry, RightSidebarSnippetField, RightSidebarSnippetView,
@@ -417,7 +417,14 @@ fn remote_lease_failure_disposition(
     }
 }
 
-const FILE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
+// How much of a file the preview reads, colours and lets scroll: 1.5 MiB,
+// which takes in nearly any source file whole. The truncation note in
+// every locale names it.
+const FILE_PREVIEW_MAX_BYTES: usize = 1536 * 1024;
+// A file up to this size is coloured as it is read, in some tens of
+// milliseconds: browsing small files never shows one plain first. A larger
+// one shows plain and takes its colours when they are worked out.
+const FILE_PREVIEW_COLOUR_AT_ONCE_BYTES: usize = 64 * 1024;
 const EMPTY_FILE_MESSAGE: &str = "Empty file";
 fn right_sidebar_arg(id: &'static str, name: &'static str, value: impl Into<String>) -> String {
     let mut args = FluentArgs::new();
@@ -1975,6 +1982,19 @@ struct RightSidebarLoadedFilePreview {
     /// The file's modification time and length as read, for an edited
     /// preview to tell another writer's later change from its own text.
     disk_stamp: Option<(std::time::SystemTime, u64)>,
+    colours: FilePreviewColours,
+}
+
+/// What colours a text preview's lines.
+enum FilePreviewColours {
+    /// Nothing: a file with no language to colour.
+    Plain,
+    /// The lines carry their colours already: a file small enough to colour
+    /// as it is read, so it never shows plain first.
+    Done,
+    /// The text the lines were cut from and its language, to colour them by
+    /// in the background once they show.
+    Later(LanguageId, String),
 }
 
 #[derive(Debug, Clone)]
@@ -3936,11 +3956,10 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_generation =
             self.right_sidebar_file_preview_generation.wrapping_add(1);
         let generation = self.right_sidebar_file_preview_generation;
-        self.right_sidebar_file_preview_highlight_cancel
-            .store(1, AtomicOrdering::Relaxed);
-        self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
-        let highlight_cancel = Arc::clone(&self.right_sidebar_file_preview_highlight_cancel);
+        let highlight_cancel = self.restart_right_sidebar_file_preview_highlight();
+        self.right_sidebar_file_preview_pending_colours = None;
         self.right_sidebar_file_preview_lines.clear();
+        self.right_sidebar_file_preview_syntax_dark = None;
         self.set_right_sidebar_file_preview_raw_text(None);
         self.right_sidebar_file_preview_widths = None;
         self.clear_right_sidebar_file_preview_slice_cache();
@@ -3956,17 +3975,12 @@ impl crate::TermWindow {
                 Some(crate::i18n::tr("right-window-unavailable"));
             return;
         };
-        let use_dark_syntax_theme = matches!(
-            crate::native_settings::effective_appearance(),
-            window::Appearance::Dark | window::Appearance::DarkHighContrast
-        );
         let load_path = path.clone();
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
-                Ok(load_right_sidebar_file_preview_with_cancellation(
+                Ok(load_right_sidebar_file_preview_from_path(
                     &load_path,
-                    use_dark_syntax_theme,
-                    Some(highlight_cancel.as_ref()),
+                    &highlight_cancel,
                 ))
             })
             .await
@@ -3981,6 +3995,7 @@ impl crate::TermWindow {
                 truncated: false,
                 raw_text: None,
                 disk_stamp: None,
+                colours: FilePreviewColours::Plain,
             });
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 term_window.apply_right_sidebar_file_preview_result(generation, path, result);
@@ -4048,10 +4063,10 @@ impl crate::TermWindow {
         self.right_sidebar_remote_files.clear_selection();
         self.right_sidebar_file_preview_generation =
             self.right_sidebar_file_preview_generation.wrapping_add(1);
-        self.right_sidebar_file_preview_highlight_cancel
-            .store(1, AtomicOrdering::Relaxed);
-        self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
+        self.restart_right_sidebar_file_preview_highlight();
+        self.right_sidebar_file_preview_pending_colours = None;
         self.right_sidebar_file_preview_lines.clear();
+        self.right_sidebar_file_preview_syntax_dark = None;
         self.set_right_sidebar_file_preview_raw_text(None);
         self.right_sidebar_file_preview_widths = None;
         self.clear_right_sidebar_file_preview_slice_cache();
@@ -4288,7 +4303,13 @@ impl crate::TermWindow {
         {
             return value;
         }
-        let colors = Rc::new(full_line_colors_by_byte(line));
+        let colors = Rc::new(preview_colors_by_byte(
+            line,
+            0,
+            line.plain.len(),
+            self.right_sidebar_file_preview_syntax_dark
+                .unwrap_or_default(),
+        ));
         {
             let mut cache = self
                 .right_sidebar_file_preview_line_color_cache
@@ -4367,6 +4388,9 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_message = result.message;
         self.right_sidebar_file_preview_truncated = result.truncated;
         self.right_sidebar_file_preview_disk_stamp = result.disk_stamp;
+        // After the message and image: with "loading" still up, rendered
+        // Markdown would not count as showing.
+        self.highlight_right_sidebar_file_preview(result.colours);
         self.right_sidebar_file_preview_selection = None;
         // When restoring a remembered preview, re-apply the saved scroll once the
         // lines arrive (clamped on paint); otherwise reset to the top.
@@ -4376,6 +4400,92 @@ impl crate::TermWindow {
             .unwrap_or((0.0, 0.0));
         self.right_sidebar_file_preview_scroll_offset = scroll;
         self.right_sidebar_file_preview_horizontal_offset = horizontal;
+        self.invalidate_window();
+    }
+
+    /// Stop colouring what the preview showed before, and hand out the token
+    /// that stops what colours it next.
+    fn restart_right_sidebar_file_preview_highlight(&mut self) -> Arc<AtomicUsize> {
+        self.right_sidebar_file_preview_highlight_cancel
+            .store(1, AtomicOrdering::Relaxed);
+        self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
+        Arc::clone(&self.right_sidebar_file_preview_highlight_cancel)
+    }
+
+    /// Settle the colours of the lines just shown. Ones still to come are
+    /// worked out in the background: the lines show plain until they come,
+    /// and they go on only if the text is still the one they were for.
+    fn highlight_right_sidebar_file_preview(&mut self, colours: FilePreviewColours) {
+        self.restart_right_sidebar_file_preview_highlight();
+        self.right_sidebar_file_preview_pending_colours = None;
+        let later = match colours {
+            FilePreviewColours::Plain => {
+                self.right_sidebar_file_preview_syntax_dark = None;
+                return;
+            }
+            FilePreviewColours::Done => None,
+            FilePreviewColours::Later(language, text) => Some((language, text)),
+        };
+        let dark = matches!(
+            crate::native_settings::effective_appearance(),
+            window::Appearance::Dark | window::Appearance::DarkHighContrast
+        );
+        // Plain text takes the theme's colour now, not when the colours come.
+        self.right_sidebar_file_preview_syntax_dark = Some(dark);
+        let Some((language, text)) = later else {
+            return;
+        };
+        let text_generation = self.right_sidebar_file_preview_text_generation;
+        // Rendered Markdown shows none of them: the source is coloured when
+        // it shows.
+        if self.right_sidebar_markdown_preview_rendering() {
+            self.right_sidebar_file_preview_pending_colours =
+                Some((text_generation, language, text));
+            return;
+        }
+        self.colour_right_sidebar_file_preview(text_generation, language, text);
+    }
+
+    /// Colour `text` in the background for the preview's text as of
+    /// `text_generation`: the colours go on only if it is still that text.
+    fn colour_right_sidebar_file_preview(
+        &mut self,
+        text_generation: u64,
+        language: LanguageId,
+        text: String,
+    ) {
+        let cancel = self.restart_right_sidebar_file_preview_highlight();
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let runs = promise::spawn::spawn_into_new_thread(move || {
+                Ok::<_, anyhow::Error>(preview_color_runs(language, &text, &cancel))
+            })
+            .await;
+            if let Ok(Some(runs)) = runs {
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.apply_right_sidebar_file_preview_colors(text_generation, runs);
+                })));
+            }
+        })
+        .detach();
+    }
+
+    fn apply_right_sidebar_file_preview_colors(
+        &mut self,
+        text_generation: u64,
+        runs: Vec<Vec<RightSidebarFilePreviewRun>>,
+    ) {
+        if text_generation != self.right_sidebar_file_preview_text_generation
+            || runs.len() != self.right_sidebar_file_preview_lines.len()
+        {
+            return;
+        }
+        for (line, runs) in self.right_sidebar_file_preview_lines.iter_mut().zip(runs) {
+            line.runs = runs;
+        }
+        self.clear_right_sidebar_file_preview_slice_cache();
         self.invalidate_window();
     }
 
@@ -17796,10 +17906,7 @@ impl crate::TermWindow {
         } else {
             FILE_PREVIEW_MAX_BYTES
         };
-        let use_dark_syntax_theme = matches!(
-            crate::native_settings::effective_appearance(),
-            window::Appearance::Dark | window::Appearance::DarkHighContrast
-        );
+        let highlight_cancel = self.restart_right_sidebar_file_preview_highlight();
         promise::spawn::spawn(async move {
             let bytes = backend.read_file(path.clone(), limit).await;
             drop(operation_lease);
@@ -17812,7 +17919,7 @@ impl crate::TermWindow {
                     Ok(remote_preview_from_bytes(
                         &preview_path,
                         bytes,
-                        use_dark_syntax_theme,
+                        &highlight_cancel,
                     ))
                 })
                 .await
@@ -17823,6 +17930,7 @@ impl crate::TermWindow {
                     truncated: false,
                     raw_text: None,
                     disk_stamp: None,
+                    colours: FilePreviewColours::Plain,
                 }),
                 Err(err) => RightSidebarLoadedFilePreview {
                     lines: Vec::new(),
@@ -17831,6 +17939,7 @@ impl crate::TermWindow {
                     truncated: false,
                     raw_text: None,
                     disk_stamp: None,
+                    colours: FilePreviewColours::Plain,
                 },
             };
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -17889,6 +17998,7 @@ impl crate::TermWindow {
                 term_window.right_sidebar_file_preview_message = result.message;
                 term_window.right_sidebar_file_preview_truncated = result.truncated;
                 term_window.clear_right_sidebar_file_preview_slice_cache();
+                term_window.highlight_right_sidebar_file_preview(result.colours);
                 term_window.right_sidebar_remote_files.transition(
                     RemoteFilesEvent::PreviewFinished {
                         generation,
@@ -19292,6 +19402,13 @@ impl crate::TermWindow {
         } else if let Some(image) = self.right_sidebar_file_preview_image.clone() {
             self.paint_right_sidebar_file_preview_image(layers, metrics, &image)?;
         } else {
+            // The source shows now: colour it if that was put off while the
+            // file showed rendered.
+            if let Some((text_generation, language, text)) =
+                self.right_sidebar_file_preview_pending_colours.take()
+            {
+                self.colour_right_sidebar_file_preview(text_generation, language, text);
+            }
             let line_height = metrics.line_height;
             let visible_height =
                 self.right_sidebar_file_preview_effective_visible_height(metrics, ui_metrics);
@@ -19322,6 +19439,11 @@ impl crate::TermWindow {
             });
             let first_visible_line = (scroll_offset / line_height as f32).floor().max(0.0) as usize;
             let visible_line_count = visible_height / line_height + 3;
+            // Text with no colour of its own: the syntax theme's in a coloured
+            // file, the sidebar's in a plain one.
+            let text_foreground = self
+                .right_sidebar_file_preview_syntax_dark
+                .map_or(foreground, syntax_default_color);
             let visible_range = preview_visible_line_range(
                 self.right_sidebar_file_preview_lines.len(),
                 first_visible_line,
@@ -19334,7 +19456,7 @@ impl crate::TermWindow {
                     ui_font,
                     ui_metrics,
                     chrome,
-                    foreground,
+                    text_foreground,
                     muted_fg,
                     0,
                     &empty_line,
@@ -19359,7 +19481,7 @@ impl crate::TermWindow {
                         ui_font,
                         ui_metrics,
                         chrome,
-                        foreground,
+                        text_foreground,
                         muted_fg,
                         idx,
                         line,
@@ -19486,7 +19608,7 @@ impl crate::TermWindow {
         if let Some(profile) = profile.as_deref_mut().filter(|profile| profile.enabled) {
             profile.visible_lines += 1;
             profile.slice_requests += 1;
-            if line.spans.is_empty() {
+            if line.runs.is_empty() {
                 profile.plain_lines += 1;
             } else {
                 profile.highlighted_lines += 1;
@@ -19577,7 +19699,7 @@ impl crate::TermWindow {
         colors: bool,
     ) -> anyhow::Result<Vec<FilePreviewLineRun<'a>>> {
         let origin = file_preview_line_origin(text_x, horizontal_offset);
-        let colors = colors && !line.spans.is_empty();
+        let colors = colors && !line.runs.is_empty();
         let long_line = self
             .right_sidebar_file_preview_widths
             .as_ref()
@@ -19622,7 +19744,7 @@ impl crate::TermWindow {
         let mut runs = Vec::new();
         for chunk in long_line.visible_chunks(left, text_width as f32) {
             let (first_column, start) = long_line.bounds[chunk];
-            let (next_column, end) = long_line.bounds[chunk + 1];
+            let (_, end) = long_line.bounds[chunk + 1];
             let Some(text) = line.plain.get(start..end) else {
                 continue;
             };
@@ -19635,14 +19757,8 @@ impl crate::TermWindow {
             runs.push(FilePreviewLineRun {
                 text,
                 shaped,
-                colors: colors.then(|| {
-                    self.cached_colored_preview_slice(
-                        line_index,
-                        line,
-                        first_column,
-                        next_column - first_column,
-                    )
-                }),
+                colors: colors
+                    .then(|| self.cached_colored_preview_slice(line_index, line, start, end)),
                 first_column,
                 x: origin + long_line.starts[chunk],
                 scale: if shaped_width > 0.0 {
@@ -19879,29 +19995,29 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// The colours of a chunk of a highlighted line too long to colour whole,
-    /// one per byte, so a glyph's cluster finds its own.
+    /// The colours of bytes `start..end`, a chunk of a highlighted line too
+    /// long to colour whole, one per byte, so a glyph's cluster finds its own.
     fn cached_colored_preview_slice(
         &self,
         line_index: usize,
         line: &RightSidebarFilePreviewLine,
-        start_column: usize,
-        columns: usize,
+        start: usize,
+        end: usize,
     ) -> Rc<Vec<LinearRgba>> {
         let key = RightSidebarFilePreviewSliceCacheKey {
             generation: self.right_sidebar_file_preview_generation,
             line_index,
-            start_column,
-            columns,
+            start,
+            end,
         };
         self.cached_right_sidebar_file_preview_slice(key, || {
-            let (text, colors) = preview_visible_colored(line, start_column, columns);
-            Rc::new(
-                text.chars()
-                    .zip(colors)
-                    .flat_map(|(ch, color)| std::iter::repeat_n(color, ch.len_utf8()))
-                    .collect(),
-            )
+            Rc::new(preview_colors_by_byte(
+                line,
+                start,
+                end,
+                self.right_sidebar_file_preview_syntax_dark
+                    .unwrap_or_default(),
+            ))
         })
     }
 
@@ -21029,64 +21145,83 @@ fn sanitize_preview_text(text: &str) -> Cow<'_, str> {
 }
 
 #[cfg(test)]
-fn preview_lines_from_text(
-    path: &Path,
-    text: &str,
-    use_dark_theme: bool,
-) -> Vec<RightSidebarFilePreviewLine> {
-    preview_lines_from_text_with_cancellation(path, text, use_dark_theme, None)
+fn preview_lines_from_text(path: &Path, text: &str) -> Vec<RightSidebarFilePreviewLine> {
+    let (mut lines, highlight) = preview_lines_and_highlight(path, text);
+    if let Some((language, text)) = highlight {
+        let runs = preview_color_runs(language, &text, &AtomicUsize::new(0))
+            .expect("the preview text highlights");
+        for (line, runs) in lines.iter_mut().zip(runs) {
+            line.runs = runs;
+        }
+    }
+    lines
 }
 
-fn preview_lines_from_text_with_cancellation(
+/// `text` as preview lines, plain, and what colours them afterwards: its
+/// language and the text as the lines show it, when it has a language.
+fn preview_lines_and_highlight(
     path: &Path,
     text: &str,
-    use_dark_theme: bool,
-    cancellation: Option<&std::sync::atomic::AtomicUsize>,
-) -> Vec<RightSidebarFilePreviewLine> {
-    if cancellation
-        .map(|token| token.load(AtomicOrdering::Relaxed) != 0)
-        .unwrap_or(false)
-    {
-        return Vec::new();
-    }
+) -> (
+    Vec<RightSidebarFilePreviewLine>,
+    Option<(LanguageId, String)>,
+) {
     // Sanitize before highlighting so byte offsets in the highlight result line
     // up with what is actually drawn.
     let text = sanitize_preview_text(text);
-    let text = text.as_ref();
-    let mut highlight_end = text
-        .len()
-        .min(thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT);
-    while !text.is_char_boundary(highlight_end) {
-        highlight_end = highlight_end.saturating_sub(1);
-    }
-    let highlight_source = &text[..highlight_end];
-    let highlighted = match syntax_highlight_pool()
-        .install(|| thinkterm_syntax::highlight_path(path, highlight_source, cancellation))
-    {
-        Ok(Some(result)) => result,
-        Ok(None) => {
-            if cancellation
-                .map(|token| token.load(AtomicOrdering::Relaxed) != 0)
-                .unwrap_or(false)
-            {
-                return Vec::new();
-            }
-            return preview_plain_lines_from_text(text);
-        }
-        Err(err) => {
-            let was_cancelled = cancellation
-                .map(|token| token.load(AtomicOrdering::Relaxed) != 0)
-                .unwrap_or(false);
-            if !was_cancelled {
-                log::warn!("failed to highlight file preview: {err:#}");
-            } else {
-                return Vec::new();
-            }
-            return preview_plain_lines_from_text(text);
-        }
-    };
+    let lines = preview_plain_lines_from_text(&text);
+    let highlight =
+        thinkterm_syntax::detect_path(path, &text).map(|language| (language, text.into_owned()));
+    (lines, highlight)
+}
 
-    highlighted_preview_lines(text, &highlighted.spans, use_dark_theme)
+/// `text`'s preview lines and what colours them: at once for a file up to
+/// `FILE_PREVIEW_COLOUR_AT_ONCE_BYTES`, so it never shows plain first; later,
+/// in the background, for a larger one.
+fn preview_lines_and_colours(
+    path: &Path,
+    text: &str,
+    cancel: &AtomicUsize,
+) -> (Vec<RightSidebarFilePreviewLine>, FilePreviewColours) {
+    let (mut lines, highlight) = preview_lines_and_highlight(path, text);
+    let colours = match highlight {
+        None => FilePreviewColours::Plain,
+        Some((language, text)) if text.len() <= FILE_PREVIEW_COLOUR_AT_ONCE_BYTES => {
+            match preview_color_runs(language, &text, cancel) {
+                Some(runs) => {
+                    for (line, runs) in lines.iter_mut().zip(runs) {
+                        line.runs = runs;
+                    }
+                    FilePreviewColours::Done
+                }
+                None => FilePreviewColours::Plain,
+            }
+        }
+        Some((language, text)) => FilePreviewColours::Later(language, text),
+    };
+    (lines, colours)
+}
+
+/// The colour runs of each of `text`'s preview lines; none when it could not
+/// be highlighted or `cancel` was set.
+fn preview_color_runs(
+    language: LanguageId,
+    text: &str,
+    cancel: &AtomicUsize,
+) -> Option<Vec<Vec<RightSidebarFilePreviewRun>>> {
+    let cancelled = || cancel.load(AtomicOrdering::Relaxed) != 0;
+    match syntax_highlight_pool()
+        .install(|| thinkterm_syntax::highlight(language, text, Some(cancel)))
+    {
+        Ok(highlighted) if !cancelled() => Some(preview_line_runs(text, &highlighted.spans)),
+        Ok(_) => None,
+        Err(err) => {
+            if !cancelled() {
+                log::warn!("failed to highlight file preview: {err:#}");
+            }
+            None
+        }
+    }
 }
 
 fn syntax_highlight_pool() -> &'static rayon::ThreadPool {
@@ -21205,33 +21340,38 @@ fn note_code_colors(
 
 fn preview_plain_lines_from_text(text: &str) -> Vec<RightSidebarFilePreviewLine> {
     if text.is_empty() {
-        vec![preview_line_from_plain("")]
-    } else {
-        text.lines().map(preview_line_from_plain).collect()
+        return vec![preview_line_from_plain("")];
     }
+    let mut lines: Vec<_> = text.lines().map(preview_line_from_plain).collect();
+    // Collected by doubling, the list could keep up to as much room again
+    // spare, for as long as the preview shows.
+    lines.shrink_to_fit();
+    lines
 }
 
 fn preview_line_from_plain(line: &str) -> RightSidebarFilePreviewLine {
     RightSidebarFilePreviewLine {
         plain: line.to_string(),
         char_count: line.chars().count(),
-        spans: Vec::new(),
+        runs: Vec::new(),
     }
 }
 
-fn highlighted_preview_lines(
+/// Each preview line's colour runs from `highlights`, byte ranges in `text`.
+/// Plain text needs a run only before something coloured: what follows the
+/// last run is plain, and a line all plain has no runs at all.
+fn preview_line_runs(
     text: &str,
     highlights: &[HighlightSpan],
-    use_dark_theme: bool,
-) -> Vec<RightSidebarFilePreviewLine> {
+) -> Vec<Vec<RightSidebarFilePreviewRun>> {
     if text.is_empty() {
-        return vec![preview_line_from_plain("")];
+        return vec![Vec::new()];
     }
 
-    let default_color = syntax_default_color(use_dark_theme);
     let mut lines = Vec::new();
     let mut source_offset = 0usize;
     let mut span_index = 0usize;
+    // Cut as `preview_plain_lines_from_text` cuts, by `str::lines`.
     for raw_line in text.split_inclusive('\n') {
         let without_newline = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let line = without_newline
@@ -21242,64 +21382,50 @@ fn highlighted_preview_lines(
             span_index += 1;
         }
 
-        let mut cursor = source_offset;
-        let mut spans = Vec::new();
+        let mut runs = Vec::new();
         let mut index = span_index;
         while let Some(span) = highlights.get(index) {
             if span.range.start >= line_end {
                 break;
             }
-            let start = span
-                .range
-                .start
-                .max(cursor)
-                .max(source_offset)
-                .min(line_end);
+            let start = span.range.start.max(source_offset);
             let end = span.range.end.min(line_end);
-            if cursor < start {
-                push_preview_span(&mut spans, &text[cursor..start], default_color);
-            }
             if start < end {
-                push_preview_span(
-                    &mut spans,
-                    &text[start..end],
-                    syntax_color(span.kind, use_dark_theme),
-                );
-                cursor = end;
+                push_preview_run(&mut runs, start - source_offset, None);
+                push_preview_run(&mut runs, end - source_offset, Some(span.kind));
             }
             index += 1;
         }
-        if cursor < line_end {
-            push_preview_span(&mut spans, &text[cursor..line_end], default_color);
-        }
-
-        lines.push(RightSidebarFilePreviewLine {
-            plain: line.to_string(),
-            char_count: line.chars().count(),
-            spans,
-        });
+        runs.shrink_to_fit();
+        lines.push(runs);
         source_offset = source_offset.saturating_add(raw_line.len());
     }
     lines
 }
 
-fn push_preview_span(spans: &mut Vec<RightSidebarFilePreviewSpan>, text: &str, color: LinearRgba) {
-    if text.is_empty() {
+/// Carry `runs` on to byte `end` in `kind`: a last run of that kind grows,
+/// and nothing is added where `runs` already reach.
+fn push_preview_run(
+    runs: &mut Vec<RightSidebarFilePreviewRun>,
+    end: usize,
+    kind: Option<HighlightKind>,
+) {
+    if end <= runs.last().map_or(0, |run| run.end as usize) {
         return;
     }
-    let char_count = text.chars().count();
-    if let Some(previous) = spans.last_mut() {
-        if previous.color == color {
-            previous.text.push_str(text);
-            previous.char_count = previous.char_count.saturating_add(char_count);
-            return;
-        }
+    let end = end as u32;
+    match runs.last_mut() {
+        Some(last) if last.kind == kind => last.end = end,
+        _ => runs.push(RightSidebarFilePreviewRun { end, kind }),
     }
-    spans.push(RightSidebarFilePreviewSpan {
-        text: text.to_string(),
-        char_count,
-        color,
-    });
+}
+
+/// The colour of a run of `kind`, plain text being `kind` none.
+fn preview_run_color(kind: Option<HighlightKind>, use_dark_theme: bool) -> LinearRgba {
+    match kind {
+        Some(kind) => syntax_color(kind, use_dark_theme),
+        None => syntax_default_color(use_dark_theme),
+    }
 }
 
 fn syntax_default_color(use_dark_theme: bool) -> LinearRgba {
@@ -21463,55 +21589,42 @@ fn shaped_run_byte_at_x(
     }
 }
 
-/// Per-byte colours for a whole highlighted line: `colors[b]` is the colour of
-/// the character that byte `b` of `line.plain` belongs to. Spans concatenate to
-/// `line.plain`, so this aligns with a glyph's `cluster` (a byte offset) for the
-/// full-line horizontal-scroll fast path. Plain lines have no spans and use a
-/// uniform foreground instead.
-fn full_line_colors_by_byte(line: &RightSidebarFilePreviewLine) -> Vec<LinearRgba> {
-    let mut colors = Vec::with_capacity(line.plain.len());
-    for span in &line.spans {
-        for ch in span.text.chars() {
-            for _ in 0..ch.len_utf8() {
-                colors.push(span.color);
-            }
-        }
-    }
-    colors
-}
-
-/// Collect the visible horizontal window of a highlighted line into a single
-/// string plus a parallel per-character colour list, so the whole window can be
-/// shaped in one call. `start_column`/`max_columns` are in characters.
-fn preview_visible_colored(
+/// Per-byte colours for bytes `start..end` of a highlighted line:
+/// `colors[b - start]` is the colour of the character byte `b` of
+/// `line.plain` belongs to, so a glyph's `cluster` (a byte offset into what
+/// was shaped) finds its colour without a byte-to-character table. Plain
+/// lines have no runs and use a uniform foreground instead.
+fn preview_colors_by_byte(
     line: &RightSidebarFilePreviewLine,
-    start_column: usize,
-    max_columns: usize,
-) -> (String, Vec<LinearRgba>) {
-    let mut text = String::new();
-    let mut colors = Vec::new();
-    let mut skip = start_column;
-    let mut remaining = max_columns;
-    for span in &line.spans {
-        if remaining == 0 {
+    start: usize,
+    end: usize,
+    use_dark_theme: bool,
+) -> Vec<LinearRgba> {
+    let mut colors = Vec::with_capacity(end.saturating_sub(start));
+    // The first run reaching past `start`: a long line's chunk looks it up
+    // rather than walking every run before it.
+    let first = line.runs.partition_point(|run| run.end as usize <= start);
+    let mut run_start = first
+        .checked_sub(1)
+        .map_or(0, |previous| line.runs[previous].end as usize);
+    for run in &line.runs[first..] {
+        if run_start >= end {
             break;
         }
-        let span_columns = span.char_count;
-        if skip >= span_columns {
-            skip -= span_columns;
-            continue;
-        }
-        for ch in span.text.chars().skip(skip) {
-            if remaining == 0 {
-                break;
-            }
-            text.push(ch);
-            colors.push(span.color);
-            remaining -= 1;
-        }
-        skip = 0;
+        let run_end = (run.end as usize).min(end);
+        let count = run_end.saturating_sub(run_start.max(start));
+        colors.resize(
+            colors.len() + count,
+            preview_run_color(run.kind, use_dark_theme),
+        );
+        run_start = run.end as usize;
     }
-    (text, colors)
+    // Plain after the last run.
+    colors.resize(
+        end.saturating_sub(start),
+        syntax_default_color(use_dark_theme),
+    );
+    colors
 }
 
 fn preview_text_slice(text: &str, start_column: usize, max_columns: usize) -> Cow<'_, str> {
@@ -22546,10 +22659,11 @@ fn visible_file_row_range(
     start.min(row_count)..end.min(row_count)
 }
 
-fn load_right_sidebar_file_preview_with_cancellation(
+/// The file at `path` for the preview: its lines, and what colours them.
+/// `cancel` stops colouring a file nobody shows any more.
+fn load_right_sidebar_file_preview_from_path(
     path: &Path,
-    use_dark_syntax_theme: bool,
-    cancellation: Option<&AtomicUsize>,
+    cancel: &AtomicUsize,
 ) -> RightSidebarLoadedFilePreview {
     if is_preview_image_path(path) {
         return match load_file_preview_image(path) {
@@ -22560,6 +22674,7 @@ fn load_right_sidebar_file_preview_with_cancellation(
                 truncated: false,
                 raw_text: None,
                 disk_stamp: None,
+                colours: FilePreviewColours::Plain,
             },
             Err(err) => RightSidebarLoadedFilePreview {
                 lines: Vec::new(),
@@ -22568,6 +22683,7 @@ fn load_right_sidebar_file_preview_with_cancellation(
                 truncated: false,
                 raw_text: None,
                 disk_stamp: None,
+                colours: FilePreviewColours::Plain,
             },
         };
     }
@@ -22583,10 +22699,10 @@ fn load_right_sidebar_file_preview_with_cancellation(
     {
         message = None;
     }
-    let lines = if message.is_none() {
-        preview_lines_from_text_with_cancellation(path, &text, use_dark_syntax_theme, cancellation)
+    let (lines, colours) = if message.is_none() {
+        preview_lines_and_colours(path, &text, cancel)
     } else {
-        Vec::new()
+        (Vec::new(), FilePreviewColours::Plain)
     };
     let raw_text = message.is_none().then_some(text);
     RightSidebarLoadedFilePreview {
@@ -22596,6 +22712,7 @@ fn load_right_sidebar_file_preview_with_cancellation(
         truncated,
         raw_text,
         disk_stamp,
+        colours,
     }
 }
 
@@ -22619,7 +22736,7 @@ fn is_preview_image_extension(extension: Option<&str>) -> bool {
 fn remote_preview_from_bytes(
     path: &RemotePath,
     mut remote: RemoteFileBytes,
-    use_dark_syntax_theme: bool,
+    cancel: &AtomicUsize,
 ) -> RightSidebarLoadedFilePreview {
     if is_preview_image_extension(path.extension()) {
         if remote.truncated {
@@ -22633,6 +22750,7 @@ fn remote_preview_from_bytes(
                 truncated: true,
                 raw_text: None,
                 disk_stamp: None,
+                colours: FilePreviewColours::Plain,
             };
         }
         let encoded_bytes = remote.bytes.len();
@@ -22653,6 +22771,7 @@ fn remote_preview_from_bytes(
                     truncated: false,
                     raw_text: None,
                     disk_stamp: None,
+                    colours: FilePreviewColours::Plain,
                 }
             }
             Ok((width, height)) => RightSidebarLoadedFilePreview {
@@ -22665,6 +22784,7 @@ fn remote_preview_from_bytes(
                 truncated: false,
                 raw_text: None,
                 disk_stamp: None,
+                colours: FilePreviewColours::Plain,
             },
             Err(err) => RightSidebarLoadedFilePreview {
                 lines: Vec::new(),
@@ -22673,6 +22793,7 @@ fn remote_preview_from_bytes(
                 truncated: false,
                 raw_text: None,
                 disk_stamp: None,
+                colours: FilePreviewColours::Plain,
             },
         };
     }
@@ -22695,17 +22816,12 @@ fn remote_preview_from_bytes(
             ),
         }
     };
-    let lines = if message.is_none() {
+    let (lines, colours) = if message.is_none() {
         // The highlighter only uses the basename/extension; never pass the
         // remote path through local filesystem operations.
-        preview_lines_from_text_with_cancellation(
-            Path::new(path.file_name()),
-            &text,
-            use_dark_syntax_theme,
-            None,
-        )
+        preview_lines_and_colours(Path::new(path.file_name()), &text, cancel)
     } else {
-        Vec::new()
+        (Vec::new(), FilePreviewColours::Plain)
     };
     let raw_text = message.is_none().then_some(text);
     RightSidebarLoadedFilePreview {
@@ -22715,6 +22831,7 @@ fn remote_preview_from_bytes(
         truncated: remote.truncated,
         raw_text,
         disk_stamp: None,
+        colours,
     }
 }
 
@@ -23930,13 +24047,14 @@ mod tests {
         encode_pasted_image_png, failed_folder_download, file_preview_close_requires_reflow,
         file_preview_horizontal_scroll_max, file_preview_line_origin,
         file_preview_unmeasured_chars, file_release_action, file_row_placement,
-        full_line_colors_by_byte, image_pixels_within_preview_budget, load_dir_cache_for_test,
-        load_file_preview, load_file_preview_image, naturalish_cmp, note_code_highlight_key,
+        image_pixels_within_preview_budget, load_dir_cache_for_test, load_file_preview,
+        load_file_preview_image, naturalish_cmp, note_code_highlight_key,
         note_code_highlight_lines, note_code_row_height, note_image_display_size,
         note_longest_word, note_open_pending_for_vault, note_release_action, note_run_pieces,
         note_wrap_breaks, open_with_candidate_allowed, pasted_image_file_name, path_key,
-        pick_free_remote_name, preflight_local_copy, preview_line_count, preview_lines_from_text,
-        preview_plain_lines_from_text, preview_text_range, preview_visible_colored,
+        pick_free_remote_name, preflight_local_copy, preview_colors_by_byte, preview_line_count,
+        preview_line_runs, preview_lines_and_colours, preview_lines_from_text,
+        preview_plain_lines_from_text, preview_run_color, preview_text_range,
         preview_visible_line_range, problem_for_read_dir, remote_lease_failure_disposition,
         rescan_plan, resolve_drop_destination, resolve_local_drop_target,
         resolve_remote_drop_target, right_sidebar_file_browse_rows_from_dir_cache,
@@ -23946,11 +24064,11 @@ mod tests {
         sorted_open_with_candidates, spawn_pasted_image_staging, stage_pasted_image,
         terminal_paste_snapshot_mismatch, virtual_note_line_range,
         visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
-        wrapping_note_table_columns, FilePreviewLongLine, FileReleaseAction, FileRowPlacement,
-        NoteCodeHighlightEntry, NoteCodeHighlightState, NoteGlyphWidthStore, NoteGlyphWidths,
-        NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
-        TerminalPasteSnapshotMismatch, TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES,
-        LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
+        wrapping_note_table_columns, FilePreviewColours, FilePreviewLongLine, FileReleaseAction,
+        FileRowPlacement, NoteCodeHighlightEntry, NoteCodeHighlightState, NoteGlyphWidthStore,
+        NoteGlyphWidths, NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
+        TerminalPasteSnapshotMismatch, TerminalPasteTarget, FILE_PREVIEW_COLOUR_AT_ONCE_BYTES,
+        FILE_PREVIEW_MAX_BYTES, LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
         NOTE_GLYPH_WIDTHS_MAX_CHARS,
     };
     use super::{FolderProblem, RightSidebarFileDirCache, RightSidebarFileDirEntry};
@@ -23961,17 +24079,16 @@ mod tests {
     };
     use crate::termwindow::transfer_walk::{DestinationRoot, OverwritePolicy, TransferEntryKind};
     use crate::termwindow::{
-        RightSidebarFilePreviewLine, RightSidebarFilePreviewSpan, UIItem, UIItemType,
+        RightSidebarFilePreviewLine, RightSidebarFilePreviewRun, UIItem, UIItemType,
     };
     use crate::utilsprites::RenderMetrics;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use wezterm_font::units::PixelLength;
-    use window::color::LinearRgba;
     use window::Size;
 
     /// Too short for a line plus its insets still shows the first line: the
@@ -26203,26 +26320,26 @@ mod tests {
     #[test]
     fn preview_lines_from_text_highlights_known_file_types() {
         let path = std::path::Path::new("main.rs");
-        let lines = preview_lines_from_text(path, "fn main() {}", true);
+        let lines = preview_lines_from_text(path, "fn main() {}");
 
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].plain, "fn main() {}");
-        assert!(!lines[0].spans.is_empty());
+        assert!(!lines[0].runs.is_empty());
     }
 
     #[test]
     fn preview_lines_from_text_highlights_python_files() {
         let path = std::path::Path::new("script.py");
-        let lines = preview_lines_from_text(path, "def main():\n    return 1", true);
+        let lines = preview_lines_from_text(path, "def main():\n    return 1");
 
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].plain, "def main():");
-        assert!(!lines[0].spans.is_empty());
+        assert!(!lines[0].runs.is_empty());
         let colors: HashSet<_> = lines[0]
-            .spans
+            .runs
             .iter()
-            .map(|span| {
-                let color = span.color.to_srgb().to_tuple_rgba();
+            .map(|run| {
+                let color = preview_run_color(run.kind, true).to_srgb().to_tuple_rgba();
                 (
                     (color.0 * 255.0).round() as u8,
                     (color.1 * 255.0).round() as u8,
@@ -26242,79 +26359,105 @@ mod tests {
         let plain = preview_plain_lines_from_text("ab你好cd");
         assert_eq!(plain[0].char_count, 6);
 
-        let highlighted =
-            preview_lines_from_text(std::path::Path::new("script.py"), "def 你好():", true);
+        let highlighted = preview_lines_from_text(std::path::Path::new("script.py"), "def 你好():");
         let line = &highlighted[0];
         assert_eq!(line.char_count, line.plain.chars().count());
-        assert_eq!(
-            line.spans.iter().map(|span| span.char_count).sum::<usize>(),
-            line.char_count
-        );
+        // Runs end in order, inside the line, on character boundaries.
+        let mut previous = 0;
+        for run in &line.runs {
+            let end = run.end as usize;
+            assert!(previous < end && end <= line.plain.len());
+            assert!(line.plain.is_char_boundary(end));
+            previous = end;
+        }
     }
 
     #[test]
-    fn preview_visible_colored_slices_by_character_columns() {
-        let green = LinearRgba::with_components(0.0, 1.0, 0.0, 1.0);
-        let blue = LinearRgba::with_components(0.0, 0.0, 1.0, 1.0);
+    fn preview_colors_follow_runs_over_a_byte_range() {
+        use thinkterm_syntax::HighlightKind;
+        // "ab你好cd": a=0 b=1 你=2..5 好=5..8 c=8 d=9, ten bytes. A keyword to
+        // byte 5, plain to 8, a string to 9, and plain after the last run.
         let line = RightSidebarFilePreviewLine {
             plain: "ab你好cd".to_string(),
             char_count: 6,
-            spans: vec![
-                RightSidebarFilePreviewSpan {
-                    text: "ab".to_string(),
-                    char_count: 2,
-                    color: green,
+            runs: vec![
+                RightSidebarFilePreviewRun {
+                    end: 5,
+                    kind: Some(HighlightKind::Keyword),
                 },
-                RightSidebarFilePreviewSpan {
-                    text: "你好cd".to_string(),
-                    char_count: 4,
-                    color: blue,
-                },
-            ],
-        };
-
-        let (text, colors) = preview_visible_colored(&line, 2, 2);
-        assert_eq!(text, "你好");
-        assert_eq!(colors, vec![blue, blue]);
-    }
-
-    #[test]
-    fn full_line_colors_map_each_byte_to_its_span_color() {
-        let green = LinearRgba::with_components(0.0, 1.0, 0.0, 1.0);
-        let blue = LinearRgba::with_components(0.0, 0.0, 1.0, 1.0);
-        // "ab你好cd": a=0 b=1 你=2..5 好=5..8 c=8 d=9 -> 10 bytes; 你/好 are 3
-        // bytes each. The full-line h-scroll painter indexes this by a glyph's
-        // `cluster` (a byte offset), so each byte must carry its span's colour.
-        let line = RightSidebarFilePreviewLine {
-            plain: "ab你好cd".to_string(),
-            char_count: 6,
-            spans: vec![
-                RightSidebarFilePreviewSpan {
-                    text: "ab你".to_string(),
-                    char_count: 3,
-                    color: green,
-                },
-                RightSidebarFilePreviewSpan {
-                    text: "好cd".to_string(),
-                    char_count: 3,
-                    color: blue,
+                RightSidebarFilePreviewRun { end: 8, kind: None },
+                RightSidebarFilePreviewRun {
+                    end: 9,
+                    kind: Some(HighlightKind::String),
                 },
             ],
         };
+        let keyword = preview_run_color(Some(HighlightKind::Keyword), true);
+        let string = preview_run_color(Some(HighlightKind::String), true);
+        let plain = preview_run_color(None, true);
 
-        let colors = full_line_colors_by_byte(&line);
+        // The whole line: a glyph's cluster, a byte offset, finds its colour,
+        // 你 at byte 2 and 好 at byte 5 alike.
+        let colors = preview_colors_by_byte(&line, 0, line.plain.len(), true);
         assert_eq!(colors.len(), line.plain.len());
-        // bytes 0..5 (a, b, 你) -> green; 5..10 (好, c, d) -> blue.
-        for b in 0..5 {
-            assert_eq!(colors[b], green, "byte {b} should be green");
-        }
-        for b in 5..10 {
-            assert_eq!(colors[b], blue, "byte {b} should be blue");
-        }
-        // A multi-byte glyph's cluster maps to the right colour: 你 at byte 2,
-        // 好 at byte 5.
-        assert_eq!(colors[2], green);
-        assert_eq!(colors[5], blue);
+        assert_eq!(&colors[..5], &[keyword; 5]);
+        assert_eq!(&colors[5..8], &[plain; 3]);
+        assert_eq!(colors[8], string);
+        assert_eq!(colors[9], plain);
+
+        // A long line's chunk, indexed from its own start.
+        assert_eq!(
+            preview_colors_by_byte(&line, 5, 10, true),
+            vec![plain, plain, plain, string, plain]
+        );
+        // A line with no runs is plain throughout.
+        let bare = RightSidebarFilePreviewLine {
+            runs: Vec::new(),
+            ..line.clone()
+        };
+        assert_eq!(preview_colors_by_byte(&bare, 2, 5, true), vec![plain; 3]);
+    }
+
+    #[test]
+    fn preview_line_runs_cut_highlights_into_lines_and_merge_alike() {
+        use thinkterm_syntax::{HighlightKind, HighlightSpan};
+        let run = |end, kind| RightSidebarFilePreviewRun { end, kind };
+        let span = |range, kind| HighlightSpan { range, kind };
+
+        let text = "let a = 1;\n\nlet b;";
+        let runs = preview_line_runs(
+            text,
+            &[
+                span(0..3, HighlightKind::Keyword),
+                span(8..9, HighlightKind::Number),
+                // Next to the one before and alike: the two make one run.
+                span(9..10, HighlightKind::Number),
+                span(12..15, HighlightKind::Keyword),
+            ],
+        );
+        let keyword = Some(HighlightKind::Keyword);
+        assert_eq!(
+            runs,
+            vec![
+                vec![
+                    run(3, keyword),
+                    run(8, None),
+                    run(10, Some(HighlightKind::Number)),
+                ],
+                // A blank line, and plain text after a line's last colour,
+                // need no runs.
+                vec![],
+                vec![run(3, keyword)],
+            ]
+        );
+
+        // A comment over two lines colours each of them.
+        let comment = Some(HighlightKind::Comment);
+        assert_eq!(
+            preview_line_runs("/* a\nb */", &[span(0..9, HighlightKind::Comment)]),
+            vec![vec![run(4, comment)], vec![run(4, comment)]]
+        );
+        assert_eq!(preview_line_runs("", &[]), vec![Vec::new()]);
     }
 
     #[test]
@@ -26432,7 +26575,7 @@ mod tests {
         assert_eq!(plain[0].plain.chars().count(), line.chars().count());
         assert!(!plain[0].plain.contains("..."));
 
-        let highlighted = preview_lines_from_text(std::path::Path::new("min.css"), &line, true);
+        let highlighted = preview_lines_from_text(std::path::Path::new("min.css"), &line);
         assert_eq!(highlighted.len(), 1);
         assert_eq!(highlighted[0].plain.chars().count(), line.chars().count());
         assert!(!highlighted[0].plain.contains("..."));
@@ -26472,15 +26615,42 @@ mod tests {
     }
 
     #[test]
-    fn preview_highlight_limit_never_splits_utf8_or_truncates_text() {
-        let mut text = "a".repeat(thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT - 1);
-        text.push('你');
-        text.push_str("tail");
+    fn a_small_file_comes_coloured_and_a_large_one_takes_its_colours_later() {
+        let cancel = AtomicUsize::new(0);
+        let rust = std::path::Path::new("main.rs");
+        // Small: coloured as it is read, so it never shows plain first.
+        let (lines, colours) = preview_lines_and_colours(rust, "fn main() {}\n", &cancel);
+        assert!(matches!(colours, FilePreviewColours::Done));
+        assert!(!lines[0].runs.is_empty());
 
-        let lines = preview_lines_from_text(std::path::Path::new("large.py"), &text, true);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].plain, text);
-        assert_eq!(lines[0].char_count, text.chars().count());
+        // Large: shown plain, with what colours it later.
+        let large = "fn f() {}\n".repeat(FILE_PREVIEW_COLOUR_AT_ONCE_BYTES / 10 + 1);
+        let (lines, colours) = preview_lines_and_colours(rust, &large, &cancel);
+        assert!(lines.iter().all(|line| line.runs.is_empty()));
+        match colours {
+            FilePreviewColours::Later(_, text) => assert_eq!(text, large),
+            _ => panic!("a large file is coloured in the background"),
+        }
+
+        // No language: plain.
+        let (_, colours) =
+            preview_lines_and_colours(std::path::Path::new("notes.txt"), "plain", &cancel);
+        assert!(matches!(colours, FilePreviewColours::Plain));
+    }
+
+    #[test]
+    fn preview_colours_all_it_reads_past_the_old_highlight_limit() {
+        // Only the first 256 KiB used to be coloured; now a preview colours
+        // all it reads, and the text still comes through whole.
+        let line = "def f(): return 1\n";
+        let mut text = line.repeat(thinkterm_syntax::DEFAULT_HIGHLIGHT_BYTE_LIMIT / line.len() + 8);
+        text.push_str("def 你好(): pass");
+
+        let lines = preview_lines_from_text(std::path::Path::new("large.py"), &text);
+        let last = lines.last().unwrap();
+        assert_eq!(last.plain, "def 你好(): pass");
+        assert_eq!(last.char_count, last.plain.chars().count());
+        assert!(!last.runs.is_empty(), "the end of a long file is coloured");
     }
 
     #[test]
