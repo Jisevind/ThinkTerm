@@ -4832,7 +4832,7 @@ impl TermWindow {
             workspace_notification_pulse_started_at: None,
             right_sidebar_width: ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize),
             right_sidebar_collapsed: true,
-            right_sidebar_mode: RightSidebarMode::Snippets,
+            right_sidebar_mode: RightSidebarMode::initial(),
             right_sidebar_agents_scroll: 0.0,
             right_sidebar_agents_open_subtasks: HashSet::new(),
             right_sidebar_agents_fitted: HashMap::new(),

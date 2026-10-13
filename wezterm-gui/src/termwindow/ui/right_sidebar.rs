@@ -2036,6 +2036,17 @@ impl RightSidebarMode {
             .collect()
     }
 
+    /// The panel a new window's sidebar opens on: Agents while it is
+    /// offered, otherwise the first panel that is.
+    pub(crate) fn initial() -> Self {
+        let panels = Self::enabled_panels();
+        if panels.contains(&Self::Agents) {
+            Self::Agents
+        } else {
+            panels.first().copied().unwrap_or(Self::Snippets)
+        }
+    }
+
     /// Whether the sidebar offers anything at all. Hot: `right_sidebar_width`
     /// asks it, and that runs several times per frame and again on every
     /// pointer move over the tab bar -- so one settings read, no Vec, and it
