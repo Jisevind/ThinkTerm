@@ -23,6 +23,8 @@ ThinkTerm is an open-source **terminal with a built-in multiplexer, written in R
 
 **Platforms:** macOS · Linux · Windows · Web · TUI — iOS and Android in development.
 
+https://github.com/user-attachments/assets/7317e369-db86-463f-9379-a8a2ed4b602b
+
 <table>
   <tr>
     <td width="50%" align="center">
