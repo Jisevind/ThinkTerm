@@ -3025,7 +3025,14 @@ fn notify_system(workspace: &str, announcement: WorkAnnouncement, finished_after
     });
     let thread = thread_display_name_for_workspace(workspace).unwrap_or_else(|| workspace.to_string());
     let reason = crate::agent_status::workspace_reason(workspace).unwrap_or_default();
-    wezterm_toast_notification::persistent_toast_notification(&format!("{thread} · {state}"), &reason);
+    // A click brings the thread up.
+    let target =
+        crate::notification_click::NotificationTarget::Thread(workspace.to_string()).encode();
+    wezterm_toast_notification::persistent_toast_notification_with_target(
+        &format!("{thread} · {state}"),
+        &reason,
+        &target,
+    );
 }
 
 pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {

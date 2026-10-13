@@ -1017,6 +1017,9 @@ enum ShowWindowCommand {
     Normal,
     Minimize,
     Maximize,
+    /// Back from the taskbar to what it was -- maximized, if it was -- and
+    /// nothing for a window that is not minimized.
+    RestoreIfMinimized,
 }
 
 fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
@@ -1026,14 +1029,17 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
     promise::spawn::spawn(async move {
         unsafe {
             log::trace!("applying ShowWindowCommand {show:?}");
-            ShowWindow(
-                hwnd.0,
-                match show {
-                    ShowWindowCommand::Normal => SW_NORMAL,
-                    ShowWindowCommand::Minimize => SW_MINIMIZE,
-                    ShowWindowCommand::Maximize => SW_MAXIMIZE,
-                },
-            );
+            let command = match show {
+                ShowWindowCommand::Normal => Some(SW_NORMAL),
+                ShowWindowCommand::Minimize => Some(SW_MINIMIZE),
+                ShowWindowCommand::Maximize => Some(SW_MAXIMIZE),
+                ShowWindowCommand::RestoreIfMinimized => {
+                    (IsIconic(hwnd.0) != winapi::shared::minwindef::FALSE).then_some(SW_RESTORE)
+                }
+            };
+            if let Some(command) = command {
+                ShowWindow(hwnd.0, command);
+            }
         }
     })
     .detach();
@@ -1270,6 +1276,13 @@ impl WindowOps for Window {
             }
         })
         .detach();
+    }
+
+    fn focus_with_activation_token(&self, _token: Option<&str>) {
+        // Brought forward while minimized, a window stays minimized: restore
+        // it first. Both are scheduled, in this order.
+        schedule_show_window(self.0, ShowWindowCommand::RestoreIfMinimized);
+        self.focus();
     }
 
     fn set_frame_rect(&self, rect: ScreenRect) {

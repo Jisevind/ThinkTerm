@@ -951,6 +951,14 @@ pub trait WindowOps {
     fn restore(&self) {}
     fn focus(&self) {}
 
+    /// Bring the window forward for something another program handed on,
+    /// such as a clicked notification. Wayland lets a window take focus only
+    /// with the activation token that came with it; elsewhere this is
+    /// `focus`.
+    fn focus_with_activation_token(&self, _token: Option<&str>) {
+        self.focus()
+    }
+
     fn toggle_fullscreen(&self) {}
 
     fn config_did_change(&self, _config: &config::ConfigHandle) {}

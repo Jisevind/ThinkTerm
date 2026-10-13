@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use crate::ToastNotification as TN;
-use xml::escape::escape_str_pcdata;
+use xml::escape::{escape_str_attribute, escape_str_pcdata};
 
 use windows::core::{Error as WinError, IInspectable, Interface, HSTRING};
 use windows::Data::Xml::Dom::XmlDocument;
@@ -31,8 +31,14 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
         ""
     };
 
+    // A click on the toast itself activates it with these arguments.
+    let launch = match &toast.target {
+        Some(target) => format!(r#" launch="{}""#, escape_str_attribute(target)),
+        None => String::new(),
+    };
+
     xml.LoadXml(HSTRING::from(format!(
-        r#"<toast duration="long">
+        r#"<toast duration="long"{}>
         <visual>
             <binding template="ToastGeneric">
                 <text>{}</text>
@@ -41,6 +47,7 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
         </visual>
         {}
     </toast>"#,
+        launch,
         escape_str_pcdata(&toast.title),
         escape_str_pcdata(&toast.message),
         url_actions
@@ -58,6 +65,10 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
             if args == "show" {
                 if let Some(url) = toast.url.as_ref() {
                     wezterm_open_url::open_url(url);
+                }
+            } else if let Some(target) = toast.target.as_ref() {
+                if args.to_string_lossy() == *target {
+                    crate::clicked(target.clone(), None);
                 }
             }
 

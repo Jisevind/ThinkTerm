@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use smithay_client_toolkit::activation::{ActivationHandler, ActivationState, RequestData};
 use smithay_client_toolkit::compositor::{CompositorState, SurfaceData};
 use smithay_client_toolkit::data_device_manager::data_device::DataDevice;
 use smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource;
@@ -23,7 +24,7 @@ use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_data_device, delegate_output, delegate_pointer, delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor, delegate_xdg_shell, delegate_xdg_window, registry_handlers
+    delegate_activation, delegate_compositor, delegate_data_device, delegate_output, delegate_pointer, delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor, delegate_xdg_shell, delegate_xdg_window, registry_handlers
 };
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::GlobalList;
@@ -74,6 +75,9 @@ pub(super) struct WaylandState {
     pub(super) shm: Shm,
     pub(super) mem_pool: RefCell<SlotPool>,
     pub(super) kde_blur_manager: Option<OrgKdeKwinBlurManager>,
+    /// xdg-activation, when the compositor offers it: how a window comes
+    /// forward with a token another program handed on.
+    pub(super) activation: Option<ActivationState>,
 }
 
 impl WaylandState {
@@ -119,6 +123,7 @@ impl WaylandState {
             shm,
             mem_pool: RefCell::new(mem_pool),
             kde_blur_manager: blur_manager,
+            activation: ActivationState::bind(globals, qh).ok(),
         };
         Ok(wayland_state)
     }
@@ -174,6 +179,15 @@ delegate_xdg_shell!(WaylandState);
 delegate_xdg_window!(WaylandState);
 
 delegate_primary_selection!(WaylandState);
+
+// Tokens only come from elsewhere; none are asked for.
+impl ActivationHandler for WaylandState {
+    type RequestData = RequestData;
+
+    fn new_token(&mut self, _token: String, _data: &RequestData) {}
+}
+
+delegate_activation!(WaylandState);
 
 delegate_dispatch!(WaylandState: [ZwpTextInputManagerV3: GlobalData] => TextInputState);
 delegate_dispatch!(WaylandState: [ZwpTextInputV3: TextInputData] => TextInputState);

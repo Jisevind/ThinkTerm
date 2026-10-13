@@ -543,6 +543,7 @@ impl FallbackResolveInfo {
                         fallback_str.escape_unicode()
                     ),
                     url: Some(url.to_string()),
+                    target: None,
                     timeout: Some(Duration::from_secs(15)),
                 }
                 .show();

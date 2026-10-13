@@ -8286,6 +8286,36 @@ impl TermWindow {
         }
     }
 
+    /// Show this window's terminal for something about to be brought up in
+    /// it, as a clicked notification's pane: a page over the terminal goes
+    /// behind it, Live Overview closes, and a thread activation still under
+    /// way no longer takes the window over when it lands.
+    pub(crate) fn bring_terminal_forward(&mut self) {
+        self.close_live_overview();
+        self.set_content_view_active(false);
+        self.next_local_thread_activation_generation = self
+            .next_local_thread_activation_generation
+            .saturating_add(1)
+            .max(1);
+        self.local_thread_activation = None;
+        self.workspace_sidebar_pending_thread_selection = None;
+    }
+
+    /// Close Live Overview, when it is open. It covers the whole window and
+    /// keeps a recording of it: put behind the terminal instead, it would
+    /// linger stale, holding that recording.
+    pub(crate) fn close_live_overview(&mut self) {
+        let key = crate::termwindow::live_overview::LIVE_OVERVIEW_CONTENT_VIEW_KEY;
+        let overview = self
+            .content_views
+            .iter()
+            .find(|tab| tab.key.as_deref() == Some(key))
+            .map(|tab| tab.id);
+        if let Some(id) = overview {
+            self.close_content_view_by_id(id);
+        }
+    }
+
     pub(crate) fn activate_content_view(&mut self, id: ContentViewId) {
         if self
             .content_views

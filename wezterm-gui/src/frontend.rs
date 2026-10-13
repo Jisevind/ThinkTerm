@@ -330,37 +330,39 @@ impl GuiFrontEnd {
                 MuxNotification::PaneExited { .. } => {}
                 MuxNotification::Alert {
                     pane_id,
-                    alert:
-                        Alert::ToastNotification {
-                            title,
-                            body,
-                            focus: _,
-                        },
+                    alert: Alert::ToastNotification { title, body, focus },
                 } => {
                     let mux = Mux::get();
 
                     if let Some((_domain, window_id, tab_id)) = mux.resolve_pane_id(pane_id) {
                         let config = config::configuration();
+                        // Nothing focused yet, as in a window not clicked
+                        // since it opened, suppresses nothing.
+                        let focused = mux.resolve_focused_pane(&client_id);
+                        let show = match config.notification_handling {
+                            NotificationHandling::NeverShow => false,
+                            NotificationHandling::AlwaysShow => true,
+                            NotificationHandling::SuppressFromFocusedPane => {
+                                focused.map_or(true, |(_, _, _, f_pane)| f_pane != pane_id)
+                            }
+                            NotificationHandling::SuppressFromFocusedTab => {
+                                focused.map_or(true, |(_, _, f_tab, _)| f_tab != tab_id)
+                            }
+                            NotificationHandling::SuppressFromFocusedWindow => {
+                                focused.map_or(true, |(_, f_window, _, _)| f_window != window_id)
+                            }
+                        };
 
-                        if let Some((_fdomain, f_window, f_tab, f_pane)) =
-                            mux.resolve_focused_pane(&client_id)
-                        {
-                            let show = match config.notification_handling {
-                                NotificationHandling::NeverShow => false,
-                                NotificationHandling::AlwaysShow => true,
-                                NotificationHandling::SuppressFromFocusedPane => f_pane != pane_id,
-                                NotificationHandling::SuppressFromFocusedTab => f_tab != tab_id,
-                                NotificationHandling::SuppressFromFocusedWindow => {
-                                    f_window != window_id
-                                }
-                            };
-
-                            if show {
-                                let message = if title.is_none() { "" } else { &body };
-                                let title = title.as_ref().unwrap_or(&body);
-                                // FIXME: if notification.focus is true, we should do
-                                // something here to arrange to focus pane_id when the
-                                // notification is clicked
+                        if show {
+                            let message = if title.is_none() { "" } else { &body };
+                            let title = title.as_ref().unwrap_or(&body);
+                            if focus {
+                                // A click brings the pane up.
+                                let target =
+                                    crate::notification_click::NotificationTarget::Pane(pane_id)
+                                        .encode();
+                                persistent_toast_notification_with_target(title, message, &target);
+                            } else {
                                 persistent_toast_notification(title, message);
                             }
                         }
@@ -1206,6 +1208,7 @@ fn spawn_malloc_pressure_relief_thread() {}
 pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
     let front_end = GuiFrontEnd::try_new()?;
     FRONT_END.with(|f| *f.borrow_mut() = Some(Rc::clone(&front_end)));
+    crate::notification_click::install();
 
     let config_subscription = config::subscribe_to_config_reload({
         move || {

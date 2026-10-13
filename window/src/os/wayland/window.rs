@@ -490,6 +490,17 @@ impl WindowOps for WaylandWindow {
         });
     }
 
+    fn focus_with_activation_token(&self, token: Option<&str>) {
+        // Without a token the compositor would refuse: nothing to ask for.
+        let Some(token) = token.map(str::to_string) else {
+            return;
+        };
+        WaylandConnection::with_window_inner(self.0, move |inner| {
+            inner.activate(token);
+            Ok(())
+        });
+    }
+
     fn close(&self) {
         WaylandConnection::with_window_inner(self.0, |inner| {
             inner.close();
@@ -810,6 +821,18 @@ impl WaylandWindowInner {
             .frame_presented_flags
             .borrow_mut()
             .remove(&self.window_id);
+    }
+
+    fn activate(&mut self, token: String) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let conn = Connection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow();
+        match state.activation.as_ref() {
+            Some(activation) => activation.activate::<WaylandState>(window.wl_surface(), token),
+            None => log::debug!("the compositor has no xdg-activation to come forward with"),
+        }
     }
 
     fn show(&mut self) {

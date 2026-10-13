@@ -8,13 +8,20 @@ use objc2_foundation::{ns_string, NSArray, NSDictionary, NSError, NSSet, NSStrin
 use objc2_user_notifications::{
     UNAuthorizationOptions, UNMutableNotificationContent, UNNotification, UNNotificationAction,
     UNNotificationActionOptions, UNNotificationCategory, UNNotificationCategoryOptions,
-    UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
-    UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    UNNotificationDefaultActionIdentifier, UNNotificationPresentationOptions,
+    UNNotificationRequest, UNNotificationResponse, UNUserNotificationCenter,
+    UNUserNotificationCenterDelegate,
 };
 use std::sync::{LazyLock, Once};
 
 const NEEDS_SIGN: &str = "Note that the application must be code-signed \
                           for UNUserNotificationCenter to work";
+
+/// UNUserNotificationCenter throws, taking the whole process down, unless
+/// it runs from an app bundle; a development build is a bare binary.
+fn in_app_bundle() -> bool {
+    std::env::current_exe().is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
 
 fn ns_error_to_string(err: *mut NSError) -> String {
     if err.is_null() {
@@ -73,6 +80,14 @@ define_class!(
                 }
             }
 
+            // The notification itself was clicked, not one of its buttons.
+            if action.isEqualToString(UNNotificationDefaultActionIdentifier) {
+                let target = user_info.valueForKey(ns_string!("target"));
+                if let Some(Ok(target)) = target.map(|t| t.downcast::<NSString>()) {
+                    crate::clicked(target.to_string(), None);
+                }
+            }
+
             completion_handler.call(());
         }
     }
@@ -97,6 +112,9 @@ const CENTER: LazyLock<Retained<UNUserNotificationCenter>> =
     LazyLock::new(UNUserNotificationCenter::currentNotificationCenter);
 
 pub fn initialize() {
+    if !in_app_bundle() {
+        return;
+    }
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         CENTER.requestAuthorizationWithOptions_completionHandler(
@@ -148,6 +166,9 @@ pub fn initialize() {
 }
 
 pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
+    if !in_app_bundle() {
+        return Err("notifications need ThinkTerm.app; this is a bare binary".into());
+    }
     initialize();
     unsafe {
         log::debug!("show_notif center.delegate is {:?}", CENTER.delegate());
@@ -156,14 +177,24 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
         notif.setTitle(&NSString::from_str(&toast.title));
         notif.setBody(&NSString::from_str(&toast.message));
 
+        let mut keys = vec![];
+        let mut values = vec![];
         if let Some(url) = &toast.url {
-            let info =
-                NSDictionary::from_slices(&[ns_string!("url")], &[&*NSString::from_str(&url)]);
+            keys.push(ns_string!("url"));
+            values.push(NSString::from_str(url));
+            notif.setCategoryIdentifier(ns_string!("SHOW_URL_ACTION"));
+        }
+        if let Some(target) = &toast.target {
+            keys.push(ns_string!("target"));
+            values.push(NSString::from_str(target));
+        }
+        if !keys.is_empty() {
+            let values: Vec<&NSString> = values.iter().map(|value| &**value).collect();
+            let info = NSDictionary::from_slices(&keys, &values);
             notif.setUserInfo(
                 info.downcast_ref::<NSDictionary>()
                     .expect("is NSDictionary"),
             );
-            notif.setCategoryIdentifier(ns_string!("SHOW_URL_ACTION"));
         }
 
         let identifier = uuid::Uuid::new_v4().to_string();

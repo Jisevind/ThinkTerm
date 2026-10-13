@@ -2,7 +2,7 @@
 //! See <https://developer.gnome.org/notification-spec/>
 
 use crate::ToastNotification;
-use futures_util::stream::{abortable, StreamExt};
+use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use zbus::proxy;
@@ -58,6 +58,11 @@ trait Notifications {
 
     #[zbus(signal)]
     fn notification_closed(&self, nid: u32, reason: u32) -> zbus::Result<()>;
+
+    /// Sent just before `ActionInvoked`, by servers that implement version
+    /// 1.2 of the spec: the token that lets the app take focus for it.
+    #[zbus(signal)]
+    fn activation_token(&self, nid: u32, activation_token: String) -> zbus::Result<()>;
 }
 
 /// Timeout/expiration was reached
@@ -100,8 +105,21 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
         return Ok(());
     }
 
+    // Every signal of the service, in the order the server sent them, and
+    // from before the notification exists: the token comes just before the
+    // click it belongs to, and a stream per signal lost that order.
+    let mut signals = proxy.inner().receive_all_signals().await?;
+
     let mut hints = HashMap::new();
     hints.insert("urgency", Value::U8(2 /* Critical */));
+    let mut actions = vec![];
+    if notif.url.is_some() {
+        actions.extend(["show", "Show"]);
+    }
+    if notif.target.is_some() {
+        // The action of a click on the notification itself.
+        actions.extend(["default", "Show"]);
+    }
     let notification = proxy
         .notify(
             "ThinkTerm",
@@ -109,45 +127,49 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
             "com.roversx.thinkterm",
             &notif.title,
             &notif.message,
-            if notif.url.is_some() {
-                &["show", "Show"]
-            } else {
-                &[]
-            },
+            &actions,
             &hints,
             notif.timeout.map(|d| d.as_millis() as _).unwrap_or(0),
         )
         .await?;
 
-    let (mut invoked_stream, abort_invoked) = abortable(proxy.receive_action_invoked().await?);
-    let (mut closed_stream, abort_closed) = abortable(proxy.receive_notification_closed().await?);
-
-    futures_util::try_join!(
-        async {
-            while let Some(signal) = invoked_stream.next().await {
-                let args = signal.args()?;
-                if args.nid == notification {
-                    if let Some(url) = notif.url.as_ref() {
-                        wezterm_open_url::open_url(url);
-                        abort_closed.abort();
-                        break;
-                    }
+    let mut activation_token = None;
+    while let Some(signal) = signals.next().await {
+        let header = signal.header();
+        let Some(member) = header.member() else {
+            continue;
+        };
+        match member.as_str() {
+            "ActivationToken" => {
+                let (nid, token): (u32, String) = signal.body().deserialize()?;
+                if nid == notification {
+                    activation_token = Some(token);
                 }
             }
-            Ok::<(), zbus::Error>(())
-        },
-        async {
-            while let Some(signal) = closed_stream.next().await {
-                let args = signal.args()?;
-                let _reason = Reason::new(args.reason);
-                if args.nid == notification {
-                    abort_invoked.abort();
+            "ActionInvoked" => {
+                let (nid, action_key): (u32, String) = signal.body().deserialize()?;
+                if nid != notification {
+                    continue;
+                }
+                match (action_key.as_str(), &notif.url, &notif.target) {
+                    ("default", _, Some(target)) => {
+                        crate::clicked(target.clone(), activation_token.take())
+                    }
+                    (_, Some(url), _) => wezterm_open_url::open_url(url),
+                    _ => continue,
+                }
+                break;
+            }
+            "NotificationClosed" => {
+                let (nid, reason): (u32, u32) = signal.body().deserialize()?;
+                if nid == notification {
+                    let _reason = Reason::new(reason);
                     break;
                 }
             }
-            Ok(())
+            _ => {}
         }
-    )?;
+    }
 
     Ok(())
 }

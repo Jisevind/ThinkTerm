@@ -1112,10 +1112,10 @@ impl TermWindow {
                 crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
             }
             AgentPanelAction::Reveal(pane_id) => {
-                self.reveal_agent_pane(pane_id);
+                self.reveal_pane(pane_id);
             }
             AgentPanelAction::RevealElsewhere(pane_id) => {
-                self.reveal_agent_pane_elsewhere(pane_id, context);
+                self.reveal_pane_elsewhere(pane_id, context, None);
             }
             AgentPanelAction::ToggleSubtasks(pane_id) => {
                 if !self.right_sidebar_agents_open_subtasks.remove(&pane_id) {
@@ -1339,15 +1339,20 @@ impl TermWindow {
         }
     }
 
-    /// The agent lives in another window: deep-focus its tab and pane in
-    /// the owning mux window first, then activate the backing thread —
-    /// the same path a left-sidebar thread click takes, which switches
-    /// the workspace and brings the right window forward. The activated
-    /// window then comes up already pointing at the agent.
-    fn reveal_agent_pane_elsewhere(&mut self, pane_id: PaneId, context: &dyn WindowOps) {
+    /// The pane lives in a mux window this one does not show: deep-focus
+    /// its tab and pane in the owning mux window first, then open the
+    /// backing thread with [`Self::reveal_thread`]. The window that shows
+    /// it then comes up already pointing at the pane. Says whether that is
+    /// this window.
+    pub(crate) fn reveal_pane_elsewhere(
+        &mut self,
+        pane_id: PaneId,
+        context: &dyn WindowOps,
+        activation_token: Option<String>,
+    ) -> bool {
         let mux = Mux::get();
         let Some((_domain, window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
-            return;
+            return false;
         };
         let tab_idx = mux.get_window(window_id).and_then(|window| {
             (0..window.len()).find(|idx| {
@@ -1369,66 +1374,99 @@ impl TermWindow {
             .get_window(window_id)
             .map(|window| window.get_workspace().to_string())
         else {
-            return;
+            return false;
         };
-        if let Some(thread_id) = crate::workspace_threads::thread_id_for_workspace_any(&workspace) {
-            // Only a thread of this Space (or one it references) can be
-            // activated here; activate_workspace_thread's guard silently
-            // drops anything else, which used to make these clicks no-ops.
-            let home_space = crate::workspace_threads::thread_space_id(&thread_id);
-            let in_this_space = home_space.as_deref() == Some(self.active_space_id.as_str());
-            let referenced = !in_this_space
-                && crate::workspace_threads::thread_ref_exists(&self.active_space_id, &thread_id);
-            if in_this_space || referenced {
-                self.activate_workspace_thread(thread_id, context);
-                return;
-            }
-            let Some(home_space) = home_space else {
-                return;
-            };
-            // The thread belongs to another Space. Hand the activation to
-            // the window owning that Space, inside that window's own event
-            // loop -- the mux-window lookup would only find a window that
-            // is already displaying this very thread, which is exactly the
-            // case that cannot happen here. Same shape as live_overview's
-            // open_thread_response.
-            if let Some(target_owner_id) =
-                crate::workspace_threads::window_owner_for_space(&home_space)
-            {
-                let Some(target) = crate::frontend::front_end()
-                    .gui_window_for_recovery_slot(FrontendRecoverySlot::Window(target_owner_id))
-                else {
-                    return;
-                };
-                let target_window = target.window.clone();
-                target.window.notify(TermWindowNotif::Apply(Box::new(
-                    move |target_term_window| {
-                        // Ownership can change between the click and this
-                        // callback; do not steal a Space on a stale lookup.
-                        if crate::workspace_threads::window_owner_for_space(&home_space)
-                            != Some(target_owner_id)
-                            || target_term_window.frontend_recovery_slot()
-                                != FrontendRecoverySlot::Window(target_owner_id)
-                        {
-                            return;
-                        }
-                        target_term_window.activate_workspace_thread(thread_id, &target_window);
-                        target_window.focus();
-                    },
-                )));
-                return;
-            }
-            // No window owns that Space: navigate this one there, exactly
-            // as opening a windowless Space's thread does elsewhere.
-            if let Some(window) = self.window.clone() {
-                self.switch_space_to_thread(home_space, Some(thread_id), &window);
-            }
-        }
+        self.reveal_thread(&workspace, context, activation_token)
     }
 
-    /// Focus the tab and pane hosting this agent, when it lives in this
-    /// window.
-    fn reveal_agent_pane(&mut self, pane_id: PaneId) {
+    /// Activate the thread backing `workspace` -- the same path a
+    /// left-sidebar thread click takes, which switches the workspace and
+    /// brings the right window forward. Says whether this window now shows
+    /// it: a thread of a Space another window owns goes to that window,
+    /// which comes forward itself, with `activation_token` when one came.
+    pub(crate) fn reveal_thread(
+        &mut self,
+        workspace: &str,
+        context: &dyn WindowOps,
+        activation_token: Option<String>,
+    ) -> bool {
+        let Some(thread_id) = crate::workspace_threads::thread_id_for_workspace_any(workspace)
+        else {
+            return false;
+        };
+        // Only a thread of this Space (or one it references) can be
+        // activated here; activate_workspace_thread's guard silently
+        // drops anything else, which used to make these clicks no-ops.
+        let home_space = crate::workspace_threads::thread_space_id(&thread_id);
+        let in_this_space = home_space.as_deref() == Some(self.active_space_id.as_str());
+        let referenced = !in_this_space
+            && crate::workspace_threads::thread_ref_exists(&self.active_space_id, &thread_id);
+        if in_this_space || referenced {
+            // Activating hands the thread to a window already showing it,
+            // which comes forward itself; otherwise the thread opens here,
+            // at once or once its panes are up.
+            let handed_off = self.workspace_shown_elsewhere(workspace);
+            self.activate_workspace_thread(thread_id, context);
+            return !handed_off;
+        }
+        let Some(home_space) = home_space else {
+            return false;
+        };
+        // The thread belongs to another Space. Hand the activation to
+        // the window owning that Space, inside that window's own event
+        // loop -- the mux-window lookup would only find a window that
+        // is already displaying this very thread, which is exactly the
+        // case that cannot happen here. Same shape as live_overview's
+        // open_thread_response.
+        if let Some(target_owner_id) = crate::workspace_threads::window_owner_for_space(&home_space)
+        {
+            let Some(target) = crate::frontend::front_end()
+                .gui_window_for_recovery_slot(FrontendRecoverySlot::Window(target_owner_id))
+            else {
+                return false;
+            };
+            let target_window = target.window.clone();
+            target.window.notify(TermWindowNotif::Apply(Box::new(
+                move |target_term_window| {
+                    // Ownership can change between the click and this
+                    // callback; do not steal a Space on a stale lookup.
+                    if crate::workspace_threads::window_owner_for_space(&home_space)
+                        != Some(target_owner_id)
+                        || target_term_window.frontend_recovery_slot()
+                            != FrontendRecoverySlot::Window(target_owner_id)
+                    {
+                        return;
+                    }
+                    // Activating puts pages behind the terminal; Live
+                    // Overview has to close, or it lingers stale.
+                    target_term_window.close_live_overview();
+                    target_term_window.activate_workspace_thread(thread_id, &target_window);
+                    target_window.focus_with_activation_token(activation_token.as_deref());
+                },
+            )));
+            return false;
+        }
+        // No window owns that Space: navigate this one there, exactly
+        // as opening a windowless Space's thread does elsewhere.
+        if let Some(window) = self.window.clone() {
+            return self.switch_space_to_thread(home_space, Some(thread_id), &window);
+        }
+        false
+    }
+
+    /// Whether activating `workspace`'s thread here would hand it to another
+    /// window already showing it: the check `activate_workspace_thread` makes.
+    fn workspace_shown_elsewhere(&self, workspace: &str) -> bool {
+        crate::workspace_threads::window_to_show_in_workspace(workspace).is_some_and(|target| {
+            target != self.mux_window_id
+                && crate::frontend::front_end()
+                    .gui_window_for_mux_window(target)
+                    .is_some()
+        })
+    }
+
+    /// Focus the tab and pane `pane_id` is in, when it lives in this window.
+    pub(crate) fn reveal_pane(&mut self, pane_id: PaneId) {
         let mux = Mux::get();
         let Some((_domain, window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
             return;

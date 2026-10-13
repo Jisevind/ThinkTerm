@@ -54,6 +54,7 @@ mod markdown_editor;
 mod local_sessions;
 mod native_paths;
 mod native_settings;
+mod notification_click;
 mod overlay;
 mod perf;
 mod plugins;
