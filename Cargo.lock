@@ -10611,6 +10611,7 @@ dependencies = [
  "frecency",
  "futures",
  "hdrhistogram",
+ "hostname",
  "image",
  "k9",
  "lazy_static",

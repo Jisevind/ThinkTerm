@@ -247,6 +247,11 @@ impl TermWindow {
         // Between rows of a group: plain enough to stay out of the way, but
         // a shade firmer than the separator token, which vanished here.
         let divider = muted_fg.mul_alpha(0.22);
+        // The agent in the pane this window is on lies on a faint tint of
+        // the accent, so the list shows where you are; a hover still shows
+        // through it.
+        let active_pane_id = self.get_active_pane_no_overlay().map(|pane| pane.pane_id());
+        let active_tint = chrome.accent.mul_alpha(0.14);
         // A working description shimmers from the quieter grey up to white
         // (black on a light theme): from the brighter grey the light that
         // passed was too close to the text to see.
@@ -470,6 +475,21 @@ impl TermWindow {
                 )
                 .context("agent row hover")?;
             }
+            if Some(agent.pane_id) == active_pane_id {
+                self.fill_rounded_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(
+                        content_x as f32,
+                        band.visible_y as f32,
+                        content_width as f32,
+                        band.visible_height as f32,
+                    ),
+                    active_tint,
+                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 10.0,
+                )
+                .context("active agent row")?;
+            }
             let in_this_window = agent.window_id == Some(self.mux_window_id);
             self.ui_items.push(UIItem {
                 x: content_x,
@@ -609,6 +629,34 @@ impl TermWindow {
                 )?;
             }
             line_y += cell_height + line_gap;
+            // Which worktree: threads are named after tasks, and several
+            // can share a name while their checkouts differ.
+            if let Some(worktree) = agent.worktree.as_ref().filter(|_| layout.worktree) {
+                if visible(line_y, cell_height) {
+                    let branch_size = (cell_height * 4 / 5).max(1);
+                    let branch_y = line_y + (cell_height - branch_size) / 2;
+                    self.paint_sidebar_icon(
+                        layers,
+                        SvgIcon::GitBranch,
+                        text_x,
+                        branch_y,
+                        branch_size,
+                        muted_fg,
+                    )?;
+                    let label_x = text_x + branch_size + metrics.icon_gap / 2;
+                    self.paint_agent_text(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        &worktree.label(),
+                        label_x,
+                        line_y,
+                        text_right.saturating_sub(label_x),
+                        muted_fg,
+                    )?;
+                }
+                line_y += cell_height + line_gap;
+            }
 
             let Some(report) = agent.report.as_ref() else {
                 continue;
@@ -1775,6 +1823,8 @@ struct AgentRowLayout {
     height: usize,
     /// The description, with the waiting reason in front of it.
     message: bool,
+    /// The git worktree it is in, under the place.
+    worktree: bool,
     progress: Option<u8>,
     /// The sub-tasks the folded line counts; none when they are not shown.
     subtask_count: usize,
@@ -1793,10 +1843,13 @@ impl AgentRowLayout {
         line: usize,
         bar: usize,
     ) -> Self {
+        let worktree = agent.worktree.is_some();
+        let base_height = base_height + if worktree { line } else { 0 };
         let Some(report) = agent.report.as_ref() else {
             return Self {
                 height: base_height,
                 message: false,
+                worktree,
                 progress: None,
                 subtask_count: 0,
                 subtasks: 0,
@@ -1821,6 +1874,7 @@ impl AgentRowLayout {
         Self {
             height,
             message,
+            worktree,
             progress,
             subtask_count,
             subtasks,
@@ -2244,6 +2298,7 @@ mod tests {
             place: String::new(),
             workspace: String::new(),
             machine: String::new(),
+            worktree: None,
             report: Some(ProgramReport {
                 state: ProgramReportState::Working,
                 kind: None,
@@ -2294,6 +2349,7 @@ mod tests {
             place: place.to_string(),
             workspace: String::new(),
             machine: String::new(),
+            worktree: None,
             report: None,
             since_unix,
         }

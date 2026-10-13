@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod worktree;
+
 /// Clickable controls in the Agents panel; carried by
 /// `UIItemType::RightSidebarAgent`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +77,9 @@ pub(crate) struct AgentPaneStatus {
     /// `workspace_threads::thread_place_and_machine_for_workspace` keys it;
     /// empty for this device. Resolved with `place`, once per snapshot.
     pub machine: String,
+    /// The git worktree its directory is in, when that is on this device.
+    /// Resolved with `place`, once per snapshot.
+    pub worktree: Option<worktree::Worktree>,
     /// What the program said about itself with OSC 7501, when it did.
     pub report: Option<ProgramReport>,
     /// Unix seconds when `state` last changed, on the detecting host's
@@ -194,11 +199,34 @@ pub(crate) fn agent_panes() -> std::sync::Arc<Vec<AgentPaneStatus>> {
                 Some((window_id, workspace)) => (Some(*window_id), workspace.clone()),
                 None => (None, String::new()),
             };
-            let (place, machine) = if workspace.is_empty() {
-                (String::new(), String::new())
+            let thread = if workspace.is_empty() {
+                None
             } else {
                 crate::workspace_threads::thread_place_and_machine_for_workspace(&workspace)
-                    .unwrap_or_else(|| (workspace.clone(), String::new()))
+            };
+            // Only this device's own files can say which worktree it is in:
+            // for a thread of this device, with no ssh or mosh in front, in
+            // a shell that does not report another machine.
+            let here = thread
+                .as_ref()
+                .is_some_and(|(_, machine)| machine.is_empty())
+                && !pane.foreground_program().is_some_and(|program| {
+                    mux::foreground_program::is_remote_session_client(&program)
+                })
+                && pane
+                    .copy_user_vars()
+                    .get("WEZTERM_HOST")
+                    .is_none_or(|host| worktree::names_this_machine(host));
+            let worktree = if here {
+                pane.get_current_working_dir(mux::pane::CachePolicy::AllowStale)
+                    .and_then(|url| worktree::worktree_of(&url))
+            } else {
+                None
+            };
+            let (place, machine) = match thread {
+                Some(thread) => thread,
+                None if workspace.is_empty() => (String::new(), String::new()),
+                None => (workspace.clone(), String::new()),
             };
             let raw_title = pane.get_title();
             let title =
@@ -218,6 +246,7 @@ pub(crate) fn agent_panes() -> std::sync::Arc<Vec<AgentPaneStatus>> {
                 place,
                 workspace,
                 machine,
+                worktree,
                 report: status.report,
                 since_unix: status.since_unix,
             })
@@ -762,6 +791,7 @@ mod tests {
             place: place.to_string(),
             workspace: String::new(),
             machine: String::new(),
+            worktree: None,
             report: None,
             since_unix: 0,
         }

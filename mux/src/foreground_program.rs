@@ -375,7 +375,9 @@ fn choose(
     }
 }
 
-fn is_remote_session_client(program: &ForegroundProgram) -> bool {
+/// Whether `program` is a client whose terminal is on another machine:
+/// `ssh`, `mosh` and the like.
+pub fn is_remote_session_client(program: &ForegroundProgram) -> bool {
     let name = program.runs.as_deref().unwrap_or(&program.executable);
     REMOTE_SESSION_CLIENTS.contains(&name)
 }

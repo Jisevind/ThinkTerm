@@ -70,6 +70,7 @@ thinkterm-i18n.workspace = true
 frecency.workspace = true
 futures.workspace = true
 hdrhistogram.workspace = true
+hostname.workspace = true
 thinkterm-file-index.workspace = true
 image.workspace = true
 lazy_static.workspace = true
