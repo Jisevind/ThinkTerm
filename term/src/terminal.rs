@@ -72,8 +72,8 @@ pub enum Alert {
     /// A change to the progress bar state
     Progress(Progress),
     /// The shell reported (OSC 133) that a command finished, with the
-    /// status it gave, or `None` when a new prompt ended the command
-    /// without one.
+    /// status it gave, or `None` when it gave none: its end mark left the
+    /// status out, or a new prompt ended the command.
     CommandFinished {
         exit_code: Option<i32>,
     },

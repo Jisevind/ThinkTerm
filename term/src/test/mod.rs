@@ -415,6 +415,23 @@ fn shell_commands_follow_the_osc_133_marks() {
 }
 
 #[test]
+fn a_command_end_without_a_status_is_not_a_success() {
+    let mut term = TestTerm::new(4, 20, 0);
+    term.print("\x1b]133;A;aid=1\x07$ \x1b]133;B\x07\x1b]133;C;\x07");
+    // OSC 133;D may leave the status out: the command ended, how is unknown.
+    term.print("\x1b]133;D;aid=1\x07");
+    assert_eq!(term.shell_commands().finished, 1);
+    assert_eq!(term.shell_commands().last_exit, None);
+
+    // Without its status, a nested shell's end still keeps its aid, and is
+    // not taken for the end of the outer shell's command.
+    term.print("\x1b]133;A;aid=1\x07\x1b]133;C;\x07\x1b]133;A;aid=2\x07");
+    term.print("\x1b]133;C;\x07\x1b]133;D;aid=2\x07");
+    assert!(term.shell_commands().running);
+    assert_eq!(term.shell_commands().finished, 1);
+}
+
+#[test]
 fn application_palette_override_tracks_osc_set_query_and_reset() {
     let mut term = TestTerm::new(4, 8, 0);
     assert!(term.palette_override().is_none());

@@ -1106,7 +1106,7 @@ impl<'a> Performer<'a> {
                 FinalTermSemanticPrompt::CommandStatus { status, aid },
             ) => {
                 if self.counts_shell_mark(aid.as_deref()) {
-                    self.finish_shell_command(Some(status));
+                    self.finish_shell_command(status);
                 }
             }
 

@@ -746,7 +746,8 @@ pub enum FinalTermSemanticPrompt {
 
     /// Indicates the result of the command
     CommandStatus {
-        status: i32,
+        /// The command's exit status, which the shell may leave out.
+        status: Option<i32>,
         aid: Option<String>,
     },
 }
@@ -771,7 +772,13 @@ impl FinalTermSemanticPrompt {
         let mut params = HashMap::new();
         use core::convert::TryInto;
 
-        for s in osc.iter().skip(if param == "D" { 3 } else { 2 }) {
+        // D's first field is the exit status, unless it was left out and the
+        // field is already one of the options.
+        let status_field = match osc.get(2) {
+            Some(field) if param == "D" && !field.contains(&b'=') => Some(*field),
+            _ => None,
+        };
+        for s in osc.iter().skip(if status_field.is_some() { 3 } else { 2 }) {
             if let Some(equal) = s.iter().position(|c| *c == b'=') {
                 let key = &s[..equal];
                 let value = &s[equal + 1..];
@@ -798,13 +805,10 @@ impl FinalTermSemanticPrompt {
         }
 
         if param == "D" {
-            let status = match osc.get(2).map(|&p| p) {
-                Some(s) => match str::from_utf8(s) {
-                    Ok(s) => s.parse().unwrap_or(0),
-                    _ => 0,
-                },
-                _ => 0,
-            };
+            // Left out or unreadable, the status is unknown, not a success.
+            let status = status_field
+                .and_then(|s| str::from_utf8(s).ok())
+                .and_then(|s| s.parse().ok());
 
             return Ok(Self::CommandStatus {
                 status,
@@ -872,13 +876,22 @@ impl Display for FinalTermSemanticPrompt {
                 }
             }
             Self::CommandStatus {
-                status,
+                status: Some(status),
                 aid: Some(aid),
             } => {
                 write!(f, "D;{};err={};aid={}", status, status, aid)?;
             }
-            Self::CommandStatus { status, aid: None } => {
+            Self::CommandStatus {
+                status: Some(status),
+                aid: None,
+            } => {
                 write!(f, "D;{}", status)?;
+            }
+            Self::CommandStatus { status: None, aid } => {
+                write!(f, "D")?;
+                if let Some(aid) = aid {
+                    write!(f, ";aid={}", aid)?;
+                }
             }
         }
         Ok(())
@@ -1760,7 +1773,7 @@ mod test {
             parse(&["133", "D", "1"], "\x1b]133;D;1\x1b\\"),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus {
-                    status: 1,
+                    status: Some(1),
                     aid: None
                 }
             )
@@ -1770,11 +1783,60 @@ mod test {
             parse(&["133", "D", "0"], "\x1b]133;D;0\x1b\\"),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus {
-                    status: 0,
+                    status: Some(0),
                     aid: None
                 }
             )
         );
+
+        // The status is optional; left out, it is unknown rather than 0.
+        assert_eq!(
+            parse(&["133", "D"], "\x1b]133;D\x1b\\"),
+            OperatingSystemCommand::FinalTermSemanticPrompt(
+                FinalTermSemanticPrompt::CommandStatus {
+                    status: None,
+                    aid: None
+                }
+            )
+        );
+
+        assert_eq!(
+            parse(&["133", "D", "aid=23"], "\x1b]133;D;aid=23\x1b\\"),
+            OperatingSystemCommand::FinalTermSemanticPrompt(
+                FinalTermSemanticPrompt::CommandStatus {
+                    status: None,
+                    aid: Some("23".to_owned())
+                }
+            )
+        );
+
+        // An empty or unreadable status, and options in its place, are none.
+        for (fields, encoded, aid) in [
+            (&["133", "D", ""][..], "\x1b]133;D\x1b\\", None),
+            (
+                &["133", "D", "", "aid=23"][..],
+                "\x1b]133;D;aid=23\x1b\\",
+                Some("23"),
+            ),
+            (&["133", "D", "abc"][..], "\x1b]133;D\x1b\\", None),
+            (
+                &["133", "D", "err=CANCEL", "aid=23"][..],
+                "\x1b]133;D;aid=23\x1b\\",
+                Some("23"),
+            ),
+        ] {
+            assert_eq!(
+                parse(fields, encoded),
+                OperatingSystemCommand::FinalTermSemanticPrompt(
+                    FinalTermSemanticPrompt::CommandStatus {
+                        status: None,
+                        aid: aid.map(str::to_owned)
+                    }
+                ),
+                "{:?}",
+                fields
+            );
+        }
 
         assert_eq!(
             parse(
@@ -1783,7 +1845,7 @@ mod test {
             ),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus {
-                    status: 0,
+                    status: Some(0),
                     aid: Some("23".to_owned())
                 }
             )
@@ -1796,7 +1858,7 @@ mod test {
             ),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus {
-                    status: 1,
+                    status: Some(1),
                     aid: Some("23".to_owned())
                 }
             )
