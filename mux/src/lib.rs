@@ -70,6 +70,12 @@ pub enum MuxNotification {
     PaneOutput(PaneId),
     PaneAdded(PaneId),
     PaneRemoved(PaneId),
+    /// The program the pane started has ended. Raised before the pane is
+    /// removed, when it is removed because of it.
+    PaneExited {
+        pane_id: PaneId,
+        exit: thinkterm_proto::PaneExit,
+    },
     /// The mux that owns this pane re-classified its agent status; read
     /// the fresh value via `Pane::agent_status`.
     AgentStatusChanged(PaneId),
@@ -473,7 +479,21 @@ pub struct Mux {
     num_panes_by_workspace: RwLock<HashMap<String, usize>>,
     main_thread_id: std::thread::ThreadId,
     agent: Option<AgentProxy>,
+    /// How the last few panes' programs ended, so a `wait` that arrives
+    /// after its pane closed still learns the status. Oldest first, at most
+    /// `RECENT_PANE_EXITS` long, and each kept for `RECENT_PANE_EXIT_TTL`.
+    recent_pane_exits:
+        Mutex<std::collections::VecDeque<(PaneId, thinkterm_proto::PaneExit, Instant)>>,
+    /// Panes whose exit is recorded but not yet announced. The announcement
+    /// waits for the main thread, and goes out at once if the pane is
+    /// removed first, so that `PaneExited` always precedes `PaneRemoved`.
+    /// Payloads stay here until announced even if exit history evicts them.
+    unannounced_pane_exits: Mutex<HashMap<PaneId, thinkterm_proto::PaneExit>>,
 }
+
+/// How many ended panes `Mux::recent_pane_exit` remembers, and for how long.
+const RECENT_PANE_EXITS: usize = 128;
+const RECENT_PANE_EXIT_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Default)]
 struct TabResizeNotificationState {
@@ -1087,6 +1107,7 @@ fn read_from_pane_pty(
     };
 
     let heartbeat = parse_watchdog::register(pane_id);
+    let exit_watch = pane.clone();
     std::thread::spawn({
         let dead = Arc::clone(&dead);
         let control = control.clone();
@@ -1187,6 +1208,15 @@ fn read_from_pane_pty(
             .detach();
         }
         ExitBehavior::Close => {
+            // The program's end usually closes the pty, and it is reaped a
+            // moment after. Give it that moment: then the mux has the
+            // status (`cli wait`, `PaneExited`) before it removes the pane.
+            if let Some(pane) = exit_watch.upgrade() {
+                let deadline = Instant::now() + EXIT_STATUS_GRACE;
+                while !pane.is_dead() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             promise::spawn::spawn_into_main_thread(async move {
                 let mux = Mux::get();
                 mux.remove_pane(pane_id);
@@ -1197,6 +1227,9 @@ fn read_from_pane_pty(
 
     dead.store(true, Ordering::Relaxed);
 }
+
+/// How long a pane closed by its pty's end waits for its program's status.
+const EXIT_STATUS_GRACE: Duration = Duration::from_millis(250);
 
 lazy_static::lazy_static! {
     static ref MUX: Mutex<Option<Arc<Mux>>> = Mutex::new(None);
@@ -1303,6 +1336,8 @@ impl Mux {
             #[cfg(test)]
             frontend_geometry_failures: Mutex::new(std::collections::VecDeque::new()),
             palette_advisories: Mutex::new(PaletteAdvisoryState::default()),
+            recent_pane_exits: Mutex::new(std::collections::VecDeque::new()),
+            unannounced_pane_exits: Mutex::new(HashMap::new()),
             identity: RwLock::new(None),
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
@@ -2755,6 +2790,58 @@ impl Mux {
         self.panes.read().get(&pane_id).map(Arc::clone)
     }
 
+    /// The program `pane_id` started has ended: remember how, for
+    /// `recent_pane_exit`, and tell the subscribers. Callable from any
+    /// thread, and with any lock held: the news is sent later, from the main
+    /// thread, and before the pane's removal if that comes first.
+    pub fn record_pane_exit(&self, pane_id: PaneId, exit: thinkterm_proto::PaneExit) {
+        {
+            let now = Instant::now();
+            let mut recent = self.recent_pane_exits.lock();
+            recent.retain(|(id, _, at)| {
+                *id != pane_id && now.duration_since(*at) < RECENT_PANE_EXIT_TTL
+            });
+            if recent.len() >= RECENT_PANE_EXITS {
+                recent.pop_front();
+            }
+            recent.push_back((pane_id, exit.clone(), now));
+            // Keep pending payloads independently of bounded exit history.
+            self.unannounced_pane_exits.lock().insert(pane_id, exit);
+        }
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Some(mux) = Mux::try_get() {
+                mux.announce_pane_exit(pane_id, false);
+            }
+        })
+        .detach();
+    }
+
+    /// Send the news of a recorded exit, once: from the pane's removal,
+    /// just before its `PaneRemoved`, or later from the main thread. Later
+    /// is too late for a pane already removed -- every client has dropped
+    /// it -- and `recent_pane_exit` still has the status for `cli wait`.
+    fn announce_pane_exit(&self, pane_id: PaneId, removing: bool) {
+        let exit = match self.unannounced_pane_exits.lock().remove(&pane_id) {
+            Some(exit) => exit,
+            None => return,
+        };
+        if !removing && !self.panes.read().contains_key(&pane_id) {
+            return;
+        }
+        self.notify(MuxNotification::PaneExited { pane_id, exit });
+    }
+
+    /// How the program of a pane that has ended exited, while it is among
+    /// the last `RECENT_PANE_EXITS` to have done so, and recently.
+    pub fn recent_pane_exit(&self, pane_id: PaneId) -> Option<thinkterm_proto::PaneExit> {
+        self.recent_pane_exits
+            .lock()
+            .iter()
+            .rev()
+            .find(|(id, _, at)| *id == pane_id && at.elapsed() < RECENT_PANE_EXIT_TTL)
+            .map(|(_, exit, _)| exit.clone())
+    }
+
     pub fn get_tab(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         self.tabs.read().get(&tab_id).map(Arc::clone)
     }
@@ -2813,6 +2900,8 @@ impl Mux {
         if let Some(pane) = removed {
             log::debug!("killing pane {}", pane_id);
             pane.kill();
+            // How its program ended goes out first, if that is still to go.
+            self.announce_pane_exit(pane_id, true);
             self.notify(MuxNotification::PaneRemoved(pane_id));
             changed = true;
         }
@@ -4133,6 +4222,95 @@ mod tests {
         let before = quiet.frontend_access_state();
         quiet.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
         assert_eq!(quiet.frontend_access_state().generation, before.generation);
+    }
+
+    #[test]
+    fn pending_exit_notifications_outlive_history_eviction_and_expiry() {
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Mux::new(None);
+        let announced = Arc::new(Mutex::new(Vec::new()));
+        {
+            let announced = Arc::clone(&announced);
+            mux.subscribe(move |n| {
+                if let MuxNotification::PaneExited { pane_id, exit } = n {
+                    announced.lock().push((pane_id, exit.code));
+                }
+                true
+            });
+        }
+        let count = RECENT_PANE_EXITS + 2;
+        for pane_id in 0..count {
+            mux.record_pane_exit(
+                pane_id,
+                thinkterm_proto::PaneExit {
+                    code: Some(pane_id as u32),
+                    signal: None,
+                },
+            );
+        }
+        assert_eq!(mux.recent_pane_exit(0), None);
+        // Expiry must not lose the pending payloads either.
+        for (_, _, at) in mux.recent_pane_exits.lock().iter_mut() {
+            *at = Instant::now() - RECENT_PANE_EXIT_TTL;
+        }
+        for pane_id in 0..count {
+            mux.announce_pane_exit(pane_id, true);
+            mux.announce_pane_exit(pane_id, true);
+        }
+        let expected: Vec<_> = (0..count).map(|id| (id, Some(id as u32))).collect();
+        assert_eq!(*announced.lock(), expected);
+        assert!(mux.unannounced_pane_exits.lock().is_empty());
+    }
+
+    #[test]
+    fn recent_pane_exits_are_bounded_and_keep_the_latest() {
+        // Announcements are queued for the main thread; a scheduler that
+        // merely holds them is enough.
+        let _executor = promise::spawn::SimpleExecutor::new();
+        let mux = Mux::new(None);
+        let announced = Arc::new(Mutex::new(Vec::new()));
+        {
+            let announced = Arc::clone(&announced);
+            mux.subscribe(move |n| {
+                if let MuxNotification::PaneExited { pane_id, .. } = n {
+                    announced.lock().push(pane_id);
+                }
+                true
+            });
+        }
+        let exit = |code| thinkterm_proto::PaneExit {
+            code: Some(code),
+            signal: None,
+        };
+        for pane_id in 0..RECENT_PANE_EXITS + 2 {
+            mux.record_pane_exit(pane_id, exit(pane_id as u32));
+        }
+        assert!(
+            announced.lock().is_empty(),
+            "never from inside the recording"
+        );
+        // What removing the pane does: the news goes out then, and only once.
+        mux.announce_pane_exit(5, true);
+        mux.announce_pane_exit(5, true);
+        assert_eq!(*announced.lock(), vec![5]);
+        // Too late for a pane that is no longer in the mux.
+        mux.announce_pane_exit(6, false);
+        assert_eq!(*announced.lock(), vec![5]);
+        assert_eq!(
+            mux.recent_pane_exit(6),
+            Some(exit(6)),
+            "still there for `wait`"
+        );
+
+        assert_eq!(mux.recent_pane_exits.lock().len(), RECENT_PANE_EXITS);
+        // The oldest two made room.
+        assert_eq!(mux.recent_pane_exit(0), None);
+        assert_eq!(mux.recent_pane_exit(1), None);
+        assert_eq!(mux.recent_pane_exit(2), Some(exit(2)));
+        // A pane that ends again (a held pane respawned) has one entry.
+        mux.record_pane_exit(2, exit(9));
+        assert_eq!(mux.recent_pane_exit(2), Some(exit(9)));
+        assert_eq!(mux.recent_pane_exits.lock().len(), RECENT_PANE_EXITS);
     }
 
     #[test]

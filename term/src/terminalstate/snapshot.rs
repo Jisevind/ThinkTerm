@@ -179,6 +179,42 @@ pub struct KittySnapshot {
     pub transmission_in_progress: bool,
 }
 
+/// How far the shell has got by its OSC 133 marks (see
+/// [`crate::ShellCommands`]), and which shell's marks are followed. Kept out
+/// of [`TerminalSnapshot`] so that its shape, which every predecessor's
+/// decoder expects, stays as it is: a handoff carries this beside it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellCommandsSnapshot {
+    pub reported: bool,
+    pub finished: u64,
+    pub running: bool,
+    pub last_exit: Option<i32>,
+    pub aid: Option<String>,
+}
+
+impl TerminalState {
+    pub fn snapshot_shell_commands(&self) -> ShellCommandsSnapshot {
+        let commands = self.shell_commands;
+        ShellCommandsSnapshot {
+            reported: commands.reported,
+            finished: commands.finished,
+            running: commands.running,
+            last_exit: commands.last_exit,
+            aid: self.shell_aid.clone(),
+        }
+    }
+
+    pub fn restore_shell_commands(&mut self, snapshot: ShellCommandsSnapshot) {
+        self.shell_commands = crate::ShellCommands {
+            reported: snapshot.reported,
+            finished: snapshot.finished,
+            running: snapshot.running,
+            last_exit: snapshot.last_exit,
+        };
+        self.shell_aid = snapshot.aid;
+    }
+}
+
 /// `termwiz::input::KeyboardEncoding` without serde; the kitty flags travel
 /// as their bits.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

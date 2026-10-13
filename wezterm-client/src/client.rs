@@ -441,10 +441,14 @@ async fn process_unilateral_inner_async(
             // workspaces included, so unmapped is routine and implies no
             // topology change worth a resync. The value was recorded into
             // the snapshot above; the mirror seeds from it whenever it
-            // materializes.
+            // materializes. Programs ending are told to every client too,
+            // and a pane appearing only to event subscribers.
             if matches!(
                 decoded.pdu,
-                Pdu::AgentStatusChanged(_) | Pdu::ForegroundProgramChanged(_)
+                Pdu::AgentStatusChanged(_)
+                    | Pdu::ForegroundProgramChanged(_)
+                    | Pdu::PaneExited(_)
+                    | Pdu::PaneAdded(_)
             ) {
                 return Ok(());
             }
@@ -463,6 +467,8 @@ async fn process_unilateral_inner_async(
 
     let pane = match mux.get_pane(local_pane_id) {
         Some(p) => p,
+        // A program's end can be told after its mirror was dropped.
+        None if matches!(decoded.pdu, Pdu::PaneExited(_) | Pdu::PaneAdded(_)) => return Ok(()),
         None => {
             log::debug!("got {decoded:?}, but local pane {local_pane_id} no longer exists; resync");
             client_domain.resync_for_remote_pane(pane_id).await?;
@@ -498,6 +504,20 @@ async fn process_unilateral_inner_async(
     client_pane.process_unilateral(decoded.pdu).await
 }
 
+/// Where a client without a domain of its own -- the CLI -- sends what the
+/// server pushes, once it has asked to hear it. See `tap_unilateral_pdus`.
+static UNILATERAL_TAP: std::sync::Mutex<Option<Sender<Pdu>>> = std::sync::Mutex::new(None);
+
+/// Hand every PDU the server pushes to a client without a local domain
+/// (the CLI's own connection) to the returned receiver, rather than drop
+/// it. At most `capacity` wait unread; the rest are dropped, with a
+/// warning, so a reader that stops reading cannot grow it without bound.
+pub fn tap_unilateral_pdus(capacity: usize) -> Receiver<Pdu> {
+    let (tx, rx) = smol::channel::bounded(capacity);
+    *UNILATERAL_TAP.lock().unwrap() = Some(tx);
+    rx
+}
+
 fn process_unilateral(
     local_domain_id: Option<DomainId>,
     connection_generation: u64,
@@ -507,9 +527,14 @@ fn process_unilateral(
     let local_domain_id = match local_domain_id {
         Some(id) => id,
         None => {
-            // FIXME: We currently get a bunch of these; we'll need
-            // to do something to advise the server when we want them.
-            // For now, we just ignore them.
+            // No panes to update here. A caller that asked for the
+            // server's pushes gets them; anyone else ignores them.
+            if let Some(tap) = UNILATERAL_TAP.lock().unwrap().as_ref() {
+                if tap.try_send(decoded.pdu).is_err() {
+                    log::warn!("dropping a server push nobody is reading");
+                }
+                return Ok(());
+            }
             log::trace!(
                 "client doesn't have a real local domain, \
                  so unilateral message cannot be processed by it"
@@ -2789,6 +2814,8 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+    rpc!(get_pane_run_state, GetPaneRunState, GetPaneRunStateResponse);
+    rpc!(subscribe_events, SubscribeEvents, UnitResponse);
 }
 
 /// The outage clock to carry into the next reconnect round, given how the

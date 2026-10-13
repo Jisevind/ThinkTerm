@@ -21,6 +21,7 @@ pub mod layout;
 pub mod pane;
 pub mod program;
 pub mod renderable;
+pub mod run_state;
 pub mod split;
 
 pub use agent::{
@@ -34,6 +35,7 @@ pub use layout::{PaneEntry, PaneNode, PaneStackEntry, SerdeUrl};
 pub use pane::{Pattern, SearchResult};
 pub use program::ForegroundProgram;
 pub use renderable::{RenderableDimensions, StableCursorPosition};
+pub use run_state::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 pub use split::{SplitDirection, SplitDirectionAndSize, SplitRequest, SplitSize};
 
 pub type WindowId = usize;

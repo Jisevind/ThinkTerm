@@ -605,6 +605,17 @@ async fn process_async_with_peer<S: ConnectionStream>(
                     }
                 }
             }
+            // A connection subscribed to events reads no pane contents:
+            // output costs it nothing, and an alert goes straight out
+            // rather than waiting for the pane's parser.
+            Ok(Item::Notif(MuxNotification::PaneOutput(_))) if handler.events_subscribed => {}
+            Ok(Item::Notif(MuxNotification::Alert { pane_id, alert }))
+                if handler.events_subscribed =>
+            {
+                if !matches!(alert, wezterm_term::Alert::PaletteChanged) {
+                    send_notif_pdu(Pdu::NotifyAlert(codec::NotifyAlert { pane_id, alert }));
+                }
+            }
             Ok(Item::Notif(MuxNotification::PaneOutput(pane_id))) => {
                 log::trace!("notification: pane output {pane_id}");
                 handler.schedule_pane_push(pane_id);
@@ -620,6 +631,14 @@ async fn process_async_with_peer<S: ConnectionStream>(
             Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
                 handler.forget_pane(pane_id);
                 send_notif_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id }));
+            }
+            // To every client: a GUI mirroring the pane tells its own
+            // clients in turn.
+            Ok(Item::Notif(MuxNotification::PaneExited { pane_id, exit })) => {
+                send_notif_pdu(Pdu::PaneExited(codec::PaneExited { pane_id, exit }));
+            }
+            Ok(Item::Notif(MuxNotification::PaneAdded(pane_id))) if handler.events_subscribed => {
+                send_notif_pdu(Pdu::PaneAdded(codec::PaneAdded { pane_id }));
             }
             Ok(Item::Notif(other)) => {
                 log::trace!("notification with nothing for the connection to do: {other:?}");
@@ -762,14 +781,17 @@ async fn admission_withdrawn(revoked: &Option<smol::channel::Receiver<()>>) {
 }
 
 /// What the connection loop needs for a mux notification, prepared on the
-/// main thread. Pane output, alerts and pane removal need the handler's
-/// own state and go through as they are; everything else becomes the PDU
-/// it will be sent as, with whatever the mux has to be asked read here.
+/// main thread. Pane output, alerts, panes coming and going and programs
+/// ending need the handler's own state and go through as they are;
+/// everything else becomes the PDU it will be sent as, with whatever the
+/// mux has to be asked read here.
 fn item_for_notification(n: MuxNotification) -> Option<Item> {
     let write = |pdu: Pdu| Some(Item::WritePdu(DecodedPdu { serial: 0, pdu }));
     match n {
         MuxNotification::PaneOutput(_)
         | MuxNotification::Alert { .. }
+        | MuxNotification::PaneAdded(_)
+        | MuxNotification::PaneExited { .. }
         | MuxNotification::PaneRemoved(_) => Some(Item::Notif(n)),
         MuxNotification::AgentStatusChanged(pane_id) => {
             // Read the status at send time so the payload is always the
@@ -861,8 +883,7 @@ fn item_for_notification(n: MuxNotification) -> Option<Item> {
         MuxNotification::DefaultPaletteChanged => write(Pdu::DefaultPalette(codec::DefaultPalette {
             palette: crate::sessionhandler::configured_default_palette(),
         })),
-        MuxNotification::PaneAdded(_)
-        | MuxNotification::SaveToDownloads { .. }
+        MuxNotification::SaveToDownloads { .. }
         | MuxNotification::WindowRemoved(_)
         | MuxNotification::WindowCreated(_)
         | MuxNotification::WindowInvalidated(_)

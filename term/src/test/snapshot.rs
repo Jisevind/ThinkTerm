@@ -418,3 +418,28 @@ fn restore_applies_agent_budgets_without_changing_other_user_variables() {
         normal
     );
 }
+
+#[test]
+fn the_shell_command_count_survives_a_restore() {
+    let mut original = terminal(10);
+    // One command finished, and a second one -- a shell of its own -- runs.
+    original.advance_bytes("\x1b]133;A;cl=m;aid=1\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07");
+    original.advance_bytes("\x1b]133;D;0;aid=1\x07\x1b]133;A;cl=m;aid=1\x07$ \x1b]133;B\x07");
+    original.advance_bytes("bash\r\n\x1b]133;C\x07");
+    let shell = original.snapshot_shell_commands();
+    assert!(shell.reported && shell.running);
+    assert_eq!(shell.finished, 1);
+
+    let mut copy = restored(original.snapshot(), 10);
+    copy.restore_shell_commands(shell.clone());
+    assert_eq!(copy.shell_commands(), original.shell_commands());
+    assert_eq!(copy.snapshot_shell_commands(), shell);
+
+    // The inner shell's marks are still told from the outer one's.
+    copy.advance_bytes("\x1b]133;D;0;aid=2\x07\x1b]133;A;cl=m;aid=2\x07");
+    assert!(copy.shell_commands().running);
+    assert_eq!(copy.shell_commands().finished, 1);
+    copy.advance_bytes("\x1b]133;D;9;aid=1\x07");
+    assert_eq!(copy.shell_commands().finished, 2);
+    assert_eq!(copy.shell_commands().last_exit, Some(9));
+}

@@ -121,6 +121,9 @@ pub(crate) struct PerPane {
     queued_input_bytes: usize,
     /// A drain task exists for `inputs`.
     input_draining: bool,
+    /// The connection subscribed to events: a push carries the pane's
+    /// alerts and nothing of what it shows.
+    events_only: bool,
 }
 
 /// What may wait for one pane from one connection before further input is
@@ -787,6 +790,14 @@ fn maybe_push_pane_changes(
     per_pane: Arc<Mutex<PerPane>>,
     force_with_input_serial: Option<InputSerial>,
 ) -> anyhow::Result<()> {
+    {
+        // A connection subscribed to events gets the pane's alerts and
+        // none of what it shows.
+        let mut per_pane = per_pane.lock().unwrap();
+        if per_pane.events_only {
+            return send_pane_alerts(pane.pane_id(), &sender, &mut per_pane);
+        }
+    }
     // Application palette provenance must arrive even when the state is
     // `None`: that explicit reset prevents a server's configured/advisory
     // palette from taking over client rendering. Send it before line changes
@@ -840,18 +851,24 @@ fn maybe_push_pane_changes(
         })?;
     }
 
+    send_pane_alerts(pane.pane_id(), &sender, &mut per_pane)
+}
+
+fn send_pane_alerts(
+    pane_id: PaneId,
+    sender: &PduSender,
+    per_pane: &mut PerPane,
+) -> anyhow::Result<()> {
     let notifications: Vec<Alert> = per_pane.notifications.drain(..).collect();
     for alert in notifications {
         match alert {
             // The current application state was sent (and de-duplicated)
-            // above. Never forward this alert as a configured palette.
+            // with the pane's contents. Never forward this alert as a
+            // configured palette.
             Alert::PaletteChanged => {}
             alert => {
                 sender.send(DecodedPdu {
-                    pdu: Pdu::NotifyAlert(NotifyAlert {
-                        pane_id: pane.pane_id(),
-                        alert,
-                    }),
+                    pdu: Pdu::NotifyAlert(NotifyAlert { pane_id, alert }),
                     serial: 0,
                 })?;
             }
@@ -1111,6 +1128,8 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::WriteToPane(_)
             | Pdu::SendKeyDown(_)
             | Pdu::MarkProgramStatusSeen(_)
+            | Pdu::GetPaneRunState(_)
+            | Pdu::SubscribeEvents(_)
             | Pdu::SendMouseEvent(_)
             | Pdu::SendPaste(_)
             | Pdu::Resize(_)
@@ -1164,6 +1183,9 @@ pub struct SessionHandler {
     /// `PluginFrame` on; it closes when this does, or when the client
     /// sends an empty frame.
     plugin_pipe: Option<crate::plugin_relay::Pipe>,
+    /// The client sent `SubscribeEvents`: it hears of panes appearing,
+    /// and its pane pushes carry alerts only.
+    pub(crate) events_subscribed: bool,
 }
 
 impl Drop for SessionHandler {
@@ -1197,6 +1219,7 @@ impl SessionHandler {
             palette_session_id: None,
             proxy_client_id: None,
             plugin_pipe: None,
+            events_subscribed: false,
         }
     }
 
@@ -1271,11 +1294,21 @@ impl SessionHandler {
     }
 
     pub(crate) fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
-        Arc::clone(
-            self.per_pane
-                .entry(pane_id)
-                .or_insert_with(|| Arc::new(Mutex::new(PerPane::default()))),
-        )
+        let events_only = self.events_subscribed;
+        Arc::clone(self.per_pane.entry(pane_id).or_insert_with(|| {
+            Arc::new(Mutex::new(PerPane {
+                events_only,
+                ..PerPane::default()
+            }))
+        }))
+    }
+
+    /// From now on this connection hears what happens, not what panes show.
+    fn subscribe_events(&mut self) {
+        self.events_subscribed = true;
+        for per_pane in self.per_pane.values() {
+            per_pane.lock().unwrap().events_only = true;
+        }
     }
 
     /// Queue terminal input for `pane_id` and see that a drain is running.
@@ -1812,6 +1845,41 @@ impl SessionHandler {
                     )
                 })
                 .detach();
+            }
+
+            Pdu::GetPaneRunState(GetPaneRunState { pane_id }) => {
+                async fn run_state(
+                    pane_id: PaneId,
+                ) -> anyhow::Result<thinkterm_proto::PaneRunState> {
+                    let mux = Mux::get();
+                    if let Some(pane) = mux.get_pane(pane_id) {
+                        return pane.run_state().await;
+                    }
+                    // Gone already: what is remembered of how it ended.
+                    let exit = mux
+                        .recent_pane_exit(pane_id)
+                        .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                    Ok(thinkterm_proto::PaneRunState {
+                        program: thinkterm_proto::ProgramState::Exited(exit),
+                        shell: Default::default(),
+                    })
+                }
+
+                spawn_into_main_thread(async move {
+                    promise::spawn::spawn(async move {
+                        let result = run_state(pane_id).await.map(|state| {
+                            Pdu::GetPaneRunStateResponse(GetPaneRunStateResponse { pane_id, state })
+                        });
+                        send_response(result);
+                    })
+                    .detach();
+                })
+                .detach();
+            }
+
+            Pdu::SubscribeEvents(SubscribeEvents {}) => {
+                self.subscribe_events();
+                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
             }
 
             Pdu::MarkProgramStatusSeen(MarkProgramStatusSeen { pane_id }) => {
@@ -2876,6 +2944,9 @@ impl SessionHandler {
             // client that had just proved it was alive.
             Pdu::Pong(_) => {}
             Pdu::AgentStatusChanged { .. }
+            | Pdu::GetPaneRunStateResponse { .. }
+            | Pdu::PaneExited { .. }
+            | Pdu::PaneAdded { .. }
             | Pdu::GetAgentStatusesResponse { .. }
             | Pdu::ForegroundProgramChanged { .. }
             | Pdu::GetForegroundProgramsResponse { .. }
@@ -3502,6 +3573,63 @@ mod tests {
                 (0, "DefaultPalette")
             ],
             "the acknowledgement first, then the state; no tabs, so no viewports"
+        );
+    }
+
+    #[test]
+    fn subscribing_to_events_turns_pane_pushes_into_alerts() {
+        use super::{send_pane_alerts, PduSender, SessionHandler};
+        use codec::{DecodedPdu, NotifyAlert, SubscribeEvents};
+        use std::sync::Mutex;
+        use wezterm_term::Alert;
+
+        let sent: Arc<Mutex<Vec<DecodedPdu>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        let mut handler = SessionHandler::new(PduSender::new(move |pdu| {
+            sink.lock().unwrap().push(pdu);
+            Ok(())
+        }));
+        let before = handler.per_pane(1);
+        assert!(!before.lock().unwrap().events_only);
+
+        handler.process_one(DecodedPdu {
+            serial: 3,
+            pdu: Pdu::SubscribeEvents(SubscribeEvents {}),
+        });
+        assert!(handler.events_subscribed);
+        assert!(
+            before.lock().unwrap().events_only,
+            "panes seen before as well"
+        );
+        assert!(handler.per_pane(2).lock().unwrap().events_only);
+
+        let mut state = PerPane::default();
+        state.notifications = vec![
+            Alert::Bell,
+            Alert::PaletteChanged,
+            Alert::CommandFinished { exit_code: Some(1) },
+        ];
+        let sender = handler.to_write_tx.clone();
+        send_pane_alerts(5, &sender, &mut state).unwrap();
+        assert!(state.notifications.is_empty());
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent[0].serial, 3);
+        assert_eq!(sent[0].pdu.pdu_name(), "UnitResponse");
+        let alerts: Vec<&Pdu> = sent[1..].iter().map(|d| &d.pdu).collect();
+        assert_eq!(
+            alerts,
+            vec![
+                &Pdu::NotifyAlert(NotifyAlert {
+                    pane_id: 5,
+                    alert: Alert::Bell
+                }),
+                &Pdu::NotifyAlert(NotifyAlert {
+                    pane_id: 5,
+                    alert: Alert::CommandFinished { exit_code: Some(1) }
+                }),
+            ],
+            "a palette change is never sent as an alert"
         );
     }
 

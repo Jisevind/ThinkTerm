@@ -414,6 +414,13 @@ impl ClientPane {
                         .foreground_program_changed(self.local_pane_id);
                 }
             }
+            Pdu::PaneExited(PaneExited { exit, .. }) => {
+                // Told on, so that whoever asks this mux -- `cli events`
+                // or `cli wait` against the GUI -- hears it as well.
+                Mux::get().record_pane_exit(self.local_pane_id, exit);
+            }
+            // Meant for event subscribers; a mirror learns of panes by resync.
+            Pdu::PaneAdded(_) => {}
             Pdu::PaneRemoved(PaneRemoved { pane_id }) => {
                 log::trace!("remote pane {} has been removed", pane_id);
                 self.session.set_dead(true);
@@ -995,6 +1002,17 @@ impl Pane for ClientPane {
             Ok(SearchScrollbackResponse { results }) => Ok(results),
             Err(e) => Err(e),
         }
+    }
+
+    async fn run_state(&self) -> anyhow::Result<thinkterm_proto::PaneRunState> {
+        let response = self
+            .client
+            .client
+            .get_pane_run_state(GetPaneRunState {
+                pane_id: self.remote_pane_id,
+            })
+            .await?;
+        Ok(response.state)
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {

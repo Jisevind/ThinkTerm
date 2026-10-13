@@ -71,6 +71,27 @@ pub enum Alert {
     OutputSinceFocusLost,
     /// A change to the progress bar state
     Progress(Progress),
+    /// The shell reported (OSC 133) that a command finished, with the
+    /// status it gave, or `None` when a new prompt ended the command
+    /// without one.
+    CommandFinished {
+        exit_code: Option<i32>,
+    },
+}
+
+/// How far the shell in a terminal has got, as far as it says with the
+/// OSC 133 semantic prompt marks. All zero until the first mark arrives.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ShellCommands {
+    /// The shell has sent a mark, so the rest of this means something.
+    pub reported: bool,
+    /// Commands finished since the first mark. The shell integration also
+    /// reports one for a prompt answered with an empty line.
+    pub finished: u64,
+    /// A command has started (`133;C`) and not yet finished.
+    pub running: bool,
+    /// The status the last finished command reported.
+    pub last_exit: Option<i32>,
 }
 
 pub trait AlertHandler: Send + Sync {

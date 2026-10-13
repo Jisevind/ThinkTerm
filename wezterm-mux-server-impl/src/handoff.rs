@@ -225,8 +225,13 @@ const KITTY_VIRTUAL_TAG: &[u8] = b"KGPA\x02";
 const KITTY_NUMBERS_TAG: &[u8] = b"KGPA\x03";
 const KITTY_PLACEMENTS_TAG: &[u8] = b"KGPA\x04";
 const KITTY_RELATIVES_TAG: &[u8] = b"KGPA\x05";
+const SHELL_COMMANDS_TAG: &[u8] = b"TTSH\x01";
 
-fn encode_snapshot(snapshot: &TerminalSnapshot, graphics: &wezterm_term::KittyGraphicsSnapshot) -> anyhow::Result<Vec<u8>> {
+fn encode_snapshot(
+    snapshot: &TerminalSnapshot,
+    graphics: &wezterm_term::KittyGraphicsSnapshot,
+    shell: &wezterm_term::ShellCommandsSnapshot,
+) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     snapshot.serialize(&mut varbincode::Serializer::new(&mut bytes))
         .context("encoding a terminal snapshot")?;
@@ -267,15 +272,29 @@ fn encode_snapshot(snapshot: &TerminalSnapshot, graphics: &wezterm_term::KittyGr
                 .context("encoding Kitty placement identities")?;
         }
     }
+    // Last, after the Kitty parts. A successor from before those never reads
+    // past the prefix; one that knows them refuses this, and with it the
+    // handoff, so the old server carries on.
+    if shell.reported {
+        bytes.extend_from_slice(SHELL_COMMANDS_TAG);
+        shell.serialize(&mut varbincode::Serializer::new(&mut bytes))
+            .context("encoding the shell's command count")?;
+    }
     zstd::encode_all(&bytes[..], 3).context("compressing a terminal snapshot")
 }
 
-fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<(TerminalSnapshot, Option<wezterm_term::KittyGraphicsSnapshot>)> {
+fn decode_snapshot(
+    bytes: &[u8],
+) -> anyhow::Result<(
+    TerminalSnapshot,
+    Option<wezterm_term::KittyGraphicsSnapshot>,
+    Option<wezterm_term::ShellCommandsSnapshot>,
+)> {
     let bytes = zstd::decode_all(bytes).context("decompressing a terminal snapshot")?;
     let mut reader = &bytes[..];
     let snapshot = TerminalSnapshot::deserialize(&mut varbincode::Deserializer::new(&mut reader))
         .context("decoding a terminal snapshot")?;
-    let graphics = if reader.is_empty() {
+    let graphics = if reader.is_empty() || reader.starts_with(SHELL_COMMANDS_TAG) {
         None
     } else {
         let has_relatives = reader.starts_with(KITTY_RELATIVES_TAG);
@@ -307,10 +326,15 @@ fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<(TerminalSnapshot, Option<wez
             Some(wezterm_term::kitty_relative::RelativeSnapshot::deserialize(&mut varbincode::Deserializer::new(&mut reader))
                 .context("decoding Kitty relative placements")?)
         } else { None };
-        anyhow::ensure!(reader.is_empty(), "trailing bytes after Kitty snapshot extension");
         Some(wezterm_term::KittyGraphicsSnapshot { playback, virtual_images, image_numbers, placements, relatives })
     };
-    Ok((snapshot, graphics))
+    let shell = if reader.starts_with(SHELL_COMMANDS_TAG) {
+        reader = &reader[SHELL_COMMANDS_TAG.len()..];
+        Some(wezterm_term::ShellCommandsSnapshot::deserialize(&mut varbincode::Deserializer::new(&mut reader))
+            .context("decoding the shell's command count")?)
+    } else { None };
+    anyhow::ensure!(reader.is_empty(), "trailing bytes after the terminal snapshot's extensions");
+    Ok((snapshot, graphics, shell))
 }
 
 // ------------------------------------------------------- the old server
@@ -537,7 +561,7 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
         let local = pane
             .downcast_ref::<LocalPane>()
             .expect("checked above");
-        let (snapshot, graphics) = local.snapshot_terminal();
+        let (snapshot, graphics, shell) = local.snapshot_terminal();
         paused.push(guard);
         panes.push((
             HandoffPane {
@@ -545,7 +569,7 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
                 description: parts.description,
                 pid: parts.pid,
                 tty_name: parts.tty_name.map(|name| name.to_string_lossy().into_owned()),
-                snapshot: encode_snapshot(&snapshot, &graphics)?,
+                snapshot: encode_snapshot(&snapshot, &graphics, &shell)?,
             },
             parts.pty_fd,
         ));
@@ -734,6 +758,7 @@ struct Received {
     fd: OwnedFd,
     snapshot: TerminalSnapshot,
     graphics: Option<wezterm_term::KittyGraphicsSnapshot>,
+    shell: Option<wezterm_term::ShellCommandsSnapshot>,
 }
 
 /// Receive the panes, the windows and the listening socket; only on
@@ -760,9 +785,9 @@ pub fn complete(
                 let pane_id = pane.pane_id;
                 let fd = recv_owned_fd(&stream)?;
                 fail_at("pane")?;
-                let (snapshot, graphics) = decode_snapshot(&pane.snapshot)
+                let (snapshot, graphics, shell) = decode_snapshot(&pane.snapshot)
                     .with_context(|| format!("pane {pane_id}'s snapshot"))?;
-                received.push(Received { pane, fd, snapshot, graphics });
+                received.push(Received { pane, fd, snapshot, graphics, shell });
                 write_message(&mut stream, &HandoffMessage::Ack)?;
             }
             HandoffMessage::Topology(list) => {
@@ -853,7 +878,7 @@ fn ensure_blocking(fd: &OwnedFd) -> anyhow::Result<()> {
 }
 
 fn adopt_pane(item: Received, domain_id: DomainId) -> anyhow::Result<Arc<dyn Pane>> {
-    let Received { pane, fd, snapshot, mut graphics } = item;
+    let Received { pane, fd, snapshot, mut graphics, shell } = item;
     ensure_blocking(&fd).context("making an adopted pty blocking")?;
     let master = portable_pty::unix::master_from_raw_fd(fd, pane.tty_name.map(PathBuf::from))?;
     let writer = master.take_writer()?;
@@ -885,6 +910,11 @@ fn adopt_pane(item: Received, domain_id: DomainId) -> anyhow::Result<Arc<dyn Pan
         for err in restored.into_iter().filter_map(Result::err) {
             log::warn!("adopting a pane without its {err:#}");
         }
+    }
+    // Without it a shell that reported its commands would read as one that
+    // never did, until its next prompt.
+    if let Some(shell) = shell {
+        terminal.restore_shell_commands(shell);
     }
     // The old server kept serving between the snapshot and Commit; a
     // resize in that window reached the pty but not the snapshot.
@@ -1105,17 +1135,18 @@ mod tests {
         term.advance_bytes("hello");
         let snapshot = term.snapshot();
         let mut graphics = term.snapshot_kitty_graphics();
-        let bytes = encode_snapshot(&snapshot, &graphics).unwrap();
-        assert_eq!(decode_snapshot(&bytes).unwrap(), (snapshot, None));
+        let shell = term.snapshot_shell_commands();
+        let bytes = encode_snapshot(&snapshot, &graphics, &shell).unwrap();
+        assert_eq!(decode_snapshot(&bytes).unwrap(), (snapshot, None, None));
         let snapshot = term.snapshot();
         graphics.playback.selections.push(wezterm_term::kitty_animation::KittyPlaybackEntry {
             image_id: 1,
             data_hash: [7; 32],
             animation: wezterm_term::kitty_animation::KittyAnimation::new([0, 40], 100),
         });
-        let bytes = encode_snapshot(&snapshot, &graphics).unwrap();
+        let bytes = encode_snapshot(&snapshot, &graphics, &shell).unwrap();
         let decoded = decode_snapshot(&bytes).unwrap();
-        assert_eq!(decoded, (term.snapshot(), Some(graphics.clone())));
+        assert_eq!(decoded, (term.snapshot(), Some(graphics.clone()), None));
         // Exactly the predecessor's decoder: it consumes the same prefix
         // and can adopt the terminal without understanding this extension.
         let raw = zstd::decode_all(&bytes[..]).unwrap();
@@ -1138,8 +1169,8 @@ mod tests {
         for animated in [true, false] {
             if !animated { graphics.playback.selections.clear(); }
             graphics.virtual_images = virtuals.clone();
-            let bytes = encode_snapshot(&snapshot, &graphics).unwrap();
-            assert_eq!(decode_snapshot(&bytes).unwrap(), (term.snapshot(), Some(graphics.clone())));
+            let bytes = encode_snapshot(&snapshot, &graphics, &shell).unwrap();
+            assert_eq!(decode_snapshot(&bytes).unwrap(), (term.snapshot(), Some(graphics.clone()), None));
             let raw = zstd::decode_all(&bytes[..]).unwrap();
             let mut reader = &raw[..];
             let old = TerminalSnapshot::deserialize(&mut varbincode::Deserializer::new(&mut reader)).unwrap();
@@ -1152,8 +1183,8 @@ mod tests {
         for with_virtuals in [true, false] {
             if !with_virtuals { graphics.virtual_images.clear(); }
             graphics.image_numbers = vec![(12, 1), (12, 2), (13, 3)];
-            let bytes = encode_snapshot(&snapshot, &graphics).unwrap();
-            assert_eq!(decode_snapshot(&bytes).unwrap(), (term.snapshot(), Some(graphics.clone())));
+            let bytes = encode_snapshot(&snapshot, &graphics, &shell).unwrap();
+            assert_eq!(decode_snapshot(&bytes).unwrap(), (term.snapshot(), Some(graphics.clone()), None));
             let raw = zstd::decode_all(&bytes[..]).unwrap();
             let mut reader = &raw[..];
             let old = TerminalSnapshot::deserialize(&mut varbincode::Deserializer::new(&mut reader)).unwrap();
@@ -1168,8 +1199,8 @@ mod tests {
             placements: Vec::new(),
             cell_tags: [Vec::new(), Vec::new()],
         });
-        let bytes = encode_snapshot(&snapshot, &graphics).unwrap();
-        assert_eq!(decode_snapshot(&bytes).unwrap(), (term.snapshot(), Some(graphics)));
+        let bytes = encode_snapshot(&snapshot, &graphics, &shell).unwrap();
+        assert_eq!(decode_snapshot(&bytes).unwrap(), (term.snapshot(), Some(graphics), None));
         let raw = zstd::decode_all(&bytes[..]).unwrap();
         let mut reader = &raw[..];
         let old = TerminalSnapshot::deserialize(&mut varbincode::Deserializer::new(&mut reader)).unwrap();
@@ -1178,6 +1209,44 @@ mod tests {
         assert!(decode_snapshot(&zstd::encode_all(&raw[..raw.len()-1], 3).unwrap()).is_err());
         let mut trailing = raw; trailing.push(0);
         assert!(decode_snapshot(&zstd::encode_all(&trailing[..], 3).unwrap()).is_err());
+    }
+
+    #[test]
+    fn the_shell_command_count_travels_after_the_snapshot() {
+        let mut term = wezterm_term::Terminal::new(
+            TerminalSize { rows: 4, cols: 10, pixel_width: 80, pixel_height: 64, dpi: 96 },
+            Arc::new(config::TermConfig::new()), "ThinkTerm", "test", Box::new(Vec::new()));
+        term.advance_bytes("\x1b]133;A;cl=m;aid=1\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07");
+        term.advance_bytes("\x1b]133;D;3;aid=1\x07\x1b]133;A;cl=m;aid=1\x07");
+        let snapshot = term.snapshot();
+        let mut graphics = term.snapshot_kitty_graphics();
+        let shell = term.snapshot_shell_commands();
+        assert!(shell.reported);
+        assert_eq!(shell.last_exit, Some(3));
+        // On its own and after a Kitty part: either way the predecessor's
+        // decoder reads the same prefix.
+        for kitty in [false, true] {
+            if kitty {
+                graphics.playback.selections.push(wezterm_term::kitty_animation::KittyPlaybackEntry {
+                    image_id: 1,
+                    data_hash: [7; 32],
+                    animation: wezterm_term::kitty_animation::KittyAnimation::new([0, 40], 100),
+                });
+            }
+            let bytes = encode_snapshot(&snapshot, &graphics, &shell).unwrap();
+            assert_eq!(
+                decode_snapshot(&bytes).unwrap(),
+                (term.snapshot(), kitty.then(|| graphics.clone()), Some(shell.clone()))
+            );
+            let raw = zstd::decode_all(&bytes[..]).unwrap();
+            let mut reader = &raw[..];
+            let old = TerminalSnapshot::deserialize(&mut varbincode::Deserializer::new(&mut reader)).unwrap();
+            assert_eq!(old, snapshot);
+            assert!(reader.starts_with(if kitty { KITTY_PLAYBACK_TAG } else { SHELL_COMMANDS_TAG }));
+            assert!(decode_snapshot(&zstd::encode_all(&raw[..raw.len() - 1], 3).unwrap()).is_err());
+            let mut trailing = raw; trailing.push(0);
+            assert!(decode_snapshot(&zstd::encode_all(&trailing[..], 3).unwrap()).is_err());
+        }
     }
 
     #[test]
@@ -1195,8 +1264,9 @@ mod tests {
         for _ in 0..2 {
             let snapshot = terminal.snapshot();
             let graphics = terminal.snapshot_kitty_graphics();
-            let bytes = encode_snapshot(&snapshot, &graphics).unwrap();
-            let (decoded, state) = decode_snapshot(&bytes).unwrap();
+            let shell = terminal.snapshot_shell_commands();
+            let bytes = encode_snapshot(&snapshot, &graphics, &shell).unwrap();
+            let (decoded, state, _) = decode_snapshot(&bytes).unwrap();
             assert_eq!(decoded, snapshot);
             assert_eq!(state.as_ref(), Some(&graphics));
             let raw = zstd::decode_all(&bytes[..]).unwrap();

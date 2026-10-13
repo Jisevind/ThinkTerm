@@ -339,6 +339,11 @@ pub struct LocalPane {
     /// The progress the terminal last reported, for `get_progress` while
     /// the parser holds the terminal.
     last_progress: Mutex<Progress>,
+    /// What the shell last reported about its commands, for `run_state`
+    /// while the parser holds the terminal.
+    last_shell_commands: Mutex<wezterm_term::ShellCommands>,
+    /// How the program ended, once `is_dead` has seen it end.
+    exit: Mutex<Option<thinkterm_proto::PaneExit>>,
 }
 
 #[async_trait(?Send)]
@@ -582,12 +587,8 @@ impl Pane for LocalPane {
                 };
 
                 if let Some(status) = status {
-                    let success = match status.success() {
-                        true => true,
-                        false => configuration()
-                            .clean_exit_codes
-                            .contains(&status.exit_code()),
-                    };
+                    *self.exit.lock() = Some(pane_exit(&status));
+                    let success = exited_cleanly(&status, &configuration().clean_exit_codes);
 
                     match (
                         self.exit_behavior()
@@ -1137,6 +1138,34 @@ impl Pane for LocalPane {
         term.get_semantic_zones()
     }
 
+    async fn run_state(&self) -> anyhow::Result<thinkterm_proto::PaneRunState> {
+        use thinkterm_proto::{PaneRunState, ProgramState, ShellCommands};
+        // Asked over and over by a waiting `cli wait`, on the main thread:
+        // never wait for the parser.
+        let shell = match self.terminal.try_lock() {
+            Some(term) => term.shell_commands(),
+            None => *self.last_shell_commands.lock(),
+        };
+        let program = match &*self.process.lock() {
+            ProcessState::Running { .. } => ProgramState::Running,
+            ProcessState::DeadPendingClose { .. } | ProcessState::Dead => {
+                match self.exit.lock().clone() {
+                    Some(exit) => ProgramState::Exited(exit),
+                    None => ProgramState::Unknown,
+                }
+            }
+        };
+        Ok(PaneRunState {
+            program,
+            shell: ShellCommands {
+                reported: shell.reported,
+                finished: shell.finished,
+                running: shell.running,
+                last_exit: shell.last_exit,
+            },
+        })
+    }
+
     async fn search(
         &self,
         pattern: Pattern,
@@ -1449,12 +1478,30 @@ impl AlertHandler for LocalPaneNotifHandler {
 /// to be blocked in read even after the child process has died.
 /// We need to wake up and notice that the child terminated in order
 /// for our state to wind down.
+fn pane_exit(status: &ExitStatus) -> thinkterm_proto::PaneExit {
+    thinkterm_proto::PaneExit {
+        code: status.exit_code_if_known(),
+        signal: status.signal().map(str::to_string),
+    }
+}
+
+/// Whether `status` is a clean exit for `exit_behavior`. A pane a handoff
+/// adopted ends with no status to judge by, and closes as though it exited
+/// cleanly: a plain `exit` there should not read as a failure.
+fn exited_cleanly(status: &ExitStatus, clean_exit_codes: &[u32]) -> bool {
+    status.success()
+        || status
+            .exit_code_if_known()
+            .map_or(true, |code| clean_exit_codes.contains(&code))
+}
+
 /// This block schedules a background thread to wait for the child
 /// to terminate, and then nudge the muxer to check for dead processes.
 /// Without this, typing `exit` in `cmd.exe` would keep the pane around
 /// until something else triggered the mux to prune dead processes.
 fn split_child(
     mut process: Box<dyn Child>,
+    pane_id: PaneId,
 ) -> (
     Receiver<IoResult<ExitStatus>>,
     Box<dyn ChildKiller + Sync>,
@@ -1467,6 +1514,12 @@ fn split_child(
 
     std::thread::spawn(move || {
         let status = process.wait();
+        // Given to the mux as the program is reaped, not when the pane is
+        // next asked whether it is dead: a pane removed by then is never
+        // asked, and `cli wait` would never learn how it ended.
+        if let (Ok(status), Some(mux)) = (&status, Mux::try_get()) {
+            mux.record_pane_exit(pane_id, pane_exit(status));
+        }
         tx.try_send(status).ok();
         promise::spawn::spawn_into_main_thread(async move {
             let mux = Mux::get();
@@ -1532,13 +1585,23 @@ impl LocalPane {
 
     /// Everything the terminal remembers. Take it with the reader paused
     /// (`crate::pause_pane_reader`), or it is a moment behind the pty.
-    pub fn snapshot_terminal(&self) -> (wezterm_term::TerminalSnapshot, wezterm_term::KittyGraphicsSnapshot) {
+    pub fn snapshot_terminal(
+        &self,
+    ) -> (
+        wezterm_term::TerminalSnapshot,
+        wezterm_term::KittyGraphicsSnapshot,
+        wezterm_term::ShellCommandsSnapshot,
+    ) {
         let mut term = self.terminal.lock();
         // A resize, configuration or focus noted while the parser held
         // the terminal is the parser's to apply; with the reader parked it
         // never will, so apply it here or the snapshot lags the pty.
         self.apply_pending_and_store(&mut term);
-        (term.snapshot(), term.snapshot_kitty_graphics())
+        (
+            term.snapshot(),
+            term.snapshot_kitty_graphics(),
+            term.snapshot_shell_commands(),
+        )
     }
 
     pub fn new(
@@ -1550,7 +1613,7 @@ impl LocalPane {
         domain_id: DomainId,
         command_description: String,
     ) -> Self {
-        let (process, signaller, pid) = split_child(process);
+        let (process, signaller, pid) = split_child(process, pane_id);
 
         terminal.set_device_control_handler(Box::new(LocalPaneDCSHandler {
             pane_id,
@@ -1567,6 +1630,8 @@ impl LocalPane {
         }
         let last_summary = Mutex::new(PaneSummary::from_terminal(&mut terminal, false));
         let config = Mutex::new(terminal.get_config());
+        // Not zero for a terminal a handoff restored.
+        let last_shell_commands = Mutex::new(terminal.shell_commands());
 
         Self {
             pane_id,
@@ -1593,6 +1658,8 @@ impl LocalPane {
             pending_seen: Mutex::new(false),
             shell_idle: Mutex::new(None),
             last_progress: Mutex::new(Progress::default()),
+            last_shell_commands,
+            exit: Mutex::new(None),
         }
     }
 
@@ -1626,6 +1693,7 @@ impl LocalPane {
         self.apply_pending_focus(term);
         self.store_summary(term);
         *self.last_progress.lock() = term.get_progress();
+        *self.last_shell_commands.lock() = term.shell_commands();
     }
 
     fn anything_pending(&self) -> bool {
@@ -1833,6 +1901,25 @@ mod summary_tests {
     use super::*;
     use portable_pty::PtySize;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn pane_exit_preserves_unknown_and_known_statuses() {
+        assert_eq!(pane_exit(&ExitStatus::unknown()).code, None);
+        assert_eq!(pane_exit(&ExitStatus::with_exit_code(0)).code, Some(0));
+        assert_eq!(pane_exit(&ExitStatus::with_exit_code(7)).code, Some(7));
+        let killed = pane_exit(&ExitStatus::with_signal("Terminated"));
+        assert_eq!(killed.code, Some(1));
+        assert_eq!(killed.signal.as_deref(), Some("Terminated"));
+    }
+
+    #[test]
+    fn an_unknown_status_closes_like_a_clean_exit() {
+        assert!(exited_cleanly(&ExitStatus::unknown(), &[]));
+        assert!(exited_cleanly(&ExitStatus::with_exit_code(0), &[]));
+        assert!(!exited_cleanly(&ExitStatus::with_exit_code(3), &[]));
+        assert!(exited_cleanly(&ExitStatus::with_exit_code(3), &[3]));
+        assert!(!exited_cleanly(&ExitStatus::with_signal("Terminated"), &[]));
+    }
 
     /// A child that never exits, so the waiter thread `LocalPane::new`
     /// spawns sits on it for the life of the test.

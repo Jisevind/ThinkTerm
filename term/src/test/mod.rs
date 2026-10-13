@@ -334,6 +334,87 @@ fn program_status_reports_are_answered_kept_and_retired() {
 }
 
 #[test]
+fn shell_commands_follow_the_osc_133_marks() {
+    struct Alerts(Arc<Mutex<Vec<Alert>>>);
+    impl AlertHandler for Alerts {
+        fn alert(&mut self, alert: Alert) {
+            self.0.lock().unwrap().push(alert);
+        }
+    }
+
+    let mut term = TestTerm::new(4, 20, 0);
+    let alerts = Arc::new(Mutex::new(vec![]));
+    term.set_notification_handler(Box::new(Alerts(Arc::clone(&alerts))));
+    assert_eq!(term.shell_commands(), ShellCommands::default());
+
+    // The first prompt: the shell reports, and nothing has finished yet.
+    term.print("\x1b]133;A;cl=m;aid=1\x07$ \x1b]133;B\x07");
+    assert_eq!(
+        term.shell_commands(),
+        ShellCommands {
+            reported: true,
+            ..Default::default()
+        }
+    );
+
+    // A command runs, and its status comes before the next prompt.
+    term.print("make\r\n\x1b]133;C;\x07");
+    assert!(term.shell_commands().running);
+    term.print("error\r\n\x1b]133;D;2;aid=1\x07\x1b]133;A;cl=m;aid=1\x07");
+    assert_eq!(
+        term.shell_commands(),
+        ShellCommands {
+            reported: true,
+            finished: 1,
+            running: false,
+            last_exit: Some(2),
+        }
+    );
+
+    // A shell that reports no status: the next prompt ends the command.
+    term.print("\x1b]133;C;\x07\x1b]133;A\x07");
+    assert_eq!(
+        term.shell_commands(),
+        ShellCommands {
+            reported: true,
+            finished: 2,
+            running: false,
+            last_exit: None,
+        }
+    );
+
+    // A command that starts another shell (ssh, a subshell): its prompts
+    // and statuses are not the outer shell's.
+    term.print("\x1b]133;A;aid=1\x07\x1b]133;C;\x07");
+    term.print("\x1b]133;A;cl=m;aid=2\x07\x1b]133;P;k=i\x07% \x1b]133;B\x07");
+    term.print("\x1b]133;C;\x07\x1b]133;D;0;aid=2\x07\x1b]133;A;aid=2\x07");
+    assert!(
+        term.shell_commands().running,
+        "still inside the outer command"
+    );
+    assert_eq!(term.shell_commands().finished, 2);
+    term.print("\x1b]133;D;5;aid=1\x07\x1b]133;A;aid=1\x07");
+    assert_eq!(term.shell_commands().finished, 3);
+    assert_eq!(term.shell_commands().last_exit, Some(5));
+
+    // Another shell at an idle prompt has taken over (`exec`).
+    term.print("\x1b]133;A;aid=3\x07\x1b]133;C;\x07\x1b]133;D;4;aid=3\x07");
+    assert_eq!(term.shell_commands().finished, 4);
+    assert_eq!(term.shell_commands().last_exit, Some(4));
+
+    let finished: Vec<_> = alerts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|alert| match alert {
+            Alert::CommandFinished { exit_code } => Some(*exit_code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, vec![Some(2), None, Some(5), Some(4)]);
+}
+
+#[test]
 fn application_palette_override_tracks_osc_set_query_and_reset() {
     let mut term = TestTerm::new(4, 8, 0);
     assert!(term.palette_override().is_none());

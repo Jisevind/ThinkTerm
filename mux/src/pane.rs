@@ -508,6 +508,13 @@ pub trait Pane: Downcast + Send + Sync {
         Ok(vec![])
     }
 
+    /// How far the pane's programs have got: whether the program it
+    /// started is still running, and what its shell has reported about
+    /// its commands. A mirror asks the mux that owns the pane.
+    async fn run_state(&self) -> anyhow::Result<thinkterm_proto::PaneRunState> {
+        Ok(thinkterm_proto::PaneRunState::unknown())
+    }
+
     /// Retrieve the set of semantic zones
     fn get_semantic_zones(&self) -> anyhow::Result<Vec<SemanticZone>> {
         Ok(vec![])
