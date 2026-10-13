@@ -11,16 +11,16 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{wrap_path_for_width, wrap_snippet_text_for_width};
 use crate::termwindow::{ContentViewId, TermWindow, TermWindowNotif};
 use crate::ui::{
-    draw_scrollbar, rect, wheel_delta_pixels, ButtonVariant, ControlState, DrawContext,
-    InteractionState,
+    apply_wheel, draw_scrollbar, rect, ButtonVariant, ControlState, DrawContext, InteractionState,
     ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Mutex;
+use std::time::Instant;
 use wezterm_font::LoadedFont;
 use window::WindowOps;
-use window::{MouseEventKind as WMEK, MousePress, RectF};
+use window::{MouseEvent, MouseEventKind as WMEK, MousePress, RectF};
 
 const CONTENT_MAX_W: f32 = 860.0;
 const PAD: f32 = 48.0;
@@ -65,6 +65,8 @@ pub(crate) struct ProjectRootView {
     widgets: UiContext<ProjectRootAction>,
     interaction: InteractionState<ProjectRootAction>,
     scroll: ScrollState,
+    /// The scroll was still gliding after the last paint.
+    scroll_animating: bool,
     /// UI scale captured at paint time; mouse handlers get no `DrawContext`.
     last_ui_scale: f32,
 }
@@ -87,6 +89,7 @@ impl ProjectRootView {
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
             scroll: ScrollState::new(),
+            scroll_animating: false,
             last_ui_scale: 1.0,
         }
     }
@@ -197,6 +200,8 @@ impl ProjectRootView {
     ) -> anyhow::Result<()> {
         self.widgets.clear();
         self.last_ui_scale = ctx.scale();
+        // The glide a notched wheel was given lives in the scroll state.
+        self.scroll_animating = self.scroll.advance_animation(Instant::now());
         ctx.draw_rect(
             layers,
             0,
@@ -568,16 +573,6 @@ impl ProjectRootView {
     fn on_mouse_impl(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         let hit = self.widgets.hit_test(x, y).map(|target| target.action);
         match kind {
-            WMEK::VertWheel(amount) => {
-                let old = self.scroll.offset;
-                self.scroll
-                    .scroll_by(wheel_delta_pixels(amount, self.last_ui_scale));
-                if (self.scroll.offset - old).abs() > 0.01 {
-                    ContentViewResponse::Redraw
-                } else {
-                    ContentViewResponse::Ignored
-                }
-            }
             WMEK::Move => {
                 if self.interaction.hovered != hit {
                     self.interaction.hovered = hit;
@@ -707,6 +702,18 @@ impl ContentView for ProjectRootView {
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         self.on_mouse_impl(x, y, kind)
+    }
+
+    fn on_wheel(&mut self, _x: f32, _y: f32, event: &MouseEvent) -> ContentViewResponse {
+        if apply_wheel(event, &mut self.scroll, self.last_ui_scale) {
+            ContentViewResponse::Redraw
+        } else {
+            ContentViewResponse::Ignored
+        }
+    }
+
+    fn next_frame_time(&self) -> Option<Instant> {
+        self.scroll_animating.then(Instant::now)
     }
 
     fn on_key(

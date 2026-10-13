@@ -14,21 +14,22 @@ use crate::termwindow::ui::right_sidebar::wrap_snippet_text_for_width;
 use crate::termwindow::TermWindow;
 use crate::ui::anim::Easing;
 use crate::ui::{
-    card_grid, card_is_warm, card_rect, char_index_for_x, contains, draw_button,
+    apply_wheel, card_grid, card_is_warm, card_rect, char_index_for_x, contains, draw_button,
     draw_button_on_layer, draw_icon_button, draw_scrollbar, draw_text_input,
-    draw_text_input_on_layer, draw_toggle, rect, row_visible, shared_grid_columns,
-    wheel_delta_pixels, ButtonSpec, ButtonVariant, CardGrid, ControlState, DrawContext,
-    EditModifiers, InputCaret, InteractionState, RowAlign, ScrollState, TextInputSpec,
-    TextInputState, UiContext, UiPalette, UiTokens, WidgetKind,
+    draw_text_input_on_layer, draw_toggle, rect, row_visible, shared_grid_columns, ButtonSpec,
+    ButtonVariant, CardGrid, ControlState, DrawContext, EditModifiers, InputCaret,
+    InteractionState, RowAlign, ScrollState, TextInputSpec, TextInputState, UiContext, UiPalette,
+    UiTokens, WidgetKind,
 };
 use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use fluent_bundle::FluentArgs;
 use std::rc::Rc;
+use std::time::Instant;
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
 use window::color::LinearRgba;
-use window::{MouseEventKind as WMEK, MousePress, RectF};
+use window::{MouseEvent, MouseEventKind as WMEK, MousePress, RectF};
 
 pub(crate) const SSH_HOSTS_CONTENT_VIEW_KEY: &str = "ssh-hosts";
 
@@ -234,6 +235,13 @@ pub(crate) struct SshHostsView {
     widgets: UiContext<SshViewAction>,
     interaction: InteractionState<SshViewAction>,
     scroll: ScrollState,
+    /// Either scroll state was still gliding after the last paint.
+    scroll_animating: bool,
+    /// `~/.ssh/config` as last read, with the stamp it had then. The list is
+    /// rebuilt on every paint so hosts saved elsewhere show up, and the page
+    /// paints for each scroll step and caret blink; the file is read again
+    /// only when its stamp moves.
+    system_hosts: Option<(ssh_hosts::SshConfigStamp, Vec<SshHostEntry>)>,
 }
 
 impl SshHostsView {
@@ -259,6 +267,8 @@ impl SshHostsView {
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
             scroll: ScrollState::new(),
+            scroll_animating: false,
+            system_hosts: None,
         };
         view.refresh();
         view
@@ -276,7 +286,17 @@ impl SshHostsView {
         let needle = self.search.text().trim().to_ascii_lowercase();
         let show_system_hosts = !self.system_hosts_collapsed || !needle.is_empty();
         self.system_host_count = 0;
-        self.filtered = ssh_hosts::list_all_hosts()
+        let stamp = ssh_hosts::system_ssh_config_stamp();
+        let cached = match &self.system_hosts {
+            Some((read_at, hosts)) if stamp == Some(*read_at) => Some(hosts.clone()),
+            _ => None,
+        };
+        let system_hosts = cached.unwrap_or_else(|| {
+            let hosts = ssh_hosts::list_system_hosts();
+            self.system_hosts = stamp.map(|stamp| (stamp, hosts.clone()));
+            hosts
+        });
+        self.filtered = ssh_hosts::list_all_hosts_with(system_hosts)
             .into_iter()
             .filter(|entry| {
                 if needle.is_empty() {
@@ -541,25 +561,6 @@ impl SshHostsView {
     fn on_mouse_impl(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         let hit = self.widgets.hit_test(x, y).map(|t| t.action);
         match kind {
-            WMEK::VertWheel(amount) => {
-                let scroll = if self.point_in_host_list(x, y) {
-                    Some(&mut self.scroll)
-                } else if contains(self.form_area, x, y) {
-                    Some(&mut self.form_scroll)
-                } else {
-                    None
-                };
-                let Some(scroll) = scroll else {
-                    return ContentViewResponse::Ignored;
-                };
-                let old = scroll.offset;
-                scroll.scroll_by(wheel_delta_pixels(amount, self.last_ui_scale));
-                if (scroll.offset - old).abs() > 0.01 {
-                    ContentViewResponse::Redraw
-                } else {
-                    ContentViewResponse::Ignored
-                }
-            }
             WMEK::Move => {
                 if self.interaction.hovered != hit {
                     self.interaction.hovered = hit;
@@ -1348,6 +1349,10 @@ impl SshHostsView {
         let w = area.size.width;
         let h = area.size.height;
         self.last_ui_scale = ctx.px(1.0).max(0.01);
+        // The glide a notched wheel was given lives in the scroll states.
+        let now = Instant::now();
+        self.scroll_animating =
+            self.scroll.advance_animation(now) | self.form_scroll.advance_animation(now);
 
         ctx.draw_rect(layers, 0, ox, oy, w, h, palette.window_bg)?;
 
@@ -2958,6 +2963,26 @@ impl ContentView for SshHostsView {
         self.on_mouse_impl(x, y, kind)
     }
 
+    fn on_wheel(&mut self, x: f32, y: f32, event: &MouseEvent) -> ContentViewResponse {
+        let scale = self.last_ui_scale;
+        let scroll = if self.point_in_host_list(x, y) {
+            &mut self.scroll
+        } else if contains(self.form_area, x, y) {
+            &mut self.form_scroll
+        } else {
+            return ContentViewResponse::Ignored;
+        };
+        if apply_wheel(event, scroll, scale) {
+            ContentViewResponse::Redraw
+        } else {
+            ContentViewResponse::Ignored
+        }
+    }
+
+    fn next_frame_time(&self) -> Option<Instant> {
+        self.scroll_animating.then(Instant::now)
+    }
+
     fn on_key(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse {
         self.on_key_impl(key, mods)
     }
@@ -3015,6 +3040,39 @@ mod tests {
             shell_integration_failure: None,
             files_auto_connect: false,
         }
+    }
+
+    fn wheel(precise_y: Option<f32>, notches: i16) -> window::MouseEvent {
+        window::MouseEvent {
+            kind: window::MouseEventKind::VertWheel(notches),
+            coords: window::Point::new(10, 10),
+            screen_coords: window::ScreenPoint::new(10, 10),
+            mouse_buttons: window::MouseButtons::NONE,
+            modifiers: window::Modifiers::NONE,
+            precise_scroll_delta: precise_y.map(|y| window::PreciseScrollDelta { x: 0.0, y }),
+            scroll_phase: None,
+            momentum_phase: None,
+            precise_wheel_lines: None,
+        }
+    }
+
+    #[test]
+    fn the_host_list_follows_a_trackpad_and_glides_on_a_wheel() {
+        use super::ContentView;
+        let mut view = SshHostsView::new();
+        view.list_area = crate::ui::rect(0.0, 0.0, 400.0, 300.0);
+        view.scroll.set_extents(300.0, 3000.0);
+
+        // A trackpad reports a few pixels at a time, alongside a wheel amount
+        // of 0; read in whole notches, the list would not move at all.
+        let response = view.on_wheel(10.0, 10.0, &wheel(Some(-7.5), 0));
+        assert!(matches!(response, ContentViewResponse::Redraw));
+        assert_eq!(view.scroll.offset, 7.5);
+
+        // A notched wheel sets off a glide instead of jumping a whole step.
+        view.on_wheel(10.0, 10.0, &wheel(None, -1));
+        assert_eq!(view.scroll.offset, 7.5);
+        assert!(view.scroll.velocity > 0.0);
     }
 
     #[test]

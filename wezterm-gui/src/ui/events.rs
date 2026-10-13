@@ -34,7 +34,13 @@ pub(crate) fn apply_wheel_to_area(
     if !contains(area, event.coords.x as f32, event.coords.y as f32) {
         return false;
     }
+    apply_wheel(event, scroll, scale)
+}
 
+/// [`apply_wheel_to_area`] for a caller that has already picked the scroll
+/// area under the pointer. A trackpad's pixels are taken as they come -- the
+/// system already supplies the glide -- and a notched wheel is given one.
+pub(crate) fn apply_wheel(event: &MouseEvent, scroll: &mut ScrollState, scale: f32) -> bool {
     scroll.set_phase(event.momentum_phase.or(event.scroll_phase));
 
     if let Some(delta) = precise_wheel_delta_pixels(event) {
