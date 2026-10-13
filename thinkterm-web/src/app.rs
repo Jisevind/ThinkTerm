@@ -88,6 +88,169 @@ fn preview_row(line: &termwiz::surface::Line, palette: &ColorPalette) -> Preview
     PreviewRow { runs }
 }
 
+/// A tab as it is split, for a thumbnail of the whole tab: every pane on
+/// show with its screen where it lies, in the tab's cells (`left`, `top`),
+/// the dividers in the cells between them; a zoomed pane alone, filling it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TabPreview {
+    pub cols: usize,
+    pub rows: usize,
+    /// The colours of the pane asked about, for the tab round its panes.
+    pub foreground: String,
+    pub background: String,
+    pub panes: Vec<PanePreview>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PanePreview {
+    pub left: usize,
+    pub top: usize,
+    pub screen: ScreenPreview,
+}
+
+/// Where a pane lies in its tab, as one listing of the layout has it: its
+/// left column and top row there, and its size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Place {
+    pane: PaneId,
+    left: usize,
+    top: usize,
+    cols: usize,
+    rows: usize,
+}
+
+/// The panes on show in the tab that holds `pane_id`, each where it lies:
+/// a stack's pane in front, a zoomed pane alone.
+fn tab_places(layout: &codec::ListPanesResponse, pane_id: PaneId) -> Option<Vec<Place>> {
+    use thinkterm_proto::layout::{PaneEntry, PaneNode};
+    fn shown(node: &PaneNode, out: &mut Vec<PaneEntry>) {
+        match node {
+            PaneNode::Empty => {}
+            PaneNode::Leaf(entry) => out.push(entry.clone()),
+            PaneNode::Stack(stack) => out.extend(stack.panes.get(stack.active).or(stack.panes.first()).cloned()),
+            PaneNode::Split { left, right, .. } => {
+                shown(left, out);
+                shown(right, out);
+            }
+        }
+    }
+    let tab = layout.tabs.iter().find(|node| crate::attach::contains_pane(node, pane_id))?;
+    let mut entries = Vec::new();
+    shown(tab, &mut entries);
+    let place = |e: &PaneEntry| Place { pane: e.pane_id, left: e.left_col, top: e.top_row, cols: e.size.cols, rows: e.size.rows };
+    if let Some(zoomed) = entries.iter().find(|e| e.is_zoomed_pane) {
+        return Some(vec![Place { left: 0, top: 0, ..place(zoomed) }]);
+    }
+    (!entries.is_empty()).then(|| entries.iter().map(place).collect())
+}
+
+/// A pane's whole screen, for a thumbnail with the terminal's shape: every
+/// row of its viewport at its own size, in its own colours. A run's
+/// background is `""` where it is the screen's own (`background`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScreenPreview {
+    pub cols: usize,
+    pub rows: usize,
+    pub foreground: String,
+    pub background: String,
+    pub lines: Vec<Vec<ScreenRun>>,
+}
+
+impl ScreenPreview {
+    /// `cols` by `rows`, the size its place in the tab was listed at: of a
+    /// pane resized since, what lies outside goes (a run across the edge
+    /// is the picture's to clip), and rows it lacks are blank.
+    fn fit(&mut self, cols: usize, rows: usize) {
+        self.lines.resize(rows, Vec::new());
+        for runs in &mut self.lines {
+            runs.retain(|run| run.col < cols);
+        }
+        self.cols = cols;
+        self.rows = rows;
+    }
+}
+
+/// Text from column `col` across `width` columns: one wide character, or
+/// narrow ones of one foreground and background, so a picture can put
+/// every run where the terminal has it whatever its faces' widths.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScreenRun {
+    pub text: String,
+    pub fg: String,
+    pub bg: String,
+    pub col: usize,
+    pub width: usize,
+    /// Narrow characters, a cell each: another can join them.
+    #[serde(skip)]
+    narrow: bool,
+}
+
+/// A line's cells as runs of one foreground and background, each wide
+/// character a run of its own, in the colours the terminal draws them in
+/// (`emit`): bold lifting the first eight to their bright twins, a
+/// reversed cell, or every cell of a reversed screen, with the two swapped
+/// (both, and they are as they were, a default ground left unpainted), a
+/// concealed one blank. A background that is the screen's own is left
+/// out, and trailing blanks on it go.
+fn screen_row(line: &termwiz::surface::Line, palette: &ColorPalette, reversed: bool) -> Vec<ScreenRun> {
+    use wezterm_term::color::ColorAttribute;
+    let mut runs: Vec<ScreenRun> = Vec::new();
+    let mut push = |text: &str, fg: String, bg: String, col: usize, width: usize| match runs.last_mut() {
+        Some(last)
+            if width == 1 && last.narrow && last.col + last.width == col && last.fg == fg && last.bg == bg =>
+        {
+            last.text.push_str(text);
+            last.width += 1;
+        }
+        _ => runs.push(ScreenRun { text: text.to_string(), fg, bg, col, width, narrow: width == 1 }),
+    };
+    // The screen's own colours, as `ScreenPreview` has them.
+    let (screen_fg, screen_bg) = if reversed {
+        (palette.background, palette.foreground)
+    } else {
+        (palette.foreground, palette.background)
+    };
+    let (screen_fg, screen_bg) = (screen_fg.to_rgb_string(), screen_bg.to_rgb_string());
+    let mut at = 0usize;
+    for cell in line.visible_cells() {
+        let col = cell.cell_index();
+        for gap in at..col {
+            push(" ", screen_fg.clone(), String::new(), gap, 1);
+        }
+        let attrs = cell.attrs();
+        let fg = crate::emit::resolve_fg(attrs, attrs.foreground(), palette);
+        let bg = palette.resolve_bg(attrs.background());
+        let swapped = attrs.reverse() != reversed;
+        let unpainted = !swapped && attrs.background() == ColorAttribute::Default;
+        let (fg, bg) = if swapped { (bg, fg) } else { (fg, bg) };
+        let (fg, bg) = (fg.to_rgb_string(), bg.to_rgb_string());
+        let bg = if unpainted || bg == screen_bg { String::new() } else { bg };
+        let width = cell.width().max(1);
+        if attrs.invisible() {
+            for at in col..col + width {
+                push(" ", fg.clone(), bg.clone(), at, 1);
+            }
+        } else {
+            push(cell.str(), fg, bg, col, width);
+        }
+        at = col + width;
+    }
+    while let Some(last) = runs.last_mut() {
+        if !last.bg.is_empty() {
+            break;
+        }
+        let trimmed = last.text.trim_end();
+        if trimmed.is_empty() {
+            runs.pop();
+        } else {
+            last.width -= last.text.chars().count() - trimmed.chars().count();
+            last.text.truncate(trimmed.len());
+            break;
+        }
+    }
+    runs
+}
+
 /// See `App::threads_view`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ThreadsView {
@@ -1206,23 +1369,41 @@ impl<P: Platform, L: Link> App<P, L> {
     pub fn set_selection(self: &Rc<Self>, anchor: (usize, usize), head: (usize, usize)) {
         {
             let mut inner = self.inner.borrow_mut();
-            let Some(place) = Self::focused_placement(&inner) else {
+            let Some((pane_id, selection)) = Self::visible_selection(&inner, anchor, head) else {
                 return;
             };
-            let (_, rows) = Self::shown_in(&inner, &place);
-            let Some(cell) = inner.panes.get_mut(&place.pane_id) else {
+            let Some(cell) = inner.panes.get_mut(&pane_id) else {
                 return;
             };
-            let dims = Self::shown_dims(&cell.session);
-            let visible = visible_rows(&dims, rows, cell.scroll_from_bottom);
-            cell.selection = Some(Selection {
-                anchor: (visible.start + anchor.0 as StableRowIndex, anchor.1),
-                head: (visible.start + head.0 as StableRowIndex, head.1),
-                mode: 1,
-            });
+            cell.selection = Some(selection);
             inner.selecting = false;
         }
         self.request_frame();
+    }
+
+    /// The text between two visible cells of the focused pane, both ends
+    /// inclusive, as a selection of them would copy it -- read without
+    /// making one, so the pane's own selection, and a drag making it, stay.
+    pub fn text_between(&self, anchor: (usize, usize), head: (usize, usize)) -> Option<String> {
+        let inner = self.inner.borrow();
+        let (_, selection) = Self::visible_selection(&inner, anchor, head)?;
+        Self::text_of(&inner, &selection)
+    }
+
+    /// A cell selection between two visible cells of the focused pane, in
+    /// the rows of its scrollback they show.
+    fn visible_selection(inner: &Inner<P, L>, anchor: (usize, usize), head: (usize, usize)) -> Option<(PaneId, Selection)> {
+        let place = Self::focused_placement(inner)?;
+        let (_, rows) = Self::shown_in(inner, &place);
+        let cell = inner.panes.get(&place.pane_id)?;
+        let dims = Self::shown_dims(&cell.session);
+        let visible = visible_rows(&dims, rows, cell.scroll_from_bottom);
+        let selection = Selection {
+            anchor: (visible.start + anchor.0 as StableRowIndex, anchor.1),
+            head: (visible.start + head.0 as StableRowIndex, head.1),
+            mode: 1,
+        };
+        Some((place.pane_id, selection))
     }
 
     pub fn clear_selection(self: &Rc<Self>) {
@@ -1238,12 +1419,10 @@ impl<P: Platform, L: Link> App<P, L> {
         self.request_frame();
     }
 
-    /// What is selected in the focused pane, for the platform's clipboard.
     /// The `rows` rows of any pane on the server ending at its cursor's
     /// row, as text, for a thumbnail of a tab this page is not showing: a
     /// fresh shell's prompt sits at the top of a tall pane, and the rows
-    /// under it are nothing to look at. Two round trips: the pane's
-    /// dimensions, then its lines.
+    /// under it are nothing to look at.
     pub fn preview_lines(self: &Rc<Self>, pane_id: PaneId, rows: usize) -> crate::platform::LocalFuture<Result<Vec<PreviewRow>>> {
         let link = self.inner.borrow().link.clone();
         // The pane's own colours if it is drawn here, else the scheme's.
@@ -1252,35 +1431,17 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.panes.get(&pane_id).map(|c| c.palette.clone()).unwrap_or_else(|| inner.configured())
         };
         Box::pin(async move {
-            let (dims, cursor) = thinkterm_session::host::request(
-                &link,
-                Pdu::GetPaneRenderableDimensions(codec::GetPaneRenderableDimensions { pane_id }),
-                |pdu| match pdu {
-                    Pdu::GetPaneRenderableDimensionsResponse(r) => Ok((r.dimensions, r.cursor_position)),
-                    other => Err(other),
-                },
-            )
+            let (_, lines) = Self::pane_rows(link, pane_id, |dims, cursor| {
+                let bottom = cursor
+                    .y
+                    .saturating_add(1)
+                    .min(dims.physical_top + dims.viewport_rows as StableRowIndex);
+                let top = bottom
+                    .saturating_sub(rows as StableRowIndex)
+                    .max(dims.scrollback_top);
+                top..bottom
+            })
             .await?;
-            if !dims.is_plausible() {
-                anyhow::bail!("the pane reported impossible dimensions");
-            }
-            let bottom = cursor
-                .y
-                .saturating_add(1)
-                .min(dims.physical_top + dims.viewport_rows as StableRowIndex);
-            let top = bottom
-                .saturating_sub(rows as StableRowIndex)
-                .max(dims.scrollback_top);
-            let response = thinkterm_session::host::request(
-                &link,
-                Pdu::GetLines(codec::GetLines { pane_id, lines: vec![top..bottom] }),
-                |pdu| match pdu {
-                    Pdu::GetLinesResponse(r) => Ok(r),
-                    other => Err(other),
-                },
-            )
-            .await?;
-            let (lines, _) = response.lines.extract_data();
             let mut out: Vec<(StableRowIndex, PreviewRow)> = lines
                 .into_iter()
                 .map(|(row, line)| (row, preview_row(&line, &palette)))
@@ -1290,6 +1451,128 @@ impl<P: Platform, L: Link> App<P, L> {
         })
     }
 
+    /// The whole screen of any pane on the server, every row of its
+    /// viewport, for a thumbnail that has the terminal's shape and so can
+    /// stand in for it (see `ScreenPreview`).
+    pub fn preview_screen(self: &Rc<Self>, pane_id: PaneId) -> crate::platform::LocalFuture<Result<ScreenPreview>> {
+        let link = self.inner.borrow().link.clone();
+        let palette = {
+            let inner = self.inner.borrow();
+            inner.panes.get(&pane_id).map(|c| c.palette.clone()).unwrap_or_else(|| inner.configured())
+        };
+        Box::pin(async move {
+            let (dims, lines) = Self::pane_rows(link, pane_id, |dims, _| {
+                dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex
+            })
+            .await?;
+            let (top, rows) = (dims.physical_top, dims.viewport_rows);
+            let mut screen = vec![Vec::new(); rows];
+            for (row, line) in lines {
+                if let Some(slot) = usize::try_from(row - top).ok().and_then(|i| screen.get_mut(i)) {
+                    *slot = screen_row(&line, &palette, dims.reverse_video);
+                }
+            }
+            let (foreground, background) = if dims.reverse_video {
+                (palette.background, palette.foreground)
+            } else {
+                (palette.foreground, palette.background)
+            };
+            Ok(ScreenPreview {
+                cols: dims.cols,
+                rows,
+                foreground: foreground.to_rgb_string(),
+                background: background.to_rgb_string(),
+                lines: screen,
+            })
+        })
+    }
+
+    /// A pane's dimensions, then the rows `range` picks out of them, as
+    /// the server sends them, each with its index: two round trips.
+    async fn pane_rows(
+        link: L,
+        pane_id: PaneId,
+        range: impl FnOnce(
+            &thinkterm_proto::RenderableDimensions,
+            &thinkterm_proto::StableCursorPosition,
+        ) -> std::ops::Range<StableRowIndex>,
+    ) -> Result<(thinkterm_proto::RenderableDimensions, Vec<(StableRowIndex, termwiz::surface::Line)>)> {
+        let (dims, cursor) = thinkterm_session::host::request(
+            &link,
+            Pdu::GetPaneRenderableDimensions(codec::GetPaneRenderableDimensions { pane_id }),
+            |pdu| match pdu {
+                Pdu::GetPaneRenderableDimensionsResponse(r) => Ok((r.dimensions, r.cursor_position)),
+                other => Err(other),
+            },
+        )
+        .await?;
+        if !dims.is_plausible() {
+            anyhow::bail!("the pane reported impossible dimensions");
+        }
+        let lines = range(&dims, &cursor);
+        let response = thinkterm_session::host::request(
+            &link,
+            Pdu::GetLines(codec::GetLines { pane_id, lines: vec![lines] }),
+            |pdu| match pdu {
+                Pdu::GetLinesResponse(r) => Ok(r),
+                other => Err(other),
+            },
+        )
+        .await?;
+        Ok((dims, response.lines.extract_data().0))
+    }
+
+    /// Every pane on show in the tab that holds `pane_id`, each one's whole
+    /// screen where it lies in the tab, for a thumbnail of the tab as it is
+    /// split (see `TabPreview`). The panes' places and sizes are the layout
+    /// as last listed; their screens are fetched together, two round trips
+    /// each. A pane that cannot say (closed since) leaves its place blank.
+    pub fn preview_tab(self: &Rc<Self>, pane_id: PaneId) -> crate::platform::LocalFuture<Result<TabPreview>> {
+        let places = {
+            let inner = self.inner.borrow();
+            inner.layout.as_ref().and_then(|layout| tab_places(layout, pane_id))
+        }
+        // Not listed yet: the pane alone, at the size it says.
+        .unwrap_or_else(|| vec![Place { pane: pane_id, left: 0, top: 0, cols: 0, rows: 0 }]);
+        let screens: Vec<_> = places.iter().map(|place| self.preview_screen(place.pane)).collect();
+        Box::pin(async move {
+            let screens = futures::future::join_all(screens).await;
+            let (mut cols, mut rows) = (0, 0);
+            let mut asked = None;
+            let mut failed = None;
+            let mut panes = Vec::with_capacity(places.len());
+            for (place, screen) in places.into_iter().zip(screens) {
+                // The tab as large as listed, a blank place included.
+                cols = cols.max(place.left + place.cols);
+                rows = rows.max(place.top + place.rows);
+                let mut screen = match screen {
+                    Ok(screen) => screen,
+                    Err(err) => {
+                        failed = Some(err);
+                        continue;
+                    }
+                };
+                if place.cols > 0 && place.rows > 0 {
+                    screen.fit(place.cols, place.rows);
+                }
+                if place.pane == pane_id {
+                    asked = Some((screen.foreground.clone(), screen.background.clone()));
+                }
+                cols = cols.max(place.left + screen.cols);
+                rows = rows.max(place.top + screen.rows);
+                panes.push(PanePreview { left: place.left, top: place.top, screen });
+            }
+            if panes.is_empty() {
+                return Err(failed.unwrap_or_else(|| anyhow::anyhow!("no pane to show")));
+            }
+            let (foreground, background) = asked
+                .or_else(|| panes.first().map(|p| (p.screen.foreground.clone(), p.screen.background.clone())))
+                .unwrap_or_default();
+            Ok(TabPreview { cols, rows, foreground, background, panes })
+        })
+    }
+
+    /// What is selected in the focused pane, for the platform's clipboard.
     pub fn selected_text(&self) -> Option<String> {
         Self::selection_text(&self.inner.borrow())
     }
@@ -2757,13 +3040,19 @@ impl<P: Platform, L: Link> App<P, L> {
 
     fn selection_text(inner: &Inner<P, L>) -> Option<String> {
         let sel = inner.focused().selection?;
+        Self::text_of(inner, &sel)
+    }
+
+    /// What a selection covers in the focused pane, each row's trailing
+    /// blanks dropped.
+    fn text_of(inner: &Inner<P, L>, sel: &Selection) -> Option<String> {
         let ((r0, _), (r1, _)) = sel.ordered();
         let (first, lines) = inner.focused().session.get_lines(r0..r1 + 1);
         let width = Self::focused_placement(inner).map(|p| Self::shown(&p).0).unwrap_or(inner.cols);
         let mut out = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             let row = first + i as StableRowIndex;
-            let range = Self::selection_on_row(width, &sel, row, line);
+            let range = Self::selection_on_row(width, sel, row, line);
             let mut text = String::new();
             for cell in line.visible_cells() {
                 if range.contains(&cell.cell_index()) {
@@ -5426,17 +5715,23 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.recompute_palettes()
         };
         self.repaint_palettes(&changed);
-        // The pane in use takes the new scheme on the server too -- on show
-        // only: telling a host's server which pane has focus moves its
-        // desktop's tab when the desktop follows the page.
-        if self.platform.shown() {
-            let (link, pane, palette) = {
-                let inner = self.inner.borrow();
-                (inner.link.clone(), inner.focused_pane, inner.configured())
-            };
-            Self::advise_focus(&self.platform, link, pane, palette);
-        }
+        self.advise_palette();
         Self::notify(&self.inner.borrow());
+    }
+
+    /// The pane in use takes the scheme on the server too -- on show only:
+    /// telling a host's server which pane has focus moves its desktop's tab
+    /// when the desktop follows the page. A scheme chosen off show is told
+    /// with this once the page is shown again.
+    pub fn advise_palette(self: &Rc<Self>) {
+        if !self.platform.shown() {
+            return;
+        }
+        let (link, pane, palette) = {
+            let inner = self.inner.borrow();
+            (inner.link.clone(), inner.focused_pane, inner.configured())
+        };
+        Self::advise_focus(&self.platform, link, pane, palette);
     }
 
     /// The page's preferences, as the model holds them.
@@ -7077,5 +7372,175 @@ mod tests {
         assert_eq!(grid_for(800, 19, 10, 20), None);
         assert_eq!(grid_for(800, 400, 10, 20), Some((80, 20)));
         assert_eq!(grid_for(15, 20, 10, 20), Some((2, 1)));
+    }
+
+    #[test]
+    fn a_tab_is_placed_as_it_is_split() {
+        use super::tab_places;
+        use thinkterm_proto::layout::{PaneEntry, PaneNode, PaneStackEntry};
+        use thinkterm_proto::split::{SplitDirection, SplitDirectionAndSize};
+        use wezterm_term::TerminalSize;
+
+        let pane = |tab_id, pane_id, left_col, top_row, is_zoomed_pane| PaneEntry {
+            window_id: 0,
+            tab_id,
+            pane_id,
+            title: String::new(),
+            size: TerminalSize { rows: 12, cols: 40, ..TerminalSize::default() },
+            working_dir: None,
+            is_active_pane: false,
+            is_zoomed_pane,
+            alt_screen: false,
+            workspace: "default".to_string(),
+            cursor_pos: Default::default(),
+            physical_top: 0,
+            top_row,
+            left_col,
+            tty_name: None,
+        };
+        let split = |left, right| PaneNode::Split {
+            left: Box::new(left),
+            right: Box::new(right),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: TerminalSize::default(),
+                second: TerminalSize::default(),
+            },
+        };
+        let stack = PaneStackEntry { active: 1, panes: vec![pane(2, 22, 41, 13, false), pane(2, 23, 41, 13, false)], pane_stack_id: None };
+        let layout = codec::ListPanesResponse {
+            tabs: vec![
+                PaneNode::Leaf(pane(1, 10, 0, 0, false)),
+                split(
+                    PaneNode::Leaf(pane(2, 20, 0, 0, false)),
+                    split(PaneNode::Leaf(pane(2, 21, 41, 0, false)), PaneNode::Stack(stack)),
+                ),
+                split(PaneNode::Leaf(pane(3, 30, 0, 0, false)), PaneNode::Leaf(pane(3, 31, 41, 0, true))),
+            ],
+            tab_titles: Vec::new(),
+            window_titles: Default::default(),
+        };
+        let at = |pane_id| tab_places(&layout, pane_id).map(|places| places.iter().map(|p| (p.pane, p.left, p.top)).collect::<Vec<_>>());
+        assert_eq!(at(10), Some(vec![(10, 0, 0)]));
+        assert_eq!(
+            at(22),
+            Some(vec![(20, 0, 0), (21, 41, 0), (23, 41, 13)]),
+            "every pane on show, a stack's one in front"
+        );
+        assert_eq!(at(30), Some(vec![(31, 0, 0)]), "a zoomed pane alone");
+        assert_eq!(at(99), None);
+        // Each at the size the same listing has it.
+        let place = tab_places(&layout, 21).unwrap()[1];
+        assert_eq!((place.cols, place.rows), (40, 12));
+    }
+
+    #[test]
+    fn a_pane_fits_the_place_listed_for_it() {
+        use super::{ScreenPreview, ScreenRun};
+
+        let run = |text: &str, col| ScreenRun {
+            text: text.to_string(),
+            fg: String::new(),
+            bg: String::new(),
+            col,
+            width: text.len(),
+            narrow: true,
+        };
+        // Wider and taller than its place: resized since it was listed.
+        let mut screen = ScreenPreview {
+            cols: 6,
+            rows: 3,
+            foreground: String::new(),
+            background: String::new(),
+            lines: vec![vec![run("ab", 0), run("cd", 4)], vec![run("x", 0)], vec![run("gone", 0)]],
+        };
+        screen.fit(4, 2);
+        let seen: Vec<Vec<&str>> = screen.lines.iter().map(|runs| runs.iter().map(|r| r.text.as_str()).collect()).collect();
+        assert_eq!((screen.cols, screen.rows, seen), (4, 2, vec![vec!["ab"], vec!["x"]]));
+        // Shorter: the rows it lacks are blank.
+        screen.fit(4, 3);
+        assert_eq!(screen.lines.len(), 3);
+        assert!(screen.lines[2].is_empty());
+    }
+
+    #[test]
+    fn a_screen_row_keeps_its_backgrounds_and_reversed_cells() {
+        use super::screen_row;
+        use termwiz::cell::{Cell, CellAttributes, Intensity};
+        use termwiz::color::AnsiColor;
+        use termwiz::surface::{Line, SEQ_ZERO};
+        use wezterm_term::color::{ColorAttribute, ColorPalette};
+
+        let palette = ColorPalette::default();
+        let fg = palette.foreground.to_rgb_string();
+        let bg = palette.background.to_rgb_string();
+        let plain = CellAttributes::default();
+        let mut line = Line::from_text("ab  ", &plain, SEQ_ZERO, None);
+        let mut inverse = CellAttributes::default();
+        inverse.set_reverse(true);
+        line.set_cell(1, Cell::new('b', inverse.clone()), SEQ_ZERO);
+        let mut on_red = CellAttributes::default();
+        on_red.set_background(AnsiColor::Maroon);
+        let red = palette.resolve_bg(on_red.background()).to_rgb_string();
+        line.set_cell(4, Cell::new(' ', on_red), SEQ_ZERO);
+
+        let runs = screen_row(&line, &palette, false);
+        let seen: Vec<(&str, &str, &str, usize, usize)> =
+            runs.iter().map(|r| (r.text.as_str(), r.fg.as_str(), r.bg.as_str(), r.col, r.width)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("a", fg.as_str(), "", 0, 1),
+                ("b", bg.as_str(), fg.as_str(), 1, 1),
+                ("  ", fg.as_str(), "", 2, 2),
+                (" ", fg.as_str(), red.as_str(), 4, 1),
+            ]
+        );
+
+        // A wide character is a run of its own, and what follows it
+        // starts where the terminal has it.
+        let wide = Line::from_text("a界b", &plain, SEQ_ZERO, None);
+        let runs = screen_row(&wide, &palette, false);
+        let seen: Vec<(&str, usize, usize)> = runs.iter().map(|r| (r.text.as_str(), r.col, r.width)).collect();
+        assert_eq!(seen, vec![("a", 0, 1), ("界", 1, 2), ("b", 3, 1)]);
+
+        // Blanks on the screen's own background end a row, a reversed
+        // screen's too; a cell reversed on one is as it was, its ground
+        // left unpainted, as the terminal leaves it.
+        let short = Line::from_text("x   ", &plain, SEQ_ZERO, None);
+        let runs = screen_row(&short, &palette, false);
+        assert_eq!((runs.len(), runs[0].text.as_str()), (1, "x"));
+        let mut both = Line::from_text("x   ", &plain, SEQ_ZERO, None);
+        both.set_cell(2, Cell::new('y', inverse), SEQ_ZERO);
+        let runs = screen_row(&both, &palette, true);
+        let seen: Vec<(&str, &str, &str, usize)> =
+            runs.iter().map(|r| (r.text.as_str(), r.fg.as_str(), r.bg.as_str(), r.col)).collect();
+        assert_eq!(seen, vec![("x ", bg.as_str(), "", 0), ("y", fg.as_str(), "", 2)]);
+
+        // Bold lifts the first eight colours to their bright twins, as the
+        // terminal draws them.
+        let mut bold = CellAttributes::default();
+        bold.set_intensity(Intensity::Bold);
+        bold.set_foreground(AnsiColor::Navy);
+        let loud = Line::from_text("d", &bold, SEQ_ZERO, None);
+        let runs = screen_row(&loud, &palette, false);
+        assert_eq!(runs[0].fg, palette.resolve_fg(ColorAttribute::PaletteIndex(12)).to_rgb_string());
+
+        // A wide character of two (a kana and its voicing mark) is a run of
+        // its own as well: nothing narrow joins it.
+        let marked = Line::from_text("か\u{3099}b", &plain, SEQ_ZERO, None);
+        let runs = screen_row(&marked, &palette, false);
+        let seen: Vec<(&str, usize, usize)> = runs.iter().map(|r| (r.text.as_str(), r.col, r.width)).collect();
+        assert_eq!(seen, vec![("か\u{3099}", 0, 2), ("b", 2, 1)]);
+
+        // Concealed text is not drawn; its background is.
+        let mut hidden = CellAttributes::default();
+        hidden.set_invisible(true);
+        hidden.set_background(AnsiColor::Maroon);
+        let mut secret = Line::from_text("a", &plain, SEQ_ZERO, None);
+        secret.set_cell(1, Cell::new('s', hidden), SEQ_ZERO);
+        let runs = screen_row(&secret, &palette, false);
+        let seen: Vec<(&str, &str, usize)> = runs.iter().map(|r| (r.text.as_str(), r.bg.as_str(), r.col)).collect();
+        assert_eq!(seen, vec![("a", "", 0), (" ", red.as_str(), 1)]);
     }
 }

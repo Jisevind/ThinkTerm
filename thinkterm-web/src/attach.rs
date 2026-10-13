@@ -240,7 +240,7 @@ pub async fn reattach<L: Link>(
 }
 
 /// Whether a tab's layout still holds this pane.
-fn contains_pane(node: &PaneNode, pane_id: PaneId) -> bool {
+pub(crate) fn contains_pane(node: &PaneNode, pane_id: PaneId) -> bool {
     match node {
         PaneNode::Empty => false,
         PaneNode::Leaf(entry) => entry.pane_id == pane_id,
