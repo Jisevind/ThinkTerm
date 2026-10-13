@@ -8,6 +8,10 @@ use std::fs;
 use std::path::Path;
 
 pub type SshHostId = String;
+
+/// The ssh option carrying a host's other addresses to the connection:
+/// wezterm-ssh's `OTHER_ADDRESSES`.
+pub const OTHER_ADDRESSES_OPTION: &str = "thinkterm_other_addresses";
 pub const DEFAULT_MOSH_SERVER_COMMAND: &str = "mosh-server new -s -l LANG=en_US.UTF-8";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -16,6 +20,13 @@ pub struct SshHostSpec {
     pub host: String,
     #[serde(default)]
     pub port: Option<u16>,
+    /// Other addresses the host answers at -- a LAN name, a Tailscale name,
+    /// a public address with a forwarded port -- tried after `host`, in
+    /// order, for whichever answers first. Each is `host` or `host:port`;
+    /// without a port, `port` applies. The host key is checked against
+    /// `host` whichever one carries the connection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_addresses: Vec<String>,
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
@@ -181,6 +192,7 @@ pub fn parse_system_ssh_config(content: &str) -> Vec<SshHostEntry> {
                     label: alias.clone(),
                     host: alias,
                     port: block.port,
+                    other_addresses: Vec::new(),
                     username: block.user.clone(),
                     identity_file: block.identity_file.clone(),
                     password: None,
@@ -285,6 +297,28 @@ pub fn ssh_domain_name(spec: &SshHostSpec) -> String {
     format!("ssh:{}", endpoint(spec))
 }
 
+/// The host's other addresses as they are tried: trimmed, without blanks,
+/// repeats or the host's own address.
+pub fn other_addresses(spec: &SshHostSpec) -> Vec<String> {
+    let mut addresses: Vec<String> = Vec::new();
+    for address in &spec.other_addresses {
+        let address = address.trim();
+        if address.is_empty() || address == spec.host || addresses.iter().any(|a| a == address) {
+            continue;
+        }
+        addresses.push(address.to_string());
+    }
+    addresses
+}
+
+/// Other addresses as a person types them: separated by commas or spaces.
+pub fn parse_other_addresses(text: &str) -> Vec<String> {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|address| !address.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
     let mut ssh_option = spec
         .ssh_options
@@ -299,6 +333,10 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
     ssh_option
         .entry("connecttimeout".into())
         .or_insert_with(|| "10".into());
+    let other_addresses = other_addresses(spec);
+    if !other_addresses.is_empty() {
+        ssh_option.insert(OTHER_ADDRESSES_OPTION.into(), other_addresses.join(" "));
+    }
     SshDomain {
         name: ssh_domain_name(spec),
         remote_address: match spec.port {
@@ -321,6 +359,42 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_option_is_the_one_the_connection_reads() {
+        assert_eq!(OTHER_ADDRESSES_OPTION, wezterm_ssh::OTHER_ADDRESSES);
+    }
+
+    #[test]
+    fn other_addresses_reach_the_connection_cleaned_up() {
+        let mut spec: SshHostSpec =
+            serde_json::from_value(serde_json::json!({"label": "myhost", "host": "myhost"}))
+                .unwrap();
+        assert!(
+            spec.other_addresses.is_empty(),
+            "a host saved before them has none"
+        );
+        assert!(!build_ssh_domain(&spec)
+            .ssh_option
+            .contains_key(OTHER_ADDRESSES_OPTION));
+        assert!(!serde_json::to_string(&spec)
+            .unwrap()
+            .contains("other_addresses"));
+
+        spec.other_addresses =
+            parse_other_addresses("myhost.local, 203.0.113.7:2200  myhost ,myhost.local");
+        assert_eq!(
+            spec.other_addresses,
+            vec!["myhost.local", "203.0.113.7:2200", "myhost", "myhost.local"]
+        );
+        assert_eq!(
+            build_ssh_domain(&spec)
+                .ssh_option
+                .get(OTHER_ADDRESSES_OPTION)
+                .map(String::as_str),
+            Some("myhost.local 203.0.113.7:2200")
+        );
+    }
 
     #[test]
     fn parses_only_concrete_system_hosts() {
@@ -357,6 +431,7 @@ mod tests {
             label: "server".into(),
             host: "example.test".into(),
             port: Some(22),
+            other_addresses: Vec::new(),
             username: Some("root".into()),
             identity_file: None,
             password: None,

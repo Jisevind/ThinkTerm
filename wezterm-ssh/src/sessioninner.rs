@@ -18,10 +18,9 @@ use filedescriptor::{
 };
 use portable_pty::ExitStatus;
 use smol::channel::{bounded, Receiver, Sender, TryRecvError};
-use socket2::{Domain, Socket, Type};
+use socket2::Socket;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +34,11 @@ pub(crate) struct DescriptorState {
 /// loop iteration moves at most this much per stream, so it bounds the
 /// throughput of a busy channel; 8 KiB made a mux client's output crawl.
 pub(crate) const CHANNEL_BUFFER: usize = 64 * 1024;
+
+/// Whether `address` is the host's own, as opposed to one of its others.
+fn is_own(address: &(String, u16), hostname: &str, port: u16) -> bool {
+    address.0 == hostname && address.1 == port
+}
 
 pub(crate) struct ChannelInfo {
     pub channel_id: ChannelId,
@@ -142,7 +146,6 @@ impl SessionInner {
             ))))
             .context("notifying user of banner")?;
 
-        let sess = libssh_rs::Session::new()?;
         let verbose = self
             .config
             .get("wezterm_ssh_verbose")
@@ -150,7 +153,6 @@ impl SessionInner {
             .unwrap_or("false")
             == "true";
         if verbose {
-            sess.set_option(libssh_rs::SshOption::LogLevel(libssh_rs::LogLevel::Packet))?;
 
             /// libssh logs to stderr, but on Windows in the GUI there isn't a valid
             /// stderr for it to log to.
@@ -188,8 +190,96 @@ impl SessionInner {
                 libssh_rs::sys::ssh_set_log_callback(Some(log_callback));
             }
         }
-        sess.set_option(libssh_rs::SshOption::Hostname(hostname.clone()))?;
-        sess.set_option(libssh_rs::SshOption::User(Some(user)))?;
+
+        // A session per address tried: see `connect_to_host`.
+        let mut not_this_host = vec![];
+        let (sess, _child, reached) = loop {
+            let sess = self.libssh_session(&hostname, &user, port, verbose)?;
+            let (sock, child, reached) =
+                self.connect_to_host(&hostname, port, verbose, &not_this_host)?;
+            self.shutdown.watch(&sock)?;
+            let raw = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::IntoRawFd;
+                    sock.into_raw_fd()
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::IntoRawSocket;
+                    sock.into_raw_socket()
+                }
+            };
+
+            sess.set_option(libssh_rs::SshOption::Socket(raw))?;
+
+            sess.connect()
+                .with_context(|| format!("Connecting to {hostname}:{port}"))?;
+
+            if let Some(other) = reached.as_ref().filter(|at| !is_own(at, &hostname, port)) {
+                if matches!(
+                    sess.is_known_server()?,
+                    libssh_rs::KnownHosts::Changed | libssh_rs::KnownHosts::Other
+                ) {
+                    self.pass_over(&hostname, other)?;
+                    not_this_host.push(other.clone());
+                    continue;
+                }
+            }
+            break (sess, child, reached);
+        };
+
+        let banner = sess.get_server_banner()?;
+        self.tx_event
+            .try_send(SessionEvent::Banner(Some(banner)))
+            .context("notifying user of banner")?;
+
+        self.host_verification_libssh(&sess, &hostname, port)?;
+        self.authenticate_libssh(&sess)?;
+        if let Some(reached) = &reached {
+            crate::addresses::remember_reached(&hostname, port, reached);
+        }
+
+        if let Ok(banner) = sess.get_issue_banner() {
+            self.tx_event
+                .try_send(SessionEvent::Banner(Some(banner)))
+                .context("notifying user of banner")?;
+        }
+
+        self.tx_event
+            .try_send(SessionEvent::Authenticated)
+            .context("notifying user that session is authenticated")?;
+
+        if let Some("yes") = self.config.get("forwardagent").map(|s| s.as_str()) {
+            if self.identity_agent().is_some() {
+                sess.enable_accept_agent_forward(true);
+            } else {
+                log::error!("ForwardAgent is set to yes, but IdentityAgent is not set");
+            }
+        }
+        sess.set_blocking(false);
+        let mut sess = SessionWrap::with_libssh(sess);
+        let result = self.request_loop(&mut sess);
+        self.close_sftp_handles(&mut sess);
+        result
+    }
+
+    /// A libssh session for the host, with every option set except the
+    /// socket.
+    #[cfg(feature = "libssh-rs")]
+    fn libssh_session(
+        &self,
+        hostname: &str,
+        user: &str,
+        port: u16,
+        verbose: bool,
+    ) -> anyhow::Result<libssh_rs::Session> {
+        let sess = libssh_rs::Session::new()?;
+        if verbose {
+            sess.set_option(libssh_rs::SshOption::LogLevel(libssh_rs::LogLevel::Packet))?;
+        }
+        sess.set_option(libssh_rs::SshOption::Hostname(hostname.to_string()))?;
+        sess.set_option(libssh_rs::SshOption::User(Some(user.to_string())))?;
         sess.set_option(libssh_rs::SshOption::Port(port))?;
         sess.options_parse_config(None)?; // FIXME: overridden config path?
         if let Some(agent) = self.config.get("identityagent") {
@@ -217,57 +307,7 @@ impl SessionInner {
         if let Some(host_key) = self.config.get("hostkeyalgorithms") {
             sess.set_option(libssh_rs::SshOption::HostKeys(host_key.to_string()))?;
         }
-
-        let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
-        self.shutdown.watch(&sock)?;
-        let raw = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::IntoRawFd;
-                sock.into_raw_fd()
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::IntoRawSocket;
-                sock.into_raw_socket()
-            }
-        };
-
-        sess.set_option(libssh_rs::SshOption::Socket(raw))?;
-
-        sess.connect()
-            .with_context(|| format!("Connecting to {hostname}:{port}"))?;
-
-        let banner = sess.get_server_banner()?;
-        self.tx_event
-            .try_send(SessionEvent::Banner(Some(banner)))
-            .context("notifying user of banner")?;
-
-        self.host_verification_libssh(&sess, &hostname, port)?;
-        self.authenticate_libssh(&sess)?;
-
-        if let Ok(banner) = sess.get_issue_banner() {
-            self.tx_event
-                .try_send(SessionEvent::Banner(Some(banner)))
-                .context("notifying user of banner")?;
-        }
-
-        self.tx_event
-            .try_send(SessionEvent::Authenticated)
-            .context("notifying user that session is authenticated")?;
-
-        if let Some("yes") = self.config.get("forwardagent").map(|s| s.as_str()) {
-            if self.identity_agent().is_some() {
-                sess.enable_accept_agent_forward(true);
-            } else {
-                log::error!("ForwardAgent is set to yes, but IdentityAgent is not set");
-            }
-        }
-        sess.set_blocking(false);
-        let mut sess = SessionWrap::with_libssh(sess);
-        let result = self.request_loop(&mut sess);
-        self.close_sftp_handles(&mut sess);
-        result
+        Ok(sess)
     }
 
     #[cfg(feature = "ssh2")]
@@ -303,17 +343,31 @@ impl SessionInner {
             ))))
             .context("notifying user of banner")?;
 
-        let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
-        self.shutdown.watch(&sock)?;
+        // A session per address tried: see `connect_to_host`.
+        let mut not_this_host = vec![];
+        let (sess, _child, reached) = loop {
+            let (sock, child, reached) =
+                self.connect_to_host(&hostname, port, verbose, &not_this_host)?;
+            self.shutdown.watch(&sock)?;
 
-        let mut sess = ssh2::Session::new()?;
-        if verbose {
-            sess.trace(ssh2::TraceFlags::all());
-        }
-        sess.set_blocking(true);
-        sess.set_tcp_stream(sock);
-        sess.handshake()
-            .with_context(|| format!("ssh handshake with {}", remote_address))?;
+            let mut sess = ssh2::Session::new()?;
+            if verbose {
+                sess.trace(ssh2::TraceFlags::all());
+            }
+            sess.set_blocking(true);
+            sess.set_tcp_stream(sock);
+            sess.handshake()
+                .with_context(|| format!("ssh handshake with {}", remote_address))?;
+
+            if let Some(other) = reached.as_ref().filter(|at| !is_own(at, &hostname, port)) {
+                if self.known_key_differs(&sess, &hostname, port)? {
+                    self.pass_over(&hostname, other)?;
+                    not_this_host.push(other.clone());
+                    continue;
+                }
+            }
+            break (sess, child, reached);
+        };
 
         self.tx_event
             .try_send(SessionEvent::Banner(sess.banner().map(|s| s.to_string())))
@@ -324,6 +378,9 @@ impl SessionInner {
 
         self.authenticate(&sess, &user, &hostname)
             .context("authentication")?;
+        if let Some(reached) = &reached {
+            crate::addresses::remember_reached(&hostname, port, reached);
+        }
 
         self.tx_event
             .try_send(SessionEvent::Authenticated)
@@ -343,12 +400,16 @@ impl SessionInner {
     /// If proxy_command is set, then we execute that process for ourselves
     /// too, as proxy commands are not supported by libssh2 and are not supported
     /// on Windows in libssh.
+    /// With other addresses for the host (see `crate::addresses`), also
+    /// gives back the one that answered, and leaves out those in
+    /// `not_this_host`: other addresses found serving some other machine.
     fn connect_to_host(
         &self,
         hostname: &str,
         port: u16,
         verbose: bool,
-    ) -> anyhow::Result<(Socket, Option<KillOnDropChild>)> {
+        not_this_host: &[(String, u16)],
+    ) -> anyhow::Result<(Socket, Option<KillOnDropChild>, Option<(String, u16)>)> {
         self.shutdown.check()?;
         match self.config.get("proxycommand").map(|s| s.as_str()) {
             Some("none") | None => {}
@@ -390,74 +451,64 @@ impl SessionInner {
                         _ => a.into_raw_fd(),
                     };
 
-                    return Ok((Socket::from_raw_fd(dest), Some(child)));
+                    return Ok((Socket::from_raw_fd(dest), Some(child), None));
                 }
                 #[cfg(windows)]
                 unsafe {
                     use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-                    return Ok((Socket::from_raw_socket(a.into_raw_socket()), Some(child)));
+                    return Ok((
+                        Socket::from_raw_socket(a.into_raw_socket()),
+                        Some(child),
+                        None,
+                    ));
                 }
             }
         }
 
-        let addr = (hostname, port)
-            .to_socket_addrs()?
-            .find(|addr| self.filter_sock_addr(addr))
-            .with_context(|| format!("resolving address for {}", hostname))?;
-        if verbose {
-            log::info!("resolved {hostname}:{port} -> {addr:?}");
-        }
-        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
-        self.shutdown.watch(&sock)?;
-        if let Some(bind_addr) = self.config.get("bindaddress") {
-            let bind_addr = (bind_addr.as_str(), 0)
-                .to_socket_addrs()?
-                .find(|addr| self.filter_sock_addr(addr))
-                .with_context(|| format!("resolving bind address {bind_addr:?}"))?;
+        let mut candidates = crate::addresses::candidates(&self.config, hostname, port);
+        candidates.retain(|address| !not_this_host.contains(address));
+        let dialer = crate::addresses::Dialer::from_config(&self.config);
+        if candidates.len() > 1 {
             if verbose {
-                log::info!("binding to {bind_addr:?}");
+                log::info!("trying {hostname}:{port} at {candidates:?}");
             }
-            sock.bind(&bind_addr.into())
-                .with_context(|| format!("binding to {bind_addr:?}"))?;
+            let raced = crate::addresses::race(&candidates, dialer, || self.shutdown.check());
+            let (sock, index) = match raced {
+                Ok(won) => won,
+                Err(err) => {
+                    crate::addresses::forget_reached(hostname, port);
+                    return Err(err);
+                }
+            };
+            let reached = candidates.swap_remove(index);
+            if !is_own(&reached, hostname, port) {
+                self.tx_event
+                    .try_send(SessionEvent::Banner(Some(format!(
+                        "Reached {hostname} at {}:{}",
+                        reached.0, reached.1
+                    ))))
+                    .context("notifying user of banner")?;
+            }
+            self.shutdown.check()?;
+            return Ok((sock, None, Some(reached)));
         }
 
-        // Honor a connect timeout so that an unreachable host fails promptly
-        // instead of blocking for the OS default (~75s on macOS, or indefinitely
-        // for blackhole routes). `connect_timeout` leaves the socket in
-        // non-blocking mode, so restore blocking afterwards for the handshake.
-        match self
-            .config
-            .get("connecttimeout")
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|seconds| *seconds > 0)
-            .map(Duration::from_secs)
-        {
-            Some(timeout) => {
-                sock.connect_timeout(&addr.into(), timeout)
-                    .with_context(|| {
-                        format!("Connecting to {hostname}:{port} ({addr:?}) within {timeout:?}")
-                    })?;
-                sock.set_nonblocking(false).with_context(|| {
-                    format!("restoring blocking mode after connect to {hostname}:{port}")
-                })?;
-            }
-            None => {
-                sock.connect(&addr.into())
-                    .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
-            }
-        }
+        let sock = dialer.dial_with(hostname, port, verbose, |sock| self.shutdown.watch(sock))?;
         self.shutdown.check()?;
-        Ok((sock, None))
+        Ok((sock, None, None))
     }
 
-    /// Used to restrict to_socket_addrs results to the address
-    /// family specified by the config
-    fn filter_sock_addr(&self, addr: &std::net::SocketAddr) -> bool {
-        match self.config.get("addressfamily").map(|s| s.as_str()) {
-            Some("inet") => addr.is_ipv4(),
-            Some("inet6") => addr.is_ipv6(),
-            None | Some("any") | Some(_) => true,
-        }
+    /// An other address answered as some other machine: say so, and the
+    /// caller tries the rest.
+    fn pass_over(&self, hostname: &str, (host, port): &(String, u16)) -> anyhow::Result<()> {
+        log::warn!(
+            "{host}:{port} holds a different host key than {hostname}; trying its other addresses"
+        );
+        self.tx_event
+            .try_send(SessionEvent::Banner(Some(format!(
+                "{host}:{port} is not {hostname} (its host key differs); trying the others"
+            ))))
+            .context("notifying user of banner")
     }
 
     fn do_keepalive(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {

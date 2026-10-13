@@ -37,7 +37,7 @@ impl AgentCommand {
     }
 }
 
-fn state_label(state: AgentState) -> &'static str {
+pub(crate) fn state_label(state: AgentState) -> &'static str {
     match state {
         AgentState::Working => "working",
         AgentState::Blocked => "blocked",

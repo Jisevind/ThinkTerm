@@ -323,6 +323,12 @@ pub struct TerminalState {
 
     clear_semantic_attribute_on_newline: bool,
 
+    /// What the shell has said with OSC 133 about its commands.
+    shell_commands: ShellCommands,
+    /// The aid of the shell `shell_commands` follows. See
+    /// `counts_shell_mark`.
+    shell_aid: Option<String>,
+
     /// If true, writing a character inserts a new cell
     insert: bool,
 
@@ -639,6 +645,8 @@ impl TerminalState {
             left_and_right_margin_mode: false,
             wrap_next: false,
             clear_semantic_attribute_on_newline: false,
+            shell_commands: ShellCommands::default(),
+            shell_aid: None,
             // We default auto wrap to true even though the default for
             // a dec terminal is false, because it is more useful this way.
             dec_auto_wrap: true,
@@ -1216,6 +1224,49 @@ impl TerminalState {
 
     pub fn user_vars(&self) -> &HashMap<String, String> {
         &self.user_vars
+    }
+
+    /// What the shell has said with OSC 133 about its commands.
+    pub fn shell_commands(&self) -> ShellCommands {
+        self.shell_commands
+    }
+
+    /// Whether a mark from the shell named `aid` counts. The first shell to
+    /// name itself is the one followed, so that a shell one of its commands
+    /// starts (ssh, docker exec, a subshell) is not taken for it; a
+    /// different one at an idle prompt has replaced it. Marks naming no
+    /// shell always count.
+    fn counts_shell_mark(&mut self, aid: Option<&str>) -> bool {
+        self.shell_commands.reported = true;
+        let Some(aid) = aid else {
+            return true;
+        };
+        match &self.shell_aid {
+            Some(owner) if owner == aid => true,
+            Some(_) if self.shell_commands.running => false,
+            _ => {
+                self.shell_aid = Some(aid.to_string());
+                true
+            }
+        }
+    }
+
+    /// A prompt began. A command still marked as running has ended without
+    /// the shell reporting its status.
+    fn shell_prompt_started(&mut self, aid: Option<&str>) {
+        if self.counts_shell_mark(aid) && self.shell_commands.running {
+            self.finish_shell_command(None);
+        }
+    }
+
+    fn finish_shell_command(&mut self, exit_code: Option<i32>) {
+        self.shell_commands.reported = true;
+        self.shell_commands.running = false;
+        self.shell_commands.finished += 1;
+        self.shell_commands.last_exit = exit_code;
+        if let Some(handler) = self.alert_handler.as_mut() {
+            handler.alert(Alert::CommandFinished { exit_code });
+        }
     }
 
     fn clear_semantic_attribute_due_to_movement(&mut self) {

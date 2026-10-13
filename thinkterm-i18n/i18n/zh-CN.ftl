@@ -517,6 +517,7 @@ ssh-new-host = 新建主机
 ssh-field-name = 名称
 ssh-field-host = 主机
 ssh-field-port = 端口
+ssh-field-other-addresses = 其他地址
 ssh-field-user = 用户
 ssh-field-password = 密码
 ssh-field-identity = 私钥文件

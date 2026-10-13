@@ -44,6 +44,16 @@ pub struct SpawnCommand {
     #[arg(long, requires = "new_window")]
     workspace: Option<String>,
 
+    /// Wait for the program to end, and exit with its status. The pane
+    /// id is printed first, as without it.
+    #[arg(long)]
+    wait: bool,
+
+    /// With --wait, give up after this long, exiting with status 124: a
+    /// number of seconds, or a number with s, m or h after it.
+    #[arg(long, value_parser = crate::cli::wait::parse_timeout, requires = "wait")]
+    timeout: Option<std::time::Duration>,
+
     /// Instead of executing your shell, run PROG.
     /// For example: `thinkterm cli spawn -- bash -l` will spawn bash
     /// as if it were a login shell.
@@ -121,6 +131,12 @@ impl SpawnCommand {
 
         log::debug!("{:?}", spawned);
         println!("{}", spawned.pane_id);
+        if self.wait {
+            let deadline = self.timeout.map(|t| std::time::Instant::now() + t);
+            let code =
+                crate::cli::wait::wait_for_program(&client, spawned.pane_id, deadline).await?;
+            crate::cli::wait::exit_with(code);
+        }
         Ok(())
     }
 }

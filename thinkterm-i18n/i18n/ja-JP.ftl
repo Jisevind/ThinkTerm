@@ -517,6 +517,7 @@ ssh-new-host = 新しいホスト
 ssh-field-name = 名前
 ssh-field-host = ホスト
 ssh-field-port = ポート
+ssh-field-other-addresses = その他のアドレス
 ssh-field-user = ユーザー
 ssh-field-password = パスワード
 ssh-field-identity = Identity ファイル

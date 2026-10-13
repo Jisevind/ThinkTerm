@@ -821,7 +821,10 @@ macro_rules! pdu {
 /// 78: Durable import request identities and reconnectable result queries.
 /// 79: Agent statuses carry programs' own OSC 7501 reports and an error state;
 ///     MarkProgramStatusSeen.
-pub const CODEC_VERSION: usize = 79;
+/// 80: How far a pane's programs have got (GetPaneRunState, PaneExited, and
+///     the CommandFinished alert from OSC 133), and SubscribeEvents for a
+///     connection that wants events rather than pane contents.
+pub const CODEC_VERSION: usize = 80;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -931,6 +934,11 @@ pdu! {
     GetImportSessionStatus: 109,
     GetImportSessionStatusResponse: 110,
     MarkProgramStatusSeen: 111,
+    GetPaneRunState: 112,
+    GetPaneRunStateResponse: 113,
+    PaneExited: 114,
+    PaneAdded: 115,
+    SubscribeEvents: 116,
 }
 
 impl Pdu {
@@ -1046,6 +1054,8 @@ impl Pdu {
             | Pdu::PaneFocused(PaneFocused { pane_id })
             | Pdu::AgentStatusChanged(AgentStatusChanged { pane_id, .. })
             | Pdu::ForegroundProgramChanged(ForegroundProgramChanged { pane_id, .. })
+            | Pdu::PaneExited(PaneExited { pane_id, .. })
+            | Pdu::PaneAdded(PaneAdded { pane_id })
             | Pdu::PaneRemoved(PaneRemoved { pane_id }) => Some(*pane_id),
             _ => None,
         }
@@ -1875,6 +1885,40 @@ pub struct PluginFrame {
 pub struct MarkProgramStatusSeen {
     pub pane_id: PaneId,
 }
+
+/// Ask how far a pane's programs have got. A pane that has already gone is
+/// answered from what the mux remembers of how its program ended.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct GetPaneRunState {
+    pub pane_id: PaneId,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct GetPaneRunStateResponse {
+    pub pane_id: PaneId,
+    pub state: thinkterm_proto::PaneRunState,
+}
+
+/// Unilateral: the program `pane_id` started has ended. Sent before the
+/// pane's `PaneRemoved`, when the pane closes because of it.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct PaneExited {
+    pub pane_id: PaneId,
+    pub exit: thinkterm_proto::PaneExit,
+}
+
+/// Unilateral, to a connection that sent `SubscribeEvents`: a pane appeared.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct PaneAdded {
+    pub pane_id: PaneId,
+}
+
+/// This connection wants to hear what happens -- panes appearing and
+/// closing, programs ending, bells, notifications, titles -- and not what
+/// the panes show: the server stops pushing their contents to it, and adds
+/// `PaneAdded`. For `thinkterm cli events` and anything like it.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct SubscribeEvents {}
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetPaneZoomed {
@@ -3056,7 +3100,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 79);
+        assert_eq!(CODEC_VERSION, 80);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3126,7 +3170,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 79);
+        assert_eq!(CODEC_VERSION, 80);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3225,10 +3269,74 @@ mod test {
     }
 
     #[test]
+    fn run_state_protocol_round_trip_at_version_80() {
+        // Same tripwire as the agent-status test above.
+        assert_eq!(CODEC_VERSION, 80);
+        use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
+
+        let exit = PaneExit {
+            code: Some(2),
+            signal: Some("Terminated".to_string()),
+        };
+        for pdu in [
+            Pdu::GetPaneRunState(GetPaneRunState { pane_id: 7 }),
+            Pdu::GetPaneRunStateResponse(GetPaneRunStateResponse {
+                pane_id: 7,
+                state: PaneRunState {
+                    program: ProgramState::Running,
+                    shell: ShellCommands {
+                        reported: true,
+                        finished: 12,
+                        running: true,
+                        last_exit: Some(1),
+                    },
+                },
+            }),
+            Pdu::GetPaneRunStateResponse(GetPaneRunStateResponse {
+                pane_id: 8,
+                state: PaneRunState {
+                    program: ProgramState::Exited(exit.clone()),
+                    shell: ShellCommands::default(),
+                },
+            }),
+            Pdu::GetPaneRunStateResponse(GetPaneRunStateResponse {
+                pane_id: 9,
+                state: PaneRunState::unknown(),
+            }),
+            Pdu::PaneExited(PaneExited { pane_id: 8, exit }),
+            Pdu::PaneExited(PaneExited {
+                pane_id: 11,
+                exit: PaneExit {
+                    code: None,
+                    signal: None,
+                },
+            }),
+            Pdu::PaneAdded(PaneAdded { pane_id: 10 }),
+            Pdu::SubscribeEvents(SubscribeEvents {}),
+            Pdu::NotifyAlert(NotifyAlert {
+                pane_id: 7,
+                alert: Alert::CommandFinished {
+                    exit_code: Some(130),
+                },
+            }),
+            Pdu::NotifyAlert(NotifyAlert {
+                pane_id: 7,
+                alert: Alert::CommandFinished { exit_code: None },
+            }),
+        ] {
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 0x80).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.serial, 0x80);
+            assert_eq!(decoded.pdu, pdu);
+        }
+    }
+
+    #[test]
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 79);
+        assert_eq!(CODEC_VERSION, 80);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

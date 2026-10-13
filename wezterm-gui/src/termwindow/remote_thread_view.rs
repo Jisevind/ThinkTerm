@@ -4,8 +4,7 @@ use crate::termwindow::content_view::{ContentView, ContentViewResponse, RemoteCo
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::TermWindow;
 use crate::ui::{
-    draw_scrollbar, rect, wheel_delta_pixels, ButtonVariant, ControlState, DrawContext,
-    InteractionState,
+    apply_wheel, draw_scrollbar, rect, ButtonVariant, ControlState, DrawContext, InteractionState,
     ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads::{self, ThreadConnectionState};
@@ -15,7 +14,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
-use window::{MouseEventKind as WMEK, MousePress, RectF, WindowOps};
+use window::{MouseEvent, MouseEventKind as WMEK, MousePress, RectF, WindowOps};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -59,6 +58,8 @@ pub(crate) struct RemoteThreadView {
     widgets: UiContext<RemoteThreadAction>,
     interaction: InteractionState<RemoteThreadAction>,
     scroll: ScrollState,
+    /// The scroll was still gliding after the last paint.
+    scroll_animating: bool,
     /// UI scale captured at paint time; mouse handlers get no `DrawContext`.
     last_ui_scale: f32,
 }
@@ -83,6 +84,7 @@ impl RemoteThreadView {
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
             scroll: ScrollState::new(),
+            scroll_animating: false,
             last_ui_scale: 1.0,
         }
     }
@@ -121,6 +123,8 @@ impl RemoteThreadView {
     ) -> anyhow::Result<()> {
         self.widgets.clear();
         self.last_ui_scale = ctx.scale();
+        // The glide a notched wheel was given lives in the scroll state.
+        self.scroll_animating = self.scroll.advance_animation(Instant::now());
         ctx.draw_rect(
             layers,
             0,
@@ -548,16 +552,6 @@ impl RemoteThreadView {
     fn on_mouse_impl(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         let hit = self.widgets.hit_test(x, y).map(|target| target.action);
         match kind {
-            WMEK::VertWheel(amount) => {
-                let old = self.scroll.offset;
-                self.scroll
-                    .scroll_by(wheel_delta_pixels(amount, self.last_ui_scale));
-                if (self.scroll.offset - old).abs() > 0.01 {
-                    ContentViewResponse::Redraw
-                } else {
-                    ContentViewResponse::Ignored
-                }
-            }
             WMEK::Move => {
                 if self.interaction.hovered != hit {
                     self.interaction.hovered = hit;
@@ -670,6 +664,9 @@ impl ContentView for RemoteThreadView {
     }
 
     fn next_frame_time(&self) -> Option<Instant> {
+        if self.scroll_animating {
+            return Some(Instant::now());
+        }
         match self.phase {
             ViewPhase::Connecting { .. } => Some(Instant::now() + Duration::from_millis(120)),
             _ => None,
@@ -709,6 +706,14 @@ impl ContentView for RemoteThreadView {
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         self.on_mouse_impl(x, y, kind)
+    }
+
+    fn on_wheel(&mut self, _x: f32, _y: f32, event: &MouseEvent) -> ContentViewResponse {
+        if apply_wheel(event, &mut self.scroll, self.last_ui_scale) {
+            ContentViewResponse::Redraw
+        } else {
+            ContentViewResponse::Ignored
+        }
     }
 
     fn on_key(&mut self, key: KeyCode, _mods: KeyModifiers) -> ContentViewResponse {

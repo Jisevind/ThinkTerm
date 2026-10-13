@@ -168,34 +168,50 @@ pub trait SlavePty {
 /// Represents the exit status of a child process.
 #[derive(Debug, Clone)]
 pub struct ExitStatus {
-    code: u32,
+    code: Option<u32>,
     signal: Option<String>,
 }
 
 impl ExitStatus {
     /// Construct an ExitStatus from a process return code
     pub fn with_exit_code(code: u32) -> Self {
-        Self { code, signal: None }
+        Self {
+            code: Some(code),
+            signal: None,
+        }
     }
 
     /// Construct an ExitStatus from a signal name
     pub fn with_signal(signal: &str) -> Self {
         Self {
-            code: 1,
+            code: Some(1),
             signal: Some(signal.to_string()),
         }
     }
 
-    /// Returns true if the status indicates successful completion
+    /// The process ended, but its actual exit status is unavailable.
+    pub fn unknown() -> Self {
+        Self {
+            code: None,
+            signal: None,
+        }
+    }
+
+    /// Returns true if the status confirms successful completion
     pub fn success(&self) -> bool {
         match self.signal {
-            None => self.code == 0,
+            None => self.code == Some(0),
             Some(_) => false,
         }
     }
 
-    /// Returns the exit code that this ExitStatus was constructed with
+    /// Returns the exit code, or 1 if the actual status is unavailable.
     pub fn exit_code(&self) -> u32 {
+        self.code.unwrap_or(1)
+    }
+
+    /// Returns the actual exit code, when it is known.
+    pub fn exit_code_if_known(&self) -> Option<u32> {
         self.code
     }
 
@@ -221,7 +237,7 @@ impl From<std::process::ExitStatus> for ExitStatus {
                 };
 
                 return ExitStatus {
-                    code: status.code().map(|c| c as u32).unwrap_or(1),
+                    code: Some(status.code().map(|c| c as u32).unwrap_or(1)),
                     signal: Some(signal),
                 };
             }
@@ -233,7 +249,10 @@ impl From<std::process::ExitStatus> for ExitStatus {
                 .map(|c| c as u32)
                 .unwrap_or_else(|| if status.success() { 0 } else { 1 });
 
-        ExitStatus { code, signal: None }
+        ExitStatus {
+            code: Some(code),
+            signal: None,
+        }
     }
 }
 
@@ -244,7 +263,10 @@ impl std::fmt::Display for ExitStatus {
         } else {
             match &self.signal {
                 Some(sig) => write!(fmt, "Terminated by {}", sig),
-                None => write!(fmt, "Exited with code {}", self.code),
+                None => match self.code {
+                    Some(code) => write!(fmt, "Exited with code {}", code),
+                    None => write!(fmt, "Exited with unknown status"),
+                },
             }
         }
     }
@@ -293,9 +315,9 @@ impl Child for std::process::Child {
 /// A process this process did not spawn: the child of a mux server that
 /// handed its pane over. Only a parent can wait on a process, so its exit
 /// is noticed by asking the kernel whether the pid still exists, four
-/// times a second; the exit status is not knowable that way and reads as
-/// success. (A pid answers as long as it is a zombie, so whoever inherits
-/// the process -- init, or a subreaper -- has to reap it.)
+/// times a second; the exit status is not knowable that way and is
+/// reported as unknown. (A pid answers as long as it is a zombie, so
+/// whoever inherits the process -- init, or a subreaper -- has to reap it.)
 #[cfg(unix)]
 pub fn adopted_child(pid: u32) -> Box<dyn Child + Send + Sync> {
     Box::new(AdoptedChild::new(pid))
@@ -374,7 +396,7 @@ fn pidfd_open(_pid: u32) -> Option<std::os::fd::OwnedFd> {
 impl Child for AdoptedChild {
     fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
         Ok(if self.exited(0) {
-            Some(ExitStatus::with_exit_code(0))
+            Some(ExitStatus::unknown())
         } else {
             None
         })
@@ -388,7 +410,7 @@ impl Child for AdoptedChild {
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
         }
-        Ok(ExitStatus::with_exit_code(0))
+        Ok(ExitStatus::unknown())
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -551,8 +573,15 @@ mod adopted_child_tests {
         let reaper = std::thread::spawn(move || real.wait());
         adopted.kill().expect("SIGHUP");
         let status = adopted.wait().expect("wait");
-        assert!(status.success(), "the status of an adopted process reads as success");
+        assert!(
+            !status.success(),
+            "an unavailable status must not claim success"
+        );
+        assert_eq!(status.exit_code_if_known(), None);
         assert!(reaper.join().unwrap().is_ok());
-        assert!(adopted.try_wait().unwrap().is_some(), "gone");
+        assert_eq!(
+            adopted.try_wait().unwrap().unwrap().exit_code_if_known(),
+            None
+        );
     }
 }

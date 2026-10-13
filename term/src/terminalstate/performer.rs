@@ -1057,45 +1057,58 @@ impl<'a> Performer<'a> {
                 self.fresh_line();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. },
+                FinalTermSemanticPrompt::FreshLineAndStartPrompt { aid, .. },
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
                 // A new shell prompt: whatever filed OSC 7501 records has
                 // finished, and only its unseen results remain.
                 self.program_status.end_of_program();
+                self.shell_prompt_started(aid.as_deref());
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::StartPrompt(_),
             ) => {
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                // Without an aid it could be a nested shell's; the A or N
+                // before it settles that.
+                self.shell_commands.reported = true;
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { .. },
+                FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { aid, .. },
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                self.shell_prompt_started(aid.as_deref());
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilNextMarker { .. },
             ) => {
                 self.pen.set_semantic_type(SemanticType::Input);
+                self.shell_commands.reported = true;
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilEndOfLine { .. },
             ) => {
                 self.pen.set_semantic_type(SemanticType::Input);
                 self.clear_semantic_attribute_on_newline = true;
+                self.shell_commands.reported = true;
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { .. },
             ) => {
                 self.pen.set_semantic_type(SemanticType::Output);
+                self.shell_commands.reported = true;
+                self.shell_commands.running = true;
             }
 
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::CommandStatus { .. },
-            ) => {}
+                FinalTermSemanticPrompt::CommandStatus { status, aid },
+            ) => {
+                if self.counts_shell_mark(aid.as_deref()) {
+                    self.finish_shell_command(Some(status));
+                }
+            }
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {

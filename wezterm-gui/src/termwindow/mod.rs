@@ -5884,6 +5884,11 @@ impl TermWindow {
                     self.refresh_thread_work_for_pane(pane_id);
                     self.update_title();
                 }
+                // Filtered out before it gets here; for event subscribers.
+                MuxNotification::Alert {
+                    alert: Alert::CommandFinished { .. },
+                    pane_id: _,
+                } => {}
                 MuxNotification::Alert {
                     alert: Alert::PaletteChanged,
                     pane_id: _,
@@ -6076,6 +6081,8 @@ impl TermWindow {
                     self.refresh_thread_work_for_pane(pane_id);
                     self.persist_workspace_layout_after_mutation("pane added");
                 }
+                // Filtered out before it gets here; for event subscribers.
+                MuxNotification::PaneExited { .. } => {}
                 MuxNotification::PaneRemoved(_) => {
                     self.refresh_all_thread_work();
                     self.persist_workspace_layout_after_mutation("pane removed");
@@ -6784,9 +6791,10 @@ impl TermWindow {
                 // contents with (or remove) the opaque handoff surface.
             }
             MuxNotification::Alert {
-                alert: Alert::ToastNotification { .. },
+                alert: Alert::ToastNotification { .. } | Alert::CommandFinished { .. },
                 ..
             }
+            | MuxNotification::PaneExited { .. }
             | MuxNotification::AssignClipboard { .. }
             | MuxNotification::SaveToDownloads { .. }
             | MuxNotification::WindowCreated(_)

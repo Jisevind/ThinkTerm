@@ -327,6 +327,7 @@ impl GuiFrontEnd {
                 MuxNotification::AgentStatusChanged(_) => {}
                 MuxNotification::ForegroundProgramChanged(_) => {}
                 MuxNotification::PaneAdded(_) => {}
+                MuxNotification::PaneExited { .. } => {}
                 MuxNotification::Alert {
                     pane_id,
                     alert:
@@ -380,7 +381,8 @@ impl GuiFrontEnd {
                         | Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
-                        | Alert::SetUserVar { .. },
+                        | Alert::SetUserVar { .. }
+                        | Alert::CommandFinished { .. },
                 } => {}
                 MuxNotification::Empty => {
                     if config::configuration().quit_when_all_windows_are_closed {
