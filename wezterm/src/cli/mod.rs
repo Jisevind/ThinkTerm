@@ -9,6 +9,7 @@ mod activate_tab;
 mod adjust_pane_size;
 mod agent;
 mod color_schemes;
+mod events;
 mod get_pane_direction;
 mod get_text;
 mod kill_pane;
@@ -17,6 +18,7 @@ mod list_clients;
 mod move_pane_to_new_tab;
 mod proxy;
 mod rename_workspace;
+mod send_key;
 mod send_text;
 mod set_tab_title;
 mod set_window_title;
@@ -24,6 +26,7 @@ mod spawn_command;
 mod split_pane;
 mod stop_server;
 mod tls_creds;
+mod wait;
 mod web_server;
 mod web_token;
 mod zoom_pane;
@@ -132,6 +135,24 @@ Outputs the pane-id for the newly created pane on success"
     /// `--no-paste`.
     #[command(name = "send-text", rename_all = "kebab")]
     SendText(send_text::SendText),
+
+    /// Press keys in a pane by name -- `enter`, `ctrl+c`, `up` -- encoded
+    /// the way the program there asked for keys, as if typed.
+    /// With `--wait`, wait for the command they start in the pane's shell
+    /// and exit with its status.
+    #[command(name = "send-key", rename_all = "kebab")]
+    SendKey(send_key::SendKey),
+
+    /// Wait for a pane's program to end, or with `--command` for the
+    /// command running in its shell, and exit with its status
+    #[command(name = "wait", rename_all = "kebab")]
+    Wait(wait::WaitCommand),
+
+    /// Print what happens as it happens -- panes opening and closing,
+    /// programs and commands finishing, bells, notifications, titles,
+    /// agent status -- until interrupted
+    #[command(name = "events", rename_all = "kebab")]
+    Events(events::EventsCommand),
 
     /// Retrieves the textual content of a pane and output it to stdout
     #[command(name = "get-text", rename_all = "kebab")]
@@ -242,6 +263,9 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::MovePaneToNewTab(cmd) => cmd.run(client).await,
         CliSubCommand::SplitPane(cmd) => cmd.run(client).await,
         CliSubCommand::SendText(cmd) => cmd.run(client).await,
+        CliSubCommand::SendKey(cmd) => cmd.run(client).await,
+        CliSubCommand::Wait(cmd) => cmd.run(client).await,
+        CliSubCommand::Events(cmd) => cmd.run(client).await,
         CliSubCommand::GetText(cmd) => cmd.run(client).await,
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
