@@ -11,14 +11,18 @@
 //!
 //! The core thread never waits on the shell's main thread. It talks back
 //! only through [`Notify`] and [`painter::GlyphPainter`], whose calls the
-//! shell must treat as coming from a background thread.
+//! shell must treat as coming from a background thread. The views the
+//! shell draws from go the other way without a wait: the core thread
+//! publishes them after a change, and [`Core::views`] reads the latest.
 
 mod core;
+mod icons;
 mod link;
 pub mod painter;
 mod platform;
 mod ssh;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -56,7 +60,9 @@ pub trait Notify: Send + Sync {
     /// A pane rang its bell.
     fn on_bell(&self);
     /// The last rows of a pane, answering `request_preview`: JSON, a list
-    /// of rows, each a list of `{"text","fg"}` runs (`App::PreviewRow`).
+    /// of rows, each a list of `{"text","fg"}` runs (`App::PreviewRow`);
+    /// or, answering `request_screen_preview`, an object: the whole tab the
+    /// pane is in, each pane's screen where it lies (`App::TabPreview`).
     fn on_preview(&self, pane: u32, rows: String);
 }
 
@@ -143,6 +149,74 @@ pub struct SshKeyPair {
     pub public_line: String,
 }
 
+/// Every view the shell draws from, as JSON, made on the core thread
+/// after a change ("null" while there is no App). `revision` grows with
+/// each publication; the same number means nothing new.
+#[derive(uniffi::Record, Clone)]
+pub struct ViewSet {
+    pub revision: u64,
+    /// The connection they are from: each `connect` starts a later one, so
+    /// a shell that just connected can tell views left from the one before.
+    pub connection: u64,
+    pub tabs: String,
+    pub threads: String,
+    pub tree: String,
+    pub sidebar: String,
+    pub navs: String,
+    pub status: String,
+    pub layout: String,
+}
+
+impl Default for ViewSet {
+    fn default() -> Self {
+        let null = || "null".to_string();
+        Self {
+            revision: 0,
+            connection: 0,
+            tabs: null(),
+            threads: null(),
+            tree: null(),
+            sidebar: null(),
+            navs: null(),
+            status: null(),
+            layout: null(),
+        }
+    }
+}
+
+/// A card heading a tab or a pane's capsule, as the shell draws it: a
+/// circle in `circle`, and on it the glyph's shape (`mask`, one byte a
+/// pixel, `size` square: how much the shape covers) in `glyph`. The
+/// colours are `#rrggbb`.
+#[derive(uniffi::Record)]
+pub struct TabIcon {
+    pub circle: String,
+    pub glyph: String,
+    pub size: u32,
+    pub mask: Vec<u8>,
+}
+
+/// What the core thread last published for the shell to read. The lock
+/// is held only to copy in or out, never while anything is made.
+pub(crate) struct Published {
+    pub views: ViewSet,
+    /// The focused pane's visible rows (`App::screen_text`), kept current
+    /// only while the shell wants them (`Core::set_screen_wanted`), with
+    /// a count of their own: output changes them and no view.
+    pub screen: String,
+    pub screen_revision: u64,
+}
+
+impl Default for Published {
+    fn default() -> Self {
+        Self {
+            views: ViewSet::default(),
+            screen: "null".into(),
+            screen_revision: 0,
+        }
+    }
+}
+
 /// The system's randomness, as ssh-key's generator wants it.
 struct SysRng(ring::rand::SystemRandom);
 
@@ -193,6 +267,14 @@ pub fn ssh_public_line(pem: String, passphrase: Option<String>, comment: String)
 pub struct Core {
     tx: Sender<core::Cmd>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// What the core thread last published.
+    published: std::sync::Arc<Mutex<Published>>,
+    /// The shell reads views from `published`; until it does, the core
+    /// makes none there (a shell that pulls each one with `view` never does).
+    views_read: std::sync::Arc<AtomicBool>,
+    /// The cards the App puts on tabs and capsules: the built-in ones,
+    /// then the connected host's.
+    icons: std::sync::Arc<icons::Shown>,
 }
 
 #[uniffi::export]
@@ -201,16 +283,25 @@ impl Core {
     pub fn new(notify: Box<dyn Notify>) -> std::sync::Arc<Self> {
         install_logger();
         let (tx, rx) = mpsc::channel();
+        let published = std::sync::Arc::new(Mutex::new(Published::default()));
+        let views_read = std::sync::Arc::new(AtomicBool::new(false));
+        let icons = std::sync::Arc::new(icons::Shown::new(icons::catalog()));
         let thread = std::thread::Builder::new()
             .name("thinkterm-core".into())
             .spawn({
                 let tx = tx.clone();
-                move || core::run(tx, rx, notify)
+                let published = std::sync::Arc::clone(&published);
+                let views_read = std::sync::Arc::clone(&views_read);
+                let icons = std::sync::Arc::clone(&icons);
+                move || core::run(tx, rx, notify, published, views_read, icons)
             })
             .expect("spawning the core thread");
         std::sync::Arc::new(Self {
             tx,
             thread: Mutex::new(Some(thread)),
+            published,
+            views_read,
+            icons,
         })
     }
 
@@ -329,8 +420,89 @@ impl Core {
 
     // ----- the App's views and commands, for the shell's own interface -----
 
-    /// One of the App's views as JSON: "tabs", "sidebar", "navs",
-    /// "status", "layout" or "strings". "null" while there is no App.
+    /// The views the core thread last published, read without waiting
+    /// for it; `on_change` says when there are new ones.
+    pub fn views(&self) -> ViewSet {
+        self.mark_views_read();
+        self.published.lock().map(|p| p.views.clone()).unwrap_or_default()
+    }
+
+    pub fn views_revision(&self) -> u64 {
+        self.mark_views_read();
+        self.published.lock().map(|p| p.views.revision).unwrap_or(0)
+    }
+
+    /// The connection the published views are from (`ViewSet::connection`),
+    /// without copying them.
+    pub fn views_connection(&self) -> u64 {
+        self.mark_views_read();
+        self.published.lock().map(|p| p.views.connection).unwrap_or(0)
+    }
+
+    /// The focused pane's visible rows as the core last published them
+    /// (`screen_text`'s JSON), current while the shell wants them. Output
+    /// changes them without an `on_change`: `screen_revision` says when.
+    pub fn screen(&self) -> String {
+        self.published.lock().map(|p| p.screen.clone()).unwrap_or_else(|_| "null".into())
+    }
+
+    pub fn screen_revision(&self) -> u64 {
+        self.published.lock().map(|p| p.screen_revision).unwrap_or(0)
+    }
+
+    /// Keep `screen` current: the shell's text input reads the rows (the
+    /// keyboard is up, or there is a selection). Unwanted, they are not
+    /// made at every paint; `screen_text` makes them on demand.
+    pub fn set_screen_wanted(&self, wanted: bool) {
+        let _ = self.tx.send(core::Cmd::WantScreen(wanted));
+    }
+
+    /// The card `id` (a tab's or a capsule's `icon`), its glyph drawn
+    /// `size` pixels square; none for an id there is no card for. Drawn on
+    /// the caller's thread, waiting on nothing: a shell keeps what it got
+    /// while `tab_icons_revision` stays.
+    pub fn tab_icon(&self, id: String, size: u32) -> Option<TabIcon> {
+        let card = self.icons.card(&id)?;
+        let size = size.clamp(1, icons::MAX_SIZE);
+        Some(TabIcon {
+            mask: icons::mask(&card.svg, size).unwrap_or_default(),
+            circle: card.circle,
+            glyph: card.glyph,
+            size,
+        })
+    }
+
+    /// Counts the changes to the cards `tab_icon` draws: each connection
+    /// brings its host's. What a shell drew before a change is stale.
+    pub fn tab_icons_revision(&self) -> u64 {
+        self.icons.revision()
+    }
+
+    /// The text between two visible cells of the focused pane, both ends
+    /// inclusive, for the clipboard; the pane's own selection is left be.
+    pub fn text_between(&self, anchor_row: u32, anchor_col: u32, head_row: u32, head_col: u32) -> Option<String> {
+        let (reply, ack) = mpsc::channel();
+        let cmd = core::Cmd::TextBetween {
+            anchor: (anchor_row as usize, anchor_col as usize),
+            head: (head_row as usize, head_col as usize),
+            reply,
+        };
+        if self.tx.send(cmd).is_err() {
+            return None;
+        }
+        ack.recv().unwrap_or(None)
+    }
+
+    /// Whether this connection's terminal is on screen with the app in
+    /// front. Off screen it keeps its session but takes no tab from
+    /// another device and marks no result as seen.
+    pub fn set_shown(&self, shown: bool) {
+        let _ = self.tx.send(core::Cmd::SetShown(shown));
+    }
+
+    /// One of the App's views as JSON: "tabs", "threads", "tree",
+    /// "sidebar", "navs", "status", "layout" or "strings", made while the
+    /// caller waits; "null" while there is no App. `views` does not wait.
     pub fn view(&self, name: String) -> String {
         let (reply, ack) = mpsc::channel();
         if self.tx.send(core::Cmd::View { name, reply }).is_err() {
@@ -453,6 +625,12 @@ impl Core {
         let _ = self.tx.send(core::Cmd::Preview { pane: pane as usize, rows: rows as usize });
     }
 
+    /// Ask for the whole tab any pane is in, as it is split, every pane's
+    /// screen with every row at its own size; `on_preview` answers.
+    pub fn request_screen_preview(&self, pane: u32) {
+        let _ = self.tx.send(core::Cmd::ScreenPreview { pane: pane as usize });
+    }
+
     pub fn selected_text(&self) -> Option<String> {
         let (reply, ack) = mpsc::channel();
         if self.tx.send(core::Cmd::SelectedText { reply }).is_err() {
@@ -510,6 +688,16 @@ impl Core {
         let _ = self.tx.send(core::Cmd::Shutdown);
         if let Some(thread) = self.thread.lock().unwrap().take() {
             let _ = thread.join();
+        }
+    }
+}
+
+impl Core {
+    /// The first read of the views has the core publish them from then on,
+    /// starting with the ones it has now.
+    fn mark_views_read(&self) {
+        if !self.views_read.swap(true, Ordering::Relaxed) {
+            let _ = self.tx.send(core::Cmd::ViewsRead);
         }
     }
 }
