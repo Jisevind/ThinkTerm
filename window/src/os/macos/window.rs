@@ -3754,7 +3754,8 @@ impl WindowView {
                     this.inner.borrow_mut().events.dispatch(event);
                 }
             }
-            None => {}
+            // The Dock menu's own entries go to the app delegate.
+            Some(RepresentedItem::DockMenuItem(_)) | None => {}
         }
     }
 

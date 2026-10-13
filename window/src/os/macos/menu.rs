@@ -206,6 +206,8 @@ pub struct MenuItem {
 pub enum RepresentedItem {
     KeyAssignment(KeyAssignment),
     ContextMenuAction(ContextMenuAction),
+    /// An app-given entry of the Dock menu, by its id.
+    DockMenuItem(String),
 }
 
 impl RepresentedItem {

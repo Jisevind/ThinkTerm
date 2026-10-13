@@ -51,6 +51,19 @@ pub enum ApplicationEvent {
     /// The system wants to open a command in the terminal
     OpenCommandScript(String),
     PerformKeyAssignment(KeyAssignment),
+    /// One of the entries the app gave for its icon's menu in the Dock was
+    /// chosen; this is its `DockMenuItem::id`.
+    DockMenuItem(String),
+}
+
+/// An entry for the app's icon menu in the Dock (macOS).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DockMenuItem {
+    pub title: String,
+    /// Shown with a check mark.
+    pub checked: bool,
+    /// What `ApplicationEvent::DockMenuItem` hands back when it is chosen.
+    pub id: String,
 }
 
 pub trait ConnectionOps {

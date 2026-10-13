@@ -1284,6 +1284,20 @@ pub fn spaces_for_window(owner_id: u64) -> Vec<SpaceView> {
     views
 }
 
+/// The Spaces windows show now, with the window owner showing each and the
+/// Space's name.
+pub fn open_spaces() -> Vec<(u64, String)> {
+    // Copied out first: naming them takes the store's lock.
+    let open: Vec<(u64, SpaceId)> = WINDOW_SPACES
+        .lock()
+        .iter()
+        .map(|(owner, space)| (*owner, space.clone()))
+        .collect();
+    open.into_iter()
+        .filter_map(|(owner, space)| Some((owner, active_space_name(&space)?)))
+        .collect()
+}
+
 pub fn active_space_name(space_id: &str) -> Option<String> {
     let mut store = THREAD_STORE.lock();
     if store.normalize_after_load() {

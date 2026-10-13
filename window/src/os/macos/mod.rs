@@ -15,6 +15,7 @@ pub mod window;
 mod keycodes;
 
 pub use self::window::*;
+pub use app::set_dock_menu_items;
 pub use bitmap::*;
 pub use connection::*;
 

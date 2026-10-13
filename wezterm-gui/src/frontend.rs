@@ -455,6 +455,15 @@ impl GuiFrontEnd {
     fn app_event_handler(event: ApplicationEvent) {
         log::trace!("Got app event {event:?}");
         match event {
+            ApplicationEvent::DockMenuItem(owner) => {
+                // A Space in the Dock menu: bring its window forward.
+                let window = owner.parse().ok().and_then(|owner| {
+                    front_end().gui_window_for_recovery_slot(FrontendRecoverySlot::Window(owner))
+                });
+                if let Some(gui) = window {
+                    gui.window.focus();
+                }
+            }
             ApplicationEvent::OpenCommandScript(file_name) => {
                 let quoted_file_name = match shlex::try_quote(&file_name) {
                     Ok(name) => name.to_owned().to_string(),
@@ -1205,10 +1214,40 @@ fn spawn_malloc_pressure_relief_thread() {
 #[cfg(not(target_os = "macos"))]
 fn spawn_malloc_pressure_relief_thread() {}
 
+/// The Spaces open in windows, for the Dock menu: by name, the one in use
+/// checked.
+#[cfg(target_os = "macos")]
+fn dock_menu_spaces() -> Vec<DockMenuItem> {
+    let Some(front_end) = try_front_end() else {
+        return vec![];
+    };
+    let mux = Mux::get();
+    let in_use = mux
+        .active_identity()
+        .and_then(|client| mux.resolve_focused_pane(&client))
+        .map(|(_domain, window_id, _tab_id, _pane_id)| window_id);
+    let mut items: Vec<DockMenuItem> = crate::workspace_threads::open_spaces()
+        .into_iter()
+        .filter_map(|(owner, name)| {
+            let gui =
+                front_end.gui_window_for_recovery_slot(FrontendRecoverySlot::Window(owner))?;
+            Some(DockMenuItem {
+                title: name,
+                checked: Some(gui.mux_window_id) == in_use,
+                id: owner.to_string(),
+            })
+        })
+        .collect();
+    items.sort_by_key(|item| item.title.to_lowercase());
+    items
+}
+
 pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
     let front_end = GuiFrontEnd::try_new()?;
     FRONT_END.with(|f| *f.borrow_mut() = Some(Rc::clone(&front_end)));
     crate::notification_click::install();
+    #[cfg(target_os = "macos")]
+    ::window::os::macos::set_dock_menu_items(dock_menu_spaces);
 
     let config_subscription = config::subscribe_to_config_reload({
         move || {

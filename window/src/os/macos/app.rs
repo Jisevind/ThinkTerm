@@ -2,7 +2,7 @@ use crate::connection::ConnectionOps;
 use crate::macos::menu::RepresentedItem;
 use crate::macos::{nsstring, nsstring_to_str};
 use crate::menu::{Menu, MenuItem};
-use crate::{ApplicationEvent, Connection};
+use crate::{ApplicationEvent, Connection, DockMenuItem};
 use cocoa::appkit::{NSApp, NSApplicationTerminateReply, NSImage, NSImageNameApplicationIcon};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSDictionary, NSInteger, NSUInteger};
@@ -12,9 +12,21 @@ use objc::declare::ClassDecl;
 use objc::rc::StrongPtr;
 use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::*;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 const CLS_NAME: &str = "WezTermAppDelegate";
+
+thread_local! {
+    static DOCK_MENU_ITEMS: RefCell<Option<Box<dyn Fn() -> Vec<DockMenuItem>>>> =
+        RefCell::new(None);
+}
+
+/// Have the Dock menu list the entries `items` gives, asked each time it
+/// opens; choosing one sends `ApplicationEvent::DockMenuItem`.
+pub fn set_dock_menu_items(items: impl Fn() -> Vec<DockMenuItem> + 'static) {
+    DOCK_MENU_ITEMS.with(|slot| *slot.borrow_mut() = Some(Box::new(items)));
+}
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
@@ -151,7 +163,21 @@ extern "C" fn wezterm_perform_key_assignment(
             }
         }
         Some(RepresentedItem::ContextMenuAction(_)) => {}
+        Some(RepresentedItem::DockMenuItem(_)) => {}
         None => {}
+    }
+}
+
+extern "C" fn thinkterm_choose_dock_menu_item(
+    _self: &mut Object,
+    _sel: Sel,
+    menu_item: *mut Object,
+) {
+    let menu_item = crate::os::macos::menu::MenuItem::with_menu_item(menu_item);
+    if let Some(RepresentedItem::DockMenuItem(id)) = menu_item.get_represented_item() {
+        if let Some(conn) = Connection::get() {
+            conn.dispatch_app_event(ApplicationEvent::DockMenuItem(id));
+        }
     }
 }
 
@@ -231,6 +257,22 @@ extern "C" fn application_dock_menu(
     new_window_item
         .set_represented_item(RepresentedItem::KeyAssignment(KeyAssignment::SpawnWindow));
     dock_menu.add_item(&new_window_item);
+    let items = DOCK_MENU_ITEMS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|items| items())
+            .unwrap_or_default()
+    });
+    if !items.is_empty() {
+        dock_menu.add_item(&MenuItem::new_separator());
+    }
+    for item in items {
+        let menu_item =
+            MenuItem::new_with(&item.title, Some(sel!(thinktermChooseDockMenuItem:)), "");
+        menu_item.set_checked(item.checked);
+        menu_item.set_represented_item(RepresentedItem::DockMenuItem(item.id));
+        dock_menu.add_item(&menu_item);
+    }
     dock_menu.autorelease()
 }
 
@@ -266,6 +308,10 @@ fn get_class() -> &'static Class {
             cls.add_method(
                 sel!(weztermPerformKeyAssignment:),
                 wezterm_perform_key_assignment as extern "C" fn(&mut Object, Sel, *mut Object),
+            );
+            cls.add_method(
+                sel!(thinktermChooseDockMenuItem:),
+                thinkterm_choose_dock_menu_item as extern "C" fn(&mut Object, Sel, *mut Object),
             );
             cls.add_method(
                 sel!(thinktermOrderFrontStandardAboutPanel:),
