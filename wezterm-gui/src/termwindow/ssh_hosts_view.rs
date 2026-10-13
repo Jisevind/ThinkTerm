@@ -35,13 +35,14 @@ pub(crate) const SSH_HOSTS_CONTENT_VIEW_KEY: &str = "ssh-hosts";
 const FIELD_NAME: usize = 0;
 const FIELD_HOST: usize = 1;
 const FIELD_PORT: usize = 2;
-const FIELD_USER: usize = 3;
-const FIELD_PASSWORD: usize = 4;
-const FIELD_IDENTITY: usize = 5;
-const FIELD_WORKSPACE: usize = 6;
-const FIELD_MOSH_SERVER: usize = 7;
-const BASE_FIELD_COUNT: usize = 7;
-const FIELD_COUNT: usize = 8;
+const FIELD_OTHER_ADDRESSES: usize = 3;
+const FIELD_USER: usize = 4;
+const FIELD_PASSWORD: usize = 5;
+const FIELD_IDENTITY: usize = 6;
+const FIELD_WORKSPACE: usize = 7;
+const FIELD_MOSH_SERVER: usize = 8;
+const BASE_FIELD_COUNT: usize = 8;
+const FIELD_COUNT: usize = 9;
 
 /// Where focus lands when the Advanced section is collapsed. Rows inside it
 /// stop being drawn, so a focus still pointing at one would silently edit an
@@ -342,6 +343,7 @@ impl SshHostsView {
         fields[FIELD_NAME] = spec.label.clone();
         fields[FIELD_HOST] = spec.host.clone();
         fields[FIELD_PORT] = spec.port.map(|p| p.to_string()).unwrap_or_default();
+        fields[FIELD_OTHER_ADDRESSES] = spec.other_addresses.join(", ");
         fields[FIELD_USER] = spec.username.clone().unwrap_or_default();
         fields[FIELD_PASSWORD] = spec
             .password
@@ -435,6 +437,7 @@ impl SshHostsView {
             label: label.clone(),
             host: host.clone(),
             port,
+            other_addresses: Vec::new(),
             username: None,
             identity_file: None,
             password: None,
@@ -454,6 +457,8 @@ impl SshHostsView {
         spec.label = label;
         spec.host = host;
         spec.port = port;
+        spec.other_addresses =
+            ssh_hosts::parse_other_addresses(&form.fields[FIELD_OTHER_ADDRESSES].text());
         spec.username = opt(&form.fields[FIELD_USER].text());
         // Encrypt the password before it is persisted to ssh_hosts.json. Never
         // fall back to plaintext: if encryption fails, keep the form open.
@@ -2017,6 +2022,28 @@ impl SshHostsView {
         y: f32,
         width: f32,
     ) -> anyhow::Result<f32> {
+        self.paint_field_hinted(
+            ctx, layers, font, palette, tokens, cursor_on, label, index, shown, "", x, y, width,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_field_hinted(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        tokens: UiTokens,
+        cursor_on: bool,
+        label: &str,
+        index: usize,
+        shown: &str,
+        placeholder: &str,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<f32> {
         let line_h = ctx.metrics.cell_size.height as f32;
         ctx.draw_text(layers, font, x, y, label, palette.muted_text, width)?;
         let input_y = y + line_h + ctx.px(LABEL_GAP);
@@ -2035,7 +2062,7 @@ impl SshHostsView {
             text_pad,
             cursor_on,
             TextInputSpec {
-                placeholder: "",
+                placeholder,
                 text: shown,
                 rect: rect(x, input_y, width, ctx.px(INPUT_H)),
                 focused,
@@ -2269,7 +2296,8 @@ impl SshHostsView {
             let mut body_layers = TripleLayerQuadAllocator::Heap(&mut heap);
 
             // ---- Connection
-            let conn_h = Self::inspector_card_height(ctx, section_h, &[field_h, field_h, field_h]);
+            let conn_h =
+                Self::inspector_card_height(ctx, section_h, &[field_h, field_h, field_h, field_h]);
             let mut fy = Self::paint_inspector_card(
                 ctx,
                 section_ctx,
@@ -2325,6 +2353,22 @@ impl SshHostsView {
                 x + pad + host_w + ctx.px(10.0),
                 fy,
                 port_w,
+            )? + gap;
+            // Tried after Host, in order, when it does not answer.
+            fy = self.paint_field_hinted(
+                ctx,
+                &mut body_layers,
+                font,
+                palette,
+                tokens,
+                cursor_on,
+                &crate::i18n::tr("ssh-field-other-addresses"),
+                FIELD_OTHER_ADDRESSES,
+                &fields[FIELD_OTHER_ADDRESSES].text(),
+                "myhost.local, 127.0.0.1",
+                x + pad,
+                fy,
+                inner,
             )? + gap;
             self.paint_field(
                 ctx,
@@ -2954,6 +2998,7 @@ mod tests {
             label: label.to_string(),
             host: host.to_string(),
             port: Some(2222),
+            other_addresses: Vec::new(),
             username: Some("deploy".to_string()),
             identity_file: Some("~/.ssh/id_ed25519".to_string()),
             password: None,

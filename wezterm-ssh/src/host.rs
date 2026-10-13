@@ -92,6 +92,40 @@ impl crate::sessioninner::SessionInner {
         }
     }
 
+    /// Whether the keys on record for `hostname:port` say this session's
+    /// server is some other machine: one is there, and the server's key is
+    /// not it. Nothing is asked or reported.
+    #[cfg(feature = "ssh2")]
+    pub fn known_key_differs(
+        &self,
+        sess: &ssh2::Session,
+        hostname: &str,
+        port: u16,
+    ) -> anyhow::Result<bool> {
+        let Some((key, _)) = sess.host_key() else {
+            return Ok(false);
+        };
+        let mut known_hosts = sess.known_hosts().context("preparing known hosts")?;
+        let files = self
+            .config
+            .get("userknownhostsfile")
+            .map(|files| files.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_else(Vec::new);
+        for file in files {
+            let file = std::path::Path::new(&file);
+            if !file.exists() {
+                continue;
+            }
+            known_hosts
+                .read_file(file, ssh2::KnownHostFileKind::OpenSSH)
+                .with_context(|| format!("reading known_hosts file {}", file.display()))?;
+            if let ssh2::CheckResult::Mismatch = known_hosts.check_port(hostname, port, key) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[cfg(feature = "ssh2")]
     pub fn host_verification(
         &mut self,

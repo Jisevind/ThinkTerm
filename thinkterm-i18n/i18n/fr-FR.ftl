@@ -526,6 +526,7 @@ ssh-new-host = Nouvel hôte
 ssh-field-name = Nom
 ssh-field-host = Hôte
 ssh-field-port = Port
+ssh-field-other-addresses = Autres adresses
 ssh-field-user = Utilisateur
 ssh-field-password = Mot de passe
 ssh-field-identity = Fichier d’identité

@@ -8502,6 +8502,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "wezterm-ssh",
 ]
 
 [[package]]

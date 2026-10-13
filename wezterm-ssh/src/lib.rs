@@ -1,6 +1,7 @@
 #[cfg(not(any(feature = "libssh-rs", feature = "ssh2")))]
 compile_error!("Either libssh-rs or ssh2 must be enabled!");
 
+mod addresses;
 mod auth;
 mod channelwrap;
 mod config;
@@ -14,6 +15,7 @@ mod sessionwrap;
 mod sftp;
 mod sftpwrap;
 
+pub use addresses::OTHER_ADDRESSES;
 pub use auth::*;
 pub use config::*;
 pub use host::*;

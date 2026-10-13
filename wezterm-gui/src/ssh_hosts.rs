@@ -23,8 +23,8 @@ use std::sync::Arc;
 use wezterm_ssh::{Session, SessionEvent};
 
 pub use thinkterm_core::ssh_hosts::{
-    default_mosh_server_command, ShellIntegrationFailure, SshHostEntry, SshHostId, SshHostSource,
-    SshHostSpec, DEFAULT_MOSH_SERVER_COMMAND,
+    default_mosh_server_command, parse_other_addresses, ShellIntegrationFailure, SshHostEntry,
+    SshHostId, SshHostSource, SshHostSpec, DEFAULT_MOSH_SERVER_COMMAND,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,7 +530,10 @@ fn read_fd_to_string(mut fd: FileDescriptor) -> std::io::Result<String> {
 
 async fn connect_mosh_bootstrap_session(spec: &SshHostSpec) -> Result<(Session, String)> {
     let dom = build_ssh_domain(spec);
-    let ssh_config = mux::ssh::ssh_domain_to_ssh_config(&dom).context("build SSH config")?;
+    let mut ssh_config = mux::ssh::ssh_domain_to_ssh_config(&dom).context("build SSH config")?;
+    // mosh-client goes to the host's own address over UDP, so the
+    // bootstrap that starts mosh-server there must not land elsewhere.
+    ssh_config.remove(wezterm_ssh::OTHER_ADDRESSES);
     let mosh_client_host = ssh_config
         .get("hostname")
         .cloned()
@@ -777,6 +780,7 @@ fn parse_system_ssh_config_str(content: &str) -> Vec<SshHostEntry> {
                 // alias-scoped options such as ProxyJump still apply.
                 host: alias.clone(),
                 port: block.port,
+                other_addresses: Vec::new(),
                 username: block.user.clone(),
                 identity_file: block.identity_file.clone(),
                 password: None,
@@ -1041,6 +1045,7 @@ Host prod *.internal
             label: "t".to_string(),
             host: "example.com".to_string(),
             port: None,
+            other_addresses: Vec::new(),
             username: None,
             identity_file: None,
             password: None,
