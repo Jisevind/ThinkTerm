@@ -37,9 +37,8 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     private var recentring = false
     /// Stepped mode: finger travel not yet a whole row.
     private var rowRemainder: CGFloat = 0
-    /// The document the text system reads: the pane's visible rows, as
-    /// the core last gave them. Fetched when a selection interaction asks
-    /// and dropped when the core reports a change.
+    /// The document the text system reads: the pane's visible rows,
+    /// decoded once and dropped when they change (`currentScreen`).
     private var screen: ScreenText?
     /// The system's selection, held so the gesture setting can take it
     /// away and put it back while the terminal stays open.
@@ -181,6 +180,10 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         guard g.state == .ended else { return }
         let t = g.translation(in: self)
         let v = g.velocity(in: self)
+        // One from the screen's left edge opens the sidebar instead, where
+        // that edge does.
+        let start = g.location(in: nil).x - g.translation(in: nil).x
+        if model?.edgePullsDrawer == true, start < TerminalScreen.edgeWidth { return }
         guard abs(t.x) > 70, abs(t.y) < 50, abs(v.x) > 400, abs(v.x) > abs(v.y) * 2 else { return }
         model?.switchTab(by: t.x < 0 ? 1 : -1)
     }
@@ -228,6 +231,34 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     override var canBecomeFirstResponder: Bool { true }
 
+    @discardableResult
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        updateScreenWanted()
+        return became
+    }
+
+    @discardableResult
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        // The handles go with the keyboard, and so does what they held:
+        // unseen, it would still hold off the edge's swipe.
+        if resigned, selected != nil {
+            selected = nil
+            tintColor = .clear
+            inputDelegate?.selectionDidChange(self)
+        }
+        updateScreenWanted()
+        return resigned
+    }
+
+    /// The text system reads the rows while the keyboard is up (marked
+    /// text, the caret) or a selection is held: the core keeps them current
+    /// then. Otherwise they are made when asked, at a wait.
+    private func updateScreenWanted() {
+        model?.setScreenWanted(isFirstResponder || selected != nil)
+    }
+
     // MARK: composition bookkeeping
 
     private func beginComposing() {
@@ -271,17 +302,30 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     // MARK: the document
 
-    /// The core changed something on screen: the rows are read again
-    /// when next asked for.
+    /// The core published new rows: they are decoded again when next
+    /// asked for. While a composition is open they change under it
+    /// unannounced: told, the text system may reset the candidates.
     func screenChanged() {
+        guard marked == nil else {
+            screen = nil
+            return
+        }
         inputDelegate?.textWillChange(self)
         screen = nil
         inputDelegate?.textDidChange(self)
     }
 
+    /// A frame was painted while the rows are not kept current: the next
+    /// question reads them again.
+    func dropScreen() { screen = nil }
+
+    /// The rows: the core's published ones while they are wanted, read
+    /// without a wait; otherwise asked for once, waiting for the core.
     private func currentScreen() -> ScreenText? {
         if let screen { return screen }
-        guard let model, let s = ViewJSON.decode(ScreenText.self, model.core.screenText()) else { return nil }
+        guard let model else { return nil }
+        let json = model.screenWanted && model.screenJSON != "null" ? model.screenJSON : model.core.screenText()
+        guard let s = ViewJSON.decode(ScreenText.self, json) else { return nil }
         screen = s
         return s
     }
@@ -375,8 +419,14 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     /// end of the marked text (the keyboard's insertion point).
     /// The system's selection over the rows, as document offsets. It is
     /// the shell's alone: the core is not told, so it draws no highlight
-    /// of its own under the system's, and the copy reads the rows here.
-    private var selected: (a: Int, b: Int)?
+    /// of its own under the system's. Only the copy asks the core, for
+    /// the selected cells' own text.
+    private var selected: (a: Int, b: Int)? {
+        didSet { updateScreenWanted() }
+    }
+
+    /// A selection is up, its handles to be moved.
+    var holdsSelection: Bool { selected != nil }
 
     var selectedTextRange: UITextRange? {
         get {
@@ -567,17 +617,20 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         }
     }
 
-    /// The selected rows' text, each row's trailing blanks dropped, as
-    /// a terminal copies: the rows are fixed-width, the words are not.
+    /// The selected cells' text, each row's trailing blanks dropped, as
+    /// a terminal copies. The core reads it from the cells: the rows here
+    /// put a stand-in after every wide character and in place of any
+    /// character outside the BMP, and a copy must carry neither.
     func selectedText() -> String? {
-        guard let selected, let raw = text(in: Range(selected.a, selected.b)) else { return nil }
-        let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
-            var s = String(line)
-            while s.last == " " { s.removeLast() }
-            return s
-        }
-        let joined = lines.joined(separator: "\n")
-        return joined.isEmpty ? nil : joined
+        guard let selected, selected.b > selected.a, let s = currentScreen() else { return nil }
+        // A selection that starts on a row's line break starts on the next row.
+        let stride = s.cols + 1
+        let start = selected.a % stride == s.cols ? selected.a + 1 : selected.a
+        // What is still on the rows, if they shrank since it was selected.
+        let end = min(selected.b, screenLength)
+        guard start < end, let first = cell(at: start), let last = cell(at: end - 1),
+              let text = model?.copyText(from: first, to: last), !text.isEmpty else { return nil }
+        return text
     }
 
     override func copy(_ sender: Any?) {

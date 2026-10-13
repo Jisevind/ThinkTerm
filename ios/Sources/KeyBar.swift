@@ -11,12 +11,16 @@ struct KeyBar: View {
     @State private var tab: KeyPanelTab = KeyBar.debugTab
     @ObservedObject private var settings = AppSettings.shared
 
-    /// `--keypanel snippets` also picks the face it opens on.
+    /// `--keypanel snippets` also picks the face it opens on (debug builds).
     private static var debugTab: KeyPanelTab {
+        #if DEBUG
         let args = ProcessInfo.processInfo.arguments
         guard let i = args.firstIndex(of: "--keypanel"), i + 1 < args.count,
               let tab = KeyPanelTab(rawValue: args[i + 1]) else { return .keys }
         return tab
+        #else
+        return .keys
+        #endif
     }
 
     var body: some View {

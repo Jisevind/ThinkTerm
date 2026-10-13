@@ -69,10 +69,6 @@ final class AppSettings: ObservableObject {
 
     // MARK: interface
 
-    /// "one" or "two" levels of tabs: threads over tabs, or tabs alone.
-    @Published var tabBarLevels: String {
-        didSet { defaults.set(tabBarLevels, forKey: "ui.tabbar") }
-    }
     /// The bars over split panes; off, the rows go to the terminal.
     @Published var paneBars: Bool {
         didSet { defaults.set(paneBars, forKey: "ui.panebars") }
@@ -144,7 +140,6 @@ final class AppSettings: ObservableObject {
         cursorBlink = d.object(forKey: "cursor.blink") as? Bool ?? true
         bell = d.object(forKey: "bell") as? Bool ?? false
         resizeMode = d.string(forKey: "resize.mode") ?? "auto"
-        tabBarLevels = d.string(forKey: "ui.tabbar") ?? "two"
         paneBars = d.object(forKey: "ui.panebars") as? Bool ?? true
         hapticKeys = d.object(forKey: "key.haptics") as? Bool ?? true
         autoKeyPanel = d.object(forKey: "key.autopanel") as? Bool ?? false

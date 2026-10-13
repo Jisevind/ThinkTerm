@@ -67,11 +67,17 @@ struct HostsView: View {
         .navigationBarTitleDisplayMode(.large)
         .searchable(text: $search, placement: .navigationBarDrawer, prompt: tr("hosts.search"))
         .navigationDestination(for: Host.self) { host in
-            if host.name == "probe" {
+            #if DEBUG
+            // The development row's stand-in host, told by its id: a real
+            // host may well be called "probe".
+            if host.id == probe.id {
                 TerminalScreen(model: sessions.model(for: nil, store: store))
             } else {
                 TerminalScreen(model: sessions.model(for: host, store: store))
             }
+            #else
+            TerminalScreen(model: sessions.model(for: host, store: store))
+            #endif
         }
         // A separate destination type so the context menu's Connect can push
         // without fighting the value-based destination above.

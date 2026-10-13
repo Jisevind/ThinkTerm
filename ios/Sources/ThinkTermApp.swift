@@ -4,24 +4,30 @@ import SwiftUI
 struct ThinkTermApp: App {
     @StateObject private var store = HostStore()
     @StateObject private var sessions = Sessions()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             Group {
-                #if DEBUG
-                if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--auto") || $0.hasSuffix("test") }) {
+                if TerminalModel.automated {
                     // The automated flows go straight to the probe's host.
                     NavigationStack { TerminalScreen(model: sessions.model(for: nil, store: store)) }
                 } else {
                     RootTabs(store: store)
                 }
-                #else
-                RootTabs(store: store)
-                #endif
             }
             .environmentObject(store)
             .environmentObject(sessions)
             .preferredColorScheme(.dark)
+        }
+        // Every open connection hears about the background, on screen or
+        // not, whichever way the app was opened.
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background: sessions.detachForBackground()
+            case .active: sessions.reattachAfterBackground()
+            default: break
+            }
         }
     }
 
@@ -53,8 +59,6 @@ struct ThinkTermApp: App {
 /// with the rest of the app.
 private struct RootTabs: View {
     let store: HostStore
-    @EnvironmentObject private var sessions: Sessions
-    @Environment(\.scenePhase) private var scenePhase
     @State private var path = NavigationPath()
     @ObservedObject private var lang = AppLanguage.shared
 
@@ -73,17 +77,9 @@ private struct RootTabs: View {
             }
             .tabItem { Label(tr("hosts"), systemImage: "server.rack") }
             NavigationStack {
-                SettingsView(model: nil, showLog: nil)
+                SettingsView(showLog: nil)
             }
             .tabItem { Label(tr("settings"), systemImage: "gearshape") }
-        }
-        // Every open connection hears about the background, on screen or not.
-        .onChange(of: scenePhase) { _, phase in
-            switch phase {
-            case .background: sessions.detachForBackground()
-            case .active: sessions.reattachAfterBackground()
-            default: break
-            }
         }
     }
 }

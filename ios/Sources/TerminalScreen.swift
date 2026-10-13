@@ -9,109 +9,325 @@ struct TerminalScreen: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var lang = AppLanguage.shared
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.displayScale) private var displayScale
+    /// The drawer is out (a narrow screen).
     @State private var showTree = false
+    /// The screen is wide enough to keep the sidebar beside the terminal,
+    /// and whether it is kept there.
+    @State private var wide = false
+    @AppStorage("sidebar.pinned") private var sidebarPinned = true
     @State private var showLog = false
     @State private var showSettings = false
     @State private var menu: MenuSheet?
     @State private var editingHost: Host?
     /// A bar being dragged moves the divider it hangs from.
     @State private var barDrag: CGPoint?
-    /// The bar's width, for the strip in its middle: a principal item is
-    /// centred and clipped when wider than its slot, so it is sized.
-    @State private var barWidth: CGFloat = 402
-    /// The software keyboard is up: the key bar shows with it.
+    /// The software keyboard is up for the terminal: the key bar shows
+    /// with it.
     @State private var keyboardUp = false
-    /// The overview: the terminal shrinks into its thread's card and the
-    /// cards fade in around it, as the desktop's Live Overview zooms out.
+    /// The drawer's rows are made while it is open and while it slides
+    /// shut, not while it lies hidden under the screen.
+    @State private var drawerShown = false
+    /// How far a swipe from the left edge has pulled the screen off the
+    /// drawer, as the Claude app's does; it springs back if let go short.
+    @GestureState(resetTransaction: Transaction(animation: TerminalScreen.slide))
+    private var edgePull: CGFloat = 0
+    @State private var edgeDrag = EdgeDrag()
+    /// Where the system puts a bar along the top (`barRoom`): on an
+    /// unfolded Duo, below the rounded corners, not at the screen's top.
+    @State private var topRoom = EdgeInsets()
+    /// A name the sidebar asked for (`SidebarView.editing`), kept here so
+    /// the question stands wherever the sidebar is.
+    @State private var renaming: (kind: String, id: String)?
+    @State private var renameText = ""
+    /// The overview (`OverviewScreen`): the terminal shrinks into its
+    /// thread's card and the cards fade in around it, as the desktop's Live
+    /// Overview zooms out; a card tapped grows back into the terminal.
+    /// `overviewOpen` while it is the screen's, `overviewVisible` while its
+    /// cards are up (a close included).
     @State private var overviewOpen = false
-    @State private var overviewShown = false
-    /// The cards stay while the terminal comes back out of its card.
     @State private var overviewVisible = false
+    @State private var cardsAlpha: Double = 0
+    /// Where the live card's picture is while the terminal is on its way
+    /// into it; every card's is in `moves`.
+    @State private var landingThumb: CGRect?
     @State private var terminalFrame: CGRect = .zero
-    @State private var cardFrame: CardFrames?
-    /// The card's header, carried along with the terminal by the zoom.
-    @State private var heroFrames: CardFrames?
-    @State private var heroScale: CGFloat = 1
-    @State private var heroOffset: CGSize = .zero
-    @State private var heroAlpha: Double = 0
-    /// The moving card's border: its natural height follows the zoom.
-    @State private var heroFrameHeight: CGFloat = 0
-    /// The thread whose card the terminal is moving into or out of, and
-    /// the card a tap picked on the way back.
-    @State private var heroThread: ThreadView?
-    @State private var picked: (thread: ThreadView, frames: CardFrames)?
-    @State private var zoomScale: CGFloat = 1
-    @State private var zoomOffset: CGSize = .zero
-    @State private var zoomClip: CGFloat?
-    /// Once in the card the terminal fades into the card's own preview.
-    @State private var zoomFade: Double = 1
-    /// Once the terminal has faded, the live card shows its preview rows.
-    @State private var livePreview = false
-    @State private var deletingThread: ThreadView?
+    /// The terminal's top and bottom on the screen: the bar's buttons are
+    /// above it and the keys below it scroll sideways, so a swipe from the
+    /// edge there is theirs.
+    @State private var terminalSpan: ClosedRange<CGFloat> = 0...CGFloat.infinity
+    /// The terminal is hidden while a picture of it flies in its place.
+    @State private var terminalAlpha: Double = 1
+    @State private var flight = Flight()
+    /// The thread the terminal went into the card of, and whether the
+    /// card's picture shows in its place.
+    @State private var liveThread: String?
+    @State private var liveShown = false
+    @State private var moves = OverviewMoves()
+    /// Whether tabs lie past the start of the strip and past its end.
+    @State private var stripEnds = StripEnds()
 
-    /// The tabs live in the navigation bar, between the system's own back
-    /// button and the menu; the keys sit below the terminal, and nothing
-    /// else. Every piece of chrome takes the terminal's own background.
+    /// On a phone held upright the sidebar is a drawer the whole screen
+    /// slides off, rounding its corner -- by the button or a swipe from the
+    /// left edge -- and a tap on what shows of it comes back; on a wide screen (an iPad, an unfolded Duo, landscape) it stays
+    /// at the left at full height, and the bar runs over the terminal only,
+    /// as on the desktop.
     var body: some View {
+        GeometryReader { geo in
+            // Decided in the pass that lays it out, so the terminal is sized
+            // once; the state follows a pass later, for the buttons.
+            let wide = geo.size.width >= Self.wideWidth
+            let drawerOpen = showTree && !wide
+            let drawerWidth = min(Self.columnWidth + 40, geo.size.width * 0.84)
+            let pulled = drawerOpen || edgePull > 0
+            ZStack(alignment: .topLeading) {
+                if !wide {
+                    // The drawer lies under the screen, which slides off it.
+                    sidebar(live: pulled || drawerShown)
+                        .frame(width: drawerWidth)
+                        .opacity(pulled ? 1 : 0)
+                        .allowsHitTesting(drawerOpen)
+                        .accessibilityHidden(!drawerOpen)
+                }
+                HStack(spacing: 0) {
+                    if wide && sidebarPinned {
+                        sidebar(live: true).frame(width: Self.columnWidth)
+                        Rectangle().fill(Color.white.opacity(0.08)).frame(width: 1).ignoresSafeArea()
+                    }
+                    screen
+                        .clipShape(RoundedRectangle(cornerRadius: pulled ? 28 : 0, style: .continuous))
+                        .overlay {
+                            if drawerOpen {
+                                // What shows of the screen takes it back.
+                                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                                    .fill(Color.black.opacity(0.35))
+                                    .ignoresSafeArea()
+                                    .onTapGesture { showTree = false }
+                            }
+                        }
+                        .shadow(color: .black.opacity(pulled ? 0.55 : 0), radius: 20)
+                }
+                .offset(x: drawerOpen ? drawerWidth : min(edgePull, drawerWidth))
+            }
+            .simultaneousGesture(
+                // A swipe right from the left edge opens the drawer, the
+                // screen following the finger; one from further in is the
+                // terminal's (a selection, a scroll).
+                DragGesture(minimumDistance: 10, coordinateSpace: .global)
+                    .updating($edgePull) { drag, pull, transaction in
+                        // Back once it is none: brought back past where it began.
+                        let next = pullsDrawer(drag) ? max(0, drag.translation.width) : 0
+                        if next == 0 && pull > 0 {
+                            transaction.animation = Self.slide
+                        }
+                        pull = next
+                    }
+                    .onEnded { drag in
+                        // Far enough, or flung far enough, and not flung back.
+                        let far = drag.translation.width > drawerWidth / 3 || drag.predictedEndTranslation.width > drawerWidth / 2
+                        if far && drag.velocity.width > -200 && pullsDrawer(drag) { showSidebar() }
+                        edgeDrag.start = nil
+                    },
+                including: wide || drawerOpen ? .subviews : .all
+            )
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 24).onEnded { drag in
+                    // A swipe to the left, not a scroll of the list that
+                    // drifts.
+                    let move = drag.translation
+                    if move.width < -60 && abs(move.width) > abs(move.height) { showTree = false }
+                },
+                including: drawerOpen ? .all : .subviews
+            )
+            .animation(Self.slide, value: showTree)
+            .animation(Self.slide, value: sidebarPinned)
+            .onAppear {
+                self.wide = wide
+                model.edgePullsDrawer = !wide && !showTree
+            }
+            .onChange(of: wide) { _, wide in
+                self.wide = wide
+                if wide { showTree = false }
+                model.edgePullsDrawer = !wide && !showTree
+            }
+        }
+        // Under the status bar: the terminal's colour, or the sidebar's
+        // beside an open drawer (the screen is clipped to its frame).
+        .background((drawerOpen ? Color(white: 0.07) : cardsAlpha > 0 ? OverviewScreen.backdrop : model.background).ignoresSafeArea())
+        .onChange(of: drawerOpen) { _, open in
+            model.edgePullsDrawer = !wide && !open
+            if open {
+                drawerShown = true
+            } else {
+                // The only field it can leave focused is its search.
+                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    if !drawerOpen { drawerShown = false }
+                }
+            }
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
+    }
+
+    /// Wide enough for the sidebar to stay beside the terminal.
+    private static let wideWidth: CGFloat = 700
+    /// How near the left edge a swipe must start to open the drawer.
+    static let edgeWidth: CGFloat = 24
+    /// The screen sliding off the drawer and back, and the column coming
+    /// and going.
+    private static let slide = Animation.spring(response: 0.34, dampingFraction: 0.88)
+    private static let columnWidth: CGFloat = 280
+    private static let barHeight: CGFloat = 54
+    /// How far in from an end of the tab strip its tabs fade.
+    private static let stripFade: CGFloat = 28
+    private var drawerOpen: Bool { showTree && !wide }
+
+    /// A drag that pulls the drawer out: from the screen's left edge and
+    /// sideways, over the terminal (the bar's buttons are above it, the
+    /// keys under it scroll sideways), and not a selection's handle being
+    /// moved. Decided as it sets off and kept, so a thumb's arc turning up
+    /// or down on the way does not let go of the screen.
+    private func pullsDrawer(_ drag: DragGesture.Value) -> Bool {
+        if edgeDrag.start != drag.startLocation {
+            let move = drag.translation
+            edgeDrag.start = drag.startLocation
+            edgeDrag.pulls = drag.startLocation.x < Self.edgeWidth && move.width > abs(move.height)
+                && terminalSpan.contains(drag.startLocation.y) && model.inputView?.holdsSelection != true
+        }
+        return edgeDrag.pulls
+    }
+
+    /// The sidebar, opened (a drawer) or brought back (a column).
+    private func showSidebar() {
+        moves.waiting = false
+        if wide { sidebarPinned = true } else { model.dismissKeyboard(); showTree = true }
+    }
+
+    /// A drawer covers the terminal and takes its keyboard down; a column
+    /// leaves both be.
+    private func toggleSidebar() {
+        moves.waiting = false
+        if wide { sidebarPinned.toggle() } else { model.dismissKeyboard(); showTree.toggle() }
+    }
+
+    /// Back to the hosts, an overview waiting to open left shut: the
+    /// screen is gone only once it has slid away.
+    private func leave() {
+        moves.waiting = false
+        dismiss()
+    }
+
+    private func threadName(_ id: String) -> String {
+        for space in model.tree?.spaces ?? [] {
+            for project in space.projects {
+                if let thread = project.threads.first(where: { $0.id == id }) { return thread.name }
+            }
+        }
+        return ""
+    }
+
+    private func sidebar(live: Bool) -> some View {
+        SidebarPanel(
+            model: model,
+            hostName: hostName,
+            connected: connected,
+            done: { if !wide { showTree = false } },
+            onEditHost: { showTree = false; editingHost = model.host },
+            onSettings: { showSettings = true },
+            onOverview: { openOverview() },
+            overviewOn: overviewOpen,
+            live: live
+        )
+    }
+
+    /// The terminal's page: the bar, then the strip, the terminal, the
+    /// status line and the keys. Every piece of chrome takes the
+    /// terminal's own background.
+    private var screen: some View {
+        VStack(spacing: 0) {
+            topBar
+            content
+        }
+        .barRoom(.top, height: Self.barHeight, $topRoom)
+        .background((cardsAlpha > 0 ? OverviewScreen.backdrop : model.background).ignoresSafeArea())
+        .ignoresSafeArea(.container, edges: .bottom)
+        // Another keyboard (the sidebar's search, a name being asked for)
+        // is not the terminal's: it does not resize it.
+        .ignoresSafeArea(keyboardUp ? [] : .keyboard, edges: .bottom)
+    }
+
+    /// The sidebar, back to the hosts, and the strip in the rest of the
+    /// bar; the round buttons in the system's glass.
+    private var topBar: some View {
+        HStack(spacing: 8) {
+            Button { toggleSidebar() } label: { barIcon("sidebar.left") }
+                .buttonStyle(.plain)
+                .glassCircle()
+                .accessibilityLabel(tr("sidebar"))
+            Button { leave() } label: { barIcon("chevron.left") }
+                .buttonStyle(.plain)
+                .glassCircle()
+                .accessibilityLabel(tr("hosts"))
+            if overviewOpen {
+                // The overview's own bar: its name, and the way back.
+                Text(tr("overview"))
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .padding(.leading, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button { closeOverview() } label: { barIcon("xmark") }
+                    .buttonStyle(.plain)
+                    .glassCircle()
+                    .accessibilityLabel(tr("done"))
+            } else {
+                tabStrip.frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        // The screen's left side is the sidebar's while it stays there.
+        .padding(.leading, max(10, wide && sidebarPinned ? 0 : topRoom.leading))
+        .padding(.trailing, max(10, topRoom.trailing))
+        .frame(height: Self.barHeight)
+        .padding(.top, max(0, topRoom.top))
+        .contentShape(Rectangle())
+        // Pinching the bar zooms out to the overview.
+        .gesture(MagnifyGesture().onEnded { value in
+            if value.magnification < 0.8 { openOverview() }
+        })
+        // The text follows the system's size, as far as the bar holds it.
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+    }
+
+    private func barIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.body.weight(.semibold))
+            .foregroundColor(cardsAlpha > 0 ? .white : model.ink)
+            .frame(width: 42, height: 42)
+            .contentShape(Circle())
+    }
+
+    private var content: some View {
         ZStack(alignment: .topLeading) {
             if overviewVisible {
                 OverviewScreen(
-                    model: model, isPresented: $overviewShown, cardFrame: $cardFrame,
-                    liveThread: currentThreadId, livePreview: livePreview,
-                    onPick: { thread, frames in if let frames { picked = (thread, frames) } }
+                    model: model, stage: terminalFrame.size, liveThread: liveThread, liveShown: liveShown,
+                    onThumb: { noteThumb($0, $1) }, onPick: { pick($0) }, onClose: { closeOverview() }
                 )
-                    .opacity(gridOpacity)
-                    .onChange(of: overviewShown) { _, shown in if !shown { closeOverview() } }
+                .opacity(cardsAlpha)
+                .allowsHitTesting(overviewOpen)
             }
-            // The card's own header rides along with the terminal: laid out at
-            // the card's size, blown up to the terminal's width, and shrunk
-            // with the same zoom, so the whole card closes in.
-            if let hero = heroFrames, let thread = heroThread {
-                let sEnd = hero.thumb.width / max(terminalFrame.width, 1)
-                ThreadCardHeader(thread: thread)
-                    .frame(width: hero.card.width, height: hero.thumb.minY - hero.card.minY, alignment: .top)
-                    .background(Color(red: 0.10, green: 0.11, blue: 0.13))
-                    .clipShape(UnevenRoundedRectangle(topLeadingRadius: 13, topTrailingRadius: 13))
-                    .scaleEffect(1 / sEnd, anchor: .topLeading)
-                    .scaleEffect(heroScale, anchor: .topLeading)
-                    .offset(heroOffset)
-                    .opacity(heroAlpha * zoomFade)
-                    .zIndex(3)
-                    .allowsHitTesting(false)
-                // The moving card's border, around header and terminal slice
-                // together; the card's own border waits until it has landed.
-                RoundedRectangle(cornerRadius: 13)
-                    .stroke(Color.accentColor, lineWidth: 2)
-                    .frame(width: hero.card.width, height: heroFrameHeight)
-                    .scaleEffect(1 / sEnd, anchor: .topLeading)
-                    .scaleEffect(heroScale, anchor: .topLeading)
-                    .offset(heroOffset)
-                    .opacity(heroAlpha * zoomFade)
-                    .zIndex(3)
-                    .allowsHitTesting(false)
-            }
-            // Above the cards, so the shrunken terminal shows in its card;
-            // untouchable meanwhile, so the cards get the taps.
+            // Above the cards, so the terminal shows on its way into its
+            // card; untouchable meanwhile, so the cards get the taps.
             VStack(spacing: 0) {
-                if twoLevel {
-                    tabSubstrip.opacity(overviewOpen ? 0 : 1)
-                }
                 terminal
-                    .background(GeometryReader { geo in
-                        Color.clear
-                            .onAppear { terminalFrame = geo.frame(in: .named("screen")) }
-                            .onChange(of: geo.frame(in: .named("screen"))) { _, f in terminalFrame = f }
-                    })
-                    .mask(alignment: .bottom) {
-                        // The card's own corners, once the terminal is in it.
-                        UnevenRoundedRectangle(bottomLeadingRadius: 13 / zoomScale, bottomTrailingRadius: 13 / zoomScale)
-                            .frame(height: zoomClip)
-                    }
-                    .scaleEffect(zoomScale, anchor: .topLeading)
-                    .offset(zoomOffset)
-                    .opacity(zoomFade)
+                    .opacity(terminalAlpha)
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("screen")) } action: { terminalFrame = $0 }
+                    .onGeometryChange(for: ClosedRange<CGFloat>.self) { geo in
+                        let frame = geo.frame(in: .global)
+                        return frame.minY...max(frame.minY, frame.maxY)
+                    } action: { terminalSpan = $0 }
                     .zIndex(2)
-                    .allowsHitTesting(!overviewOpen)
                 statusLine.opacity(overviewOpen ? 0 : 1)
                 if (keyboardUp || model.panelOpen) && !overviewOpen {
                     // With the keyboard down the bar sits on the home
@@ -124,57 +340,52 @@ struct TerminalScreen: View {
             .animation(.easeOut(duration: 0.2), value: keyboardUp)
             .animation(.easeOut(duration: 0.2), value: model.panelOpen)
             .zIndex(1)
-            .allowsHitTesting(!overviewOpen)
-        }
-        .overlay {
-            SidebarPanel(
-                model: model,
-                isPresented: $showTree,
-                hostName: hostName,
-                connected: connected,
-                onEditHost: { showTree = false; editingHost = model.host },
-                onSettings: { showTree = false; showSettings = true },
-                onOverview: { showTree = false; openOverview() }
-            )
+            .allowsHitTesting(!overviewVisible)
+            // A picture of the terminal on its way into a card or out of one.
+            Flyway(flight: flight)
+                .allowsHitTesting(false)
+                .zIndex(3)
         }
         .coordinateSpace(name: "screen")
-        .background(overviewOpen ? Color(white: 0.06) : model.background)
-        .background(GeometryReader { geo in
-            Color.clear.onAppear { barWidth = geo.size.width }
-                .onChange(of: geo.size.width) { _, w in barWidth = w }
-        })
+        .background(cardsAlpha > 0 ? OverviewScreen.backdrop : model.background)
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
             let frame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect) ?? .zero
-            keyboardUp = frame.height > 0
+            // The sidebar's search has a keyboard too, and no key bar.
+            keyboardUp = frame.height > 0 && model.inputView?.isFirstResponder == true
+            // The terminal's back before the overview it was put away for.
+            if keyboardUp { moves.waiting = false }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
             keyboardUp = false
         }
-        .onChange(of: cardFrame) { _, frames in
-            // The card's thumbnail is laid out: the terminal goes there --
-            // even when it came late and the overview opened without it.
-            if overviewShown, let frames, heroFrames == nil { zoom(into: frames) }
+        .onChange(of: landingThumb) { _, thumb in
+            // The cards are laid out (or the card moved, scrolled into
+            // sight), even after the picture got where they were thought to
+            // be: it goes on to the card, and the cards come out from under
+            // the cover.
+            guard let thumb, overviewOpen, !liveShown, !moves.closing else { return }
+            flyIn(to: thumb)
+            flight.fadeCover(to: 0, duration: 0.3)
         }
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(.hidden, for: .tabBar)
-        .toolbarBackground(model.background, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .toolbar {
-            // The strip takes the bar from the two leading buttons to the
-            // trailing margin: nothing sits at the right any more.
-            ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 140, 120)) }
-            ToolbarItem(placement: .topBarLeading) {
-                // The desktop's sidebar: the projects and threads, as a
-                // panel; the keyboard goes first, or the panel sits on it.
-                Button { model.dismissKeyboard(); showTree = true } label: { Image(systemName: "sidebar.left") }
+        .onChange(of: livePicture) { _, _ in fadeIntoCard() }
+        .onChange(of: currentThreadId) { _, now in
+            if overviewOpen, !moves.closing, let now, now != liveThread,
+               let thread = model.threads?.threads.first(where: { $0.id == now }) {
+                // Another thread picked elsewhere (the sidebar): it is the
+                // one the overview closes into.
+                pick(thread)
+            } else if moves.picked != nil {
+                // The picked thread is the terminal's now; its first frame
+                // follows.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { revealPicked(force: false) }
             }
         }
-        .ignoresSafeArea(.container, edges: .bottom)
         .sheet(item: $model.pendingHostKey) { challenge in
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     Text(tr("hostkey.approve.title")).font(.headline)
-                    Text("\(challenge.hostname):\(challenge.port)")
+                    // Verbatim: an interpolated number is localised, "2,299".
+                    Text(verbatim: "\(challenge.hostname):\(challenge.port)")
                     Text(challenge.fingerprint).font(.system(.body, design: .monospaced))
                         .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     Text(tr("hostkey.approve.body"))
@@ -188,28 +399,71 @@ struct TerminalScreen: View {
         }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
-                SettingsView(model: model, showLog: $showLog)
+                SettingsView(showLog: $showLog)
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) { Button(tr("done")) { showSettings = false } }
                     }
             }
         }
-        .onChange(of: showLog) { _, on in model.wantsStats = on }
+        .onChange(of: showLog) { _, on in model.logShown = on }
+        .onChange(of: model.sidebar?.editing) { _, editing in
+            // A new project has no id yet: the same field, asking for the
+            // name of what is about to exist.
+            guard let editing, editing.kind != "none" else { return }
+            if renaming == nil {
+                renameText = ""
+                renaming = (editing.kind, editing.id ?? "")
+            }
+        }
+        .onChange(of: model.nameAsks) { _, _ in
+            // "+" asks at once, even while the core still asks from before.
+            renameText = ""
+            renaming = ("new-project", "")
+        }
+        .onChange(of: model.sidebar?.new_project_error) { _, error in
+            // A folder the core refused: asked again, with why.
+            if error != nil, model.sidebar?.editing.kind == "new-project", renaming == nil {
+                renaming = ("new-project", "")
+            }
+        }
+        .alert(
+            renaming?.kind == "new-project" ? tr("project.new") : tr("rename"),
+            isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+        ) {
+            // A new project is a folder on the host, ~/dir or /dir.
+            TextField(renaming?.kind == "new-project" ? "~/" : tr("f.name"), text: $renameText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button(tr("save")) {
+                model.sideKey("Enter", value: renameText)
+                renaming = nil
+            }
+            Button(tr("cancel"), role: .cancel) {
+                model.sideKey("Escape", value: "")
+                renaming = nil
+            }
+        } message: {
+            if renaming?.kind == "new-project", let error = model.sidebar?.new_project_error {
+                Text(error)
+            }
+        }
+        .confirmationDialog(
+            tr("thread.delete.title", threadName(model.confirming?.split(separator: ":", maxSplits: 1).last.map(String.init) ?? "")),
+            isPresented: Binding(get: { model.confirming != nil }, set: { if !$0 { model.confirming = nil } }),
+            titleVisibility: .visible
+        ) {
+            // Deleting ends every program in the thread: it is asked first.
+            Button(tr("delete"), role: .destructive) {
+                if let action = model.confirming { model.menuAction(action) }
+                model.confirming = nil
+            }
+            Button(tr("cancel"), role: .cancel) { model.confirming = nil }
+        } message: {
+            Text(tr("thread.delete.body"))
+        }
         .sheet(item: $menu) { sheet in
             MenuList(model: model, sheet: sheet) { menu = nil }
                 .presentationDetents([.medium, .large])
-        }
-        .confirmationDialog(
-            tr("thread.delete.title", deletingThread?.name ?? ""),
-            isPresented: Binding(get: { deletingThread != nil }, set: { if !$0 { deletingThread = nil } }),
-            titleVisibility: .visible,
-            presenting: deletingThread
-        ) { thread in
-            // Deleting ends every program in the thread: it is asked first.
-            Button(tr("delete"), role: .destructive) { model.sideClick("delete", id: thread.id) }
-            Button(tr("cancel"), role: .cancel) {}
-        } message: { _ in
-            Text(tr("thread.delete.body"))
         }
         .sheet(item: $editingHost) { host in
             HostEditView(host: host) { edited, secret, passphrase in
@@ -221,25 +475,51 @@ struct TerminalScreen: View {
             }
         }
         .onAppear {
+            moves.onScreen = true
             model.enterScreen()
             // The automated flows connect on their own schedule; a session
             // found open is simply shown.
-            let args = ProcessInfo.processInfo.arguments
-            if !args.contains(where: { $0.hasSuffix("test") || $0 == "--autoconnect" }), !model.isConnected {
+            if !TerminalModel.automated, !model.isConnected {
                 model.connect()
             }
             #if DEBUG
+            let args = ProcessInfo.processInfo.arguments
+            // When a flag fires: the seconds after it, if given.
+            func when(_ flag: String, _ otherwise: Double) -> Double? {
+                guard let at = args.firstIndex(of: flag) else { return nil }
+                return at + 1 < args.count ? Double(args[at + 1]) ?? otherwise : otherwise
+            }
+            // On time: the system lets a long wait run late by up to a
+            // tenth of it, which would run two flags a moment apart as one.
+            // Not once the screen is gone.
+            func after(_ seconds: Double, _ work: @escaping () -> Void) {
+                let timer = DispatchSource.makeTimerSource(queue: .main)
+                timer.schedule(deadline: .now() + seconds, leeway: .milliseconds(1))
+                timer.setEventHandler {
+                    if moves.onScreen { work() }
+                    timer.cancel()
+                }
+                timer.resume()
+            }
             // Screenshots of the sheets, which no script can tap open.
-            if args.contains("--open-tree") {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 14) { showTree = true }
+            if let t = when("--open-tree", 14) { after(t) { showSidebar() } }
+            if let t = when("--open-overview", 14) { after(t) { openOverview() } }
+            // The overview's ways back: a running thread's card by its
+            // place among them, or the close button.
+            if let at = args.firstIndex(of: "--overview-pick"), at + 1 < args.count, let n = Int(args[at + 1]) {
+                after(17) {
+                    let running = (model.threads?.threads ?? []).filter(\.live)
+                    if running.indices.contains(n) { pick(running[n]) }
+                }
             }
-            if args.contains("--open-overview") {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 14) { openOverview() }
-            }
+            if let t = when("--overview-close", 17) { after(t) { closeOverview() } }
             #endif
         }
         .onDisappear {
-            // The picture goes, the connection stays (see Sessions).
+            // The picture goes, the connection stays (see Sessions), and an
+            // overview left open, or on its way, lets its screens go.
+            moves.onScreen = false
+            overviewClosed()
             model.leaveScreen()
         }
     }
@@ -261,113 +541,98 @@ struct TerminalScreen: View {
         return .red
     }
 
-    /// The desktop's two layers, as two rows: threads (the sidebar's
-    /// layer, one per workspace) in the navigation bar, the current
-    /// thread's tabs in a strip under it. A server without threads (no
-    /// session state) shows its tabs in the bar instead.
-    private var twoLevel: Bool { settings.tabBarLevels == "two" && !(model.threads?.threads.isEmpty ?? true) }
-
+    /// The current thread's tabs, as the desktop's bar has them; the
+    /// threads are the sidebar's.
     private var tabStrip: some View {
-        HStack(spacing: 2) {
-            ScrollViewReader { reader in
+        let current = model.tabs?.tabs.first(where: { $0.current })?.tab
+        return ScrollViewReader { reader in
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    if twoLevel {
-                        ForEach(model.threads?.threads ?? []) { thread in
-                            Button {
-                                // The one on show opens the tree; another is shown.
-                                if thread.current { showTree = true } else { model.sideClick("thread", id: thread.id) }
-                            } label: {
-                                HStack(spacing: 5) {
-                                    Circle().fill(threadColor(thread)).frame(width: 6, height: 6)
-                                    Text(thread.name)
-                                        .font(.system(size: 12, weight: thread.current ? .semibold : .regular))
-                                        .lineLimit(1)
-                                    if thread.current {
-                                        closeX { deletingThread = thread }
-                                    }
-                                }
-                                .padding(.leading, 10)
-                                .padding(.trailing, thread.current ? 4 : 10)
-                                .frame(minWidth: 64, minHeight: 26)
-                                .background(thread.current ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
-                                .clipShape(Capsule())
-                            }
-                            .buttonStyle(.plain)
-                            .contextMenu {
-                                AppMenuItems(model: model, kind: "thread", id: thread.id)
-                            }
-                            .id("thread:" + thread.id)
-                        }
-                        Button { model.sideClick("new-thread") } label: {
-                            Image(systemName: "plus").font(.system(size: 13, weight: .semibold)).padding(6)
-                                .foregroundColor(Color.white.opacity(0.62))
-                        }
-                        .buttonStyle(.plain)
-                    } else {
-                        tabPills(size: 12, height: 26)
-                        newTabButton
-                    }
+                // As tall as the round buttons beside them, in their glass.
+                HStack(spacing: 8) {
+                    tabPills(height: 42)
+                    newTabButton
+                }
+                // A scroll comes to rest with a whole pill at the start.
+                .scrollTargetLayout()
+                .glassGroup(spacing: 8)
+            }
+            .scrollTargetBehavior(.viewAligned)
+            // The glass swells as it is pressed, above and below the strip;
+            // at its ends the tabs scrolled off it are cut, not drawn over
+            // the buttons before it, and fade out on their way there.
+            .scrollClipDisabled()
+            .clipShape(SideClip())
+            .onScrollGeometryChange(for: StripEnds.self) { geo in
+                StripEnds(before: geo.visibleRect.minX > 1, after: geo.visibleRect.maxX < geo.contentSize.width - 1)
+            } action: { _, ends in
+                stripEnds = ends
+            }
+            .overlay { stripFades }
+            .onAppear {
+                // First shown, or back from the overview: the current tab
+                // at the start, once the strip is laid out.
+                DispatchQueue.main.async {
+                    if let current { reader.scrollTo("tab:\(current)", anchor: .leading) }
                 }
             }
-            .onChange(of: model.threads?.threads.first(where: { $0.current })?.id) { _, id in
-                if let id { reader.scrollTo("thread:" + id, anchor: .center) }
-            }
-            .onChange(of: model.tabs?.tabs.first(where: { $0.current })?.tab) { _, tab in
-                if let tab, !twoLevel { reader.scrollTo("tab:\(tab)", anchor: .center) }
-            }
+            .onChange(of: current) { _, tab in
+                // A new tab's pill is laid out in this same pass: at the
+                // start once it is.
+                DispatchQueue.main.async {
+                    if let tab { reader.scrollTo("tab:\(tab)", anchor: .leading) }
+                }
             }
         }
-        .foregroundColor(.white)
+        .foregroundColor(model.ink)
     }
 
-    /// The current thread's tabs, under the bar.
-    private var tabSubstrip: some View {
-        HStack(spacing: 4) {
-            ScrollViewReader { reader in
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 4) {
-                        tabPills(size: 11.5, height: 22)
-                    }
-                }
-                .onChange(of: model.tabs?.tabs.first(where: { $0.current })?.tab) { _, tab in
-                    if let tab { reader.scrollTo("tab:\(tab)", anchor: .center) }
-                }
-            }
-            newTabButton
+    /// The bar's ground over the strip's ends where tabs lie past them, so
+    /// they fade out there rather than end in a cut; an end with nothing
+    /// past it stays sharp.
+    private var stripFades: some View {
+        let ground = cardsAlpha > 0 ? OverviewScreen.backdrop : model.background
+        return HStack(spacing: 0) {
+            LinearGradient(colors: [ground, ground.opacity(0)], startPoint: .leading, endPoint: .trailing)
+                .frame(width: Self.stripFade)
+                .opacity(stripEnds.before ? 1 : 0)
+            Spacer(minLength: 0)
+            LinearGradient(colors: [ground.opacity(0), ground], startPoint: .leading, endPoint: .trailing)
+                .frame(width: Self.stripFade)
+                .opacity(stripEnds.after ? 1 : 0)
         }
-        .foregroundColor(.white)
-        .padding(.horizontal, 8)
-        .frame(height: 32)
-        .contentShape(Rectangle())
-        // Pinching the strip zooms out to the overview.
-        .gesture(MagnifyGesture().onEnded { value in
-            if value.magnification < 0.8 { openOverview() }
-        })
-        .background(model.background)
+        .animation(.easeOut(duration: 0.15), value: stripEnds)
+        .allowsHitTesting(false)
     }
 
-    private func tabPills(size: CGFloat, height: CGFloat) -> some View {
+    /// The tabs as the desktop's capsules: the card of what each runs at
+    /// the left, round within the capsule's round end, then its name.
+    private func tabPills(height: CGFloat) -> some View {
         ForEach(model.tabs?.tabs ?? []) { tab in
             Button {
                 model.chromeClick("pane", pane: tab.target)
             } label: {
-                HStack(spacing: 4) {
-                    Text(tab.label.isEmpty ? tr("tab.num", tab.tab) : tab.label)
-                        .font(.system(size: size, weight: tab.current ? .semibold : .regular))
-                        .lineLimit(1)
-                    if tab.current {
-                        closeX { model.chromeClick("close-tab", tab: tab.tab) }
+                // A window tab wears the terminal's card, as on the
+                // desktop; what each pane runs is on its capsule.
+                let icon = model.tabs?.icon
+                AtMost(width: 180) {
+                    HStack(spacing: 8) {
+                        TabIconCard(core: model.core, id: icon, size: height - 12, revision: model.iconsRevision)
+                        Text(tab.label.isEmpty ? tr("tab.num", tab.tab) : tab.label)
+                            .font(.subheadline.weight(tab.current ? .semibold : .regular))
+                            .lineLimit(1)
+                        if tab.current {
+                            closeX { model.chromeClick("close-tab", tab: tab.tab) }
+                        }
                     }
+                    .padding(.leading, icon == nil ? 14 : 6)
+                    .padding(.trailing, tab.current ? 6 : 14)
                 }
-                .padding(.leading, 10)
-                .padding(.trailing, tab.current ? 4 : 10)
-                .frame(minWidth: 76, maxWidth: 160, minHeight: height)
-                .foregroundColor(tab.current ? .white : Color.white.opacity(0.62))
-                .background(tab.current ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
-                .clipShape(Capsule())
+                .frame(minWidth: 76, minHeight: height)
+                .foregroundColor(tab.current ? model.ink : model.ink.opacity(0.62))
+                .contentShape(Capsule())
             }
             .buttonStyle(.plain)
+            .glassPill(lit: tab.current, ink: model.ink)
             .contextMenu {
                 AppMenuItems(model: model, kind: "tab", id: String(tab.tab))
             }
@@ -379,9 +644,9 @@ struct TerminalScreen: View {
     private func closeX(_ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: "xmark")
-                .font(.system(size: 9, weight: .bold))
-                .foregroundColor(Color.white.opacity(0.7))
-                .frame(width: 18, height: 18)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(model.ink.opacity(0.7))
+                .frame(width: 30, height: 30)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -389,171 +654,301 @@ struct TerminalScreen: View {
 
     /// "+" opens a tab; held, it offers the splits too.
     private var newTabButton: some View {
-        Button { model.chromeClick("new-tab") } label: {
-            Image(systemName: "plus").font(.system(size: 13, weight: .semibold)).padding(6)
-                .foregroundColor(Color.white.opacity(0.62))
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button(tr("newtab")) { model.chromeClick("new-tab") }
-            Button(tr("split.right")) { model.chromeClick("split-right") }
-            Button(tr("split.below")) { model.chromeClick("split-below") }
-        }
+        Button { model.chromeClick("new-tab") } label: { barIcon("plus") }
+            .buttonStyle(.plain)
+            .glassCircle()
+            .accessibilityLabel(tr("newtab"))
+            .contextMenu {
+                Button(tr("newtab")) { model.chromeClick("new-tab") }
+                Button(tr("split.right")) { model.chromeClick("split-right") }
+                Button(tr("split.below")) { model.chromeClick("split-below") }
+            }
     }
 
-    static func threadColor(status: String, live: Bool) -> Color {
-        switch status {
-        case "Running": return .green
-        case "NeedsAttention": return .orange
-        case "Done": return .blue
-        default: return live ? .gray : .gray.opacity(0.4)
-        }
-    }
-
-    private func threadColor(_ t: ThreadView) -> Color { Self.threadColor(status: t.status, live: t.live) }
-
-    // MARK: the overview's zoom
+    // MARK: the overview
 
     private var currentThreadId: String? { model.threads?.threads.first(where: { $0.current })?.id }
 
-    /// The cards' opacity follows the zoom itself, so no frame shows the
-    /// cards before the terminal has begun to shrink (or after it has
-    /// begun to grow back): one curve for both.
-    private var gridOpacity: Double {
-        guard overviewOpen else { return 0 }
-        guard let hero = heroFrames, terminalFrame.width > 0 else { return 1 }
-        let end = hero.thumb.width / terminalFrame.width
-        guard end < 0.999 else { return 1 }
-        return min(max((1 - zoomScale) / (1 - end), 0), 1)
+    /// Where the live card's picture is, its pane, and whether its
+    /// picture is drawn.
+    private var liveThumb: CGRect? { liveThread.flatMap { moves.thumbs[$0] } }
+    private var livePane: Int? {
+        liveThread.flatMap { id in model.threads?.threads.first(where: { $0.id == id }) }.flatMap(OverviewScreen.pane(of:))
+    }
+    private var livePicture: Bool { livePane.flatMap { model.pictures[$0] } != nil }
+
+    /// A card's picture moved (laid out, scrolled): kept for the flights,
+    /// and the live one's followed while the terminal is on its way in.
+    private func noteThumb(_ id: String, _ rect: CGRect) {
+        moves.thumbs[id] = rect
+        if id == liveThread, overviewOpen, !liveShown, !moves.closing { landingThumb = rect }
     }
 
     /// The home indicator's inset, for a bar that sits at the bottom
     /// while the keyboard is down.
-    private static var bottomInset: CGFloat {
+    static var bottomInset: CGFloat {
         UIApplication.shared.connectedScenes
             .compactMap { ($0 as? UIWindowScene)?.keyWindow }
             .first?.safeAreaInsets.bottom ?? 0
     }
 
+    /// Into the overview. The terminal as it is flies off at once, for
+    /// where its card is bound to be, over a cover under which the cards
+    /// are made; Core Animation keeps it going while they are, and the
+    /// cards come out from under the cover once they are laid out.
     private func openOverview() {
-        guard !overviewShown else { return }
-        model.refreshViews()
-        overviewShown = true
-        if overviewVisible, let frames = cardFrame {
-            // The cards are still up from a close a moment ago and will
-            // not lay out again: the frames they last reported serve.
-            zoom(into: frames)
+        guard !overviewVisible, !flight.flying, !moves.waiting else {
+            // Asked again from the drawer, or while it slides away: only
+            // the drawer goes.
+            if drawerOpen { showTree = false }
+            return
+        }
+        guard drawerOpen || keyboardUp || model.panelOpen else { return zoomOut() }
+        // The terminal back in its place, uncovered and at its full height,
+        // first: the cards have its shape, and it flies from where it shows.
+        model.dismissKeyboard()
+        model.panelOpen = false
+        moves.waiting = true
+        let turn = moves.turn
+        // Once; not if the drawer, the keyboard or the keys came back
+        // meanwhile, or the screen went.
+        let go = {
+            guard turn == moves.turn, moves.waiting else { return }
+            moves.waiting = false
+            guard moves.onScreen, !drawerOpen, edgePull == 0, model.inputView?.isFirstResponder != true, !model.panelOpen else { return }
+            zoomOut()
+        }
+        if drawerOpen {
+            // Once the screen has slid back over the drawer, not while it
+            // shows short of where it is laid out (a busy main thread
+            // starts the slide late); a slide that never says it is done
+            // waits no longer than a second.
+            var back = Transaction(animation: Self.slide)
+            back.addAnimationCompletion(criteria: .logicallyComplete, go)
+            withTransaction(back) { showTree = false }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: go)
         } else {
-            cardFrame = nil
-        }
-        overviewVisible = true
-        // Without a card of its own (no threads, or none current) the
-        // terminal only fades.
-        if currentThreadId == nil {
-            withAnimation(.easeOut(duration: 0.25)) { overviewOpen = true }
-        }
-        // A card the lazy grid never realises reports nothing; the
-        // overview must not stay invisible for it. After a moment, the
-        // terminal only fades.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            if overviewShown && !overviewOpen {
-                withAnimation(.easeOut(duration: 0.25)) { overviewOpen = true }
-            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: go)
         }
     }
 
-    /// Shrink the terminal into the card's thumbnail: scaled to its
-    /// width, moved into it, and masked to its height from the bottom,
-    /// so the card keeps the newest rows as the other cards' previews do.
-    private func zoom(into frames: CardFrames) {
-        guard terminalFrame.width > 0 else { return }
-        let frame = frames.thumb
-        let scale = frame.width / terminalFrame.width
-        let clip = frame.height / scale
-        // The header starts above the terminal, at the terminal's width,
-        // and lands on the card's own header.
-        let headerH = frame.minY - frames.card.minY
-        heroFrames = frames
-        heroThread = model.threads?.threads.first(where: { $0.id == currentThreadId })
-        heroScale = 1
-        heroOffset = CGSize(width: terminalFrame.minX, height: terminalFrame.minY - headerH / scale)
-        heroFrameHeight = headerH + terminalFrame.height * scale
-        heroAlpha = 0
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+    /// The terminal, where it shows uncovered, off into its card.
+    private func zoomOut() {
+        let running = (model.threads?.threads ?? []).filter(\.live)
+        let live = running.first(where: \.current)
+        moves.turn += 1
+        moves.landed = false
+        let turn = moves.turn
+        if let live, let index = running.firstIndex(of: live), terminalFrame.height > 0,
+           let shot = flight.snapshot(terminalFrame) {
+            flight.cover(UIColor(OverviewScreen.backdrop), alpha: 1)
+            flight.begin(with: shot, frame: terminalFrame, at: terminalFrame, radius: 0)
+            flyIn(to: OverviewScreen.estimatedThumb(
+                index: index, count: running.count, width: terminalFrame.width, aspect: terminalFrame.width / terminalFrame.height
+            ))
+            CATransaction.flush()
+        }
+        // The cards, after the flight is under way.
+        DispatchQueue.main.async {
+            guard turn == moves.turn else { return }
+            model.refreshViews()
+            model.keepScreens()
+            liveThread = live?.id
+            if let pane = live.flatMap(OverviewScreen.pane(of:)) { model.requestScreen(pane: pane) }
+            moves.thumbs = [:]
+            landingThumb = nil
+            liveShown = false
             overviewOpen = true
-            zoomScale = scale
-            zoomOffset = CGSize(
-                width: frame.minX - terminalFrame.minX,
-                height: frame.minY - terminalFrame.minY - (terminalFrame.height - clip) * scale
-            )
-            zoomClip = clip
-            heroScale = scale
-            heroOffset = CGSize(width: frames.card.minX, height: frames.card.minY)
-            heroFrameHeight = frames.card.height
-            heroAlpha = 1
+            overviewVisible = true
+            if flight.flying {
+                // Under the cover already: gone at once, so the cover
+                // fading off the cards shows no trace of it.
+                terminalAlpha = 0
+                withAnimation(.easeOut(duration: 0.3)) { cardsAlpha = 1 }
+            } else {
+                // Nothing flies over the live card: its picture shows.
+                withAnimation(.easeOut(duration: 0.3)) {
+                    terminalAlpha = 0
+                    cardsAlpha = 1
+                }
+                moves.landed = true
+                liveShown = true
+            }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            guard overviewOpen else { return }
-            withAnimation(.easeOut(duration: 0.18)) { zoomFade = 0 }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-                if overviewOpen { withAnimation(.easeOut(duration: 0.15)) { livePreview = true } }
+        // Cards that never say where they are show all the same.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            guard turn == moves.turn, overviewOpen, !liveShown, landingThumb == nil else { return }
+            moves.landed = true
+            liveShown = true
+            flight.fadeOut(duration: 0.2) {}
+        }
+    }
+
+    private func flyIn(to thumb: CGRect) {
+        let turn = moves.turn
+        flight.move(to: thumb, radius: OverviewScreen.thumbRadius, duration: 0.45) {
+            guard turn == moves.turn else { return }
+            moves.landed = true
+            fadeIntoCard()
+            // A picture that never comes (the server could not say) leaves
+            // the card's own background there.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                if turn == moves.turn { fadeIntoCard(force: true) }
             }
         }
     }
 
-    /// Back to the terminal. A tapped card was kept by onPick: the
-    /// terminal grows out of that card, not the one it came from.
+    /// The card's picture under the terminal's, which fades off it.
+    private func fadeIntoCard(force: Bool = false) {
+        guard overviewOpen, moves.landed, !moves.closing, !liveShown, livePicture || force else { return }
+        liveShown = true
+        let turn = moves.turn
+        DispatchQueue.main.async {
+            if turn == moves.turn { flight.fadeOut(duration: 0.2) {} }
+        }
+    }
+
+    /// A card's picture as a view to fly out of it, at once; drawn again
+    /// at the terminal's size off the main thread and put in when it is,
+    /// on the way.
+    private func flyingPicture(of pane: Int) -> UIView? {
+        guard let card = model.pictures[pane], terminalFrame.width > 0 else { return nil }
+        let scale = displayScale
+        let view = UIImageView(image: UIImage(cgImage: card, scale: scale, orientation: .up))
+        view.contentMode = .scaleToFill
+        view.backgroundColor = UIColor(model.screens[pane].flatMap { Color(hex: $0.background) } ?? model.background)
+        model.paint(pane: pane, pixels: CGSize(width: terminalFrame.width * scale, height: terminalFrame.height * scale)) {
+            [weak view] full in view?.image = UIImage(cgImage: full, scale: scale, orientation: .up)
+        }
+        return view
+    }
+
+    /// Back into the thread on show: its picture lifts off its card and
+    /// grows to the screen as the cards go under the cover, and the
+    /// terminal takes over (`flyBack`).
     private func closeOverview() {
-        if let pick = picked, terminalFrame.width > 0 {
-            picked = nil
-            let frame = pick.frames.thumb
-            let scale = frame.width / terminalFrame.width
-            let clip = frame.height / scale
-            // Placed in the new card without animation: nothing shows yet.
-            var t = Transaction(); t.disablesAnimations = true
-            withTransaction(t) {
-                heroFrames = pick.frames
-                heroThread = pick.thread
-                zoomScale = scale
-                zoomOffset = CGSize(
-                    width: frame.minX - terminalFrame.minX,
-                    height: frame.minY - terminalFrame.minY - (terminalFrame.height - clip) * scale
-                )
-                zoomClip = clip
-                heroScale = scale
-                heroOffset = CGSize(width: pick.frames.card.minX, height: pick.frames.card.minY)
-                heroFrameHeight = pick.frames.card.height
+        guard overviewOpen, !moves.closing else { return }
+        moves.turn += 1
+        moves.closing = true
+        let turn = moves.turn
+        let backdrop = UIColor(OverviewScreen.backdrop)
+        if !moves.landed && flight.flying {
+            // Still on its way in: it turns back.
+            flight.fadeCover(to: 1, duration: 0.2)
+            flight.move(to: terminalFrame, radius: 0, duration: 0.35) { flyBack(turn) }
+        } else if let thumb = liveThumb, let pane = livePane, let picture = flyingPicture(of: pane) {
+            flight.cover(backdrop, alpha: 0)
+            flight.begin(with: picture, frame: terminalFrame, at: thumb, radius: OverviewScreen.thumbRadius)
+            flight.fadeCover(to: 1, duration: 0.3)
+            flight.move(to: terminalFrame, radius: 0, duration: 0.4) { flyBack(turn) }
+        } else {
+            fadeBack(turn)
+            return
+        }
+        CATransaction.flush()
+    }
+
+    /// Nothing to fly: the terminal fades back over the cards, its bar
+    /// back at once.
+    private func fadeBack(_ turn: Int) {
+        flight.end()
+        overviewOpen = false
+        withAnimation(.easeOut(duration: 0.25)) {
+            terminalAlpha = 1
+            cardsAlpha = 0
+        } completion: {
+            if turn == moves.turn { overviewClosed() }
+        }
+    }
+
+    /// A card tapped. The thread on show comes back as `closeOverview`
+    /// has it; another's picture leaves its card and grows to the screen,
+    /// and the terminal takes over from it once it shows that thread
+    /// (`revealPicked`).
+    private func pick(_ thread: ThreadView) {
+        guard overviewOpen, !moves.closing else { return }
+        if thread.id == liveThread {
+            closeOverview()
+            return
+        }
+        if currentThreadId != thread.id { model.sideClick("thread", id: thread.id) }
+        moves.turn += 1
+        moves.closing = true
+        moves.grown = false
+        moves.picked = thread.id
+        let turn = moves.turn
+        guard let thumb = moves.thumbs[thread.id], let pane = OverviewScreen.pane(of: thread),
+              let picture = flyingPicture(of: pane) else {
+            // Its picture not drawn yet: none flies, not even the thread
+            // on show's, and the terminal fades back once it shows this one.
+            flight.end()
+            moves.grown = true
+            if currentThreadId == thread.id {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { revealPicked(force: false) }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                if turn == moves.turn { revealPicked(force: true) }
+            }
+            return
+        }
+        flight.cover(UIColor(OverviewScreen.backdrop), alpha: 0)
+        flight.begin(with: picture, frame: terminalFrame, at: thumb, radius: OverviewScreen.thumbRadius)
+        flight.fadeCover(to: 1, duration: 0.3)
+        flight.move(to: terminalFrame, radius: 0, duration: 0.42) {
+            guard turn == moves.turn else { return }
+            moves.grown = true
+            revealPicked(force: false)
+        }
+        CATransaction.flush()
+        // A switch that never shows ends the wait all the same.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            if turn == moves.turn { revealPicked(force: true) }
+        }
+    }
+
+    private func revealPicked(force: Bool) {
+        guard let picked = moves.picked else { return }
+        guard force || (moves.grown && currentThreadId == picked) else { return }
+        moves.picked = nil
+        flyBack(moves.turn)
+    }
+
+    /// The picture fills the screen: the terminal and its bar come back
+    /// under it, the picture fades off it, and the cards are taken down
+    /// after, out of sight under the terminal.
+    private func flyBack(_ turn: Int) {
+        guard turn == moves.turn else { return }
+        guard flight.flying else { return fadeBack(turn) }
+        terminalAlpha = 1
+        cardsAlpha = 0
+        overviewOpen = false
+        DispatchQueue.main.async {
+            guard turn == moves.turn else { return }
+            flight.fadeOut(duration: 0.15) {
+                if turn == moves.turn { overviewClosed() }
             }
         }
-        withAnimation(.easeOut(duration: 0.1)) { livePreview = false }
-        withAnimation(.easeOut(duration: 0.15)) { zoomFade = 1 }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            // Opened again already: the zoom in progress is the new one's.
-            guard !overviewShown else { return }
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.9)) {
-                overviewOpen = false
-                zoomScale = 1
-                zoomOffset = .zero
-                zoomClip = nil
-                heroScale = 1
-                heroAlpha = 0
-                if let hero = heroFrames {
-                    let sEnd = hero.thumb.width / max(terminalFrame.width, 1)
-                    let headerH = hero.thumb.minY - hero.card.minY
-                    heroOffset = CGSize(width: terminalFrame.minX, height: terminalFrame.minY - headerH / sEnd)
-                    heroFrameHeight = headerH + terminalFrame.height * sEnd
-                }
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            if !overviewShown {
-                overviewVisible = false
-                heroFrames = nil
-                // The cards go with the grid; the next open lays them out
-                // again and hears their frames afresh.
-                cardFrame = nil
-            }
-        }
+    }
+
+    /// The cards are gone: the overview lets go of what it held, and what
+    /// was set to run on its way in or out finds itself overtaken.
+    private func overviewClosed() {
+        moves.turn += 1
+        moves.waiting = false
+        flight.end()
+        overviewOpen = false
+        overviewVisible = false
+        liveThread = nil
+        liveShown = false
+        moves.thumbs = [:]
+        landingThumb = nil
+        terminalAlpha = 1
+        cardsAlpha = 0
+        moves.landed = false
+        moves.closing = false
+        moves.grown = false
+        moves.picked = nil
+        model.releaseScreens()
     }
 
     // MARK: the terminal with its overlays
@@ -595,7 +990,7 @@ struct TerminalScreen: View {
                 // Asked not to redial: the card offers it instead.
                 ConnectionCard(phase: .disconnected, hostName: hostName, canEdit: model.host != nil) { action in
                     switch action {
-                    case .back: dismiss()
+                    case .back: leave()
                     default: model.connect()
                     }
                 }
@@ -611,7 +1006,7 @@ struct TerminalScreen: View {
                         }
                         model.connect()
                     case .edit: editingHost = model.host
-                    case .back: dismiss()
+                    case .back: leave()
                     }
                 }
             }
@@ -661,16 +1056,21 @@ struct TerminalScreen: View {
                     model.chromeClick("pane", pane: member.pane)
                 } label: {
                     HStack(spacing: 4) {
-                        if member.busy {
+                        if member.icon != nil {
+                            TabIconCard(
+                                core: model.core, id: member.icon, size: 15, busy: member.busy,
+                                revision: model.iconsRevision
+                            )
+                        } else if member.busy {
                             ProgressView().controlSize(.mini)
                         }
                         Text(member.title.isEmpty ? "shell" : member.title)
                             .lineLimit(1)
-                            .font(.system(size: 11, weight: member.current ? .semibold : .regular))
+                            .font(.caption2.weight(member.current ? .semibold : .regular))
                     }
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(member.current ? Color.white.opacity(nav.focused ? 0.22 : 0.12) : Color.clear)
+                    .background(member.current ? model.ink.opacity(nav.focused ? 0.22 : 0.12) : Color.clear)
                     .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
@@ -685,11 +1085,13 @@ struct TerminalScreen: View {
             }
             .buttonStyle(.plain)
         }
-        .foregroundColor(nav.focused ? .white : .gray)
+        .foregroundColor(nav.focused ? model.ink : .gray)
         .padding(.horizontal, 6)
         .frame(width: min(nav.rect.width, maxWidth), height: nav.rect.height, alignment: .leading)
+        // The bar's height is the core's: its text grows only so far.
+        .dynamicTypeSize(...DynamicTypeSize.large)
         .background(model.background)
-        .background(Color.white.opacity(nav.focused ? 0.1 : 0.04))
+        .background(model.ink.opacity(nav.focused ? 0.1 : 0.04))
         .contentShape(Rectangle())
         .contextMenu {
             AppMenuItems(model: model, kind: "pane", id: String(nav.rect.pane))
@@ -781,6 +1183,71 @@ struct MenuSheet: Identifiable {
     var key: String { kind + ":" + id }
 }
 
+/// A thread's status as the desktop's sidebar shows it: a spinner while
+/// it works, an alert while it waits on someone, a check when it finished
+/// unseen; otherwise the core's dot -- the one on show, open, pinned,
+/// unread or quiet. Every state takes the same square, `size` × 2, so a
+/// row or a chip keeps its width as the status changes.
+struct ThreadMark: View {
+    var status: String
+    var dot: String
+    var size: CGFloat
+
+    // The web page's tokens (tokens.css), which follow the desktop's.
+    static let open = Color(hex: "#61B8FF") ?? .blue
+    static let done = Color(hex: "#7CE5A2") ?? .green
+    static let warn = Color(hex: "#DB7320") ?? .orange
+
+    var body: some View {
+        Group {
+            switch status {
+            case "Running":
+                Spinner(color: Self.open).padding(size * 0.15)
+            case "NeedsAttention":
+                Image(systemName: "exclamationmark.circle.fill")
+                    .resizable().scaledToFit().foregroundColor(Self.warn)
+            case "Done":
+                Image(systemName: "checkmark.circle.fill")
+                    .resizable().scaledToFit().foregroundColor(Self.done)
+            default:
+                Circle().fill(Self.dotColor(dot)).frame(width: size, height: size)
+            }
+        }
+        .frame(width: size * 2, height: size * 2)
+    }
+
+    static func dotColor(_ dot: String) -> Color {
+        switch dot {
+        case "Active": return done
+        case "Open": return open
+        case "Pinned": return Color(hex: "#C7C7CC") ?? .gray
+        case "Unread": return Color(hex: "#8E8E93") ?? .gray
+        default: return Color.white.opacity(0.16)
+        }
+    }
+}
+
+/// The desktop's and the page's busy mark: an open ring turning once in
+/// 0.96 s, drawn to the size it is given.
+struct Spinner: View {
+    var color: Color
+    @State private var turning = false
+
+    var body: some View {
+        Circle()
+            .trim(from: 0, to: 0.75)
+            .stroke(color, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+            .rotationEffect(.degrees(turning ? 360 : 0))
+            // Started again each time it shows: a lazy list's row comes
+            // back with its state, and an animation that ran out.
+            .onAppear {
+                turning = false
+                withAnimation(.linear(duration: 0.96).repeatForever(autoreverses: false)) { turning = true }
+            }
+            .onDisappear { turning = false }
+    }
+}
+
 /// The App's context menu for something, as the system menu that a long
 /// press opens: its items, checks, separators and submenus, built when
 /// the menu shows.
@@ -809,9 +1276,11 @@ struct AppMenuItems: View {
                     ForEach(subs, id: \.rowId) { sub in row(sub, model: model) }
                 })
             }
+            // Deleting a thread ends its programs: it is asked first.
+            let deletes = item.id.hasPrefix("delete-thread:")
             return AnyView(
-                Button {
-                    model.menuAction(item.id)
+                Button(role: deletes ? .destructive : nil) {
+                    if deletes { model.confirming = item.id } else { model.menuAction(item.id) }
                 } label: {
                     if item.checked {
                         Label(item.label, systemImage: "checkmark")
@@ -1022,4 +1491,60 @@ struct ConnectionCard: View {
         }
         return nil
     }
+}
+
+/// The tab strip's clip: its own width, with room above and below for the
+/// glass to swell into as it is pressed.
+private struct SideClip: Shape {
+    func path(in rect: CGRect) -> Path { Path(rect.insetBy(dx: 0, dy: -16)) }
+}
+
+/// Its content at most `width` across, however much is offered: in a
+/// scroll view, which offers none, a frame's limit alone sizes the frame
+/// but leaves a long name whole and spilling out of it.
+private struct AtMost: Layout {
+    var width: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let ideal = content.sizeThatFits(.unspecified).width
+        return content.sizeThatFits(ProposedViewSize(width: min(proposal.width ?? ideal, ideal, width), height: proposal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size))
+    }
+}
+
+/// What the overview's moves keep to themselves, out of SwiftUI's state so
+/// that keeping it redraws nothing: which move is the latest (a late end
+/// belongs to an older one), whether the terminal's picture is in its
+/// card, and the thread a tapped card is bringing back.
+final class OverviewMoves {
+    var turn = 0
+    /// Each card's picture, by thread, in the screen's space: read as a
+    /// flight sets off, not drawn from.
+    var thumbs: [String: CGRect] = [:]
+    var landed = false
+    /// On the way back (`closeOverview`, `pick`): taps wait.
+    var closing = false
+    var grown = false
+    var picked: String?
+    /// An open waits for the drawer or the keyboard to go first.
+    var waiting = false
+    /// The screen is up: what was set to run on it runs only then.
+    var onScreen = false
+}
+
+/// Whether tabs are scrolled off the strip's start, and lie past its end.
+private struct StripEnds: Equatable {
+    var before = false
+    var after = false
+}
+
+/// Where the drag from the left edge under way set off, and whether it
+/// pulls the drawer: decided once, as it sets off.
+final class EdgeDrag {
+    var start: CGPoint?
+    var pulls = false
 }

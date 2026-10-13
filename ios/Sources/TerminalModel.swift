@@ -17,19 +17,46 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     // The App's views, refreshed when the core says something changed.
     @Published var tabs: TabsView?
     @Published var threads: ThreadsView?
-    /// The last rows of panes the overview asked about, by pane.
-    @Published var previews: [Int: [PreviewRow]] = [:]
+    /// Whole tabs, as they are split, by the pane a card shows, for the
+    /// overview's cards, and their pictures, drawn off the main thread
+    /// (`paintScreen`): asked for while it is up, let go when it closes
+    /// (`releaseScreens`).
+    @Published private(set) var screens: [Int: TabPreview] = [:]
+    @Published private(set) var pictures: [Int: CGImage] = [:]
+    /// Moves with each screen that comes in: its picture is drawn again.
+    @Published private(set) var screenSerials: [Int: Int] = [:]
+    private var screensWanted = false
+    /// When each pane's screen was asked for, until it comes: one question
+    /// a pane at a time, asked again only if it goes long unanswered.
+    private var screenAsks: [Int: ContinuousClock.Instant] = [:]
+    /// Moves when the screens are let go: a picture drawn before is not kept.
+    private var paintTurn = 0
+    private let painter = DispatchQueue(label: "thinkterm.screen-pictures", qos: .userInitiated)
     @Published var sidebar: SidebarView?
+    /// Moves when the tab icon cards change (`Core.tabIconsRevision`): the
+    /// cards on show are drawn again.
+    @Published private(set) var iconsRevision: UInt64 = 0
+    /// A menu action that ends something (`delete-thread:…`), awaiting a yes.
+    @Published var confirming: String?
+    /// Counts the sidebar's "+": the screen asks for the folder.
+    @Published private(set) var nameAsks = 0
     @Published var tree: TreeView?
     @Published var navs: [NavView] = []
     @Published var status: StatusView?
     @Published var title = ""
     @Published var connection = ""
     /// The key panel is up in the keyboard's place.
+    #if DEBUG
     @Published var panelOpen = ProcessInfo.processInfo.arguments.contains("--keypanel")
+    #else
+    @Published var panelOpen = false
+    #endif
     /// A thread this phone was on last time it was in this host, put
     /// back once the threads are listed after a connect.
     private var restoredThread = false
+    /// The connection whose views were out when this one was asked for:
+    /// its listing is not this connection's first.
+    private var connectionBefore: UInt64 = 0
     private var lastThreadKey: String? { host.map { "thread.last." + $0.id.uuidString } }
 
     var isConnected: Bool {
@@ -53,7 +80,18 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private var toastTimer: Timer?
     /// The terminal's background, as the App paints it: the chrome around
     /// the terminal takes the same colour.
-    @Published var background = Color(white: 0.11)
+    @Published var background = Color(white: 0.11) {
+        didSet { ink = Self.ink(over: background) }
+    }
+    /// The chrome's ink over `background`: white over a dark scheme, near
+    /// black over a light one.
+    @Published private(set) var ink = Color.white
+
+    private static func ink(over color: Color) -> Color {
+        var (r, g, b, a): (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
+        guard UIColor(color).getRed(&r, green: &g, blue: &b, alpha: &a) else { return .white }
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.6 ? Color(white: 0.1) : .white
+    }
     /// The App's font size in points, from its layout view.
     @Published private(set) var fontPt: Double = 11
     /// The focused pane's place in its scrollback: rows above the bottom,
@@ -65,8 +103,25 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// the screen, for as long as iOS allows.
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     @Published var animating = false
-    /// The log view is open: the stats are worth refreshing.
-    var wantsStats = false
+    /// The log view is open.
+    var logShown = false
+    /// The log view is open or developer mode is on: the stats are worth
+    /// refreshing.
+    var wantsStats: Bool { logShown || settings.devMode }
+    /// The views last read from the core.
+    private var lastViews: ViewSet?
+    /// The focused pane's rows for the text input, kept current by the
+    /// core while they are wanted (the keyboard is up, or a selection).
+    private(set) var screenWanted = false
+    /// A swipe from the screen's left edge pulls the sidebar out (a narrow
+    /// screen, the drawer shut): a flick that starts there is not a tab's.
+    var edgePullsDrawer = false
+    private(set) var screenJSON = "null"
+    private var screenRevision: UInt64 = 0
+    /// This connection's terminal is on screen, and the app in front: the
+    /// core is told, so a session behind the screen takes nothing.
+    private var onScreen = false
+    private var inFront = true
     /// The preferences, followed as they change.
     let settings = AppSettings.shared
     var smoothScroll: Bool { settings.smoothScroll }
@@ -93,7 +148,6 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     var cursorRect = CGRect(x: 8, y: 8, width: 2, height: 20)
 
     private let frameNeeded = AtomicFlag()
-    private let changePending = AtomicFlag()
     private var displayLink: CADisplayLink?
     private var statsTimer: Timer?
     private var logLines: [String] = []
@@ -110,6 +164,12 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private var probeKeyPath = "/tmp/ttp-ssh/userkey"
     private var probeRemoteCommand = "/tmp/ttp-ssh/thinkterm-remote cli --prefer-mux proxy"
     private var probeUser = probeUserName()
+    // The acceptance flow's requests answered, and its stall gauge.
+    private var acceptTimer: Timer?
+    private var acceptAnswered = 0
+    private var measuringTicks = false
+    private var lastTickAt: CFTimeInterval = 0
+    private var longestTickGap: CFTimeInterval = 0
     #endif
 
     init(host: Host?, store: HostStore?) {
@@ -140,7 +200,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             let stats = self.core.stats()
             if stats != self.stats { self.stats = stats }
         }
+        #if DEBUG
         if let name = arg("--scheme") { settings.schemeName = name }
+        #endif
         applyScrollMode()
         applyScheme()
         settings.$schemeName.dropFirst().sink { [weak self] _ in self?.applyScheme() }.store(in: &subscriptions)
@@ -159,7 +221,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             self.disconnect()
             self.connect()
         }.store(in: &subscriptions)
-        settings.$devMode.sink { [weak self] on in self?.wantsStats = on || (self?.wantsStats ?? false) }.store(in: &subscriptions)
+        // The size, though, every pane takes live, from either settings page.
+        applyFontSize(settings.fontSize)
+        settings.$fontSize.dropFirst().removeDuplicates().sink { [weak self] pt in self?.applyFontSize(pt) }.store(in: &subscriptions)
         #if DEBUG
         if args.contains("--autotest") { scheduleAutotest() }
         if args.contains("--autoconnect") { scheduleAutoconnect() }
@@ -167,13 +231,30 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if args.contains("--seltest") { scheduleSelectionTest() }
         if args.contains("--treetest") { scheduleTreeTest() }
         if args.contains("--uitest") { scheduleUiTest() }
+        if args.contains("--accepttest") { scheduleAcceptTest() }
         #endif
     }
 
+    /// The sidebar's "+": the screen asks for the folder.
+    func askName() { nameAsks += 1 }
+
     /// The screen went away but the connection stays: the frame loop
     /// rests until the screen is back. The surface goes with the view.
-    func leaveScreen() { displayLink?.isPaused = true }
-    func enterScreen() { displayLink?.isPaused = false }
+    func leaveScreen() {
+        // Its text input goes with it: nothing reads the rows.
+        setScreenWanted(false)
+        displayLink?.isPaused = true
+        onScreen = false
+        updateShown()
+    }
+
+    func enterScreen() {
+        displayLink?.isPaused = false
+        onScreen = true
+        updateShown()
+    }
+
+    private func updateShown() { core.setShown(shown: onScreen && inFront) }
 
     func shutdown() {
         clearHostKeyRequest()
@@ -188,8 +269,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     /// The chosen face first, the symbols fallback after it.
     var fontPaths: [String] {
-        let face = settings.fontFamily == "Fira Code" ? "FiraCode-Regular" : "JetBrainsMono-Regular"
-        return [face, "SymbolsNerdFontMono-Regular"].compactMap {
+        [terminalFace, "SymbolsNerdFontMono-Regular"].compactMap {
             Bundle.main.path(forResource: $0, ofType: "ttf")
         }
     }
@@ -206,6 +286,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// Connect to the model's host with the secret from the Keychain.
     func connect() {
         restoredThread = false
+        // A new connection's views are all new, even ones that read the
+        // same: the first listing puts the phone back on its thread. The
+        // core may still have the last connection's out until it gets here.
+        lastViews = nil
+        connectionBefore = core.viewsConnection()
         guard let host else {
             // Only the automated flows open a screen with no host.
             #if DEBUG
@@ -377,6 +462,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.setSetting(key: "language", value: "\"\(L10n.currentTag)\"")
     }
 
+    /// The base text size of every pane; a pinch scales one pane on top.
+    private func applyFontSize(_ pt: Double) {
+        core.setSetting(key: "font", value: "{\"mode\":\"pinned\",\"pt\":\(pt)}")
+    }
+
     /// The tab `by` places along the strip from the current one, shown.
     func switchTab(by: Int) {
         guard let tabs = tabs?.tabs, !tabs.isEmpty,
@@ -386,10 +476,63 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         chromeClick("pane", pane: tabs[next].target)
     }
 
-    /// The last rows of a pane, for a thumbnail; `previews` fills in.
-    func requestPreview(pane: Int, rows: Int = 8) {
-        core.requestPreview(pane: UInt32(pane), rows: UInt32(rows))
+    /// The overview opened: the screens asked for are kept until it
+    /// closes (`releaseScreens`).
+    func keepScreens() { screensWanted = true }
+
+    /// The whole tab a pane is in, as it is split, for a picture of it;
+    /// `screens` fills in. Asked only while they are kept.
+    func requestScreen(pane: Int) {
+        guard screensWanted else { return }
+        let now = ContinuousClock.now
+        if let asked = screenAsks[pane], now - asked < .seconds(5) { return }
+        screenAsks[pane] = now
+        core.requestScreenPreview(pane: UInt32(pane))
     }
+
+    /// The overview closed: its screens and pictures go, and answers on
+    /// the way find nobody waiting.
+    func releaseScreens() {
+        screensWanted = false
+        paintTurn += 1
+        screens = [:]
+        pictures = [:]
+        screenSerials = [:]
+        screenAsks = [:]
+    }
+
+    fileprivate func coreScreen(_ pane: Int, _ screen: TabPreview) {
+        screenAsks[pane] = nil
+        // One as it was is not drawn again.
+        guard screensWanted, screens[pane] != screen else { return }
+        screens[pane] = screen
+        screenSerials[pane, default: 0] += 1
+    }
+
+    /// Draw a pane's screen `pixels` large off the main thread: `done` has
+    /// it, unless the screens were let go meanwhile. Not kept: a flight to
+    /// the terminal's size wants it once.
+    func paint(pane: Int, pixels: CGSize, done: @escaping (CGImage) -> Void) {
+        guard let screen = screens[pane] else { return }
+        let face = terminalFace
+        let turn = paintTurn
+        painter.async { [weak self] in
+            let picture = ScreenPainter.paint(screen, pixels: pixels, face: face)
+            DispatchQueue.main.async {
+                guard let self, self.screensWanted, turn == self.paintTurn, let picture else { return }
+                done(picture)
+            }
+        }
+    }
+
+    /// Draw a pane's screen for its card; `pictures` has it once it is.
+    func paintScreen(pane: Int, pixels: CGSize) {
+        paint(pane: pane, pixels: pixels) { [weak self] picture in self?.pictures[pane] = picture }
+    }
+
+    /// The face the terminal draws in, by its PostScript name, which is
+    /// its file's name too.
+    var terminalFace: String { settings.fontFamily == "Fira Code" ? "FiraCode-Regular" : "JetBrainsMono-Regular" }
 
     /// A pane rang its bell: a buzz, if the setting says so.
     fileprivate func coreBell() {
@@ -457,29 +600,77 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     func takeOver() { core.takeOver() }
 
-    /// Pull every view the screen shows. Called on the main thread after
-    /// the core said something changed; a burst of changes is one pull.
-    func refreshViews() {
-        inputView?.screenChanged()
-        // Assigned only on a change: a published write redraws the whole
-        // screen, and the core reports changes as often as output comes.
-        let tabs = ViewJSON.decode(TabsView.self, core.view(name: "tabs"))
-        if tabs != self.tabs { self.tabs = tabs }
-        let sidebar = ViewJSON.decode(SidebarView.self, core.view(name: "sidebar"))
-        if sidebar != self.sidebar { self.sidebar = sidebar }
-        let threads = ViewJSON.decode(ThreadsView.self, core.view(name: "threads"))
-        if threads != self.threads { self.threads = threads }
-        rememberThread(threads)
-        let tree = ViewJSON.decode(TreeView.self, core.view(name: "tree"))
-        if tree != self.tree { self.tree = tree }
-        let navs = ViewJSON.decode([NavView].self, core.view(name: "navs")) ?? []
-        if navs != self.navs { self.navs = navs }
-        let status = ViewJSON.decode(StatusView.self, core.view(name: "status"))
-        if status != self.status {
-            self.status = status
-            showToast(status?.toast)
+    /// The text between two visible cells of the focused pane, for the
+    /// clipboard, as the core reads it from the cells; the pane's own
+    /// selection is left be. A copy waits for the core.
+    func copyText(from first: (row: Int, col: Int), to last: (row: Int, col: Int)) -> String? {
+        core.textBetween(anchorRow: UInt32(first.row), anchorCol: UInt32(first.col),
+                         headRow: UInt32(last.row), headCol: UInt32(last.col))
+    }
+
+    /// The text input reads the rows (the keyboard is up, or there is a
+    /// selection): the core keeps them current while it does.
+    func setScreenWanted(_ wanted: Bool) {
+        guard wanted != screenWanted else { return }
+        screenWanted = wanted
+        if wanted {
+            // What is out was made while nobody read it: the next made (the
+            // core makes one at once) is read, and until then the rows are
+            // asked for. Taken before asking, so that one is not missed.
+            screenRevision = core.screenRevision()
+        } else {
+            screenJSON = "null"
         }
-        let layout = core.view(name: "layout")
+        core.setScreenWanted(wanted: wanted)
+    }
+
+    /// Read the views the core last published. Called on the main thread
+    /// each frame the revision moved; a burst of changes is one read, and
+    /// it never waits for the core thread.
+    func refreshViews() {
+        let views = core.views()
+        guard views.revision != lastViews?.revision else { return }
+        let last = lastViews
+        lastViews = views
+        // A change of cards marks the views stale, so it is seen here.
+        let icons = core.tabIconsRevision()
+        if icons != iconsRevision { iconsRevision = icons }
+        // Decoded only when the text changed, and assigned only on a
+        // change: a published write redraws the whole screen, and the
+        // core publishes as often as output comes.
+        if views.tabs != last?.tabs {
+            let tabs = ViewJSON.decode(TabsView.self, views.tabs)
+            if tabs != self.tabs { self.tabs = tabs }
+        }
+        if views.sidebar != last?.sidebar {
+            let sidebar = ViewJSON.decode(SidebarView.self, views.sidebar)
+            if sidebar != self.sidebar { self.sidebar = sidebar }
+        }
+        let threadsChanged = views.threads != last?.threads
+        if threadsChanged {
+            let threads = ViewJSON.decode(ThreadsView.self, views.threads)
+            if threads != self.threads { self.threads = threads }
+        }
+        if views.connection > connectionBefore, threadsChanged || !restoredThread {
+            rememberThread(threads)
+        }
+        if views.tree != last?.tree {
+            let tree = ViewJSON.decode(TreeView.self, views.tree)
+            if tree != self.tree { self.tree = tree }
+        }
+        if views.navs != last?.navs {
+            let navs = ViewJSON.decode([NavView].self, views.navs) ?? []
+            if navs != self.navs { self.navs = navs }
+        }
+        if views.status != last?.status {
+            let status = ViewJSON.decode(StatusView.self, views.status)
+            if status != self.status {
+                self.status = status
+                showToast(status?.toast)
+            }
+        }
+        guard views.layout != last?.layout else { return }
+        let layout = views.layout
         if let r = layout.range(of: "\"cell\":["),
            let end = layout[r.upperBound...].firstIndex(of: "]") {
             let parts = layout[r.upperBound..<end].split(separator: ",")
@@ -554,6 +745,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private var pausedForBackground = false
 
     func detachForBackground() {
+        inFront = false
+        updateShown()
         detach()
         report("background")
         if settings.keepSessionInBackground {
@@ -578,6 +771,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     }
 
     func reattachAfterBackground() {
+        inFront = true
+        updateShown()
         endBackgroundTask()
         if pausedForBackground {
             pausedForBackground = false
@@ -609,12 +804,31 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     // MARK: frames
 
+    /// The display link: paint if asked, then read what the core published
+    /// -- the counts say whether there is anything new, without a wait.
     @objc private func tick() {
+        #if DEBUG
+        if measuringTicks {
+            let now = CACurrentMediaTime()
+            if lastTickAt > 0 { longestTickGap = max(longestTickGap, now - lastTickAt) }
+            lastTickAt = now
+        }
+        #endif
         if frameNeeded.take() {
             core.render()
+            // Unwanted rows are not kept current: read again when asked.
+            if !screenWanted { inputView?.dropScreen() }
         }
-        if changePending.take() {
+        if core.viewsRevision() != lastViews?.revision {
             refreshViews()
+        }
+        if screenWanted {
+            let revision = core.screenRevision()
+            if revision != screenRevision {
+                screenRevision = revision
+                screenJSON = core.screen()
+                inputView?.screenChanged()
+            }
         }
     }
 
@@ -640,7 +854,6 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     // MARK: notify (core thread)
 
     fileprivate func coreWantsFrame() { frameNeeded.set() }
-    fileprivate func coreChanged() { changePending.set() }
 
     fileprivate func coreStatus(_ status: String) {
         DispatchQueue.main.async {
@@ -652,7 +865,6 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             if status.hasPrefix("connecting") || status.contains("reconnect") || status.hasPrefix("disconnected") {
                 self.inputView?.dropComposition()
             }
-            self.changePending.set()
         }
     }
 
@@ -670,10 +882,30 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
                 guard host.hostname == endpoint.hostname, host.port == endpoint.port,
                       host.knownHost == nil else { return }
             }
-            self.pendingHostKey = HostKeyChallenge(id: requestID, hostname: endpoint.hostname,
+            let challenge = HostKeyChallenge(id: requestID, hostname: endpoint.hostname,
                 port: endpoint.port, hostID: endpoint.hostID, fingerprint: fingerprint)
+            #if DEBUG
+            // The automated flows dial the probe's throwaway sshd, and no
+            // one is there to read its fingerprint.
+            if self.host == nil, Self.automated {
+                self.approveHostKey(challenge)
+                return
+            }
+            #endif
+            self.pendingHostKey = challenge
         }
     }
+
+    /// Launched for an automated flow (`--autoconnect`, `--uitest`, ...):
+    /// the app opens straight on the probe's terminal and connects on the
+    /// flow's schedule. Never in a release.
+    static let automated: Bool = {
+        #if DEBUG
+        return ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--auto") || $0.hasSuffix("test") }
+        #else
+        return false
+        #endif
+    }()
 
     fileprivate func coreLogged(_ line: String) {
         print("core: " + line)
@@ -739,6 +971,74 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         q.asyncAfter(deadline: .now() + 21.0) { self.report("after reconnect"); print("AUTOCONNECT DONE") }
     }
 
+    /// `--accepttest`: connect to the probe and do what ios/tools/accept.sh
+    /// asks, the driver that cuts the connection, restarts the server and
+    /// sends the app to the background from the Mac. Its requests come one
+    /// at a time through a file the simulator shares with the Mac, as
+    /// "<n> <verb> <argument>"; each is answered on the console with
+    /// "ACCEPT ack <n> <detail>".
+    private func scheduleAcceptTest() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.connectProbe() }
+        acceptTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.pollAcceptRequest()
+        }
+    }
+
+    private static let acceptRequests = "/tmp/ttp-ssh/accept-request"
+
+    private func pollAcceptRequest() {
+        guard let text = try? String(contentsOfFile: Self.acceptRequests, encoding: .utf8) else { return }
+        let parts = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: " ", maxSplits: 2).map(String.init)
+        guard parts.count >= 2, let n = Int(parts[0]), n > acceptAnswered else { return }
+        acceptAnswered = n
+        let argument = parts.count > 2 ? parts[2] : ""
+        switch parts[1] {
+        case "state":
+            acceptAnswer(n, acceptState())
+        case "type":
+            core.text(text: argument)
+            key("Enter")
+            acceptAnswer(n, "typed")
+        case "expect":
+            // The rows as they are now, not as last published.
+            let rows = ViewJSON.decode(ScreenText.self, core.screenText())?.text ?? ""
+            acceptAnswer(n, rows.contains(argument) ? "found" : "missing")
+        case "measure":
+            // From now until "measured", asked for once what is measured
+            // has been set going: a stall it starts with is in it.
+            longestTickGap = 0
+            lastTickAt = 0
+            measuringTicks = true
+            acceptAnswer(n, "measuring")
+        case "measured":
+            // The longest the main thread went without a frame callback.
+            measuringTicks = false
+            acceptAnswer(n, String(format: "longest_gap_ms=%.0f", longestTickGap * 1000))
+        default:
+            acceptAnswer(n, "unknown")
+        }
+    }
+
+    /// One line the driver parses: the connection, and the tabs and bars
+    /// the phone shows.
+    private func acceptState() -> String {
+        refreshViews()
+        let current = tabs?.tabs.first(where: { $0.current })
+        let pane = connection.hasPrefix("pane ") ? connection.dropFirst(5).prefix(while: { $0.isNumber }) : "-"
+        // The status line stays on the pane through the App's own redials;
+        // its sticky remark is what says the link is down.
+        let connected = connection.hasPrefix("pane ") && !reconnecting ? "yes" : "no"
+        return "connected=\(connected) pane=\(pane) tab=\(current.map { String($0.tab) } ?? "-")"
+            + " tabs=\(tabs?.tabs.count ?? 0) panes=\(current?.panes.count ?? 0) bars=\(navs.count)"
+    }
+
+    private func acceptAnswer(_ n: Int, _ detail: String) {
+        let line = "ACCEPT ack \(n) \(detail)"
+        print(line)
+        log(line)
+    }
+
     /// The App's chrome over the FFI: split, list the tabs and bars, open a
     /// new tab, switch, close, and the sidebar rows.
     private func scheduleUiTest() {
@@ -747,7 +1047,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         q.asyncAfter(deadline: .now() + 5.0) {
             self.refreshViews()
             self.check("tabs view", (self.tabs?.tabs.count ?? 0) >= 1, "\(self.tabs?.tabs.count ?? -1) tabs")
-            self.check("nav bars", self.navs.count == 1, "\(self.navs.count) bars")
+            // A lone pane has no bar on the phone (Platform::bare_lone_pane).
+            self.check("lone pane, no bar", self.navs.isEmpty, "\(self.navs.count) bars")
             self.chromeClick("split-right")
         }
         q.asyncAfter(deadline: .now() + 7.0) {
@@ -774,9 +1075,17 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
         q.asyncAfter(deadline: .now() + 13.0) {
             self.refreshViews()
-            self.check("closed pane", self.navs.count == 1, "\(self.navs.count) bars")
-            self.report("ui done")
-            print("UITEST DONE")
+            self.check("closed pane, bars gone", self.navs.isEmpty, "\(self.navs.count) bars")
+            // The size from Settings reaches the open terminal, not only the next one.
+            let size = self.settings.fontSize
+            self.settings.fontSize = size + 2
+            q.asyncAfter(deadline: .now() + 1.5) {
+                self.refreshViews()
+                self.check("text size is live", abs(self.fontPt - (size + 2)) < 0.01, "\(size) -> \(self.fontPt) pt")
+                self.settings.fontSize = size
+                self.report("ui done")
+                print("UITEST DONE")
+            }
         }
     }
 
@@ -848,6 +1157,23 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
                 self.check("selection rects", rects.count == 1 && rects[0].rect.width > 0, "\(rects.count) rects, first \(rects.first?.rect ?? .zero)")
                 let under = input.closestPosition(to: CGPoint(x: rects.first?.rect.midX ?? 0, y: rects.first?.rect.midY ?? 0)) as? TerminalInputView.Pos
                 self.check("point to cell", under.map { $0.i >= a && $0.i < a + 16 } ?? false, "\(under?.i ?? -1)")
+                // Wide characters and one outside the BMP: the rows carry
+                // stand-ins for both, the copy must not.
+                self.core.text(text: "echo 复制中文😀OK\n")
+            }
+            q.asyncAfter(deadline: .now() + 2.5) {
+                let wide = "复制中文😀OK"
+                guard let screen = ViewJSON.decode(ScreenText.self, self.core.screenText()) else {
+                    return self.check("wide line on screen", false, "no rows")
+                }
+                let rows = screen.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                guard let row = rows.lastIndex(where: { $0.contains("OK") && $0.contains("文") && !$0.contains("echo") }) else {
+                    return self.check("wide line on screen", false, "not found")
+                }
+                let start = row * (screen.cols + 1)
+                input.selectedTextRange = TerminalInputView.Range(start, start + screen.cols)
+                let copied = input.selectedText() ?? ""
+                self.check("copy keeps wide text", copied == wide, copied)
                 self.report("selection done")
                 print("SELTEST DONE")
             }
@@ -861,11 +1187,23 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         q.asyncAfter(deadline: .now() + 1.5) { self.connectProbe() }
         q.asyncAfter(deadline: .now() + 5.0) {
             sizeBefore = self.sizeString()
+            let asked = Date()
             self.focusKeyboard()
-        }
-        q.asyncAfter(deadline: .now() + 6.5) {
-            let after = self.sizeString()
-            self.check("keyboard resize", after != sizeBefore, "\(sizeBefore) -> \(after)")
+            // The first keyboard in a while is slow to come up: wait for the
+            // resize, up to 5 s, rather than a fixed time.
+            func look() {
+                let after = self.sizeString()
+                let waited = Date().timeIntervalSince(asked)
+                if after != sizeBefore || waited > 5 {
+                    self.check(
+                        "keyboard resize", after != sizeBefore,
+                        "\(sizeBefore) -> \(after) after \(String(format: "%.1f", waited)) s"
+                    )
+                } else {
+                    q.asyncAfter(deadline: .now() + 0.1, execute: look)
+                }
+            }
+            look()
         }
         q.asyncAfter(deadline: .now() + 7.0) {
             guard let v = self.inputView else { self.check("input view", false, "missing"); return }
@@ -943,11 +1281,13 @@ func probeUserName() -> String {
 /// model without touching anything that needs the main thread.
 private final class NotifySink: Notify, @unchecked Sendable {
     weak var model: TerminalModel?
+    private let screenReader = DispatchQueue(label: "thinkterm.screens", qos: .userInitiated)
     func onFrameNeeded() { model?.coreWantsFrame() }
     func onStatus(status: String) { model?.coreStatus(status) }
     func onLog(line: String) { model?.coreLogged(line) }
     func onTitle(title: String) { model?.coreTitle(title) }
-    func onChange() { model?.coreChanged() }
+    /// The display link reads the views' count each frame instead.
+    func onChange() {}
     func onClipboard(text: String) {
         DispatchQueue.main.async {
             UIPasteboard.general.string = text
@@ -969,8 +1309,12 @@ private final class NotifySink: Notify, @unchecked Sendable {
     func onPublished(key: String, value: String) { model?.corePublished(key, value) }
     func onBell() { model?.coreBell() }
     func onPreview(pane: UInt32, rows: String) {
-        let decoded = ViewJSON.decode([PreviewRow].self, rows) ?? []
-        DispatchQueue.main.async { self.model?.previews[Int(pane)] = decoded }
+        // Only whole screens are asked for here (`requestScreen`), read off
+        // the core's thread, in the order they come.
+        screenReader.async {
+            guard let screen = ViewJSON.decode(TabPreview.self, rows) else { return }
+            DispatchQueue.main.async { self.model?.coreScreen(Int(pane), screen) }
+        }
     }
 }
 
