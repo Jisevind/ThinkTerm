@@ -30,6 +30,9 @@ EXTRA = {
     "p.layout": ["Layout", "布局", "レイアウト", "Disposition", "Layout"],
     "project.new": ["New project", "新建项目", "新規プロジェクト", "Nouveau projet", "Neues Projekt"],
     "sidebar": ["Sidebar", "侧栏", "サイドバー", "Barre latérale", "Seitenleiste"],
+    # The desktop's tooltip-sidebar-thread-search, with this app's word for a thread.
+    "thread.find": ["Find Thread", "查找会话", "セッションを検索", "Rechercher une session", "Thread finden"],
+    "thread.find.none": ["No thread matches", "没有匹配的会话", "一致するセッションはありません", "Aucune session ne correspond", "Kein Thread passt"],
     "keyboard.incognito": ["Incognito keyboard", "无痕键盘", "シークレット キーボード", "Clavier incognito", "Inkognito-Tastatur"],
     "thread.delete.title": ["Delete “%@”?", "删除“%@”？", "「%@」を削除しますか？", "Supprimer « %@ » ?", "„%@“ löschen?"],
     "thread.delete.body": [

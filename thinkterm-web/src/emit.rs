@@ -16,7 +16,7 @@ use thinkterm_font_core::PresentationWidth;
 use thinkterm_font_web::GlyphRole;
 use thinkterm_proto::StableCursorPosition;
 use thinkterm_render::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocatorTrait};
-use wezterm_color_types::{HsbTransform, LinearRgba};
+use wezterm_color_types::{HsbTransform, LinearRgba, SrgbaTuple};
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{CellAttributes, StableRowIndex};
 
@@ -83,7 +83,7 @@ pub fn fill_rect(
 
 /// The desktop's default `bold_brightens_ansi_colors`: bold lifts the
 /// first eight palette colours to their bright twins.
-fn resolve_fg(attrs: &CellAttributes, fg: ColorAttribute, palette: &ColorPalette) -> LinearRgba {
+pub(crate) fn resolve_fg(attrs: &CellAttributes, fg: ColorAttribute, palette: &ColorPalette) -> SrgbaTuple {
     match fg {
         ColorAttribute::PaletteIndex(idx) if idx < 8 => {
             let idx = if attrs.intensity() == Intensity::Bold {
@@ -95,7 +95,6 @@ fn resolve_fg(attrs: &CellAttributes, fg: ColorAttribute, palette: &ColorPalette
         }
         other => palette.resolve_fg(other),
     }
-    .to_linear()
 }
 
 fn intersection(r1: &Range<f32>, r2: &Range<f32>) -> Range<f32> {
@@ -246,7 +245,7 @@ pub fn emit_line(
         let attrs = &cluster.attrs;
         let bg_is_default = attrs.background() == ColorAttribute::Default;
         let bg = p.palette.resolve_bg(attrs.background()).to_linear();
-        let fg = resolve_fg(attrs, attrs.foreground(), p.palette);
+        let fg = resolve_fg(attrs, attrs.foreground(), p.palette).to_linear();
         let (fg, bg, bg_is_default) = if attrs.reverse() == !p.reverse_video {
             (bg, fg, false)
         } else {

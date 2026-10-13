@@ -1,5 +1,7 @@
 //! The network thread: an ssh session to the host, an exec channel running
 //! `thinkterm cli --prefer-mux proxy`, and the PDU bytes flowing both ways.
+//! Beside it, once a connection, the host desktop's tab icons are read on
+//! channels of their own (`icons`).
 //!
 //! One tokio thread per connection. Bytes to send arrive on an unbounded
 //! channel and are written in order; everything that comes back -- data,
@@ -10,12 +12,14 @@
 //! asks for explicit approval and retries with that exact fingerprint pinned.
 //! A remembered key that changes is always rejected.
 
+use crate::icons;
 use anyhow::{anyhow, Context, Result};
 use russh::client::{self, Handler};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::ChannelMsg;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use thinkterm_tab_icons::WireCatalog;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 #[derive(Debug, Clone)]
@@ -61,6 +65,8 @@ pub enum Net {
     Data(Vec<u8>),
     Stderr(String),
     Exit(u32),
+    /// The host's tab icon cards, read beside the protocol, or why not.
+    TabIcons(Result<WireCatalog, String>),
     Closed(String),
 }
 
@@ -151,6 +157,60 @@ async fn find_cli(session: &client::Handle<HostKeyCheck>) -> Result<String> {
             )
         }
     }
+}
+
+/// The longest a command beside the protocol may take, all told.
+const OUTPUT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// What `command` prints, on a channel of its own beside the protocol's;
+/// more than `limit` bytes is an error. A command that runs on (a forced
+/// command in place of the shell, a profile that waits) is ended with its
+/// channel.
+async fn output(session: &client::Handle<HostKeyCheck>, command: String, limit: usize) -> Result<Vec<u8>> {
+    let mut channel = bounded("opening a channel", session.channel_open_session()).await?;
+    let mut out = Vec::new();
+    let read = async {
+        bounded("exec", channel.exec(true, command)).await?;
+        loop {
+            match tokio::time::timeout(STEP, channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    out.extend_from_slice(&data);
+                    anyhow::ensure!(out.len() <= limit, "more than {limit} bytes");
+                }
+                Ok(Some(ChannelMsg::Close)) | Ok(None) => return Ok::<(), anyhow::Error>(()),
+                Ok(Some(_)) => {}
+                Err(_) => anyhow::bail!("no answer"),
+            }
+        }
+    };
+    // Each message re-arms the step's timeout; this bounds them all.
+    let read = match tokio::time::timeout(OUTPUT_DEADLINE, read).await {
+        Ok(read) => read,
+        Err(_) => Err(anyhow!("no end in {} s", OUTPUT_DEADLINE.as_secs())),
+    };
+    if read.is_err() {
+        let _ = channel.close().await;
+    }
+    read.map(|()| out)
+}
+
+/// The host desktop's tab icon cards, as its server gives a page them
+/// (`icons`): its settings, then the glyphs it imported that they name.
+async fn tab_icons(session: &client::Handle<HostKeyCheck>) -> Result<WireCatalog> {
+    // Room for what a login profile prints before the file.
+    let out = output(session, icons::settings_command(), icons::SETTINGS_LIMIT + 64 * 1024).await?;
+    let cards = icons::desktop_cards(&out).ok_or_else(|| anyhow!("no answer from /bin/sh on the host"))?;
+    let hashes = icons::imported(&cards);
+    // Glyphs that cannot be read are left out and the cards kept, as the
+    // host's server sends them to a page.
+    let svgs = match hashes.is_empty() {
+        true => Default::default(),
+        false => output(session, icons::svgs_command(&hashes), icons::svgs_limit(hashes.len()))
+            .await
+            .map(|out| icons::imported_svgs(&out, &hashes))
+            .unwrap_or_default(),
+    };
+    Ok(cards.wire(|hash| svgs.get(hash).cloned()))
 }
 
 /// Start the connection on its own thread. Returns the sender for bytes
@@ -300,8 +360,17 @@ async fn run(
     // What the command last said and how it ended: the reason a session
     // that dies at once gives, instead of a bare "ended".
     let (mut last_err, mut exit) = (String::new(), None);
+    // The host's tab icons come on channels of their own while the
+    // terminal is already in use.
+    let cards = tab_icons(&session);
+    tokio::pin!(cards);
+    let mut cards_read = false;
     loop {
         tokio::select! {
+            read = &mut cards, if !cards_read => {
+                cards_read = true;
+                deliver(Net::TabIcons(read.map_err(|err| format!("{err:#}"))));
+            }
             sent = &mut sender => {
                 let _ = session
                     .disconnect(russh::Disconnect::ByApplication, "closed", "")

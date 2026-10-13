@@ -45,6 +45,8 @@ pub struct MobilePlatform {
     /// The last size handed to `set_backing_size`, so a phone that resizes
     /// its surface itself can tell a real change from a repeat.
     backing: Cell<(u32, u32)>,
+    /// The shell has this connection's terminal on screen, in front.
+    shown: Cell<bool>,
 }
 
 impl MobilePlatform {
@@ -71,7 +73,13 @@ impl MobilePlatform {
             }),
             rng: Cell::new(seed),
             backing: Cell::new((0, 0)),
+            shown: Cell::new(true),
         }
+    }
+
+    /// Returns whether it changed.
+    pub fn set_shown(&self, shown: bool) -> bool {
+        self.shown.replace(shown) != shown
     }
 
     /// The surface's size in device pixels and its scale, from the shell.
@@ -236,6 +244,10 @@ impl Platform for MobilePlatform {
 
     fn bare_lone_pane(&self) -> bool {
         true
+    }
+
+    fn shown(&self) -> bool {
+        self.shown.get()
     }
 
     fn set_title(&self, title: &str) {

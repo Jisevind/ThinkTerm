@@ -178,7 +178,11 @@ struct KeyPanel: View {
     @State private var draft: SnippetDraft?
     /// `--settings` alongside `--keypanel` opens the settings sheet at
     /// launch: the simulator cannot be tapped, and a screenshot needs it.
+    #if DEBUG
     @State private var showSettings = ProcessInfo.processInfo.arguments.contains("--settings")
+    #else
+    @State private var showSettings = false
+    #endif
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 6)
 
@@ -216,7 +220,7 @@ struct KeyPanel: View {
         }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
-                SettingsView(model: model, showLog: nil)
+                SettingsView(showLog: nil)
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) {
                             Button(tr("done")) { showSettings = false }

@@ -1,12 +1,11 @@
 import SwiftUI
 
 /// The app's preferences, in the prototype's eight sections. The Settings
-/// tab shows it with no terminal; a terminal's menu shows it with one,
-/// and then the text size is the live pane's and the log is offered.
+/// tab and a terminal's menu show the same page; from a terminal it also
+/// offers the log. Every open terminal follows a change at once.
 struct SettingsView: View {
     @ObservedObject var settings = AppSettings.shared
     @ObservedObject private var lang = AppLanguage.shared
-    var model: TerminalModel?
     var showLog: Binding<Bool>?
 
     var body: some View {
@@ -28,17 +27,15 @@ struct SettingsView: View {
                             .lineLimit(1)
                     }
                 }
-                if let model {
-                    LiveTextSize(model: model)
-                } else {
-                    Stepper(value: $settings.fontSize, in: 6...40, step: 1) {
-                        HStack {
-                            Text(tr("textsize"))
-                            Spacer()
-                            Text(String(format: "%.0f pt", settings.fontSize))
-                                .foregroundColor(.secondary)
-                                .monospacedDigit()
-                        }
+                // The same here and in a terminal's settings: every open
+                // terminal takes the size live, and a new connection starts at it.
+                Stepper(value: $settings.fontSize, in: 6...40, step: 1) {
+                    HStack {
+                        Text(tr("textsize"))
+                        Spacer()
+                        Text(String(format: "%.0f pt", settings.fontSize))
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
                     }
                 }
                 push(tr("font.family"), selection: $settings.fontFamily, options: Self.fonts)
@@ -55,8 +52,6 @@ struct SettingsView: View {
             }
 
             Section(tr("sec.interface")) {
-                segment(tr("i.tabbar"), selection: $settings.tabBarLevels,
-                        ("one", tr("i.onelevel")), ("two", tr("i.twolevel")))
                 Toggle(tr("i.panebars"), isOn: $settings.paneBars)
             }
 
@@ -264,33 +259,6 @@ struct KeyBarKeys: View {
         }
         .navigationTitle(tr("k.keybar"))
         .navigationBarTitleDisplayMode(.inline)
-    }
-}
-
-/// The open terminal's text size, stepped live; the size a new
-/// connection starts at follows it.
-private struct LiveTextSize: View {
-    @ObservedObject var model: TerminalModel
-    @ObservedObject var settings = AppSettings.shared
-    @ObservedObject private var lang = AppLanguage.shared
-
-    var body: some View {
-        HStack {
-            Text(tr("textsize"))
-            Spacer()
-            Button { step(-1) } label: { Image(systemName: "textformat.size.smaller") }
-                .buttonStyle(.bordered)
-            Text(String(format: "%.1f pt", model.fontPt))
-                .font(.callout.monospacedDigit())
-                .frame(minWidth: 56)
-            Button { step(1) } label: { Image(systemName: "textformat.size.larger") }
-                .buttonStyle(.bordered)
-        }
-    }
-
-    private func step(_ by: Double) {
-        model.stepFont(by)
-        settings.fontSize = max(6, min(40, (model.fontPt * (1 + 0.1 * by)).rounded()))
     }
 }
 

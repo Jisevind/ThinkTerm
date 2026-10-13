@@ -30,6 +30,8 @@ struct Controls: Decodable, Hashable {
 struct TabsView: Decodable, Hashable {
     var tabs: [TabEntry]
     var controls: Controls
+    /// The terminal's card, which every window tab wears, as on the desktop.
+    var icon: String?
 }
 
 struct NavRect: Decodable, Hashable {
@@ -45,6 +47,7 @@ struct CapsuleView: Decodable, Hashable, Identifiable {
     var title: String
     var busy: Bool
     var current: Bool
+    var icon: String?
     var id: Int { pane }
 }
 
@@ -112,14 +115,39 @@ struct TreeProject: Decodable, Hashable, Identifiable {
     var threads: [ThreadRow]
 }
 
-/// A thumbnail row: `App::PreviewRow`.
-struct PreviewRow: Decodable, Hashable {
-    var runs: [PreviewRun]
+/// A tab as it is split, for a picture of it: each pane's screen where it
+/// lies, in the tab's cells (`App::TabPreview`).
+struct TabPreview: Decodable, Hashable {
+    var cols: Int
+    var rows: Int
+    var foreground: String
+    var background: String
+    var panes: [PanePreview]
 }
 
-struct PreviewRun: Decodable, Hashable {
+struct PanePreview: Decodable, Hashable {
+    var left: Int
+    var top: Int
+    var screen: ScreenPreview
+}
+
+/// A pane's whole screen: `App::ScreenPreview`.
+struct ScreenPreview: Decodable, Hashable {
+    var cols: Int
+    var rows: Int
+    var foreground: String
+    var background: String
+    var lines: [[ScreenRun]]
+}
+
+/// Text from column `col` across `width` columns, of one foreground and
+/// background (`bg` is "" on the screen's own).
+struct ScreenRun: Decodable, Hashable {
     var text: String
     var fg: String
+    var bg: String
+    var col: Int
+    var width: Int
 }
 
 struct Toast: Decodable, Hashable {

@@ -9,17 +9,20 @@
 //! futures and fires the App's timers itself. Nothing here waits on the
 //! shell.
 
+use crate::icons;
 use crate::link::SshLink;
 use crate::painter::{GlyphPainter, GlyphSeams};
 use crate::platform::MobilePlatform;
 use crate::ssh::{Net, SshParams};
-use crate::Notify;
+use crate::{Notify, Published, ViewSet};
 use anyhow::{anyhow, Context, Result};
 use futures::executor::LocalPool;
 use futures::task::LocalSpawnExt;
+use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thinkterm_font_core::FontShaper as _;
 use thinkterm_font_web::{Face, FontSet};
@@ -34,6 +37,10 @@ use thinkterm_web::platform::{Link, Platform, PointerInput, WheelDelta, WheelInp
 use wezterm_term::KeyModifiers;
 
 pub type MobileApp = App<MobilePlatform, SshLink>;
+
+/// The views are made again at most this often: a burst of output is
+/// one publication per frame, not one per change.
+const VIEWS_EVERY: Duration = Duration::from_millis(16);
 
 pub struct ConnectParams {
     pub ssh: SshParams,
@@ -145,6 +152,9 @@ pub enum Cmd {
         pane: usize,
         rows: usize,
     },
+    ScreenPreview {
+        pane: usize,
+    },
     SelectedText {
         reply: Sender<Option<String>>,
     },
@@ -153,6 +163,15 @@ pub enum Cmd {
         value: String,
     },
     SetPalette(Option<String>),
+    SetShown(bool),
+    /// The shell read `Core::views` for the first time.
+    ViewsRead,
+    WantScreen(bool),
+    TextBetween {
+        anchor: (usize, usize),
+        head: (usize, usize),
+        reply: Sender<Option<String>>,
+    },
 }
 
 /// The surface currently lent, if any.
@@ -225,23 +244,44 @@ struct State {
     settings: Vec<(String, String)>,
     /// The chosen scheme's colours as JSON, applied to every App made.
     palette: Option<String>,
+    /// A scheme was chosen while the terminal was off screen or the link
+    /// down, when the App tells the server nothing of it: told when it is
+    /// shown again over a link that is up (`tell_palette`).
+    palette_untold: bool,
+    /// Where the views and rows go for the shell to read (`Core::views`).
+    published: Arc<Mutex<Published>>,
+    /// The shell reads the views there; until it does, none are made.
+    views_read: Arc<AtomicBool>,
+    /// Something the views show changed since they were last made.
+    views_dirty: Rc<Cell<bool>>,
+    /// The shell's text input reads the rows: keep them current.
+    screen_wanted: bool,
+    /// The tab icon cards on show, shared with the shell's thread, which
+    /// draws them: the built-in ones, then the host's (`Net::TabIcons`).
+    icons: Arc<icons::Shown>,
+    /// The host (address, port, user) whose cards those are.
+    icons_host: Option<(String, u16, String)>,
+    /// A frame was painted since: the rows may have changed.
+    screen_dirty: bool,
+    /// The shell just asked for the rows: the next made go out as new.
+    screen_fresh: bool,
+    views_made: Instant,
 }
 
-pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
-    let mut state = State::new(cmd_tx, notify);
+pub fn run(
+    cmd_tx: Sender<Cmd>,
+    rx: Receiver<Cmd>,
+    notify: Box<dyn Notify>,
+    published: Arc<Mutex<Published>>,
+    views_read: Arc<AtomicBool>,
+    icons: Arc<icons::Shown>,
+) {
+    let mut state = State::new(cmd_tx, notify, published, views_read, icons);
     state.notify.on_log("core thread up".into());
     state.set_status("idle");
 
     loop {
-        let now = Instant::now();
-        let mut wait = Duration::from_secs(3600);
-        if state.animating && state.target.is_some() && state.app.is_none() {
-            wait = Duration::from_millis(100);
-        }
-        if let Some(due) = state.platform.next_deadline() {
-            wait = wait.min(due.saturating_duration_since(now));
-        }
-        match rx.recv_timeout(wait) {
+        match rx.recv_timeout(state.wait(Instant::now())) {
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(cmd) => state.handle(cmd),
             Err(RecvTimeoutError::Timeout) => {
@@ -254,13 +294,20 @@ pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
         state.pool.run_until_stalled();
         state.platform.fire_due();
         state.pool.run_until_stalled();
+        state.publish_views();
     }
     state.disconnect();
     state.notify.on_log("core thread down".into());
 }
 
 impl State {
-    fn new(cmd_tx: Sender<Cmd>, notify: Box<dyn Notify>) -> Self {
+    fn new(
+        cmd_tx: Sender<Cmd>,
+        notify: Box<dyn Notify>,
+        published: Arc<Mutex<Published>>,
+        views_read: Arc<AtomicBool>,
+        icons: Arc<icons::Shown>,
+    ) -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             #[cfg(target_vendor = "apple")]
             backends: wgpu::Backends::METAL,
@@ -296,7 +343,107 @@ impl State {
             composing: false,
             settings: Vec::new(),
             palette: None,
+            palette_untold: false,
+            published,
+            views_read,
+            views_dirty: Rc::new(Cell::new(true)),
+            screen_wanted: false,
+            icons,
+            icons_host: None,
+            screen_dirty: false,
+            screen_fresh: false,
+            views_made: Instant::now(),
         }
+    }
+
+    /// How long the loop may sleep: until a timer is due, a frame of the
+    /// idle drawing, or the views owed, which are owed only on show (off
+    /// screen they wait, `publish_views`, and the loop with them).
+    fn wait(&self, now: Instant) -> Duration {
+        let mut wait = Duration::from_secs(3600);
+        if self.animating && self.target.is_some() && self.app.is_none() {
+            wait = Duration::from_millis(100);
+        }
+        if let Some(due) = self.platform.next_deadline() {
+            wait = wait.min(due.saturating_duration_since(now));
+        }
+        let owed = self.views_dirty.get() || (self.screen_dirty && self.screen_wanted);
+        if owed && self.platform.shown() {
+            wait = wait.min((self.views_made + VIEWS_EVERY).saturating_duration_since(now));
+        }
+        wait
+    }
+
+    /// Hand the shell what changed, at most once a frame: the views after
+    /// a change the App reported, the rows after a paint while they are
+    /// wanted. Everything is made before the lock, which the shell takes
+    /// every frame. Called between commands, never from inside the App,
+    /// whose state the views borrow.
+    fn publish_views(&mut self) {
+        if !self.platform.shown() {
+            // Nobody looks at a terminal off screen (the app in the back,
+            // the hosts in front): what changed is made once it is back.
+            return;
+        }
+        let views_dirty = self.views_dirty.get();
+        if !self.screen_wanted {
+            // Rows nobody reads are not made at each paint.
+            self.screen_dirty = false;
+        }
+        if !views_dirty && !self.screen_dirty {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.views_made + VIEWS_EVERY {
+            return;
+        }
+        self.views_dirty.set(false);
+        self.screen_dirty = false;
+        self.views_made = now;
+        let views = (views_dirty && self.views_read.load(Ordering::Relaxed)).then(|| self.view_set());
+        // A change of view (another pane focused) changes the rows too.
+        let rows = self.screen_wanted.then(|| self.screen_json());
+        let fresh = std::mem::take(&mut self.screen_fresh);
+        if let Ok(mut published) = self.published.lock() {
+            if let Some(mut views) = views {
+                views.revision = published.views.revision + 1;
+                published.views = views;
+            }
+            if let Some(rows) = rows {
+                if fresh || rows != published.screen {
+                    published.screen = rows;
+                    published.screen_revision += 1;
+                }
+            }
+        }
+        // Rows alone come without it: a shell that reads none (Android)
+        // would otherwise pull every view at each paint.
+        if views_dirty {
+            self.notify.on_change();
+        }
+    }
+
+    fn view_set(&self) -> ViewSet {
+        ViewSet {
+            revision: 0,
+            connection: self.link_serial,
+            tabs: self.view("tabs"),
+            threads: self.view("threads"),
+            tree: self.view("tree"),
+            sidebar: self.view("sidebar"),
+            navs: self.view("navs"),
+            status: self.view("status"),
+            layout: self.view("layout"),
+        }
+    }
+
+    /// The focused pane's visible rows (`App::screen_text`) as JSON.
+    fn screen_json(&self) -> String {
+        self.app
+            .as_ref()
+            .and_then(|app| app.screen_text())
+            .map(|t| json(&t))
+            .unwrap_or_else(|| "null".into())
     }
 
     fn handle(&mut self, cmd: Cmd) {
@@ -516,13 +663,10 @@ impl State {
                 }
             }
             Cmd::ScreenText { reply } => {
-                let json = self
-                    .app
-                    .as_ref()
-                    .and_then(|app| app.screen_text())
-                    .map(|t| json(&t))
-                    .unwrap_or_else(|| "null".into());
-                let _ = reply.send(json);
+                let _ = reply.send(self.screen_json());
+            }
+            Cmd::TextBetween { anchor, head, reply } => {
+                let _ = reply.send(self.app.as_ref().and_then(|app| app.text_between(anchor, head)));
             }
             Cmd::SetSelection { anchor, head } => {
                 if let Some(app) = self.app.clone() {
@@ -546,6 +690,18 @@ impl State {
                     });
                 }
             }
+            Cmd::ScreenPreview { pane } => {
+                if let Some(app) = self.app.clone() {
+                    let notify = Arc::clone(&self.notify);
+                    let task = app.preview_tab(pane);
+                    let _ = self.pool.spawner().spawn_local(async move {
+                        match task.await {
+                            Ok(screen) => notify.on_preview(pane as u32, json(&screen)),
+                            Err(err) => notify.on_log(format!("tab of pane {pane}: {err:#}")),
+                        }
+                    });
+                }
+            }
             Cmd::SelectedText { reply } => {
                 let _ = reply.send(self.app.as_ref().and_then(|app| app.selected_text()));
             }
@@ -561,15 +717,62 @@ impl State {
                     if let Err(err) = app.set_setting(&key, &value) {
                         self.notify.on_log(format!("setting {key}: {err}"));
                     }
+                    if key == "terminal-scheme" && !self.palette_tellable() {
+                        self.palette_untold = true;
+                    }
                 }
             }
             Cmd::SetPalette(scheme) => {
                 self.palette = scheme.clone();
                 if let Some(app) = self.app.clone() {
                     Self::apply_palette(&app, &self.notify, scheme.as_deref());
+                    if !self.palette_tellable() {
+                        self.palette_untold = true;
+                    }
                 }
             }
+            Cmd::SetShown(shown) => {
+                if !self.platform.set_shown(shown) {
+                    return;
+                }
+                self.notify.on_log(format!("shown: {shown}"));
+                if let Some(app) = self.app.clone() {
+                    // As the browser does for a page or a machine coming on
+                    // show: what it shows is looked at, sized and listed
+                    // again, so a tab it shows is claimed now.
+                    app.visibility_changed(shown);
+                    if shown {
+                        app.resize();
+                        app.refresh_layout();
+                        self.tell_palette(&app);
+                    }
+                }
+            }
+            Cmd::ViewsRead => self.views_dirty.set(true),
+            Cmd::WantScreen(wanted) => {
+                self.screen_wanted = wanted;
+                // Made at once rather than at the next paint, and sent even
+                // when they read as the ones left from before.
+                self.screen_dirty = wanted;
+                self.screen_fresh = wanted;
+            }
         }
+    }
+
+    /// A scheme chosen off screen or while the link is down reaches the
+    /// server only from a terminal on show, over a link that is up: told
+    /// when both hold, kept until then. (Applying it again would not tell
+    /// it: the App has it.)
+    fn tell_palette(&mut self, app: &Rc<App<MobilePlatform, SshLink>>) {
+        if self.palette_untold && self.palette_tellable() {
+            self.palette_untold = false;
+            app.advise_palette();
+        }
+    }
+
+    /// The App tells the server a scheme as it is applied.
+    fn palette_tellable(&self) -> bool {
+        self.platform.shown() && self.link.as_ref().is_some_and(|link| link.is_open())
     }
 
     fn apply_palette(app: &Rc<App<MobilePlatform, SshLink>>, notify: &Arc<dyn Notify>, scheme: Option<&str>) {
@@ -613,6 +816,7 @@ impl State {
         if self.status != status {
             self.status = status.to_string();
             self.notify.on_status(self.status.clone());
+            self.views_dirty.set(true);
         }
     }
 
@@ -625,6 +829,13 @@ impl State {
 
     fn connect(&mut self, params: ConnectParams, painter: Box<dyn GlyphPainter>) -> Result<()> {
         self.disconnect();
+        // No host's cards on another's tabs: the built-in ones until this
+        // host's are read. The same host again keeps its own meanwhile.
+        let host = (params.ssh.host.clone(), params.ssh.port, params.ssh.user.clone());
+        if self.icons_host.as_ref() != Some(&host) {
+            self.show_icons(icons::catalog());
+            self.icons_host = Some(host);
+        }
         self.device_id = params.device_id.clone();
         let mut faces = Vec::new();
         for path in &params.font_paths {
@@ -706,6 +917,7 @@ impl State {
             }
             // Every timer and interval belonged to that App.
             self.platform.clear_timers();
+            self.views_dirty.set(true);
         }
         self.conn = Conn::Idle;
     }
@@ -769,7 +981,13 @@ impl State {
             return;
         };
         match net {
-            Net::Connected => link.opened(),
+            Net::Connected => {
+                link.opened();
+                // A scheme still untold for want of a link goes now.
+                if let Some(app) = self.app.clone() {
+                    self.tell_palette(&app);
+                }
+            }
             Net::Data(bytes) => {
                 self.stats.bytes_in += bytes.len() as u64;
                 if let Err(err) = link.feed(&bytes) {
@@ -785,6 +1003,8 @@ impl State {
             Net::Exit(code) => self
                 .notify
                 .on_log(format!("remote command exited with {code}")),
+            Net::TabIcons(Ok(cards)) => self.show_icons(cards),
+            Net::TabIcons(Err(err)) => self.notify.on_log(format!("tab icons: {err}")),
             Net::Closed(reason) => {
                 if self.app.is_none() {
                     self.conn = Conn::Disconnected(reason.clone());
@@ -795,6 +1015,20 @@ impl State {
                 link.closed(reason);
             }
         }
+    }
+
+    /// Put `cards` on the tabs, for the App and the shell's drawing.
+    fn show_icons(&mut self, cards: thinkterm_tab_icons::WireCatalog) {
+        if !self.icons.set(cards) {
+            return;
+        }
+        if let Some(app) = &self.app {
+            if let Err(err) = app.set_tab_icons(&self.icons.json()) {
+                self.notify.on_log(format!("tab icons: {err}"));
+            }
+        }
+        // The shell redraws the cards when it sees the views move.
+        self.views_dirty.set(true);
     }
 
     /// The link is up: attach to the server's active pane at the grid the
@@ -987,8 +1221,15 @@ impl State {
             link.set_close_handler(Box::new(move |reason| app.on_close(reason)));
         }
         {
-            let notify = Arc::clone(&self.notify);
-            app.set_on_change(Rc::new(move || notify.on_change()));
+            // Inside the App's own call: only noted here, the views are
+            // made between commands (`publish_views`).
+            let dirty = Rc::clone(&self.views_dirty);
+            app.set_on_change(Rc::new(move || dirty.set(true)));
+        }
+        if !self.platform.shown() {
+            // Made behind the screen (a reconnect while the app is in the
+            // background): it looks at nothing until it is shown.
+            app.visibility_changed(false);
         }
         app.composing(self.composing);
         for (key, value) in &self.settings {
@@ -998,6 +1239,13 @@ impl State {
         }
         if let Some(scheme) = self.palette.clone() {
             Self::apply_palette(&app, &self.notify, Some(&scheme));
+        }
+        // Made off screen, it told the server no scheme it was given. A new
+        // connection holds no scheme of before to undo: the desktop's is
+        // its own already.
+        self.palette_untold = self.palette.is_some() && !self.platform.shown();
+        if let Err(err) = app.set_tab_icons(&self.icons.json()) {
+            self.notify.on_log(format!("tab icons: {err}"));
         }
         app.fetch_tree();
         app.hide_status();
@@ -1010,6 +1258,7 @@ impl State {
             attached.pane_id, attached.tab_id, attached.server_version, attached.server_id
         ));
         self.app = Some(app);
+        self.views_dirty.set(true);
         self.conn = Conn::Ready;
         self.set_status(&format!("pane {} · {}", attached.pane_id, attached.title));
     }
@@ -1188,6 +1437,8 @@ impl State {
             if self.platform.run_frame() {
                 self.stats.frames += 1;
                 self.stats.last_frame_us = started.elapsed().as_micros();
+                // Output changes the rows without changing a view.
+                self.screen_dirty = true;
             }
             return;
         }
@@ -1272,14 +1523,17 @@ fn stable_identity(device_id: &str) -> (u64, usize) {
 mod tests {
     use super::*;
 
-    struct QuietNotify;
+    /// Says nothing, and counts `on_change`.
+    struct QuietNotify(Arc<std::sync::atomic::AtomicUsize>);
 
     impl Notify for QuietNotify {
         fn on_frame_needed(&self) {}
         fn on_status(&self, _: String) {}
         fn on_log(&self, _: String) {}
         fn on_title(&self, _: String) {}
-        fn on_change(&self) {}
+        fn on_change(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
         fn on_clipboard(&self, _: String) {}
         fn on_focus_input(&self) {}
         fn on_ime_anchor(&self, _: f64, _: f64, _: f64, _: f64) {}
@@ -1290,8 +1544,106 @@ mod tests {
     }
 
     fn state() -> State {
+        state_with(&Arc::default(), true)
+    }
+
+    fn state_with(changes: &Arc<std::sync::atomic::AtomicUsize>, views_read: bool) -> State {
         let (tx, _) = std::sync::mpsc::channel();
-        State::new(tx, Box::new(QuietNotify))
+        State::new(
+            tx,
+            Box::new(QuietNotify(Arc::clone(changes))),
+            Arc::new(Mutex::new(Published::default())),
+            Arc::new(AtomicBool::new(views_read)),
+            Arc::new(icons::Shown::new(icons::catalog())),
+        )
+    }
+
+    #[test]
+    fn views_go_out_once_a_frame_and_only_after_a_change() {
+        let changes = Arc::default();
+        let mut state = state_with(&changes, true);
+        state.views_dirty.set(false);
+        state.views_made = Instant::now() - VIEWS_EVERY;
+        state.publish_views();
+        assert_eq!(state.published.lock().unwrap().views.revision, 0, "nothing changed");
+
+        state.views_dirty.set(true);
+        state.views_made = Instant::now();
+        state.publish_views();
+        assert_eq!(state.published.lock().unwrap().views.revision, 0, "a frame has not passed");
+
+        state.views_made = Instant::now() - VIEWS_EVERY;
+        state.publish_views();
+        let views = state.published.lock().unwrap().views.clone();
+        assert_eq!(views.revision, 1);
+        assert_eq!(views.tabs, "null", "no App, no views");
+        assert!(!state.views_dirty.get());
+        assert_eq!(changes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn views_wait_while_the_terminal_is_off_screen() {
+        let changes = Arc::default();
+        let mut state = state_with(&changes, true);
+        state.platform.set_shown(false);
+        state.views_dirty.set(true);
+        state.views_made = Instant::now() - VIEWS_EVERY;
+        state.publish_views();
+        assert_eq!(state.published.lock().unwrap().views.revision, 0, "none made off screen");
+        assert!(state.views_dirty.get(), "the change waits");
+        assert!(state.wait(Instant::now()) >= Duration::from_secs(60), "and the loop sleeps meanwhile");
+
+        state.platform.set_shown(true);
+        assert_eq!(state.wait(Instant::now()), Duration::ZERO, "owed once it is back");
+        state.publish_views();
+        assert_eq!(state.published.lock().unwrap().views.revision, 1, "made once it is back");
+    }
+
+    #[test]
+    fn a_shell_that_reads_no_views_is_made_none_but_still_told() {
+        let changes = Arc::default();
+        let mut state = state_with(&changes, false);
+        state.views_made = Instant::now() - VIEWS_EVERY;
+        state.publish_views();
+        assert_eq!(state.published.lock().unwrap().views.revision, 0);
+        assert_eq!(changes.load(Ordering::Relaxed), 1, "it pulls each view itself");
+        state.handle(Cmd::ViewsRead);
+        assert!(state.views_dirty.get(), "the first read has them made");
+    }
+
+    #[test]
+    fn rows_are_kept_only_while_wanted_and_tell_nothing() {
+        let changes = Arc::default();
+        let mut state = state_with(&changes, true);
+        state.views_dirty.set(false);
+        state.screen_dirty = true;
+        state.views_made = Instant::now() - VIEWS_EVERY;
+        state.publish_views();
+        assert!(!state.screen_dirty, "a paint makes no rows nobody wants");
+        state.handle(Cmd::WantScreen(true));
+        assert!(state.screen_wanted && state.screen_dirty, "wanted rows are made at once");
+        state.publish_views();
+        assert!(!state.screen_dirty);
+        assert_eq!(changes.load(Ordering::Relaxed), 0, "rows alone come without on_change");
+    }
+
+    #[test]
+    fn a_status_change_marks_the_views_stale() {
+        let mut state = state();
+        state.views_dirty.set(false);
+        state.set_status("connecting to example");
+        assert!(state.views_dirty.get());
+    }
+
+    #[test]
+    fn shown_reaches_the_platform_once_per_change() {
+        let mut state = state();
+        assert!(state.platform.shown(), "shown until the shell says otherwise");
+        state.handle(Cmd::SetShown(false));
+        assert!(!state.platform.shown());
+        assert!(!state.platform.set_shown(false), "a repeat is no change");
+        state.handle(Cmd::SetShown(true));
+        assert!(state.platform.shown());
     }
 
     fn attached() -> Attached {

@@ -28,6 +28,8 @@ russh = { version = "0.63.3", default-features = false, features = ["ring"] }
 # For making keys: ssh-key's generator wants a rand_core 0.10 RNG.
 rand_core = "0.10"
 ring = "0.17"
+# The tab icon cards' glyphs, drawn into masks the shell tints.
+resvg.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 termwiz = { workspace = true, features = ["use_serde"] }
@@ -36,6 +38,7 @@ thinkterm-font-web.workspace = true
 thinkterm-proto.workspace = true
 thinkterm-render = { workspace = true, features = ["wgpu"] }
 thinkterm-session.workspace = true
+thinkterm-tab-icons.workspace = true
 thinkterm-web.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 uniffi = { workspace = true, features = ["cli"] }
@@ -49,3 +52,6 @@ wgpu.workspace = true
 jni-sys = "0.3"
 ndk-sys = "0.5"
 raw-window-handle.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
