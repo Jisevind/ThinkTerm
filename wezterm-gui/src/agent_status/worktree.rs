@@ -1,8 +1,10 @@
-//! The git worktree an agent's pane is in, for the Agents panel: the folder
-//! it is checked out in and the branch there. Read from the files git keeps
-//! rather than by running git, on a thread of its own -- a directory on a
-//! stalled network mount, or a file not yet downloaded, blocks whoever
-//! reads it -- and kept per directory, so the panel only ever looks it up.
+//! The linked git worktree an agent's pane is in, for the Agents panel: the
+//! folder it is checked out in and the branch there. A repository's own
+//! checkout shows nothing, since the thread already names its project.
+//! Read from the files git keeps rather than by running git, on a thread of
+//! its own -- a directory on a stalled network mount, or a file not yet
+//! downloaded, blocks whoever reads it -- and kept per directory, so the
+//! panel only ever looks it up.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -60,7 +62,7 @@ static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 
 /// The worktree a pane whose directory is `url` is in, as last looked up:
 /// `None` until it has been, or when the directory is on another machine
-/// or in no worktree. A stale answer has a fresh lookup started.
+/// or in no linked worktree. A stale answer has a fresh lookup started.
 pub(crate) fn worktree_of(url: &url::Url) -> Option<Worktree> {
     let dir = local_dir(url, &this_machine_names())?;
     let now = Instant::now();
@@ -258,20 +260,25 @@ fn local_dir(url: &url::Url, names: &[String]) -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
-/// The worktree `dir` is in: the nearest folder at or above it with a
-/// `.git` -- a directory in a repository's own checkout, a file naming the
-/// git directory in a linked worktree or a submodule.
+/// The linked worktree `dir` is in, when the nearest folder at or above it
+/// with a `.git` is one. A repository's own checkout keeps a directory
+/// there; a linked worktree, a submodule or a separated git directory keep
+/// a file naming the git directory, and only a linked worktree's points
+/// back at the repository through a `commondir`.
 fn read_worktree(dir: &Path) -> Option<Worktree> {
     for folder in dir.ancestors() {
         let dot_git = folder.join(".git");
-        let git_dir = if dot_git.is_dir() {
-            dot_git
-        } else if dot_git.is_file() {
-            let text = read_small_file(&dot_git)?;
-            folder.join(text.lines().next()?.strip_prefix("gitdir:")?.trim())
-        } else {
+        if dot_git.is_dir() {
+            return None;
+        }
+        if !dot_git.is_file() {
             continue;
-        };
+        }
+        let text = read_small_file(&dot_git)?;
+        let git_dir = folder.join(text.lines().next()?.strip_prefix("gitdir:")?.trim());
+        if !git_dir.join("commondir").is_file() {
+            return None;
+        }
         let branch = read_small_file(&git_dir.join("HEAD")).and_then(|head| branch_of_head(&head));
         return Some(Worktree {
             folder: folder.file_name()?.to_string_lossy().into_owned(),
@@ -418,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn a_checkout_and_a_linked_worktree_each_name_their_own_folder() {
+    fn only_a_linked_worktree_names_its_folder() {
         let root = tempfile::tempdir().unwrap();
         let main = root.path().join("project");
         std::fs::create_dir_all(main.join(".git/worktrees/project-fix")).unwrap();
@@ -428,6 +435,12 @@ mod tests {
             "ref: refs/heads/fix\n",
         )
         .unwrap();
+        std::fs::write(main.join(".git/worktrees/project-fix/commondir"), "../..\n").unwrap();
+        // A submodule's git directory has a HEAD but no commondir.
+        std::fs::create_dir_all(main.join(".git/modules/lib")).unwrap();
+        std::fs::write(main.join(".git/modules/lib/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(main.join("lib")).unwrap();
+        std::fs::write(main.join("lib/.git"), "gitdir: ../.git/modules/lib\n").unwrap();
         let linked = root.path().join("project-fix");
         std::fs::create_dir_all(linked.join("src")).unwrap();
         // As `git worktree add --relative-paths` writes it.
@@ -438,8 +451,8 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(main.join("src/deep")).unwrap();
 
-        let checkout = read_worktree(&main.join("src/deep")).unwrap();
-        assert_eq!(checkout.label(), "project \u{b7} main");
+        assert_eq!(read_worktree(&main.join("src/deep")), None);
+        assert_eq!(read_worktree(&main.join("lib")), None);
         let worktree = read_worktree(&linked.join("src")).unwrap();
         assert_eq!(worktree.label(), "project-fix \u{b7} fix");
     }
