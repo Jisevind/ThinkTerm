@@ -310,7 +310,9 @@ impl GuiFrontEnd {
                     .detach();
                 }
                 MuxNotification::TabTitleChanged { .. } => {}
+                MuxNotification::PaneLabelChanged { .. } => {}
                 MuxNotification::WindowTitleChanged { .. } => {}
+                MuxNotification::ClientJoined(_) | MuxNotification::ClientLeft(_) => {}
                 MuxNotification::TabResized(_) => {}
                 // Server-side only: a GUI mux owns no ThinkTerm tree. The
                 // remote tree arrives as a pushed PDU, not as a notification.
@@ -1246,6 +1248,10 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
     let front_end = GuiFrontEnd::try_new()?;
     FRONT_END.with(|f| *f.borrow_mut() = Some(Rc::clone(&front_end)));
     crate::notification_click::install();
+    // The CLI asks the desktop's own mux which thread a workspace is.
+    wezterm_mux_server_impl::thinkterm_tree::set_workspace_namer(
+        crate::workspace_threads::project_and_thread_names_for_workspace,
+    );
     #[cfg(target_os = "macos")]
     ::window::os::macos::set_dock_menu_items(dock_menu_spaces);
 
