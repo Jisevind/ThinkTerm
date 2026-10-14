@@ -18,6 +18,11 @@ pub struct SetWindowTitle {
     #[arg(long)]
     pane_id: Option<PaneId>,
 
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
+
     /// The new title for the window
     title: String,
 }
@@ -48,7 +53,8 @@ impl SetWindowTitle {
             window_id
         } else {
             // Find the current tab from the pane id
-            let pane_id = client.resolve_pane_id(self.pane_id).await?;
+            let pane_id =
+                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
             pane_id_to_window_id
                 .get(&pane_id)
                 .copied()

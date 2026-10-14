@@ -1,6 +1,7 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use std::ffi::OsString;
+use std::io::{IsTerminal, Write};
 use wezterm_client::client::Client;
 
 mod activate_pane;
@@ -20,11 +21,13 @@ mod proxy;
 mod rename_workspace;
 mod send_key;
 mod send_text;
+mod set_pane_label;
 mod set_tab_title;
 mod set_window_title;
 mod spawn_command;
 mod split_pane;
 mod stop_server;
+mod target;
 mod tls_creds;
 mod wait;
 mod web_server;
@@ -56,6 +59,116 @@ struct CliOutputFormat {
     /// "table" and "json" are possible formats.
     #[arg(long = "format", default_value = "table")]
     format: CliOutputFormatKind,
+}
+
+/// What `--pane` named is not there, or could be more than one pane: the
+/// command exits with status 3.
+#[derive(Debug)]
+pub struct NoSuchTarget(pub String);
+
+impl std::fmt::Display for NoSuchTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoSuchTarget {}
+
+/// The server could not be reached, or will not talk to this version: the
+/// command exits with status 4.
+#[derive(Debug)]
+pub struct ServerUnreachable;
+
+impl std::fmt::Display for ServerUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("could not reach the ThinkTerm server")
+    }
+}
+
+impl std::error::Error for ServerUnreachable {}
+
+/// The command line asks for something that cannot be: the command exits
+/// with status 2, as when the arguments do not parse.
+#[derive(Debug)]
+pub struct UsageError(pub String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// The status a command that failed with `err` exits with: 2 for a command
+/// line that cannot be, 3 for a pane that is not there or not one, 4 for a
+/// server out of reach, and 1 for anything else. A command that waits
+/// exits with what it waited for instead.
+pub fn exit_status(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<UsageError>().is_some() {
+        2
+    } else if err.downcast_ref::<NoSuchTarget>().is_some() || is_no_such_pane(err) {
+        3
+    } else if err.downcast_ref::<ServerUnreachable>().is_some() {
+        4
+    } else {
+        1
+    }
+}
+
+/// The error for a pane id the listing does not have.
+pub(crate) fn no_such_pane(pane_id: mux::pane::PaneId) -> anyhow::Error {
+    NoSuchTarget(format!("there is no pane {pane_id}")).into()
+}
+
+/// Whether `err` is the server's answer about a pane id it has no record
+/// of, in any of the ways its handlers word it. Any other failure -- a
+/// connection dropping, a GUI handing over -- is not.
+pub(crate) fn is_no_such_pane(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("no such pane")
+            || pane_id_in(&text, "pane ", " not found")
+            || pane_id_in(&text, "pane_id ", " invalid")
+    })
+}
+
+/// Whether `text` holds `before`, a pane id, then `after`.
+fn pane_id_in(text: &str, before: &str, after: &str) -> bool {
+    text.match_indices(before).any(|(at, _)| {
+        let rest = &text[at + before.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && rest[digits..].starts_with(after)
+    })
+}
+
+/// Text a program in a pane chose (a title, a user var, a notification),
+/// made safe to print to a terminal: control characters are written out
+/// rather than sent, so none of them reaches the terminal running this.
+pub(crate) fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Print `value` as JSON: indented for a person at a terminal, on one line
+/// for a program reading it.
+pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    if out.is_terminal() {
+        serde_json::to_writer_pretty(&mut out, value)
+    } else {
+        serde_json::to_writer(&mut out, value)
+    }
+    .map_err(crate::stdout_error)?;
+    writeln!(out).map_err(crate::stdout_error)
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -189,6 +302,11 @@ Outputs the pane-id for the newly created pane on success"
     #[command(name = "set-tab-title", rename_all = "kebab")]
     SetTabTitle(set_tab_title::SetTabTitle),
 
+    /// Label a pane, so that `--pane LABEL` finds it; an empty label takes
+    /// the label away
+    #[command(name = "set-pane-label", rename_all = "kebab")]
+    SetPaneLabel(set_pane_label::SetPaneLabel),
+
     /// Change the title of a window
     #[command(name = "set-window-title", rename_all = "kebab")]
     SetWindowTitle(set_window_title::SetWindowTitle),
@@ -237,6 +355,17 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
             cli.sub,
             CliSubCommand::WebServer(_) | CliSubCommand::WebToken(_)
         );
+    // HTML takes its colours from the server's palette, which the server
+    // sends unasked as the client registers: listened for before that.
+    // Only for it, since one viewport push per tab goes out ahead of it.
+    let palette_pushes = match &cli.sub {
+        CliSubCommand::GetText(cmd) if cmd.wants_palette() => Some(
+            wezterm_client::client::tap_unilateral_pdus_where(4, |pdu| {
+                matches!(pdu, codec::Pdu::DefaultPalette(_))
+            }),
+        ),
+        _ => None,
+    };
     let client = Client::new_default_unix_domain(
         initial,
         &mut ui,
@@ -245,7 +374,8 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         cli.class
             .as_deref()
             .unwrap_or(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS),
-    )?;
+    )
+    .context(ServerUnreachable)?;
 
     // Every ordinary RPC is deferred behind the client registration barrier
     // (see PduRegistrationBarrier) until the bootstrap handshake completes,
@@ -254,7 +384,10 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
     // discards this client and registers its own raw connection with
     // `is_proxy: true`.
     if !matches!(cli.sub, CliSubCommand::Proxy(_)) {
-        client.verify_version_compat(&ui).await?;
+        client
+            .verify_version_compat(&ui)
+            .await
+            .context(ServerUnreachable)?;
     }
 
     match cli.sub {
@@ -266,7 +399,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SendKey(cmd) => cmd.run(client).await,
         CliSubCommand::Wait(cmd) => cmd.run(client).await,
         CliSubCommand::Events(cmd) => cmd.run(client).await,
-        CliSubCommand::GetText(cmd) => cmd.run(client).await,
+        CliSubCommand::GetText(cmd) => cmd.run(client, palette_pushes).await,
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
@@ -279,6 +412,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::AdjustPaneSize(cmd) => cmd.run(client).await,
         CliSubCommand::ActivateTab(cmd) => cmd.run(client).await,
         CliSubCommand::SetTabTitle(cmd) => cmd.run(client).await,
+        CliSubCommand::SetPaneLabel(cmd) => cmd.run(client).await,
         CliSubCommand::SetWindowTitle(cmd) => cmd.run(client).await,
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,

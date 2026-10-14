@@ -9,11 +9,17 @@ pub struct ActivatePane {
     /// environment variable WEZTERM_PANE.
     #[arg(long)]
     pane_id: Option<PaneId>,
+
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
 }
 
 impl ActivatePane {
     pub async fn run(&self, client: Client) -> anyhow::Result<()> {
-        let pane_id = client.resolve_pane_id(self.pane_id).await?;
+        let pane_id =
+            crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
         client
             .set_focused_pane_id(codec::SetFocusedPane {
                 pane_id,

@@ -1,7 +1,6 @@
 use crate::cli::CliOutputFormatKind;
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use serde::Serializer as _;
 use tabout::{tabulate_output, Alignment, Column};
 use wezterm_client::client::Client;
 
@@ -11,21 +10,30 @@ pub struct ListClientsCommand {
     /// "table" and "json" are possible formats.
     #[arg(long = "format", default_value = "table")]
     format: CliOutputFormatKind,
+
+    /// The same as `--format json`.
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
 }
 
 impl ListClientsCommand {
     pub async fn run(&self, client: Client) -> anyhow::Result<()> {
         let out = std::io::stdout();
         let clients = client.list_clients().await?;
-        match self.format {
+        let format = if self.json {
+            CliOutputFormatKind::Json
+        } else {
+            self.format
+        };
+        match format {
             CliOutputFormatKind::Json => {
-                let clients = clients
+                let clients: Vec<_> = clients
                     .clients
                     .iter()
                     .cloned()
-                    .map(CliListClientsResultItem::from);
-                let mut writer = serde_json::Serializer::pretty(out.lock());
-                writer.collect_seq(clients).map_err(crate::stdout_error)?;
+                    .map(CliListClientsResultItem::from)
+                    .collect();
+                crate::cli::print_json(&clients)?;
             }
             CliOutputFormatKind::Table => {
                 let cols = vec![

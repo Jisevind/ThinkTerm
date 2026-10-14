@@ -18,6 +18,7 @@ use wezterm_gui_subcommands::*;
 
 mod asciicast;
 mod cli;
+mod config_check;
 mod plugin;
 
 //    let message = "; ❤ 😍🤢\n\x1b[91;mw00t\n\x1b[37;104;m bleet\x1b[0;m.";
@@ -234,6 +235,10 @@ enum SubCommand {
 
     #[command(name = "show-keys", about = "Show key assignments")]
     ShowKeys(ShowKeysCommand),
+
+    /// Work with the configuration file without starting anything
+    #[command(name = "config")]
+    Config(config_check::ConfigCommand),
 
     #[command(
         name = "cli",
@@ -1098,9 +1103,9 @@ impl TmuxPassthru {
     }
 }
 
-fn terminate_with_error_message(err: &str) -> ! {
+fn terminate_with_error_message(err: &str, status: i32) -> ! {
     log::error!("{}; terminating", err);
-    std::process::exit(1);
+    std::process::exit(status);
 }
 
 /// A write to stdout found its reader gone: `| head` has the lines it
@@ -1136,7 +1141,7 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
     if reader_closed(&err) {
         std::process::exit(0);
     }
-    terminate_with_error_message(&format!("{:#}", err));
+    terminate_with_error_message(&format!("{:#}", err), cli::exit_status(&err));
 }
 
 #[cfg(test)]
@@ -1218,6 +1223,7 @@ fn run() -> anyhow::Result<()> {
         | SubCommand::Connect(_) => delegate_to_gui(saver),
         SubCommand::ImageCat(cmd) => cmd.run(),
         SubCommand::SetCwd(cmd) => cmd.run(),
+        SubCommand::Config(cmd) => cmd.run(&opts),
         SubCommand::Cli(cli) => cli::run_cli(&opts, cli),
         SubCommand::Record(cmd) => cmd.run(init_config(&opts)?),
         SubCommand::Replay(cmd) => cmd.run(),

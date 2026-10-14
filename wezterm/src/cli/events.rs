@@ -1,5 +1,5 @@
 use crate::cli::agent::state_label;
-use crate::cli::CliOutputFormatKind;
+use crate::cli::{printable, CliOutputFormatKind};
 use anyhow::{bail, Context};
 use clap::Parser;
 use codec::Pdu;
@@ -23,10 +23,19 @@ pub struct EventsCommand {
     #[arg(long)]
     pane_id: Option<PaneId>,
 
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
+
     /// "table" prints a line per event; "json" prints one JSON object per
     /// line, with a "type" and the event's own fields.
     #[arg(long = "format", default_value = "table")]
     format: CliOutputFormatKind,
+
+    /// The same as `--format json`.
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
 }
 
 // One line of `--format json` each: a stable output format. Add events and
@@ -100,6 +109,11 @@ enum Event {
         tab_id: TabId,
         title: String,
     },
+    /// The pane was labelled, or with no label had its label taken away.
+    PaneLabelChanged {
+        pane_id: PaneId,
+        label: Option<String>,
+    },
     WindowTitleChanged {
         window_id: WindowId,
         title: String,
@@ -111,6 +125,24 @@ enum Event {
     WorkspaceRenamed {
         old_workspace: String,
         new_workspace: String,
+    },
+    /// A client began showing panes: a window, a browser, a phone. `epoch`
+    /// and `id` tell apart clients the rest leaves alike, such as two
+    /// browsers on one link.
+    ClientJoined {
+        hostname: String,
+        username: String,
+        pid: u32,
+        epoch: u64,
+        id: usize,
+    },
+    /// A client that showed panes went away.
+    ClientLeft {
+        hostname: String,
+        username: String,
+        pid: u32,
+        epoch: u64,
+        id: usize,
     },
 }
 
@@ -185,6 +217,23 @@ impl Event {
             Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title }) => {
                 Self::TabTitleChanged { tab_id, title }
             }
+            Pdu::PaneLabelChanged(codec::PaneLabelChanged { pane_id, label }) => {
+                Self::PaneLabelChanged { pane_id, label }
+            }
+            Pdu::ClientJoined(codec::ClientJoined { client_id }) => Self::ClientJoined {
+                hostname: client_id.hostname,
+                username: client_id.username,
+                pid: client_id.pid,
+                epoch: client_id.epoch,
+                id: client_id.id,
+            },
+            Pdu::ClientLeft(codec::ClientLeft { client_id }) => Self::ClientLeft {
+                hostname: client_id.hostname,
+                username: client_id.username,
+                pid: client_id.pid,
+                epoch: client_id.epoch,
+                id: client_id.id,
+            },
             Pdu::WindowTitleChanged(codec::WindowTitleChanged { window_id, title }) => {
                 Self::WindowTitleChanged { window_id, title }
             }
@@ -221,12 +270,15 @@ impl Event {
             | Self::ClipboardWritten { pane_id }
             | Self::AgentStatus { pane_id, .. }
             | Self::ForegroundProgram { pane_id, .. }
+            | Self::PaneLabelChanged { pane_id, .. }
             | Self::PaneFocused { pane_id } => Some(*pane_id),
             Self::TabAdded { .. }
             | Self::TabTitleChanged { .. }
             | Self::WindowTitleChanged { .. }
             | Self::WorkspaceChanged { .. }
-            | Self::WorkspaceRenamed { .. } => None,
+            | Self::WorkspaceRenamed { .. }
+            | Self::ClientJoined { .. }
+            | Self::ClientLeft { .. } => None,
         }
     }
 
@@ -310,6 +362,22 @@ impl Event {
             Self::TabTitleChanged { tab_id, title } => {
                 format!("tab_title_changed   tab {tab_id}  {title}")
             }
+            Self::PaneLabelChanged { pane_id, label } => match label {
+                Some(label) => format!("pane_label_changed  pane {pane_id}  {label}"),
+                None => format!("pane_label_changed  pane {pane_id}  (none)"),
+            },
+            Self::ClientJoined {
+                hostname,
+                username,
+                pid,
+                ..
+            } => format!("client_joined       {username}@{hostname}  pid {pid}"),
+            Self::ClientLeft {
+                hostname,
+                username,
+                pid,
+                ..
+            } => format!("client_left         {username}@{hostname}  pid {pid}"),
             Self::WindowTitleChanged { window_id, title } => {
                 format!("window_title_changed  window {window_id}  {title}")
             }
@@ -325,23 +393,17 @@ impl Event {
     }
 }
 
-/// Text a program in a pane chose (a title, a user var, a notification),
-/// made safe to print to a terminal: control characters are written out
-/// rather than sent, so none of them reaches the terminal running this.
-fn printable(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_control() {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 impl EventsCommand {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
+        let only_pane = match &self.pane {
+            Some(name) => Some(crate::cli::target::resolve(&client, None, Some(name)).await?),
+            None => self.pane_id,
+        };
+        let format = if self.json {
+            CliOutputFormatKind::Json
+        } else {
+            self.format
+        };
         let pushes = wezterm_client::client::tap_unilateral_pdus(BACKLOG);
         client.subscribe_events(codec::SubscribeEvents {}).await?;
         let mut subscribed_on = client.connection_generation();
@@ -373,10 +435,10 @@ impl EventsCommand {
             let Some(event) = Event::from_pdu(pdu) else {
                 continue;
             };
-            if self.pane_id.is_some() && event.pane_id() != self.pane_id {
+            if only_pane.is_some() && event.pane_id() != only_pane {
                 continue;
             }
-            let line = match self.format {
+            let line = match format {
                 CliOutputFormatKind::Json => serde_json::to_string(&event)?,
                 CliOutputFormatKind::Table => format!(
                     "{}  {}",
@@ -454,6 +516,38 @@ mod tests {
         let line = printable(&event.describe());
         assert!(!line.chars().any(char::is_control), "{:?}", line);
         assert!(line.contains("\\u{1b}]52;c;cHduZWQ="), "{:?}", line);
+    }
+
+    #[test]
+    fn labels_and_clients_become_events() {
+        let labelled = Event::from_pdu(Pdu::PaneLabelChanged(codec::PaneLabelChanged {
+            pane_id: 3,
+            label: Some("reviewer".to_string()),
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&labelled).unwrap(),
+            r#"{"type":"pane_label_changed","pane_id":3,"label":"reviewer"}"#
+        );
+        assert_eq!(labelled.pane_id(), Some(3));
+
+        let joined = Event::from_pdu(Pdu::ClientJoined(codec::ClientJoined {
+            client_id: thinkterm_proto::ClientId {
+                hostname: "myhost".to_string(),
+                username: "user".to_string(),
+                pid: 9,
+                epoch: 1,
+                id: 2,
+                ssh_auth_sock: None,
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&joined).unwrap(),
+            r#"{"type":"client_joined","hostname":"myhost","username":"user","pid":9,"epoch":1,"id":2}"#
+        );
+        assert_eq!(joined.pane_id(), None);
+        assert!(joined.describe().starts_with("client_joined"));
     }
 
     #[test]

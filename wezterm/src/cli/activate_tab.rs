@@ -42,6 +42,11 @@ pub struct ActivateTab {
     /// contains appropriate tabs
     #[arg(long)]
     pane_id: Option<PaneId>,
+
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
 }
 
 impl ActivateTab {
@@ -83,11 +88,12 @@ impl ActivateTab {
             tab_id
         } else {
             // Find the current tab from the pane id
-            let pane_id = client.resolve_pane_id(self.pane_id).await?;
+            let pane_id =
+                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
             let current_tab_id = pane_id_to_tab_id
                 .get(&pane_id)
                 .copied()
-                .ok_or_else(|| anyhow::anyhow!("unable to resolve current tab"))?;
+                .ok_or_else(|| crate::cli::no_such_pane(pane_id))?;
             let window = window_by_tab_id
                 .get(&current_tab_id)
                 .copied()

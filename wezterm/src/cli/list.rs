@@ -1,6 +1,5 @@
 use crate::cli::CliOutputFormatKind;
 use clap::Parser;
-use serde::Serializer as _;
 use tabout::{tabulate_output, Alignment, Column};
 use wezterm_client::client::Client;
 use wezterm_term::TerminalSize;
@@ -11,12 +10,14 @@ pub struct ListCommand {
     /// "table" and "json" are possible formats.
     #[arg(long = "format", default_value = "table")]
     format: CliOutputFormatKind,
+
+    /// The same as `--format json`.
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
 }
 
 impl ListCommand {
     pub async fn run(&self, client: Client) -> anyhow::Result<()> {
-        let out = std::io::stdout();
-
         let mut output_items = vec![];
         let panes = client.list_panes().await?;
 
@@ -35,6 +36,7 @@ impl ListCommand {
                             entry.clone(),
                             tab_title,
                             window_title,
+                            panes.pane_labels.get(&entry.pane_id).cloned(),
                         ));
                     }
                 }
@@ -44,13 +46,13 @@ impl ListCommand {
                 }
             }
         }
-        match self.format {
-            CliOutputFormatKind::Json => {
-                let mut writer = serde_json::Serializer::pretty(out.lock());
-                writer
-                    .collect_seq(output_items.iter())
-                    .map_err(crate::stdout_error)?;
-            }
+        let format = if self.json {
+            CliOutputFormatKind::Json
+        } else {
+            self.format
+        };
+        match format {
+            CliOutputFormatKind::Json => crate::cli::print_json(&output_items)?,
             CliOutputFormatKind::Table => {
                 let cols = vec![
                     Column {
@@ -81,6 +83,12 @@ impl ListCommand {
                         name: "CWD".to_string(),
                         alignment: Alignment::Left,
                     },
+                    // Last, so scripts that pick columns by place still
+                    // find the others where they were.
+                    Column {
+                        name: "LABEL".to_string(),
+                        alignment: Alignment::Left,
+                    },
                 ];
                 let data = output_items
                     .iter()
@@ -93,6 +101,7 @@ impl ListCommand {
                             format!("{}x{}", output_item.size.cols, output_item.size.rows),
                             output_item.title.to_string(),
                             output_item.cwd.to_string(),
+                            output_item.label.clone().unwrap_or_default(),
                         ]
                     })
                     .collect::<Vec<_>>();
@@ -125,6 +134,8 @@ struct CliListResultItem {
     window_id: mux::window::WindowId,
     tab_id: mux::tab::TabId,
     pane_id: mux::pane::PaneId,
+    /// The label the pane was given, if any.
+    label: Option<String>,
     workspace: String,
     size: CliListResultPtySize,
     title: String,
@@ -147,7 +158,12 @@ struct CliListResultItem {
 }
 
 impl CliListResultItem {
-    fn from(pane: mux::tab::PaneEntry, tab_title: &str, window_title: &str) -> CliListResultItem {
+    fn from(
+        pane: mux::tab::PaneEntry,
+        tab_title: &str,
+        window_title: &str,
+        label: Option<String>,
+    ) -> CliListResultItem {
         let mux::tab::PaneEntry {
             window_id,
             tab_id,
@@ -177,6 +193,7 @@ impl CliListResultItem {
             window_id,
             tab_id,
             pane_id,
+            label,
             workspace,
             size: CliListResultPtySize {
                 rows,

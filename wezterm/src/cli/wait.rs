@@ -22,6 +22,11 @@ pub struct WaitCommand {
     #[arg(long)]
     pane_id: Option<PaneId>,
 
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
+
     /// Wait for the command running in the pane's shell to finish rather
     /// than for the pane's program to end, and exit with that command's
     /// status (125 when the shell gave none). When no command has started
@@ -33,8 +38,9 @@ pub struct WaitCommand {
     command: bool,
 
     /// Give up after this long, exiting with status 124: a number of
-    /// seconds, or a number with s, m or h after it ("90", "10m").
-    #[arg(long, value_parser = parse_timeout)]
+    /// seconds, or a number with s, m or h after it ("90", "10m"). `--for`
+    /// is the same.
+    #[arg(long, visible_alias = "for", value_parser = parse_timeout)]
     timeout: Option<Duration>,
 }
 
@@ -42,7 +48,8 @@ impl WaitCommand {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
         let deadline = self.timeout.map(|t| Instant::now() + t);
         let code = with_deadline(deadline, async {
-            let pane_id = client.resolve_pane_id(self.pane_id).await?;
+            let pane_id =
+                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
             Ok(if self.command {
                 let before = shell_commands(&client, pane_id).await?;
                 // A command typed a moment ago may not have reached the shell.
@@ -213,7 +220,7 @@ pub async fn wait_for_program(
                 },
                 // Gone. Its status can still be on its way: a pane is also
                 // closed by its pty ending, before its program is reaped.
-                Err(err) if seen && is_no_such_pane(&err) => {
+                Err(err) if seen && crate::cli::is_no_such_pane(&err) => {
                     let since = *gone_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= LATE_STATUS {
                         eprintln!("pane {pane_id} closed without saying how its program ended");
@@ -230,12 +237,6 @@ pub async fn wait_for_program(
 
 /// How long a closed pane's status may still take to arrive.
 const LATE_STATUS: Duration = Duration::from_secs(1);
-
-/// The server's answer for a pane it has no record of. Any other failure
-/// -- a connection dropping, a GUI handing over -- is not the pane ending.
-fn is_no_such_pane(err: &anyhow::Error) -> bool {
-    format!("{err:#}").contains("no such pane")
-}
 
 /// What to exit with for a finished command's reported status.
 fn command_status(pane_id: PaneId, status: Option<i32>) -> i32 {
