@@ -18,6 +18,11 @@ pub struct RenameWorkspace {
     #[arg(long)]
     pane_id: Option<PaneId>,
 
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
+
     /// The new name for the workspace
     new_workspace: String,
 }
@@ -48,10 +53,11 @@ impl RenameWorkspace {
             workspace
         } else {
             // Find the current tab from the pane id
-            let pane_id = client.resolve_pane_id(self.pane_id).await?;
+            let pane_id =
+                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
             pane_id_to_workspace
                 .get(&pane_id)
-                .ok_or_else(|| anyhow::anyhow!("unable to resolve current workspace"))?
+                .ok_or_else(|| crate::cli::no_such_pane(pane_id))?
                 .to_string()
         };
 

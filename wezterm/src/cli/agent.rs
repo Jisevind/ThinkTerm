@@ -2,7 +2,6 @@
 
 use crate::cli::CliOutputFormatKind;
 use clap::Parser;
-use serde::Serializer as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tabout::{tabulate_output, Alignment, Column};
 use thinkterm_proto::{AgentEvidence, AgentState};
@@ -27,6 +26,10 @@ struct AgentListCommand {
     /// "table" and "json" are possible formats.
     #[arg(long = "format", default_value = "table")]
     format: CliOutputFormatKind,
+
+    /// The same as `--format json`.
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
 }
 
 impl AgentCommand {
@@ -62,6 +65,8 @@ fn evidence_label(evidence: AgentEvidence) -> &'static str {
 #[derive(serde::Serialize)]
 struct CliAgentResultItem {
     pane_id: mux::pane::PaneId,
+    /// The label the pane was given, if any.
+    label: Option<String>,
     agent: String,
     state: String,
     evidence: String,
@@ -77,20 +82,35 @@ impl AgentListCommand {
     async fn run(&self, client: Client) -> anyhow::Result<()> {
         let out = std::io::stdout();
         let response = client.get_agent_statuses().await?;
-        match self.format {
+        // Labels are the panes' own, listed with the panes.
+        let labels = if response.statuses.is_empty() {
+            Default::default()
+        } else {
+            client.list_panes().await?.pane_labels
+        };
+        let format = if self.json {
+            CliOutputFormatKind::Json
+        } else {
+            self.format
+        };
+        match format {
             CliOutputFormatKind::Json => {
-                let items = response.statuses.into_iter().map(|entry| CliAgentResultItem {
-                    pane_id: entry.pane_id,
-                    agent: entry.status.agent_id,
-                    state: state_label(entry.status.state).to_string(),
-                    evidence: evidence_label(entry.status.evidence).to_string(),
-                    session_id: entry.status.session_id,
-                    since_unix: entry.status.since_unix,
-                    workspace: entry.workspace,
-                    title: entry.title,
-                });
-                let mut writer = serde_json::Serializer::pretty(out.lock());
-                writer.collect_seq(items).map_err(crate::stdout_error)?;
+                let items: Vec<_> = response
+                    .statuses
+                    .into_iter()
+                    .map(|entry| CliAgentResultItem {
+                        label: labels.get(&entry.pane_id).cloned(),
+                        pane_id: entry.pane_id,
+                        agent: entry.status.agent_id,
+                        state: state_label(entry.status.state).to_string(),
+                        evidence: evidence_label(entry.status.evidence).to_string(),
+                        session_id: entry.status.session_id,
+                        since_unix: entry.status.since_unix,
+                        workspace: entry.workspace,
+                        title: entry.title,
+                    })
+                    .collect();
+                crate::cli::print_json(&items)?;
             }
             CliOutputFormatKind::Table => {
                 let now = SystemTime::now()
@@ -126,6 +146,11 @@ impl AgentListCommand {
                         name: "TITLE".to_string(),
                         alignment: Alignment::Left,
                     },
+                    // Last, as in `list`, so the others stay in place.
+                    Column {
+                        name: "LABEL".to_string(),
+                        alignment: Alignment::Left,
+                    },
                 ];
                 let data = response
                     .statuses
@@ -143,6 +168,7 @@ impl AgentListCommand {
                             )),
                             entry.workspace.clone(),
                             entry.title.clone(),
+                            labels.get(&entry.pane_id).cloned().unwrap_or_default(),
                         ]
                     })
                     .collect::<Vec<_>>();

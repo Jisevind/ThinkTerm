@@ -1708,6 +1708,7 @@ impl<P: Platform, L: Link> App<P, L> {
             Pdu::PaneRemoved(_)
             | Pdu::TabAddedToWindow(_)
             | Pdu::TabTitleChanged(_)
+            | Pdu::PaneLabelChanged(_)
             | Pdu::WindowTitleChanged(_)
             | Pdu::TabResized(_)
             | Pdu::WindowWorkspaceChanged(_) => {
@@ -3402,9 +3403,16 @@ impl<P: Platform, L: Link> App<P, L> {
                             .unwrap_or(&m.title);
                         let (title, busy) = crate::navbar::display_title(raw);
                         let busy = busy || inner.tree.agents.get(&m.pane_id) == Some(&thinkterm_proto::AgentState::Working);
+                        // A label someone gave the pane names it, as it is
+                        // in the desktop's pane bar.
+                        let title = inner
+                            .layout
+                            .as_ref()
+                            .and_then(|layout| layout.pane_labels.get(&m.pane_id).cloned())
+                            .unwrap_or(title);
                         crate::navbar::CapsuleView {
                             pane_id: m.pane_id,
-                            title: title.to_string(),
+                            title,
                             busy,
                             current: m.pane_id == place.pane_id,
                             icon: Self::pane_icon(inner, m.pane_id),
@@ -7419,6 +7427,7 @@ mod tests {
             ],
             tab_titles: Vec::new(),
             window_titles: Default::default(),
+            pane_labels: Default::default(),
         };
         let at = |pane_id| tab_places(&layout, pane_id).map(|places| places.iter().map(|p| (p.pane, p.left, p.top)).collect::<Vec<_>>());
         assert_eq!(at(10), Some(vec![(10, 0, 0)]));

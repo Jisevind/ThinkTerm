@@ -1873,14 +1873,20 @@ enum InlineTabRenameTarget {
 struct InlineTabRename {
     target: InlineTabRenameTarget,
     input: TextInputState,
+    /// The text the editor opened with.
+    initial: String,
 }
 
 impl InlineTabRename {
     fn new(target: InlineTabRenameTarget, text: String) -> Self {
         let mut input = TextInputState::new();
-        input.set_text_end(text);
+        input.set_text_end(text.clone());
         input.caret_select_all();
-        Self { target, input }
+        Self {
+            target,
+            input,
+            initial: text,
+        }
     }
 
     /// Legacy tab surfaces still paint their inline editor as title text. File
@@ -2867,7 +2873,6 @@ pub struct TermWindow {
     tab_wheel_surface_lock: Option<(TabWheelSurface, Instant)>,
     tab_wheel_direction_lock: Option<(TabWheelSurface, i16, Instant)>,
     inline_tab_rename: Option<InlineTabRename>,
-    pane_tab_title_overrides: HashMap<PaneId, String>,
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
@@ -4656,7 +4661,6 @@ impl TermWindow {
             tab_wheel_surface_lock: None,
             tab_wheel_direction_lock: None,
             inline_tab_rename: None,
-            pane_tab_title_overrides: HashMap::new(),
             right_status: String::new(),
             left_status: String::new(),
             last_mouse_coords: (0, -1),
@@ -6076,6 +6080,10 @@ impl TermWindow {
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
                 }
+                MuxNotification::PaneLabelChanged { .. } => {
+                    self.update_title_post_status();
+                    self.persist_workspace_layout_after_mutation("pane label changed");
+                }
                 MuxNotification::PaneAdded(pane_id) => {
                     self.push_window_config_to_pane(pane_id);
                     self.refresh_thread_work_for_pane(pane_id);
@@ -6116,6 +6124,8 @@ impl TermWindow {
                     }
                     self.sync_current_workspace_thread();
                 }
+                // Filtered out before they get here; for event subscribers.
+                MuxNotification::ClientJoined(_) | MuxNotification::ClientLeft(_) => {}
                 MuxNotification::Empty => {}
             },
             TermWindowNotif::EmitStatusUpdate => {
@@ -6778,6 +6788,15 @@ impl TermWindow {
                     return true;
                 }
             }
+            MuxNotification::PaneLabelChanged { pane_id, .. } => {
+                let mux = Mux::get();
+                match mux.resolve_pane_id(pane_id) {
+                    Some((_domain_id, window_id, _tab_id)) if window_id == mux_window_id => {
+                        // fall through
+                    }
+                    _ => return true,
+                }
+            }
             MuxNotification::FrontendLeaseChanged(ref state) => {
                 let mux = Mux::get();
                 if mux.window_containing_tab(state.tab_id) == Some(mux_window_id) {
@@ -6804,6 +6823,8 @@ impl TermWindow {
             | MuxNotification::ThinkTermTreeChanged
             | MuxNotification::DefaultPaletteChanged
             | MuxNotification::ThinkTermSessionChanged
+            | MuxNotification::ClientJoined(_)
+            | MuxNotification::ClientLeft(_)
             | MuxNotification::WindowWorkspaceChanged(_) => return true,
             MuxNotification::Alert {
                 alert: Alert::PaletteChanged { .. },
@@ -9514,13 +9535,11 @@ impl TermWindow {
     }
 
     fn prompt_rename_pane_tab(&mut self, pane_id: PaneId) {
-        let initial_title = self
-            .pane_tab_title_overrides
-            .get(&pane_id)
-            .cloned()
+        let mux = Mux::get();
+        let initial_title = mux
+            .pane_label(pane_id)
             .or_else(|| {
-                Mux::get()
-                    .get_pane(pane_id)
+                mux.get_pane(pane_id)
                     .map(|pane| ui::terminal_title_for_display(&pane.get_title()).to_string())
             })
             .unwrap_or_default();
@@ -9716,10 +9735,15 @@ impl TermWindow {
                     }
                 }
                 InlineTabRenameTarget::PaneTab(pane_id) => {
-                    if title.is_empty() {
-                        self.pane_tab_title_overrides.remove(&pane_id);
-                    } else {
-                        self.pane_tab_title_overrides.insert(pane_id, title);
+                    // The pane's label: kept by the mux that owns the pane,
+                    // so the CLI and other windows know the pane by it. An
+                    // unlabelled pane's editor opens on its title; left as
+                    // it was, the pane goes on following its title.
+                    let mux = Mux::get();
+                    let untouched =
+                        mux.pane_label(pane_id).is_none() && title == rename.initial.trim();
+                    if !untouched {
+                        mux.set_pane_label(pane_id, Some(&title));
                     }
                 }
                 InlineTabRenameTarget::Space(space_id) => {
@@ -9943,9 +9967,8 @@ impl TermWindow {
             return title;
         }
 
-        self.pane_tab_title_overrides
-            .get(&pane_id)
-            .cloned()
+        Mux::get()
+            .pane_label(pane_id)
             .unwrap_or_else(|| ui::terminal_title_for_display(title).to_string())
     }
 

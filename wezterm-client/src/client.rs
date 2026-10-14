@@ -505,16 +505,24 @@ async fn process_unilateral_inner_async(
 }
 
 /// Where a client without a domain of its own -- the CLI -- sends what the
-/// server pushes, once it has asked to hear it. See `tap_unilateral_pdus`.
-static UNILATERAL_TAP: std::sync::Mutex<Option<Sender<Pdu>>> = std::sync::Mutex::new(None);
+/// server pushes, once it has asked to hear it, and which of the pushes it
+/// wants. See `tap_unilateral_pdus`.
+static UNILATERAL_TAP: std::sync::Mutex<Option<(Sender<Pdu>, fn(&Pdu) -> bool)>> =
+    std::sync::Mutex::new(None);
 
 /// Hand every PDU the server pushes to a client without a local domain
 /// (the CLI's own connection) to the returned receiver, rather than drop
 /// it. At most `capacity` wait unread; the rest are dropped, with a
 /// warning, so a reader that stops reading cannot grow it without bound.
 pub fn tap_unilateral_pdus(capacity: usize) -> Receiver<Pdu> {
+    tap_unilateral_pdus_where(capacity, |_| true)
+}
+
+/// `tap_unilateral_pdus` for only the pushes `wanted` picks: the others,
+/// however many, cannot crowd them out.
+pub fn tap_unilateral_pdus_where(capacity: usize, wanted: fn(&Pdu) -> bool) -> Receiver<Pdu> {
     let (tx, rx) = smol::channel::bounded(capacity);
-    *UNILATERAL_TAP.lock().unwrap() = Some(tx);
+    *UNILATERAL_TAP.lock().unwrap() = Some((tx, wanted));
     rx
 }
 
@@ -529,8 +537,8 @@ fn process_unilateral(
         None => {
             // No panes to update here. A caller that asked for the
             // server's pushes gets them; anyone else ignores them.
-            if let Some(tap) = UNILATERAL_TAP.lock().unwrap().as_ref() {
-                if tap.try_send(decoded.pdu).is_err() {
+            if let Some((tap, wanted)) = UNILATERAL_TAP.lock().unwrap().as_ref() {
+                if wanted(&decoded.pdu) && tap.try_send(decoded.pdu).is_err() {
                     log::warn!("dropping a server push nobody is reading");
                 }
                 return Ok(());
@@ -776,6 +784,34 @@ fn process_unilateral(
         // A GUI client renders from its own configuration; the server's
         // resolved palette is only for clients that have none of their own.
         Pdu::DefaultPalette(_) => {
+            return Ok(());
+        }
+        // Only for connections that subscribed to events; a domain never does.
+        Pdu::ClientJoined(_) | Pdu::ClientLeft(_) => {
+            return Ok(());
+        }
+        Pdu::PaneLabelChanged(codec::PaneLabelChanged { pane_id, label }) => {
+            let pane_id = *pane_id;
+            let label = label.clone();
+            promise::spawn::spawn_into_main_thread(async move {
+                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let client_domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let client_domain =
+                    client_domain
+                        .downcast_ref::<ClientDomain>()
+                        .ok_or_else(|| {
+                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
+                        })?;
+                if client_domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
+
+                client_domain.process_remote_pane_label_change(pane_id, label);
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
             return Ok(());
         }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
@@ -2855,6 +2891,12 @@ impl Client {
     rpc!(get_image_cell, GetImageCell, GetImageCellResponse);
     rpc!(set_configured_palette_for_pane, SetPalette, UnitResponse);
     rpc!(set_tab_title, TabTitleChanged, UnitResponse);
+    rpc!(set_pane_label, PaneLabelChanged, UnitResponse);
+    rpc!(
+        get_workspace_names,
+        GetWorkspaceNames = (),
+        GetWorkspaceNamesResponse
+    );
     rpc!(set_window_title, WindowTitleChanged, UnitResponse);
     rpc!(rename_workspace, RenameWorkspace, UnitResponse);
     rpc!(erase_scrollback, EraseScrollbackRequest, UnitResponse);

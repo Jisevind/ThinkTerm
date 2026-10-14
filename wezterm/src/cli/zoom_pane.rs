@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::Parser;
 use codec::SetPaneZoomed;
 use mux::pane::PaneId;
@@ -12,6 +12,11 @@ pub struct ZoomPane {
     /// environment variable WEZTERM_PANE.
     #[arg(long)]
     pane_id: Option<PaneId>,
+
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
 
     /// Zooms the pane if it wasn't already zoomed
     #[arg(long, default_value = "true", default_value_ifs([
@@ -55,11 +60,12 @@ impl ZoomPane {
             }
         }
 
-        let pane_id = client.resolve_pane_id(self.pane_id).await?;
+        let pane_id =
+            crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
         let containing_tab_id = pane_id_to_tab_id
             .get(&pane_id)
             .copied()
-            .ok_or_else(|| anyhow!("unable to resolve current tab"))?;
+            .ok_or_else(|| crate::cli::no_such_pane(pane_id))?;
 
         if self.zoom || self.unzoom {
             client

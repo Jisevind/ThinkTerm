@@ -15,6 +15,11 @@ pub struct SplitPane {
     #[arg(long)]
     pane_id: Option<PaneId>,
 
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
+
     /// Equivalent to `--right`. If neither this nor any other direction
     /// is specified, the default is equivalent to `--bottom`.
     #[arg(long, conflicts_with_all=&["left", "right", "top", "bottom"])]
@@ -67,9 +72,19 @@ pub struct SplitPane {
     wait: bool,
 
     /// With --wait, give up after this long, exiting with status 124: a
-    /// number of seconds, or a number with s, m or h after it.
-    #[arg(long, value_parser = crate::cli::wait::parse_timeout, requires = "wait")]
+    /// number of seconds, or a number with s, m or h after it. `--for` is
+    /// the same.
+    #[arg(
+        long,
+        visible_alias = "for",
+        value_parser = crate::cli::wait::parse_timeout,
+        requires = "wait"
+    )]
     timeout: Option<std::time::Duration>,
+
+    /// Label the new pane, so that `--pane LABEL` finds it.
+    #[arg(long)]
+    label: Option<String>,
 
     /// Instead of executing your shell, run PROG.
     /// For example: `thinkterm cli split-pane -- bash -l` will spawn bash
@@ -80,7 +95,13 @@ pub struct SplitPane {
 
 impl SplitPane {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
-        let pane_id = client.resolve_pane_id(self.pane_id).await?;
+        // Checked before anything is spawned.
+        let label = match &self.label {
+            Some(text) => crate::cli::set_pane_label::checked_label(text)?,
+            None => None,
+        };
+        let pane_id =
+            crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
 
         let direction = if self.left || self.right || self.horizontal {
             SplitDirection::Horizontal
@@ -120,6 +141,20 @@ impl SplitPane {
             .await?;
 
         log::debug!("{:?}", spawned);
+        if let Some(label) = label {
+            // The pane is there either way, and a script needs its id, and
+            // what it ran, more than the label: a program that ended at once
+            // can take its pane with it before the label arrives.
+            let labelled = client
+                .set_pane_label(codec::PaneLabelChanged {
+                    pane_id: spawned.pane_id,
+                    label: Some(label),
+                })
+                .await;
+            if let Err(err) = labelled {
+                eprintln!("pane {} was not labelled: {err:#}", spawned.pane_id);
+            }
+        }
         println!("{}", spawned.pane_id);
         if self.wait {
             let deadline = self.timeout.map(|t| std::time::Instant::now() + t);

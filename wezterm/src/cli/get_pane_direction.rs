@@ -12,6 +12,11 @@ pub struct GetPaneDirection {
     #[arg(long)]
     pane_id: Option<PaneId>,
 
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
+
     /// The direction to consider.
     #[arg(value_parser=PaneDirectionParser{})]
     direction: PaneDirection,
@@ -19,7 +24,8 @@ pub struct GetPaneDirection {
 
 impl GetPaneDirection {
     pub async fn run(&self, client: Client) -> anyhow::Result<()> {
-        let pane_id = client.resolve_pane_id(self.pane_id).await?;
+        let pane_id =
+            crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
         let response = client
             .get_pane_direction(codec::GetPaneDirection {
                 pane_id,

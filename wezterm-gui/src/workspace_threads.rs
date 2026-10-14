@@ -245,6 +245,9 @@ pub struct TerminalSpawnSpec {
     pub cwd: Option<String>,
     pub domain: Option<String>,
     pub title: String,
+    /// The label the pane was given; the pane that replaces it gets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1443,6 +1446,7 @@ fn store_with_session_import(
                                 cwd: working_dir_from_entry(entry),
                                 domain: Some("local".into()),
                                 title: entry.title.clone(),
+                                label: None,
                             },
                             font_scale: None,
                         })
@@ -2189,6 +2193,14 @@ pub fn thread_display_name_for_workspace(workspace: &str) -> Option<String> {
     let store = THREAD_STORE.lock();
     let (project, thread) = project_and_thread_for_workspace(&store, workspace)?;
     Some(project_thread_name(project, thread))
+}
+
+/// The project and thread names behind a thread-backed workspace, for the
+/// names the CLI knows panes by. `None` for workspaces no thread claims.
+pub fn project_and_thread_names_for_workspace(workspace: &str) -> Option<(String, String)> {
+    let store = THREAD_STORE.lock();
+    let (project, thread) = project_and_thread_for_workspace(&store, workspace)?;
+    Some((project.name.clone(), thread.name.clone()))
 }
 
 fn project_thread_name(project: &Project, thread: &WorkspaceThread) -> String {
@@ -9069,7 +9081,8 @@ fn restore_node<'a>(
 ) -> LocalBoxFuture<'a, Result<()>> {
     Box::pin(async move {
         match node {
-            PaneNode::Empty | PaneNode::Leaf(_) => {}
+            PaneNode::Empty => {}
+            PaneNode::Leaf(entry) => restore_label(&mux, base_pane_id, entry, terminal_specs),
             PaneNode::Stack(stack) => {
                 restore_stack(
                     mux,
@@ -9161,10 +9174,28 @@ async fn restore_stack(
         pane_ids.push(pane.pane_id());
     }
 
+    for (pane_id, entry) in pane_ids.iter().zip(&stack.panes) {
+        restore_label(&mux, *pane_id, entry, terminal_specs);
+    }
     if let Some(pane_id) = pane_ids.get(stack.active).copied() {
         let _ = mux.activate_pane_in_stack(pane_id);
     }
     Ok(())
+}
+
+/// Give `pane_id` the label the pane it stands in for had.
+fn restore_label(
+    mux: &Mux,
+    pane_id: PaneId,
+    entry: &PaneEntry,
+    terminal_specs: &HashMap<PaneId, TerminalSpawnSpec>,
+) {
+    if let Some(label) = terminal_specs
+        .get(&entry.pane_id)
+        .and_then(|spec| spec.label.as_deref())
+    {
+        mux.set_pane_label(pane_id, Some(label));
+    }
 }
 
 fn split_second_percent(
@@ -9267,6 +9298,7 @@ fn collect_terminal_spec<F>(
             cwd: working_dir_from_entry(entry),
             domain,
             title: entry.title.clone(),
+            label: mux.pane_label(entry.pane_id),
         },
         font_scale: valid_font_scale(pane_font_scale(entry.pane_id)),
     });

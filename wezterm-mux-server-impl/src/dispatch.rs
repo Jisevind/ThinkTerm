@@ -640,6 +640,20 @@ async fn process_async_with_peer<S: ConnectionStream>(
             Ok(Item::Notif(MuxNotification::PaneAdded(pane_id))) if handler.events_subscribed => {
                 send_notif_pdu(Pdu::PaneAdded(codec::PaneAdded { pane_id }));
             }
+            Ok(Item::Notif(MuxNotification::ClientJoined(client_id)))
+                if handler.events_subscribed =>
+            {
+                send_notif_pdu(Pdu::ClientJoined(codec::ClientJoined {
+                    client_id: (*client_id).clone(),
+                }));
+            }
+            Ok(Item::Notif(MuxNotification::ClientLeft(client_id)))
+                if handler.events_subscribed =>
+            {
+                send_notif_pdu(Pdu::ClientLeft(codec::ClientLeft {
+                    client_id: (*client_id).clone(),
+                }));
+            }
             Ok(Item::Notif(other)) => {
                 log::trace!("notification with nothing for the connection to do: {other:?}");
             }
@@ -792,7 +806,9 @@ fn item_for_notification(n: MuxNotification) -> Option<Item> {
         | MuxNotification::Alert { .. }
         | MuxNotification::PaneAdded(_)
         | MuxNotification::PaneExited { .. }
-        | MuxNotification::PaneRemoved(_) => Some(Item::Notif(n)),
+        | MuxNotification::PaneRemoved(_)
+        | MuxNotification::ClientJoined(_)
+        | MuxNotification::ClientLeft(_) => Some(Item::Notif(n)),
         MuxNotification::AgentStatusChanged(pane_id) => {
             // Read the status at send time so the payload is always the
             // freshest classification, never a queued stale value.
@@ -844,6 +860,12 @@ fn item_for_notification(n: MuxNotification) -> Option<Item> {
             write(Pdu::TabTitleChanged(codec::TabTitleChanged {
                 tab_id,
                 title,
+            }))
+        }
+        MuxNotification::PaneLabelChanged { pane_id, label, .. } => {
+            write(Pdu::PaneLabelChanged(codec::PaneLabelChanged {
+                pane_id,
+                label,
             }))
         }
         MuxNotification::WindowTitleChanged { window_id, title } => {

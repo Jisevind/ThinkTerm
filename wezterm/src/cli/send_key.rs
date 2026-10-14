@@ -1,4 +1,5 @@
 use crate::cli::wait::{exit_with, parse_timeout, shell_commands, wait_for_command, with_deadline};
+use crate::cli::UsageError;
 use anyhow::{anyhow, bail};
 use clap::Parser;
 use codec::{InputSerial, SendKeyDown};
@@ -15,6 +16,11 @@ pub struct SendKey {
     #[arg(long)]
     pane_id: Option<PaneId>,
 
+    /// The pane by name rather than id: its label, its thread's name (a
+    /// thread with one pane), or `thread/label`.
+    #[arg(long, conflicts_with = "pane_id")]
+    pane: Option<String>,
+
     /// After the keys, wait for the command they start in the pane's shell
     /// to finish, and exit with its status (125 when the shell gave none):
     /// `send-key --wait enter` runs what `send-text` typed. Needs a shell
@@ -23,8 +29,9 @@ pub struct SendKey {
     wait: bool,
 
     /// With --wait, give up after this long, exiting with status 124: a
-    /// number of seconds, or a number with s, m or h after it.
-    #[arg(long, value_parser = parse_timeout, requires = "wait")]
+    /// number of seconds, or a number with s, m or h after it. `--for` is
+    /// the same.
+    #[arg(long, visible_alias = "for", value_parser = parse_timeout, requires = "wait")]
     timeout: Option<Duration>,
 
     /// The keys to press, one after another, each written as modifiers and
@@ -45,15 +52,18 @@ impl SendKey {
             .keys
             .iter()
             .map(|key| parse_key(key))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(|err| UsageError(format!("{err:#}")))?;
 
         if !self.wait {
-            let pane_id = client.resolve_pane_id(self.pane_id).await?;
+            let pane_id =
+                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
             return send_keys(&client, pane_id, events).await;
         }
         let code = with_deadline(deadline, async {
             // Finding the focused pane asks the server too.
-            let pane_id = client.resolve_pane_id(self.pane_id).await?;
+            let pane_id =
+                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
             // Counted before the keys go, so a command that finishes at
             // once is not missed.
             let before = shell_commands(&client, pane_id).await?.finished;
