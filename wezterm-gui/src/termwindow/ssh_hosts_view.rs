@@ -233,6 +233,9 @@ struct TailnetGroup {
     /// The machines as painted, those the search finds: cards name one by
     /// its place here.
     machines: Vec<TailnetMachine>,
+    /// The saved host whose machine was clicked last. Its card is ringed
+    /// while the inspector shows that host, the way a host's card is.
+    selected: Option<String>,
     /// The approval link as painted, for the buttons that open and copy it.
     login_url: Option<String>,
     /// What the card's button said when painted.
@@ -456,6 +459,7 @@ impl SshHostsView {
 
     fn open_new_form(&mut self) {
         self.close_tailnet_panel();
+        self.tailnet.selected = None;
         self.password_visible = false;
         let mut form = HostForm::default();
         form.fields[FIELD_PORT].set_text_end("22".to_string());
@@ -474,6 +478,12 @@ impl SshHostsView {
         let Some(spec) = ssh_hosts::host_spec(project_id) else {
             return;
         };
+        self.open_form_for(project_id, spec);
+    }
+
+    /// The inspector's form for the saved host `project_id`, as `spec` has
+    /// it.
+    fn open_form_for(&mut self, project_id: &str, spec: SshHostSpec) {
         self.close_tailnet_panel();
         // Revealing a password is a decision about one host. Carrying it into
         // the next one would put a stored password on screen unasked.
@@ -718,11 +728,20 @@ impl SshHostsView {
                 }
                 if let (Some(a), Some(b)) = (hit, pressed) {
                     if a == b {
-                        if let SshViewAction::Card(index) = a {
-                            if let Some(entry) = self.filtered.get(index) {
-                                self.last_click =
-                                    Some((entry.id.clone(), x, y, std::time::Instant::now()));
-                            }
+                        // A saved machine of the tailnet is that host's card
+                        // again, double click and all.
+                        let host = match a {
+                            SshViewAction::Card(index) => self.filtered.get(index),
+                            SshViewAction::TailnetMachine(index) => self
+                                .tailnet
+                                .machines
+                                .get(index)
+                                .and_then(|machine| self.saved_host_for(machine)),
+                            _ => None,
+                        };
+                        if let Some(entry) = host {
+                            self.last_click =
+                                Some((entry.id.clone(), x, y, std::time::Instant::now()));
                         }
                         self.pending_caret_click = match a {
                             SshViewAction::Search => Some((Focus::Search, x)),
@@ -988,6 +1007,7 @@ impl SshHostsView {
     fn select_host(&mut self, index: usize) {
         self.selected = index;
         self.selection_active = true;
+        self.tailnet.selected = None;
         let Some(entry) = self.filtered.get(index) else {
             return;
         };
@@ -1151,6 +1171,8 @@ impl SshHostsView {
         let editable = entry.source == SshHostSource::ThinkTerm;
         self.selected = index;
         self.selection_active = true;
+        // Its ring takes over from a tailnet machine's.
+        self.tailnet.selected = None;
         ContentViewResponse::Run(Box::new(move |term_window| {
             term_window.show_remote_host_menu(host_id, label, editable, x, y);
         }))
@@ -3601,16 +3623,28 @@ impl SshHostsView {
         })
     }
 
-    /// A machine of the tailnet: one saved as a host connects the way it
-    /// was saved; another opens a new host's form with its name and address
-    /// filled in, for whom to sign in as -- saved, it is a host like any
-    /// other, in Hosts.
+    /// A machine of the tailnet, clicked the way a host's card is: one saved
+    /// as a host is selected and its form opens in the inspector, a second
+    /// click connecting (see the mouse handler); another opens a new host's
+    /// form with its name and address filled in, for whom to sign in as --
+    /// saved, it is a host like any other, in Hosts.
     fn open_tailnet_machine(&mut self, index: usize) -> ContentViewResponse {
         let Some(machine) = self.tailnet.machines.get(index).cloned() else {
             return ContentViewResponse::Redraw;
         };
-        if let Some(entry) = self.saved_host_for(&machine) {
-            return open_thread_response(entry.id.clone());
+        if let Some(entry) = self.saved_host_for(&machine).cloned() {
+            // Its ring takes over from a host card's.
+            self.selection_active = false;
+            // As for a host card: the form already open for it keeps what
+            // was typed into it.
+            // As the store has it now: the list's copy can be older than what
+            // another window saved since, and saving that would undo it.
+            if self.form.as_ref().and_then(|form| form.editing.as_deref()) != Some(entry.id.as_str()) {
+                let spec = ssh_hosts::saved_host_spec_if_loaded(&entry.id).unwrap_or(entry.spec);
+                self.open_form_for(&entry.id, spec);
+            }
+            self.tailnet.selected = Some(entry.id);
+            return ContentViewResponse::Redraw;
         }
         self.open_new_form();
         if let Some(form) = self.form.as_mut() {
@@ -3839,6 +3873,10 @@ impl SshHostsView {
         };
         self.widgets.push(visible, WidgetKind::SidebarRow, action);
         let hovered = self.interaction.hovered == Some(action);
+        let editing = self.form.as_ref().and_then(|form| form.editing.as_deref());
+        let selected = editing.is_some()
+            && self.tailnet.selected.as_deref() == editing
+            && self.saved_host_for(&machine).map(|entry| entry.id.as_str()) == editing;
         let bg = if hovered {
             palette.sidebar_row_hover_bg
         } else {
@@ -3852,7 +3890,11 @@ impl SshHostsView {
             card.size.width,
             card.size.height,
             bg,
-            palette.separator,
+            if selected {
+                palette.accent
+            } else {
+                palette.separator
+            },
             ctx.px(CARD_RADIUS),
         )?;
 
@@ -4863,7 +4905,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_saved_as_a_host_connects_the_way_it_was_saved() {
+    fn a_machine_saved_as_a_host_opens_like_that_host_s_card() {
         let mut view = SshHostsView::new();
         view.saved_hosts = vec![SshHostEntry {
             id: "ssh-saved".to_string(),
@@ -4879,12 +4921,22 @@ mod tests {
         assert!(view.saved_host_for(&view.tailnet.machines[0]).is_some());
         assert!(view.saved_host_for(&view.tailnet.machines[1]).is_none());
 
-        // Saved: straight to it, no form to fill in again.
+        // Saved: selected, its form in the inspector, as a host card's first
+        // click does; connecting takes a second.
+        view.selection_active = true;
         assert!(matches!(
             view.open_tailnet_machine(0),
-            ContentViewResponse::Run(_)
+            ContentViewResponse::Redraw
         ));
-        assert!(view.form.is_none());
+        let form = view.form.as_ref().expect("the saved host's form");
+        assert_eq!(form.editing.as_deref(), Some("ssh-saved"));
+        assert_eq!(form.fields[FIELD_HOST].text(), "100.64.0.7");
+        assert_eq!(view.tailnet.selected.as_deref(), Some("ssh-saved"));
+        assert!(!view.selection_active);
+        // Clicked again, what was typed into its form stays.
+        view.form.as_mut().unwrap().fields[FIELD_USER].set_text_end("typed".to_string());
+        view.open_tailnet_machine(0);
+        assert_eq!(view.form.as_ref().unwrap().fields[FIELD_USER].text(), "typed");
 
         // Not saved: a new host, its name and address filled in, waiting
         // for whom to sign in as.
@@ -4892,6 +4944,7 @@ mod tests {
             view.open_tailnet_machine(1),
             ContentViewResponse::Redraw
         ));
+        assert!(view.tailnet.selected.is_none());
         let form = view.form.as_ref().expect("a new host's form");
         assert!(form.editing.is_none());
         assert_eq!(form.network, SshNetwork::Tailnet);

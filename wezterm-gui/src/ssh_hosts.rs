@@ -167,6 +167,19 @@ pub fn host_spec(host_id: &str) -> Option<SshHostSpec> {
         .map(|entry| entry.spec)
 }
 
+/// The saved record of `host_id` as the loaded store holds it now -- what
+/// another window saved since a list of hosts was read -- without loading
+/// the store when it is not.
+pub fn saved_host_spec_if_loaded(host_id: &str) -> Option<SshHostSpec> {
+    let store = SSH_HOST_STORE.lock();
+    store
+        .as_ref()?
+        .hosts
+        .iter()
+        .find(|record| record.id == host_id)
+        .map(|record| record.spec.clone())
+}
+
 pub fn host_exists(host_id: &str) -> bool {
     host_store().map(|store| store.hosts.iter().any(|record| record.id == host_id)).unwrap_or(false)
 }
