@@ -173,12 +173,10 @@ impl UiPalette {
         };
         let moved = |color: LinearRgba| -> LinearRgba {
             let [l, _, _, alpha] = color.to_oklaba();
-            let shifted = (ground_l + fit + (l - base_l)).clamp(0.0, 1.0);
-            let out = LinearRgba::from_oklaba(shifted, ground_a, ground_b, alpha);
-            LinearRgba::with_components(
-                out.0.clamp(0.0, 1.0),
-                out.1.clamp(0.0, 1.0),
-                out.2.clamp(0.0, 1.0),
+            crate::ui::color::from_oklab_clamped(
+                ground_l + fit + (l - base_l),
+                ground_a,
+                ground_b,
                 alpha,
             )
         };

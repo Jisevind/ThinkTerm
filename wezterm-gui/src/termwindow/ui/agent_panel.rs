@@ -45,6 +45,10 @@ const AGENT_ROW_GAP: usize = 10;
 const AGENT_ROW_EXTRA_INSET: usize = 6;
 /// Sub-task lines a row shows before it says how many more there are.
 const AGENT_SUBTASKS_SHOWN: usize = 5;
+/// How much lighter than the panel the row of the agent in the active pane
+/// is, in perceived lightness (OkLab L): a card lifted a little, on any
+/// theme.
+const AGENT_ACTIVE_ROW_STEP: f32 = 0.075;
 
 impl TermWindow {
     /// The strip above the list: one row holding the status line and the
@@ -247,11 +251,23 @@ impl TermWindow {
         // Between rows of a group: plain enough to stay out of the way, but
         // a shade firmer than the separator token, which vanished here.
         let divider = muted_fg.mul_alpha(0.22);
-        // The agent in the pane this window is on lies on a faint tint of
-        // the accent, so the list shows where you are; a hover still shows
-        // through it.
+        // The agent in the pane this window is on lies on the panel's ground
+        // a step lighter, a card lifted off it, so the list shows where you
+        // are. A step of perceived lightness looks the same in every theme
+        // and keeps a scheme's tint: a grey at a fixed alpha was plain on
+        // dark and all but gone on light, darker read as pressed there, and
+        // the accent, a different colour in every theme, looked muddy. Only
+        // a ground too light to lift (near white) takes the step darker.
         let active_pane_id = self.get_active_pane_no_overlay().map(|pane| pane.pane_id());
-        let active_tint = chrome.accent.mul_alpha(0.14);
+        let active_fill = self.chrome_surface(crate::ui::color::lifted(
+            chrome.workspace_sidebar_bg,
+            AGENT_ACTIVE_ROW_STEP,
+        ));
+        // A hover is drawn over it: on a light theme a thin grey rather than
+        // the palette's near-white, which is what the current row is there.
+        let hover_fill = chrome.hover_fill(chrome.sidebar_button_hover_bg);
+        // Both fills a little rounder than the snippet cards they started as.
+        let row_radius = self.ui_f32(SIDEBAR_ROW_RADIUS + 3.0) + 10.0;
         // A working description shimmers from the quieter grey up to white
         // (black on a light theme): from the brighter grey the light that
         // passed was too close to the text to see.
@@ -460,21 +476,6 @@ impl TermWindow {
                 content_width,
                 band.visible_height,
             );
-            if hovered {
-                self.fill_rounded_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(
-                        content_x as f32,
-                        band.visible_y as f32,
-                        content_width as f32,
-                        band.visible_height as f32,
-                    ),
-                    chrome.sidebar_button_hover_bg,
-                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 10.0,
-                )
-                .context("agent row hover")?;
-            }
             if Some(agent.pane_id) == active_pane_id {
                 self.fill_rounded_rectangle(
                     layers,
@@ -485,10 +486,25 @@ impl TermWindow {
                         content_width as f32,
                         band.visible_height as f32,
                     ),
-                    active_tint,
-                    self.ui_f32(SIDEBAR_ROW_RADIUS) + 10.0,
+                    active_fill,
+                    row_radius,
                 )
                 .context("active agent row")?;
+            }
+            if hovered {
+                self.fill_rounded_rectangle(
+                    layers,
+                    1,
+                    euclid::rect(
+                        content_x as f32,
+                        band.visible_y as f32,
+                        content_width as f32,
+                        band.visible_height as f32,
+                    ),
+                    hover_fill,
+                    row_radius,
+                )
+                .context("agent row hover")?;
             }
             let in_this_window = agent.window_id == Some(self.mux_window_id);
             self.ui_items.push(UIItem {

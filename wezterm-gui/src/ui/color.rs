@@ -20,6 +20,35 @@ pub(crate) fn mix(from: LinearRgba, to: LinearRgba, t: f32) -> LinearRgba {
     )
 }
 
+/// `ground` moved `step` of perceived lightness (OkLab L; a negative step
+/// darkens), keeping its tint. A step reads the same on any ground, where a
+/// grey laid over it at a fixed alpha is plain on a dark one and all but
+/// lost on a light one.
+pub(crate) fn lightness_step(ground: LinearRgba, step: f32) -> LinearRgba {
+    let [l, a, b, alpha] = ground.to_oklaba();
+    from_oklab_clamped(l + step, a, b, alpha)
+}
+
+/// `ground` a `step` lighter, a card lifted off it -- or, where it is too
+/// light for that to show (a near-white ground has no room above it), the
+/// same step darker.
+pub(crate) fn lifted(ground: LinearRgba, step: f32) -> LinearRgba {
+    let l = ground.to_oklaba()[0];
+    lightness_step(ground, if l + step <= 1.0 { step } else { -step })
+}
+
+/// The colour of perceived lightness `l` (OkLab L, kept within 0..=1) with
+/// the tint `a`, `b`, clamped into what a screen shows.
+pub(crate) fn from_oklab_clamped(l: f32, a: f32, b: f32, alpha: f32) -> LinearRgba {
+    let out = LinearRgba::from_oklaba(l.clamp(0.0, 1.0), a, b, alpha);
+    LinearRgba::with_components(
+        out.0.clamp(0.0, 1.0),
+        out.1.clamp(0.0, 1.0),
+        out.2.clamp(0.0, 1.0),
+        alpha,
+    )
+}
+
 // The standard sRGB transfer function, written out rather than reached for on
 // `LinearRgba`/`SrgbaTuple`: those two use different curves (one exact, one a
 // gamma-2.2 approximation) and so do not round-trip. These are exact inverses,
@@ -66,5 +95,28 @@ mod tests {
         let solid = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
         assert!((mix(clear, solid, 0.5).3 - 0.6).abs() < 1e-6);
         assert_eq!(mix(clear, clear, 0.7).3, 0.2);
+    }
+
+    #[test]
+    fn a_lightness_step_is_the_same_on_dark_and_light_and_keeps_the_tint() {
+        let l = |c: LinearRgba| c.to_oklaba()[0];
+        let dark = LinearRgba::with_srgba(18, 18, 20, 255);
+        let light = LinearRgba::with_srgba(226, 226, 232, 255);
+        assert!((l(lightness_step(dark, 0.075)) - l(dark) - 0.075).abs() < 1e-3);
+        let darker = lightness_step(light, -0.075);
+        assert!((l(light) - l(darker) - 0.075).abs() < 1e-3);
+        // A blue-grey ground steps to a blue-grey.
+        assert!(darker.2 > darker.0);
+        assert_eq!(darker.3, 1.0);
+    }
+
+    #[test]
+    fn a_lift_shows_even_on_a_near_white_ground() {
+        let l = |c: LinearRgba| c.to_oklaba()[0];
+        let dark = LinearRgba::with_srgba(18, 18, 20, 255);
+        assert!((l(lifted(dark, 0.075)) - l(dark) - 0.075).abs() < 1e-3);
+        // No room above white: a step down instead of none at all.
+        let white = LinearRgba::with_srgba(252, 252, 253, 255);
+        assert!((l(white) - l(lifted(white, 0.075)) - 0.075).abs() < 1e-3);
     }
 }
