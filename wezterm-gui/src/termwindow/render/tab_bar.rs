@@ -189,6 +189,9 @@ impl crate::TermWindow {
                 stable_line_idx: None,
                 line: self.terminal_bar.line(),
                 selection: 0..0,
+                selection_neighbors: (0..0, 0..0),
+                selection_text_only: false,
+                selection_rounded: false,
                 cursor: &Default::default(),
                 palette: &palette,
                 dims: &RenderableDimensions {

@@ -311,16 +311,24 @@ impl crate::TermWindow {
         let selection_pixel_range = if !params.selection.is_empty() {
             let start = params.left_pixel_x + (params.selection.start as f32 * cell_width);
             let width = (params.selection.end - params.selection.start) as f32 * cell_width;
-            let mut quad = self
-                .filled_rectangle(
+            // This row's piece of the one rounded shape the selection makes;
+            // none where a light draws the block (fading out) itself.
+            if !params.selection_text_only {
+                self.paint_selection_row(
                     layers,
                     0,
-                    euclid::rect(start, params.top_pixel_y, width, cell_height),
+                    params.left_pixel_x,
+                    params.top_pixel_y,
+                    cell_width,
+                    cell_height,
+                    &params.selection,
+                    &params.selection_neighbors,
                     params.selection_bg,
+                    params.selection_rounded,
+                    hsv,
                 )
-                .context("filled_rectangle")?;
-
-            quad.set_hsv(hsv);
+                .context("paint_selection_row")?;
+            }
 
             start..start + width
         } else {

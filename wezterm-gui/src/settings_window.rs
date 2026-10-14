@@ -911,6 +911,16 @@ impl SettingsSection {
                 "Quote Interval",
                 "Open Quotes JSON",
                 "Reset Quotes JSON",
+                "Selection Style",
+                "Rounded",
+                "Copy on Select",
+                "Right Click",
+                "Mouse",
+                "Clipboard",
+                "Paste",
+                "Copy",
+                "Copy Effect",
+                "Selection",
                 "Terminal",
             ],
             Self::Workspaces => &[
@@ -1075,6 +1085,17 @@ impl SettingsSection {
                 && crate::i18n::tr("settings-window-opacity")
                     .to_lowercase()
                     .contains(query))
+            || (self == Self::Terminal
+                && [
+                    "settings-terminal-mouse-heading",
+                    "settings-selection-style",
+                    "settings-copy-on-select",
+                    "settings-right-click",
+                    "settings-right-click-paste",
+                    "settings-copy-effect",
+                ]
+                .iter()
+                .any(|id| crate::i18n::tr(id).to_lowercase().contains(query)))
     }
 }
 
@@ -1087,6 +1108,24 @@ mod settings_search_tests {
         assert!(SettingsSection::General.matches_search("language"));
         let localized_label = crate::i18n::tr("settings-language").to_lowercase();
         assert!(SettingsSection::General.matches_search(&localized_label));
+    }
+
+    #[test]
+    fn terminal_is_found_by_its_mouse_and_clipboard_card() {
+        for query in [
+            "right click",
+            "mouse",
+            "clipboard",
+            "paste",
+            "copy",
+            "selection style",
+            "rounded",
+            "copy on select",
+        ] {
+            assert!(SettingsSection::Terminal.matches_search(query), "{}", query);
+        }
+        let localized_label = crate::i18n::tr("settings-right-click").to_lowercase();
+        assert!(SettingsSection::Terminal.matches_search(&localized_label));
     }
 
     #[test]
@@ -1239,6 +1278,32 @@ fn localized_scroll_mode_label(mode: crate::native_settings::NativeScrollMode) -
     crate::i18n::tr(match mode {
         NativeScrollMode::Stepped => "settings-scroll-mode-stepped",
         NativeScrollMode::Smooth => "settings-scroll-mode-smooth",
+    })
+}
+
+fn localized_selection_style_label(style: crate::native_settings::NativeSelectionStyle) -> String {
+    use crate::native_settings::NativeSelectionStyle;
+    crate::i18n::tr(match style {
+        NativeSelectionStyle::Rounded => "settings-selection-style-rounded",
+        NativeSelectionStyle::Square => "settings-selection-style-square",
+    })
+}
+
+fn localized_right_click_label(mode: crate::native_settings::NativeRightClick) -> String {
+    use crate::native_settings::NativeRightClick;
+    crate::i18n::tr(match mode {
+        NativeRightClick::Menu => "settings-right-click-menu",
+        NativeRightClick::Paste => "settings-right-click-paste",
+        NativeRightClick::CopyOrPaste => "settings-right-click-copy-or-paste",
+    })
+}
+
+fn localized_copy_effect_label(effect: crate::native_settings::NativeCopyEffect) -> String {
+    use crate::native_settings::NativeCopyEffect;
+    crate::i18n::tr(match effect {
+        NativeCopyEffect::Off => "settings-copy-effect-off",
+        NativeCopyEffect::White => "settings-copy-effect-white",
+        NativeCopyEffect::Color => "settings-copy-effect-color",
     })
 }
 
@@ -1538,6 +1603,10 @@ enum SettingsAction {
     ToggleBottomQuote,
     SetRemotePaneResizeMode(NativeRemotePaneResizeMode),
     SetScrollMode(crate::native_settings::NativeScrollMode),
+    SetSelectionStyle(crate::native_settings::NativeSelectionStyle),
+    ToggleCopyOnSelect,
+    SetRightClick(crate::native_settings::NativeRightClick),
+    SetCopyEffect(crate::native_settings::NativeCopyEffect),
     /// Hand the choosing to the command palette's scheme list, which already
     /// has the search and the live preview a thousand entries need.
     OpenColorSchemePicker,
@@ -4920,6 +4989,48 @@ impl SettingsWindow {
         }
     }
 
+    /// Save one of the mouse and clipboard choices. Merged into the freshest
+    /// settings for the reason `apply_text_contrast` gives; each is read
+    /// where it is used, so nothing needs telling.
+    fn apply_terminal_choice(
+        &mut self,
+        setting: &str,
+        value: String,
+        write: impl FnOnce(&mut crate::native_settings::NativeTerminalSettings),
+    ) {
+        let done = settings_tr(
+            "settings-status-value-now",
+            &[("setting", crate::i18n::tr(setting)), ("value", value)],
+        );
+        self.apply_terminal_change(setting, done, write);
+    }
+
+    /// `apply_terminal_choice` with the line to show once it is saved.
+    fn apply_terminal_change(
+        &mut self,
+        setting: &str,
+        done: String,
+        write: impl FnOnce(&mut crate::native_settings::NativeTerminalSettings),
+    ) {
+        self.ui.open_dropdown = None;
+        let mut merged = crate::native_settings::load();
+        write(&mut merged.terminal);
+        self.set_native_settings(merged);
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                self.status = done;
+            }
+            Err(err) => {
+                // Not kept: the choice shown goes back to the one in force.
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", crate::i18n::tr(setting)), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     fn apply_text_contrast(&mut self, mode: crate::native_settings::NativeTextContrast) {
         self.ui.open_dropdown = None;
         // Merge into the freshest settings rather than writing this window's
@@ -5846,6 +5957,32 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::SetScrollMode(mode) => self.apply_scroll_mode(mode),
+            SettingsAction::ToggleCopyOnSelect => {
+                let on = !self.native_settings.terminal.copy_on_select;
+                let done = crate::i18n::tr(if on {
+                    "settings-status-copy-on-select-on"
+                } else {
+                    "settings-status-copy-on-select-off"
+                });
+                self.apply_terminal_change("settings-copy-on-select", done, |terminal| {
+                    terminal.copy_on_select = on
+                })
+            }
+            SettingsAction::SetSelectionStyle(style) => self.apply_terminal_choice(
+                "settings-selection-style",
+                localized_selection_style_label(style),
+                |terminal| terminal.selection_style = style,
+            ),
+            SettingsAction::SetRightClick(mode) => {
+                self.apply_terminal_choice("settings-right-click", localized_right_click_label(mode), |terminal| {
+                    terminal.right_click = mode
+                })
+            }
+            SettingsAction::SetCopyEffect(effect) => self.apply_terminal_choice(
+                "settings-copy-effect",
+                localized_copy_effect_label(effect),
+                |terminal| terminal.copy_effect = effect,
+            ),
             SettingsAction::SetWindowOpacity(opacity) => self.apply_window_opacity(opacity),
             // Handled as a drag, on press and release.
             SettingsAction::WindowOpacitySlider => {}
@@ -12501,6 +12638,124 @@ impl SettingsWindow {
                 selected,
                 rows.rule(),
             )?);
+            Ok(rows.bottom)
+        })?;
+
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            bottom,
+            max_width,
+            &crate::i18n::tr("settings-terminal-mouse-heading"),
+        )?;
+        let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            use crate::native_settings::{NativeCopyEffect, NativeRightClick, NativeSelectionStyle};
+            let mut rows = RowCursor::new(top, this);
+            let terminal = &this.native_settings.terminal;
+            let (style, right_click, effect) =
+                (terminal.selection_style, terminal.right_click, terminal.copy_effect);
+
+            let options: Vec<(String, SettingsAction)> = NativeSelectionStyle::ALL
+                .iter()
+                .map(|s| (localized_selection_style_label(*s), SettingsAction::SetSelectionStyle(*s)))
+                .collect();
+            let selected = NativeSelectionStyle::ALL.iter().position(|s| *s == style).unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::SquareRoundCorner,
+                TileColor::Indigo,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-selection-style"),
+                &crate::i18n::tr("settings-selection-style-description"),
+                &options,
+                selected,
+                rows.rule(),
+            )?);
+
+            let copy_on_select = this.native_settings.terminal.copy_on_select;
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::ClipboardCopy,
+                TileColor::Teal,
+            )?;
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-copy-on-select"),
+                &crate::i18n::tr("settings-copy-on-select-description"),
+                copy_on_select,
+                SettingsAction::ToggleCopyOnSelect,
+                rows.rule(),
+            )?);
+
+            let options: Vec<(String, SettingsAction)> = NativeRightClick::ALL
+                .iter()
+                .map(|mode| (localized_right_click_label(*mode), SettingsAction::SetRightClick(*mode)))
+                .collect();
+            let selected = NativeRightClick::ALL.iter().position(|mode| *mode == right_click).unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::ClipboardPaste,
+                TileColor::Teal,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-right-click"),
+                // The key is Control on a Mac, Ctrl (or Strg) elsewhere.
+                &crate::i18n::tr(if cfg!(target_os = "macos") {
+                    "settings-right-click-description-macos"
+                } else {
+                    "settings-right-click-description"
+                }),
+                &options,
+                selected,
+                rows.rule(),
+            )?);
+
+            let options: Vec<(String, SettingsAction)> = NativeCopyEffect::ALL
+                .iter()
+                .map(|effect| (localized_copy_effect_label(*effect), SettingsAction::SetCopyEffect(*effect)))
+                .collect();
+            let selected = NativeCopyEffect::ALL.iter().position(|e| *e == effect).unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Copy,
+                TileColor::Blue,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-copy-effect"),
+                &crate::i18n::tr("settings-copy-effect-description"),
+                &options,
+                selected,
+                rows.rule(),
+            )?);
+
             Ok(rows.bottom)
         })?;
 

@@ -3047,6 +3047,13 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     context_menu: Option<ui::context_menu::ContextMenuState>,
+    /// Lights running round copied or pasted text, and a paste waiting to
+    /// show up for one (see `render::edge_light`).
+    edge_lights: Vec<render::edge_light::EdgeLight>,
+    pending_paste: Option<render::edge_light::PendingPaste>,
+    /// A mouse binding took the right button's press: its release does not
+    /// run the built-in right click as well.
+    right_press_claimed: bool,
     recording_overlay: ui::recording_overlay::RecordingOverlay,
     command_palette: Option<ui::command_palette::CommandPaletteState>,
     /// The contrast floor text is held to, or `None` to leave the
@@ -4053,12 +4060,37 @@ impl TermWindow {
     /// paint and the unfocused repaint throttle must agree on this set,
     /// so both read it from here: a state added to one but not the other
     /// silently strands frames or throttles what must not be throttled.
+    /// A selection was let go of: copied to `dest` while the setting has
+    /// selecting copy, and lit up for it. Otherwise only the primary
+    /// selection follows it where there is one (X11, Wayland), as every
+    /// program there keeps it for the middle button; macOS and Windows have
+    /// none, writing that would reach the clipboard.
+    fn copy_selection_let_go(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        dest: config::keyassignment::ClipboardCopyDestination,
+        text: String,
+    ) {
+        use config::keyassignment::ClipboardCopyDestination;
+        if crate::native_settings::copy_on_select() {
+            self.copy_to_clipboard(dest, text);
+            self.light_up_selection(pane, false);
+        } else if cfg!(not(any(windows, target_os = "macos"))) {
+            self.copy_to_clipboard(ClipboardCopyDestination::PrimarySelection, text);
+        }
+    }
+
     pub(crate) fn owes_frames_regardless_of_focus(&self) -> bool {
         self.content_view_fade.is_some()
             || self.active_content_view_index().is_some()
             || self.workspace_sidebar_hover.needs_frames()
             || self.right_sidebar_hover.needs_frames()
             || self.overlay_scrollbar_owes_frames()
+            // A light still running, or a paste still to show up for one:
+            // copying and then switching to the app to paste it in is the
+            // usual way, and a light left frozen on screen would stay.
+            || !self.edge_lights.is_empty()
+            || self.pending_paste.is_some()
     }
 
     /// An overlay scrollbar that is still up has a fade to finish; the
@@ -4771,6 +4803,9 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             context_menu: None,
+            edge_lights: vec![],
+            pending_paste: None,
+            right_press_claimed: false,
             recording_overlay: Default::default(),
             command_palette: None,
             text_min_contrast: crate::native_settings::text_min_contrast_ratio(&config),
@@ -5493,7 +5528,9 @@ impl TermWindow {
                     Some(pane) => pane,
                     None => return Ok(true),
                 };
+                let cursor = pane.get_cursor_position();
                 pane.send_paste(text.as_str())?;
+                self.light_up_terminal_paste(&pane, &text, cursor);
                 Ok(true)
             }
             WindowEvent::DroppedUrl(urls) => {
@@ -5507,7 +5544,9 @@ impl TermWindow {
                     .collect::<Vec<_>>()
                     .join(" ")
                     + " ";
+                let cursor = pane.get_cursor_position();
                 pane.send_paste(urls.as_str())?;
+                self.light_up_terminal_paste(&pane, &urls, cursor);
                 Ok(true)
             }
             WindowEvent::DroppedFile { paths, coords } => {
@@ -5596,7 +5635,9 @@ impl TermWindow {
                     .collect::<Vec<_>>()
                     .join(" ")
                     + " ";
+                let cursor = pane.get_cursor_position();
                 pane.send_paste(&paths)?;
+                self.light_up_terminal_paste(&pane, &paths, cursor);
                 Ok(true)
             }
             WindowEvent::DraggedFile { coords, .. } => {
@@ -10501,6 +10542,7 @@ impl TermWindow {
             let text = self.selection_text(pane);
             if !text.is_empty() {
                 self.copy_to_clipboard(*destination, text);
+                self.light_up_selection(pane, false);
                 return Ok(PerformAssignmentResult::Handled);
             }
             if let Some(text) = self.right_sidebar_file_preview_selected_text() {
@@ -10967,7 +11009,7 @@ impl TermWindow {
                 // system clipboard just from selecting/clicking.
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
-                    self.copy_to_clipboard(*dest, text);
+                    self.copy_selection_let_go(pane, *dest, text);
                     let window = self.window.as_ref().unwrap();
                     window.invalidate();
                 } else {
@@ -10977,7 +11019,7 @@ impl TermWindow {
             CompleteSelection(dest) => {
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
-                    self.copy_to_clipboard(*dest, text);
+                    self.copy_selection_let_go(pane, *dest, text);
                     let window = self.window.as_ref().unwrap();
                     window.invalidate();
                 }

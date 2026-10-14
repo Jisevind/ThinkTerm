@@ -2,7 +2,9 @@
 
 Right-click a terminal and choose **Edit Recording Masks…**. If a terminal
 application captures the mouse, hold the mouse-reporting bypass modifier
-(Shift by default) while right-clicking.
+(Shift by default) while right-clicking. If **Settings → Terminal → Right
+click** is set to anything but Menu, hold Control (Ctrl on Windows and Linux)
+as well to get the menu.
 
 - The floating toolbar starts near the bottom of the window. Drag its top handle
   or the gaps between buttons to move it.

@@ -249,6 +249,66 @@ impl NativeScrollMode {
     pub(crate) const ALL: [Self; 2] = [Self::Smooth, Self::Stepped];
 }
 
+/// How the selection is drawn: one shape with rounded corners, or a plain
+/// block per row as it always was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeSelectionStyle {
+    Rounded,
+    Square,
+}
+
+impl Default for NativeSelectionStyle {
+    fn default() -> Self {
+        Self::Rounded
+    }
+}
+
+impl NativeSelectionStyle {
+    pub(crate) const ALL: [Self; 2] = [Self::Rounded, Self::Square];
+}
+
+/// What a right click in a terminal does when no mouse binding claims it.
+/// Whichever is picked, Control with the right click opens the menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeRightClick {
+    Menu,
+    Paste,
+    /// Copy the selection when there is one (and let it go), else paste.
+    CopyOrPaste,
+}
+
+impl Default for NativeRightClick {
+    fn default() -> Self {
+        Self::Menu
+    }
+}
+
+impl NativeRightClick {
+    pub(crate) const ALL: [Self; 3] = [Self::Menu, Self::Paste, Self::CopyOrPaste];
+}
+
+/// The light that runs round copied or pasted text. Off unless chosen:
+/// what a new version changes for everyone is only the rounded selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCopyEffect {
+    Off,
+    White,
+    Color,
+}
+
+impl Default for NativeCopyEffect {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl NativeCopyEffect {
+    pub(crate) const ALL: [Self; 3] = [Self::Off, Self::White, Self::Color];
+}
+
 /// The floor the terminal holds text to against whatever it is drawn on.
 ///
 /// A program that paints its own background is self-consistent and is never
@@ -313,6 +373,20 @@ where
             NativeTextContrast::default()
         }
     })
+}
+
+/// The same for any of the plain choices: one this build cannot read (a
+/// newer build's, or a typo) reads as its default, and the file is kept.
+fn choice_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(&raw).unwrap_or_else(|_| {
+        log::warn!("unknown choice {raw} in the settings; using the default");
+        T::default()
+    }))
 }
 
 impl Default for NativeBottomQuoteMode {
@@ -520,6 +594,16 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) font_family: Option<String>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
     pub(crate) scroll_mode: NativeScrollMode,
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) selection_style: NativeSelectionStyle,
+    /// A selection let go of is copied to the clipboard, as WezTerm and
+    /// iTerm2 do; off, it only selects, as in Apple's Terminal.
+    #[serde(default = "default_true")]
+    pub(crate) copy_on_select: bool,
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) right_click: NativeRightClick,
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) copy_effect: NativeCopyEffect,
     /// See [`NativeTextContrast`]. `Off` defers to the Lua
     /// `text_min_contrast_ratio`, which is itself off unless set.
     #[serde(deserialize_with = "text_contrast_or_default")]
@@ -541,6 +625,10 @@ impl Default for NativeTerminalSettings {
             font_family: None,
             remote_pane_resize_mode: NativeRemotePaneResizeMode::default(),
             scroll_mode: NativeScrollMode::default(),
+            selection_style: NativeSelectionStyle::default(),
+            copy_on_select: true,
+            right_click: NativeRightClick::default(),
+            copy_effect: NativeCopyEffect::default(),
             text_contrast: NativeTextContrast::default(),
             bottom_quote_enabled: false,
             bottom_quote_mode: NativeBottomQuoteMode::default(),
@@ -559,6 +647,26 @@ pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
 /// `load`, which deep-clones the whole settings tree.
 pub(crate) fn scroll_mode() -> NativeScrollMode {
     load_shared().terminal.scroll_mode
+}
+
+/// Read whenever a selection is let go of, through the shared handle.
+pub(crate) fn copy_on_select() -> bool {
+    load_shared().terminal.copy_on_select
+}
+
+/// Read for every pane drawn, through the shared handle.
+pub(crate) fn selection_rounded() -> bool {
+    load_shared().terminal.selection_style == NativeSelectionStyle::Rounded
+}
+
+/// Read on every right click, through the shared handle.
+pub(crate) fn right_click() -> NativeRightClick {
+    load_shared().terminal.right_click
+}
+
+/// Read on every copy and paste, through the shared handle.
+pub(crate) fn copy_effect() -> NativeCopyEffect {
+    load_shared().terminal.copy_effect
 }
 
 /// The contrast floor in force, or `None` to leave colours alone. The
@@ -2843,6 +2951,45 @@ mod tests {
             "everything else is kept"
         );
         assert_eq!(settings.onboarding.seen_version, 7);
+    }
+
+    /// The mouse and clipboard choices too: a typo, or a newer build's
+    /// value, costs that one field and nothing else; a field this build no
+    /// longer has is passed over.
+    #[test]
+    fn unknown_mouse_and_clipboard_choices_do_not_take_the_rest_with_them() {
+        let json = r#"{
+            "version": 1,
+            "terminal": {
+                "selection_style": "pill",
+                "right_click": "copy-or-paste",
+                "copy_effect": "colour",
+                "copy_effect_path": "around",
+                "scroll_mode": "stepped"
+            },
+            "localization": { "language": "ja-JP" }
+        }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.terminal.selection_style, NativeSelectionStyle::default());
+        assert_eq!(settings.terminal.right_click, NativeRightClick::default());
+        assert_eq!(settings.terminal.copy_effect, NativeCopyEffect::default());
+        assert_eq!(settings.terminal.scroll_mode, NativeScrollMode::Stepped);
+        assert_eq!(settings.localization.language.as_deref(), Some("ja-JP"));
+
+        // Selecting copies unless turned off.
+        assert!(settings.terminal.copy_on_select);
+
+        // The ones this build knows still read as written.
+        let json = r#"{ "version": 1, "terminal": {
+            "selection_style": "square", "copy_on_select": false, "right_click": "copy_or_paste",
+            "copy_effect": "color"
+        } }"#;
+        let settings: ThinkTermNativeSettings = serde_json::from_str(json).unwrap();
+        assert!(!settings.terminal.copy_on_select);
+        assert_eq!(settings.terminal.selection_style, NativeSelectionStyle::Square);
+        assert_eq!(settings.terminal.right_click, NativeRightClick::CopyOrPaste);
+        assert_eq!(settings.terminal.copy_effect, NativeCopyEffect::Color);
     }
 
     /// The four this build does know still round-trip.

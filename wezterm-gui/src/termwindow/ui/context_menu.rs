@@ -603,7 +603,19 @@ impl crate::TermWindow {
                 }
                 self.dismiss_fallback_context_menu();
                 context.invalidate();
-                false
+                // A right click goes on to open the menu of whatever it is on
+                // -- a tab, a sidebar row, or a terminal set to show its menu --
+                // where it is. One on a terminal that would paste or copy
+                // only closes this one.
+                let on_terminal = self.resolve_ui_item(event).is_none();
+                if !on_terminal
+                    || crate::termwindow::mouseevent::right_click_mode(event.modifiers)
+                        == crate::native_settings::NativeRightClick::Menu
+                {
+                    return false;
+                }
+                self.context_menu_suppressed_release = Some(MousePress::Right);
+                true
             }
             MouseEventKind::Release(_)
             | MouseEventKind::VertWheel(_)

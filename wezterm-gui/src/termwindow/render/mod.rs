@@ -44,11 +44,13 @@ use window::color::LinearRgba;
 pub mod borders;
 pub mod corners;
 pub mod draw;
+pub mod edge_light;
 pub mod fancy_tab_bar;
 pub mod hover;
 pub mod paint;
 pub mod pane;
 pub mod screen_line;
+pub mod selection_shape;
 pub mod split;
 pub mod tab_bar;
 pub mod window_buttons;
@@ -69,6 +71,13 @@ pub struct LineQuadCacheKey {
     /// Only set if cursor.y == stable_row
     pub composing: Option<String>,
     pub selection: Range<usize>,
+    /// The selection on the rows above and below: this row's part of the
+    /// shape depends on them (see `selection_shape`).
+    pub selection_neighbors: (Range<usize>, Range<usize>),
+    /// The selection colours only the text: a light draws the block.
+    pub selection_text_only: bool,
+    /// Its corners are rounded (see `selection_shape`); only with one.
+    pub selection_rounded: bool,
     pub shape_hash: [u8; 16],
     pub font_identity: u64,
     pub top_pixel_y: NotNan<f32>,
@@ -210,6 +219,14 @@ pub struct RenderScreenLineParams<'a> {
     pub stable_line_idx: Option<StableRowIndex>,
     pub line: &'a Line,
     pub selection: Range<usize>,
+    /// The selection on the rows above and below, for the shape of this
+    /// row's part of it; empty where there is none.
+    pub selection_neighbors: (Range<usize>, Range<usize>),
+    /// Only the text in `selection` takes its colours; its block is drawn
+    /// by a light (see `edge_light`).
+    pub selection_text_only: bool,
+    /// The selection's corners are rounded, or square as they always were.
+    pub selection_rounded: bool,
     pub cursor: &'a StableCursorPosition,
     pub palette: &'a ColorPalette,
     pub dims: &'a RenderableDimensions,
@@ -1482,6 +1499,9 @@ mod line_quad_cache_tests {
             quad_generation: 0,
             composing: None,
             selection: 0..0,
+            selection_neighbors: (0..0, 0..0),
+            selection_text_only: false,
+            selection_rounded: false,
             shape_hash: [0; 16],
             font_identity: 0,
             top_pixel_y: NotNan::new(0.0).unwrap(),

@@ -9,6 +9,8 @@ use crate::termwindow::render::{
     same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     RenderScreenLineParams,
 };
+use crate::termwindow::render::edge_light::LightArea;
+use crate::termwindow::render::selection_shape::{drawn_neighbours, selected_span};
 use crate::agent_status::{AgentEvidence, AgentState, ProgramReportState};
 use crate::termwindow::ui::agent_panel::{AGENT_BLOCKED_COLOR, AGENT_DONE_COLOR};
 use crate::termwindow::ui::icons::SvgIcon;
@@ -2007,6 +2009,11 @@ impl crate::TermWindow {
                 filled_box: TextureRect,
                 window_is_transparent: bool,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
+                /// The drawn rows of double width, noted for the lights while
+                /// any are running.
+                double_width_rows: Vec<StableRowIndex>,
+                /// The selection's corners are rounded (the setting).
+                selection_rounded: bool,
                 error: Option<anyhow::Error>,
             }
 
@@ -2100,22 +2107,70 @@ impl crate::TermWindow {
                 filled_box,
                 window_is_transparent,
                 layers,
+                double_width_rows: vec![],
+                selection_rounded: crate::native_settings::selection_rounded(),
                 error: None,
             };
 
+            /// What of the selection one drawn row shows.
+            struct RowSelection {
+                span: std::ops::Range<usize>,
+                /// The spans of the rows above and below, as far as they
+                /// shape this row's part.
+                neighbours: (std::ops::Range<usize>, std::ops::Range<usize>),
+                /// Only the text takes the selection's colours: the block
+                /// under it is a light's, fading out.
+                text_only: bool,
+            }
+
             impl<'a, 'b> LineRender<'a, 'b> {
+                /// The selection on each drawn row, with the rows just
+                /// beyond the first and the last at either end: one more
+                /// entry before the first line and one after the last.
+                /// Empty (and not allocated) with no selection.
+                fn selection_spans(
+                    &self,
+                    stable_top: StableRowIndex,
+                    lines: &[&mut Line],
+                ) -> Vec<std::ops::Range<usize>> {
+                    let Some(sel) = self.selrange.filter(|_| !lines.is_empty()) else {
+                        return vec![];
+                    };
+                    let selected = |stable_row: StableRowIndex| {
+                        selected_span(&sel, stable_row, self.rectangular, self.dims.cols)
+                    };
+                    let mut spans = Vec::with_capacity(lines.len() + 2);
+                    spans.push(0..0);
+                    spans.extend(
+                        (0..lines.len()).map(|line_idx| selected(stable_top + line_idx as StableRowIndex)),
+                    );
+                    // Past the drawn rows the selection only runs straight on:
+                    // the edge cut there is not a corner.
+                    if !selected(stable_top - 1).is_empty() {
+                        spans[0] = spans[1].clone();
+                    }
+                    let after = stable_top + lines.len() as StableRowIndex;
+                    spans.push(if selected(after).is_empty() {
+                        0..0
+                    } else {
+                        spans[lines.len()].clone()
+                    });
+                    spans
+                }
+
                 fn render_line(
                     &mut self,
                     stable_top: StableRowIndex,
                     line_idx: usize,
                     line: &&mut Line,
+                    selection: RowSelection,
                 ) -> anyhow::Result<()> {
                     let stable_row = stable_top + line_idx as StableRowIndex;
-                    let selrange = self
-                        .selrange
-                        .map_or(0..0, |sel| sel.cols_for_row(stable_row, self.rectangular));
-                    // Constrain to the pane width!
-                    let selrange = selrange.start..selrange.end.min(self.dims.cols);
+                    let RowSelection {
+                        span: selrange,
+                        neighbours: selection_neighbors,
+                        text_only: selection_text_only,
+                    } = selection;
 
                     let (cursor, composing, password_input) = if self.cursor.y == stable_row {
                         (
@@ -2172,6 +2227,9 @@ impl crate::TermWindow {
                         font_identity: self.font_identity,
                         composing: composing.clone(),
                         selection: selrange.clone(),
+                        selection_neighbors: selection_neighbors.clone(),
+                        selection_text_only,
+                        selection_rounded: self.selection_rounded && !selrange.is_empty(),
                         cursor,
                         shape_hash,
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
@@ -2265,6 +2323,9 @@ impl crate::TermWindow {
                                 stable_line_idx: Some(stable_row),
                                 line: &line,
                                 selection: selrange.clone(),
+                                selection_neighbors: selection_neighbors.clone(),
+                                selection_text_only,
+                                selection_rounded: self.selection_rounded,
                                 cursor: &self.cursor,
                                 palette: &self.palette,
                                 dims: &self.dims,
@@ -2350,8 +2411,56 @@ impl crate::TermWindow {
 
             impl<'a, 'b> WithPaneLines for LineRender<'a, 'b> {
                 fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
+                    self.term_window
+                        .find_pending_paste(self.pane_id, stable_top, lines, self.dims.cols);
+                    let spans = self.selection_spans(stable_top, lines);
+                    let span = |index: usize| spans.get(index).cloned().unwrap_or(0..0);
+                    let double = |line_idx: usize| {
+                        lines.get(line_idx).is_some_and(|line| !line.is_single_width())
+                    };
+                    let rows = stable_top..stable_top + lines.len() as StableRowIndex;
+                    let blocks = if self.term_window.edge_lights.is_empty() {
+                        vec![]
+                    } else {
+                        // The light's outline counts their cells twice.
+                        self.double_width_rows = (0..lines.len())
+                            .filter(|line_idx| double(*line_idx))
+                            .map(|line_idx| stable_top + line_idx as StableRowIndex)
+                            .collect();
+                        self.term_window
+                            .light_block_spans(self.pane_id, rows, self.dims.cols)
+                    };
                     for (line_idx, line) in lines.iter().enumerate() {
-                        if let Err(err) = self.render_line(stable_top, line_idx, line) {
+                        let own = span(line_idx + 1);
+                        let selection = if own.is_empty() {
+                            let block = blocks.get(line_idx).cloned().unwrap_or(0..0);
+                            RowSelection {
+                                text_only: !block.is_empty(),
+                                span: block,
+                                neighbours: (0..0, 0..0),
+                            }
+                        } else if !self.selection_rounded {
+                            // Square, a row's block is its own alone.
+                            RowSelection {
+                                span: own,
+                                neighbours: (0..0, 0..0),
+                                text_only: false,
+                            }
+                        } else {
+                            let above = span(line_idx);
+                            let below = span(line_idx + 2);
+                            RowSelection {
+                                neighbours: drawn_neighbours(
+                                    &own,
+                                    (&above, line_idx > 0 && double(line_idx - 1)),
+                                    (&below, double(line_idx + 1)),
+                                    double(line_idx),
+                                ),
+                                span: own,
+                                text_only: false,
+                            }
+                        };
+                        if let Err(err) = self.render_line(stable_top, line_idx, line, selection) {
                             self.error.replace(err);
                             return;
                         }
@@ -2370,6 +2479,41 @@ impl crate::TermWindow {
             render.term_window.line_render_y_offset.set(0.0);
             if let Some(error) = render.error.take() {
                 return Err(error).context("error while calling with_lines_mut");
+            }
+
+            // The light round copied or pasted text, over the rows, cut to
+            // the pane like they are; where it would run past the pane's
+            // edge it runs just inside it.
+            if !render.term_window.edge_lights.is_empty() {
+                let mut lights = HeapQuadAllocator::default();
+                let area = LightArea {
+                    rows: stable_range.clone(),
+                    origin: (left_pixel_x, pane_top_pixel_y - scroll_px),
+                    cell: (
+                        pane_render_metrics.cell_size.width as f32,
+                        pane_render_metrics.cell_size.height as f32,
+                    ),
+                    cols: render_dims.cols,
+                    bounds: (
+                        left_pixel_x,
+                        content_top,
+                        left_pixel_x
+                            + render_dims.cols as f32 * pane_render_metrics.cell_size.width as f32,
+                        pane_top_pixel_y
+                            + render_dims.viewport_rows as f32
+                                * pane_render_metrics.cell_size.height as f32,
+                    ),
+                    double_width: std::mem::take(&mut render.double_width_rows),
+                    rounded: render.selection_rounded,
+                };
+                render.term_window.paint_edge_lights(
+                    &mut TripleLayerQuadAllocator::Heap(&mut lights),
+                    pane_id,
+                    &area,
+                    selection_bg,
+                    default_bg,
+                )?;
+                lights.apply_to_clipped_at(render.layers, 0.0, 0.0, render.pane_clip, 1.0)?;
             }
 
             // The overlay scrollbar goes on after the text it sits over.

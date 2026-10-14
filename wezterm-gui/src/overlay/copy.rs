@@ -517,6 +517,8 @@ impl CopyRenderable {
                 let mut selection = term_window.selection(pane_id);
                 selection.origin = Some(start);
                 selection.range = Some(range);
+                // Its range runs from the anchor to the cursor.
+                selection.backwards = false;
                 selection.rectangular = mode == SelectionMode::Block;
                 window.invalidate();
             })));

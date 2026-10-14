@@ -941,6 +941,7 @@ impl QuickSelectRenderable {
                         let mut selection = term_window.selection(pane_id);
                         let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
                         selection.origin = Some(start);
+                        selection.backwards = false;
                         selection.range = Some(SelectionRange {
                             start,
                             // inclusive range for selection, but the result
@@ -958,7 +959,10 @@ impl QuickSelectRenderable {
                     let text = term_window.selection_text(&pane);
                     if !text.is_empty() {
                         if paste {
-                            let _ = pane.send_paste(&text);
+                            let cursor = pane.get_cursor_position();
+                            if pane.send_paste(&text).is_ok() {
+                                term_window.light_up_paste(&pane, &text, cursor);
+                            }
                         }
                         if let Some(action) = action {
                             if !paste || !skip_action_on_paste {
@@ -969,6 +973,7 @@ impl QuickSelectRenderable {
                                 ClipboardCopyDestination::ClipboardAndPrimarySelection,
                                 text,
                             );
+                            term_window.light_up_selection(&pane, false);
                         }
                     }
                 }

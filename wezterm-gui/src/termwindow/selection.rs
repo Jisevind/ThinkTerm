@@ -133,6 +133,9 @@ impl super::TermWindow {
                     .unwrap_or(SelectionCoordinate::x_y(x, y));
                 self.selection(pane.pane_id()).origin = Some(origin);
                 self.selection(pane.pane_id()).rectangular = mode == SelectionMode::Block;
+                // Its range runs from the origin to the pointer, which says
+                // which way it went.
+                self.selection(pane.pane_id()).backwards = false;
 
                 // Compute the start and end horizontall cell of the selection.
                 // The selection extent depends on the mouse cursor position in relation
@@ -194,6 +197,8 @@ impl super::TermWindow {
                 let selection_range = start_word.extend_with(end_word);
                 self.selection(pane.pane_id()).range = Some(selection_range);
                 self.selection(pane.pane_id()).rectangular = false;
+                self.selection(pane.pane_id()).backwards = (end_word.start.y, end_word.start.x)
+                    < (start_word.start.y, start_word.start.x);
             }
             SelectionMode::Line => {
                 let end_line = SelectionRange::line_around(SelectionCoordinate::x_y(x, y), &**pane);
@@ -208,6 +213,7 @@ impl super::TermWindow {
                 let selection_range = start_line.extend_with(end_line);
                 self.selection(pane.pane_id()).range = Some(selection_range);
                 self.selection(pane.pane_id()).rectangular = false;
+                self.selection(pane.pane_id()).backwards = end_line.start.y < start_line.start.y;
             }
             SelectionMode::SemanticZone => {
                 let end_word = SelectionRange::zone_around(SelectionCoordinate::x_y(x, y), &**pane);
@@ -222,6 +228,8 @@ impl super::TermWindow {
                 let selection_range = start_word.extend_with(end_word);
                 self.selection(pane.pane_id()).range = Some(selection_range);
                 self.selection(pane.pane_id()).rectangular = false;
+                self.selection(pane.pane_id()).backwards = (end_word.start.y, end_word.start.x)
+                    < (start_word.start.y, start_word.start.x);
             }
         }
 
@@ -253,6 +261,7 @@ impl super::TermWindow {
                 self.selection(pane.pane_id()).origin = Some(start);
                 self.selection(pane.pane_id()).range = Some(selection_range);
                 self.selection(pane.pane_id()).rectangular = false;
+                self.selection(pane.pane_id()).backwards = false;
             }
             SelectionMode::Word => {
                 let selection_range =
@@ -261,6 +270,7 @@ impl super::TermWindow {
                 self.selection(pane.pane_id()).origin = Some(selection_range.start);
                 self.selection(pane.pane_id()).range = Some(selection_range);
                 self.selection(pane.pane_id()).rectangular = false;
+                self.selection(pane.pane_id()).backwards = false;
             }
             SelectionMode::SemanticZone => {
                 let selection_range =
@@ -269,6 +279,7 @@ impl super::TermWindow {
                 self.selection(pane.pane_id()).origin = Some(selection_range.start);
                 self.selection(pane.pane_id()).range = Some(selection_range);
                 self.selection(pane.pane_id()).rectangular = false;
+                self.selection(pane.pane_id()).backwards = false;
             }
             SelectionMode::Cell | SelectionMode::Block => {
                 self.selection(pane.pane_id())

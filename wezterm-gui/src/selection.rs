@@ -19,6 +19,9 @@ pub struct Selection {
     pub seqno: SequenceNo,
     /// Whether the selection is rectangular
     pub rectangular: bool,
+    /// It was dragged back from where it was begun, by word, line or zone:
+    /// those keep `range` in order, so it does not say.
+    pub backwards: bool,
 }
 
 pub use config::keyassignment::SelectionMode;
@@ -27,11 +30,13 @@ impl Selection {
     pub fn clear(&mut self) {
         self.range = None;
         self.origin = None;
+        self.backwards = false;
     }
 
     pub fn begin(&mut self, origin: SelectionCoordinate) {
         self.range = None;
         self.origin = Some(origin);
+        self.backwards = false;
     }
 
     pub fn is_empty(&self) -> bool {

@@ -1589,7 +1589,7 @@ impl super::TermWindow {
         true
     }
 
-    fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
+    pub(crate) fn resolve_ui_item(&self, event: &MouseEvent) -> Option<UIItem> {
         let x = event.coords.x;
         let y = event.coords.y;
         self.ui_items
@@ -2538,7 +2538,11 @@ impl super::TermWindow {
                 }
                 return;
             };
-            if event.kind == WMEK::Press(MousePress::Left) && self.right_sidebar_has_text_focus() {
+            // A right click pastes or copies in the terminal too, which a
+            // sidebar field still holding the keys would take instead.
+            if matches!(event.kind, WMEK::Press(MousePress::Left | MousePress::Right))
+                && self.right_sidebar_has_text_focus()
+            {
                 self.clear_right_sidebar_text_focus();
                 context.invalidate();
             }
@@ -8664,6 +8668,48 @@ impl super::TermWindow {
         }
     }
 
+    /// A right click in a terminal that no mouse binding claimed: what the
+    /// settings ask for, or the menu while Control is held.
+    fn terminal_right_click(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        context: &dyn WindowOps,
+        coords: ::window::Point,
+        modifiers: ::window::Modifiers,
+    ) {
+        use crate::native_settings::NativeRightClick;
+        let assignments = match right_click_mode(modifiers) {
+            NativeRightClick::Menu => {
+                let items = self.terminal_context_menu_items();
+                self.show_term_context_menu(context, coords, items);
+                return;
+            }
+            NativeRightClick::CopyOrPaste => {
+                // A selection of nothing but blank cells copies as nothing:
+                // that is a paste, not a copy that would empty the clipboard.
+                let text = self.selection_text(pane);
+                if text.is_empty() {
+                    vec![KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard)]
+                } else {
+                    // As other terminals do it: the copy lets the selection
+                    // go, so the next right click pastes. Its block fades out
+                    // with the light rather than vanishing under it.
+                    self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+                    self.light_up_selection(pane, true);
+                    vec![KeyAssignment::ClearSelection]
+                }
+            }
+            NativeRightClick::Paste => {
+                vec![KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard)]
+            }
+        };
+        for assignment in assignments {
+            if let Err(err) = self.perform_key_assignment(pane, &assignment) {
+                log::warn!("right click {assignment:?}: {err:#}");
+            }
+        }
+    }
+
     fn terminal_context_menu_items(&mut self) -> Vec<ContextMenuItem> {
         fn split_item(
             label: String,
@@ -9182,6 +9228,9 @@ impl super::TermWindow {
             }),
         };
 
+        if matches!(event.kind, WMEK::Press(MousePress::Right)) {
+            self.right_press_claimed = false;
+        }
         if allow_action {
             if let Some(mut event_trigger_type) = event_trigger_type {
                 self.current_event = Some(event_trigger_type.to_dynamic());
@@ -9250,6 +9299,9 @@ impl super::TermWindow {
                 };
 
                 if let Some(action) = self.input_map.lookup_mouse(event_trigger_type, mouse_mods) {
+                    if matches!(event.kind, WMEK::Press(MousePress::Right)) {
+                        self.right_press_claimed = true;
+                    }
                     self.perform_key_assignment(&pane, &action).ok();
                     return;
                 }
@@ -9263,9 +9315,11 @@ impl super::TermWindow {
         {
             // Own both halves of the click so the terminal application never
             // receives a press whose release opens our menu instead.
-            if matches!(event.kind, WMEK::Release(MousePress::Right)) {
-                let items = self.terminal_context_menu_items();
-                self.show_term_context_menu(context, event.coords, items);
+            // A binding that took the press took the click.
+            if matches!(event.kind, WMEK::Release(MousePress::Right))
+                && !std::mem::take(&mut self.right_press_claimed)
+            {
+                self.terminal_right_click(&pane, context, event.coords, event.modifiers);
             }
             return;
         }
@@ -9328,6 +9382,16 @@ impl super::TermWindow {
                 context.invalidate();
             }
         }
+    }
+}
+
+/// What a right click in a terminal does with `modifiers` held: what the
+/// settings ask for, or the menu while Control is held.
+pub(crate) fn right_click_mode(modifiers: ::window::Modifiers) -> crate::native_settings::NativeRightClick {
+    if modifiers.contains(::window::Modifiers::CTRL) {
+        crate::native_settings::NativeRightClick::Menu
+    } else {
+        crate::native_settings::right_click()
     }
 }
 

@@ -93,7 +93,7 @@ impl TermWindow {
         if text.is_empty() {
             return;
         }
-        if let Some(pane) = self
+        let pane = self
             .pane_state(pane_id)
             .overlay
             .as_ref()
@@ -101,9 +101,28 @@ impl TermWindow {
             .or_else(|| {
                 let mux = Mux::get();
                 mux.get_pane(pane_id)
-            })
-        {
-            pane.send_paste(text).ok();
+            });
+        if let Some(pane) = pane {
+            // Where the paste goes in, read before it does.
+            let cursor = pane.get_cursor_position();
+            if pane.send_paste(text).is_ok() {
+                self.light_up_terminal_paste(&pane, text, cursor);
+            }
+        }
+    }
+
+    /// Light up `text`, pasted into `pane` at `cursor`, if it went to the
+    /// terminal: an overlay over it takes a paste in itself (copy mode's
+    /// search line) or drops it (quick select), and the terminal's own text
+    /// there is not the paste.
+    pub(crate) fn light_up_terminal_paste(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        text: &str,
+        cursor: mux::renderable::StableCursorPosition,
+    ) {
+        if self.pane_state(pane.pane_id()).overlay.is_none() {
+            self.light_up_paste(pane, text, cursor);
         }
     }
 }
