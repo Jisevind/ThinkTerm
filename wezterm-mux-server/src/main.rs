@@ -449,6 +449,17 @@ async fn async_run(
     let mux = Mux::get();
     let config = config::configuration();
     let took_over = takeover.is_some();
+    // Before anything connects: a takeover's sessions reconnect at once.
+    // Until the predecessor lets go of the node, theirs to the tailnet's
+    // machines wait for this server's own (see follow_tailnet).
+    #[cfg(feature = "tailnet")]
+    {
+        // Through its own node, or whichever process here holds it.
+        thinkterm_tailnet::use_for_ssh_in_server();
+        if took_over {
+            thinkterm_tailnet::will_hold();
+        }
+    }
 
     // async_run is entered through SimpleExecutor, so promise's schedulers
     // are available before agent detection starts its safety tick.
@@ -506,6 +517,10 @@ async fn async_run(
         let web_servers = config.web_servers.clone();
         thread::spawn(move || {
             wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(stream);
+            // The predecessor's node went with it: two processes on one
+            // node's keys would take the node from each other.
+            #[cfg(feature = "tailnet")]
+            follow_tailnet();
             // Its descriptors close one after another as it exits; the
             // handoff socket may answer for a while after the stream did.
             // A server that cannot be taken over is one whose sessions the
@@ -551,6 +566,10 @@ async fn async_run(
     }
     #[cfg(not(unix))]
     let _ = (takeover, daemonized);
+    #[cfg(feature = "tailnet")]
+    if !took_over {
+        follow_tailnet();
+    }
     let _config_subscription = config::subscribe_to_config_reload(move || {
         promise::spawn::spawn_into_main_thread(async move {
             if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
@@ -591,6 +610,14 @@ async fn async_run(
             .await?;
     }
     Ok(())
+}
+
+/// Holds the machine's node while the tailnet is on -- the app's switch or
+/// `thinkterm tailnet up` (see thinkterm_tailnet) -- taking SSH connections
+/// from it to this machine's sshd when `thinkterm tailnet up` said to.
+#[cfg(feature = "tailnet")]
+fn follow_tailnet() {
+    thinkterm_tailnet::follow(|| {});
 }
 
 /// The pid file the predecessor handed over: same lock, our pid in it.

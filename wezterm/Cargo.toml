@@ -16,7 +16,13 @@ path = "src/bin/wezterm.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["tailnet"]
+# `thinkterm tailnet`: a tailnet joined with no Tailscale app installed.
+tailnet = ["dep:thinkterm-tailnet"]
+
 [dependencies]
+thinkterm-tailnet = { workspace = true, optional = true }
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true

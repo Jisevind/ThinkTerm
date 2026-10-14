@@ -19,6 +19,8 @@ use wezterm_gui_subcommands::*;
 mod asciicast;
 mod cli;
 mod plugin;
+#[cfg(feature = "tailnet")]
+mod tailnet;
 
 //    let message = "; ❤ 😍🤢\n\x1b[91;mw00t\n\x1b[37;104;m bleet\x1b[0;m.";
 
@@ -265,6 +267,13 @@ enum SubCommand {
         about = "List, turn on and off, reload and run plugins"
     )]
     Plugin(plugin::PluginCommand),
+
+    #[cfg(feature = "tailnet")]
+    #[command(
+        name = "tailnet",
+        about = "Join a tailnet without the Tailscale app, for this machine's mux server"
+    )]
+    Tailnet(tailnet::TailnetCommand),
 
     /// Write a project's file listing for search. The desktop runs this on a
     /// remote host over ssh; it is not meant to be run by hand.
@@ -1223,16 +1232,23 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Replay(cmd) => cmd.run(),
         SubCommand::Update(cmd) => cmd.run(),
         SubCommand::Plugin(cmd) => cmd.run(),
+        #[cfg(feature = "tailnet")]
+        SubCommand::Tailnet(cmd) => cmd.run(),
         SubCommand::ListFiles(cmd) => cmd.run(),
-        SubCommand::Tui(cmd) => thinkterm_tui::run(
-            init_config(&opts)?,
-            thinkterm_tui::TuiOptions {
-                domains: cmd.domains,
-                class_name: cmd.class,
-                prefer_mux: cmd.prefer_mux,
-                tui_config_path: cmd.tui_config,
-            },
-        ),
+        SubCommand::Tui(cmd) => {
+            // Its SSH domains connect from this process.
+            #[cfg(feature = "tailnet")]
+            thinkterm_tailnet::use_for_ssh();
+            thinkterm_tui::run(
+                init_config(&opts)?,
+                thinkterm_tui::TuiOptions {
+                    domains: cmd.domains,
+                    class_name: cmd.class,
+                    prefer_mux: cmd.prefer_mux,
+                    tui_config_path: cmd.tui_config,
+                },
+            )
+        }
         SubCommand::ShellCompletion { shell } => {
             let rendered = render_shell_completion(shell)?;
             std::io::stdout()

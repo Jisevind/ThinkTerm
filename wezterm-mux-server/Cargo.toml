@@ -15,7 +15,14 @@ path = "src/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["tailnet"]
+# Joining a tailnet with no Tailscale app installed (thinkterm-tailnet): the
+# server is the process that holds the machine's node.
+tailnet = ["dep:thinkterm-tailnet", "thinkterm-tailnet/node"]
+
 [dependencies]
+thinkterm-tailnet = { workspace = true, optional = true }
 thinkterm-import-herdr.workspace = true
 thinkterm-import.workspace = true
 anyhow.workspace = true
