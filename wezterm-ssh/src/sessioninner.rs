@@ -411,6 +411,7 @@ impl SessionInner {
         not_this_host: &[(String, u16)],
     ) -> anyhow::Result<(Socket, Option<KillOnDropChild>, Option<(String, u16)>)> {
         self.shutdown.check()?;
+        let dialer = crate::addresses::Dialer::from_config(&self.config)?;
         match self.config.get("proxycommand").map(|s| s.as_str()) {
             Some("none") | None => {}
             Some(proxy_command) => {
@@ -467,7 +468,6 @@ impl SessionInner {
 
         let mut candidates = crate::addresses::candidates(&self.config, hostname, port);
         candidates.retain(|address| !not_this_host.contains(address));
-        let dialer = crate::addresses::Dialer::from_config(&self.config);
         if candidates.len() > 1 {
             if verbose {
                 log::info!("trying {hostname}:{port} at {candidates:?}");
@@ -493,7 +493,10 @@ impl SessionInner {
             return Ok((sock, None, Some(reached)));
         }
 
-        let sock = dialer.dial_with(hostname, port, verbose, |sock| self.shutdown.watch(sock))?;
+        let closed = || self.shutdown.check().is_err();
+        let sock = dialer.dial_with(hostname, port, verbose, &closed, |sock| {
+            self.shutdown.watch(sock)
+        })?;
         self.shutdown.check()?;
         Ok((sock, None, None))
     }

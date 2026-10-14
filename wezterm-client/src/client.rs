@@ -1225,6 +1225,67 @@ fn connect_to_spawned_server(path: &Path) -> anyhow::Result<UnixStream> {
     }
 }
 
+/// Starts the server of `unix_dom` as its serve command says, with `extra`
+/// arguments after it and with the umask this process started with. Returns
+/// once it is spawned, with the command as run for showing; `--daemonize`
+/// forks and exits at once, and how that went is logged when it has.
+pub fn spawn_server(unix_dom: &UnixDomain, extra: &[&str]) -> anyhow::Result<String> {
+    let mut argv = unix_dom.serve_command()?;
+    argv.extend(extra.iter().map(std::ffi::OsString::from));
+
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+
+    #[cfg(unix)]
+    if let Some(mask) = umask::UmaskSaver::saved_umask() {
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::umask(mask);
+                Ok(())
+            });
+        }
+    }
+
+    // The server is a console-subsystem binary; without this a console
+    // window flashes every time the GUI starts it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+    }
+
+    let running = format!("{:?}", cmd);
+    log::warn!("Running: {}", running);
+
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("while spawning {}", running))?;
+    std::thread::spawn(move || match child.wait_with_output() {
+        Ok(out) => {
+            // `--daemonize` returns once it has forked, so a failing status
+            // is a server that never started at all: it lost the pid lock,
+            // or could not bind.
+            if !out.status.success() {
+                log::warn!("the server we spawned exited with {}", out.status);
+            }
+            if let Ok(stdout) = std::str::from_utf8(&out.stdout) {
+                if !stdout.is_empty() {
+                    log::warn!("stdout: {}", stdout);
+                }
+            }
+            if let Ok(stderr) = std::str::from_utf8(&out.stderr) {
+                if !stderr.is_empty() {
+                    log::warn!("stderr: {}", stderr);
+                }
+            }
+        }
+        Err(err) => {
+            log::error!("spawn: {:#}", err);
+        }
+    });
+    Ok(running)
+}
+
 pub fn unix_connect_with_retry(
     target: &UnixTarget,
     just_spawned: bool,
@@ -1617,61 +1678,11 @@ impl Reconnectable {
                 );
                 ui.output_str(&format!("Error: {}.  Will try spawning server.\n", e));
 
-                let argv = unix_dom.serve_command()?;
-
-                let mut cmd = std::process::Command::new(&argv[0]);
-                cmd.args(&argv[1..]);
-
-                #[cfg(unix)]
-                if let Some(mask) = umask::UmaskSaver::saved_umask() {
-                    unsafe {
-                        cmd.pre_exec(move || {
-                            libc::umask(mask);
-                            Ok(())
-                        });
-                    }
-                }
-
-                // The server is a console-subsystem binary; without this a
-                // console window flashes every time the GUI starts it.
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt as _;
-                    cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
-                }
-
-                log::warn!("Running: {:?}", cmd);
-                ui.output_str(&format!("Running: {:?}\n", cmd));
-
-                let child = cmd
-                    .spawn()
-                    .with_context(|| format!("while spawning {:?}", cmd))?;
+                let running = spawn_server(&unix_dom, &[])?;
+                ui.output_str(&format!("Running: {}\n", running));
                 if unix_dom.local_session_host {
                     crate::local_update::note_local_session_host_started();
                 }
-                std::thread::spawn(move || match child.wait_with_output() {
-                    Ok(out) => {
-                        // `--daemonize` returns once it has forked, so a
-                        // failing status is a server that never started at
-                        // all: it lost the pid lock, or could not bind.
-                        if !out.status.success() {
-                            log::warn!("the server we spawned exited with {}", out.status);
-                        }
-                        if let Ok(stdout) = std::str::from_utf8(&out.stdout) {
-                            if !stdout.is_empty() {
-                                log::warn!("stdout: {}", stdout);
-                            }
-                        }
-                        if let Ok(stderr) = std::str::from_utf8(&out.stderr) {
-                            if !stderr.is_empty() {
-                                log::warn!("stderr: {}", stderr);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        log::error!("spawn: {:#}", err);
-                    }
-                });
 
                 unix_connect_with_retry(&target, true, None).with_context(|| {
                     format!("(after spawning server) failed to connect to {:?}", target)
@@ -1704,11 +1715,21 @@ impl Reconnectable {
             )
         })?;
 
+        let network = match tls_client.ssh_parameters().transpose()? {
+            Some(params) => {
+                let mut config = wezterm_ssh::Config::new();
+                config.add_default_config_files();
+                let host = params.host_and_port.split(':').next().unwrap_or("");
+                wezterm_ssh::Network::from_config(&config.for_host(host))?
+            }
+            None => wezterm_ssh::Network::System,
+        };
+
         // If we are reconnecting and already bootstrapped via SSH, let's see if
         // we can connect using those same credentials and avoid running through
         // the SSH authentication flow.
         if let Some(Ok(_)) = tls_client.ssh_parameters() {
-            match self.try_connect(&tls_client, ui, &remote_address, remote_host_name) {
+            match self.try_connect(&tls_client, ui, &remote_address, remote_host_name, network) {
                 Ok(stream) => {
                     self.stream.replace(stream);
                     return Ok(());
@@ -1812,7 +1833,7 @@ impl Reconnectable {
 
         let cloned_ui = ui.clone();
         let stream = cloned_ui.run_and_log_error({
-            || self.try_connect(&tls_client, ui, &remote_address, remote_host_name)
+            || self.try_connect(&tls_client, ui, &remote_address, remote_host_name, network)
         })?;
         self.stream.replace(stream);
         Ok(())
@@ -1824,6 +1845,7 @@ impl Reconnectable {
         ui: &mut ConnectionUI,
         remote_address: &str,
         remote_host_name: &str,
+        network: wezterm_ssh::Network,
     ) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
         let mut connector = SslConnector::builder(SslMethod::tls())?;
 
@@ -1888,9 +1910,27 @@ impl Reconnectable {
             .verify_hostname(!tls_client.accept_invalid_hostnames);
 
         ui.output_str(&format!("Connecting to {} using TLS\n", remote_address));
-        let stream = TcpStream::connect(remote_address)
-            .with_context(|| format!("connecting to {}", remote_address))?;
-        stream.set_nodelay(true)?;
+        // A machine the SSH that bootstrapped the domain reached another way
+        // than the OS network -- through an embedded tailnet -- is reached
+        // that way here too.
+        let (host, port) = split_host_port(remote_address).context("invalid TLS remote address")?;
+        let registered = wezterm_ssh::dial_registered(network, host, port, None);
+        let stream = match registered {
+            Some(dialed) => {
+                let stream = TcpStream::from(
+                    dialed.with_context(|| format!("connecting to {}", remote_address))?,
+                );
+                // Not TCP underneath, and so no delay to turn off.
+                let _ = stream.set_nodelay(true);
+                stream
+            }
+            None => {
+                let stream = TcpStream::connect(remote_address)
+                    .with_context(|| format!("connecting to {}", remote_address))?;
+                stream.set_nodelay(true)?;
+                stream
+            }
+        };
         stream.set_write_timeout(Some(tls_client.write_timeout))?;
         stream.set_read_timeout(Some(tls_client.read_timeout))?;
 
@@ -1913,6 +1953,16 @@ impl Reconnectable {
         ui.output_str("TLS Connected!\n");
         Ok(stream)
     }
+}
+
+/// `host:port` or `[v6]:port`, as `remote_address` spells it.
+fn split_host_port(address: &str) -> Option<(&str, u16)> {
+    let (host, port) = address.rsplit_once(':')?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    Some((host, port.parse().ok()?))
 }
 
 impl Client {
@@ -2835,9 +2885,17 @@ fn outage_clock_after_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_auth_cancelled, outage_clock_after_session, Reconnectable};
+    use super::{is_auth_cancelled, outage_clock_after_session, split_host_port, Reconnectable};
     use crate::domain::ClientDomainConfig;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_tls_address_splits_into_host_and_port() {
+        assert_eq!(split_host_port("server-a:8080"), Some(("server-a", 8080)));
+        assert_eq!(split_host_port("[fd7a::2]:8080"), Some(("fd7a::2", 8080)));
+        assert_eq!(split_host_port("server-a"), None);
+        assert_eq!(split_host_port("server-a:port"), None);
+    }
 
     #[test]
     fn a_restored_session_ends_the_outage() {

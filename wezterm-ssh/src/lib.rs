@@ -14,6 +14,7 @@ mod sessioninner;
 mod sessionwrap;
 mod sftp;
 mod sftpwrap;
+mod through;
 
 pub use addresses::OTHER_ADDRESSES;
 pub use auth::*;
@@ -24,6 +25,7 @@ pub use session::*;
 pub use sftp::error::*;
 pub use sftp::types::*;
 pub use sftp::*;
+pub use through::{dial_registered, set_dialer, AddressFamily, Dialer, Network, NETWORK};
 
 // NOTE: Re-exported as is exposed in a public API of this crate
 pub use camino::{Utf8Path, Utf8PathBuf};
