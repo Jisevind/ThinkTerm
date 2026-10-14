@@ -8413,10 +8413,32 @@ impl TermWindow {
             }
             None => {
                 self.open_content_view(Box::new(
-                    crate::termwindow::ssh_hosts_view::SshHostsView::new_host(),
+                    crate::termwindow::ssh_hosts_view::SshHostsView::new_host()
+                        .in_window(self.window.clone()),
                 ));
             }
         }
+    }
+
+    /// Open the SSH hosts page on its Tailscale panel: where a search for
+    /// Tailscale in Settings leads. Like the new-host entry, it never closes
+    /// an open page.
+    pub(crate) fn open_ssh_hosts_view_tailscale(&mut self) {
+        let key = crate::termwindow::ssh_hosts_view::SSH_HOSTS_CONTENT_VIEW_KEY;
+        let id = match self.content_view_id_for_key(key) {
+            Some(id) => {
+                self.activate_content_view(id);
+                id
+            }
+            None => self.open_content_view(Box::new(
+                crate::termwindow::ssh_hosts_view::SshHostsView::new()
+                    .in_window(self.window.clone()),
+            )),
+        };
+        if let Some(view) = self.content_view_mut_by_id(id) {
+            view.show_tailscale_panel();
+        }
+        self.invalidate_window();
     }
 
     /// Toggle the SSH hosts content view (sidebar button / OpenSshHosts).
@@ -8428,7 +8450,8 @@ impl TermWindow {
             self.activate_content_view(id);
         } else {
             self.open_content_view(Box::new(
-                crate::termwindow::ssh_hosts_view::SshHostsView::new(),
+                crate::termwindow::ssh_hosts_view::SshHostsView::new()
+                    .in_window(self.window.clone()),
             ));
         }
     }

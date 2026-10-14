@@ -56,6 +56,7 @@ mod native_paths;
 mod native_settings;
 mod notification_click;
 mod overlay;
+mod page_poll;
 mod perf;
 mod plugins;
 mod quad;
@@ -77,6 +78,7 @@ mod state_backup;
 mod stats;
 mod tab_icons;
 mod tabbar;
+mod tailnet;
 mod termwindow;
 mod ui;
 mod unicode_names;
@@ -218,6 +220,7 @@ fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     build_initial_mux(&config::configuration(), None, None)?;
 
     let gui = crate::frontend::try_new()?;
+    crate::tailnet::start();
 
     promise::spawn::spawn(async {
         if let Err(err) = async_run_ssh(opts).await {
@@ -272,6 +275,7 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
     build_initial_mux(&config, None, None)?;
 
     let gui = crate::frontend::try_new()?;
+    crate::tailnet::start();
 
     promise::spawn::spawn(async {
         if let Err(err) = async_run_serial(opts).await {
@@ -482,12 +486,19 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 pub(crate) fn connect_domain_from_ssh_host(name: &str) -> anyhow::Result<Arc<dyn Domain>> {
     let entry = crate::ssh_hosts::list_all_hosts()
         .into_iter()
-        .find(|entry| entry.spec.label == name || entry.id == name)
+        .find(|entry| {
+            entry.spec.label == name
+                || entry.id == name
+                || crate::ssh_hosts::connect_domain_name(&entry.spec) == name
+        })
         .ok_or_else(|| {
             anyhow!("invalid domain {name}: not in ssh_domains and not a saved SSH host")
         })?;
     let mut dom = crate::ssh_hosts::build_ssh_domain(&entry.spec);
-    dom.name = name.to_string();
+    dom.name = match entry.spec.network {
+        crate::ssh_hosts::SshNetwork::System => name.to_string(),
+        crate::ssh_hosts::SshNetwork::Tailnet => crate::ssh_hosts::connect_domain_name(&entry.spec),
+    };
     dom.multiplexing = SshMultiplexing::WezTerm;
     dom.stored_password = entry
         .spec
@@ -1448,6 +1459,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     }
 
     let gui = crate::frontend::try_new()?;
+    // Only now: up to here this process could still have handed the
+    // request to a running one and exited.
+    crate::tailnet::start();
     let activity = Activity::new();
 
     promise::spawn::spawn(async move {
@@ -1490,6 +1504,29 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
                         .window
                         .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                             move |term_window| term_window.show_plugin_panel(&plugin),
+                        )));
+                }
+            }
+        })
+        .detach();
+    }
+    // And the Remote Hosts page; `tailscale` opens it on its Tailscale panel.
+    if let Some(page) = std::env::var_os("THINKTERM_OPEN_REMOTE_HOSTS") {
+        promise::spawn::spawn_into_main_thread(async move {
+            smol::Timer::after(std::time::Duration::from_millis(2500)).await;
+            if let Some(front_end) = crate::frontend::try_front_end() {
+                for gui_window in front_end.gui_windows() {
+                    let tailscale = page == "tailscale";
+                    gui_window
+                        .window
+                        .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                            move |term_window| {
+                                if tailscale {
+                                    term_window.open_ssh_hosts_view_tailscale();
+                                } else {
+                                    term_window.toggle_ssh_hosts_view();
+                                }
+                            },
                         )));
                 }
             }

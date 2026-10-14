@@ -24,7 +24,7 @@ use wezterm_ssh::{Session, SessionEvent};
 
 pub use thinkterm_core::ssh_hosts::{
     default_mosh_server_command, parse_other_addresses, ShellIntegrationFailure, SshHostEntry,
-    SshHostId, SshHostSource, SshHostSpec, DEFAULT_MOSH_SERVER_COMMAND,
+    SshHostId, SshHostSource, SshHostSpec, SshNetwork, DEFAULT_MOSH_SERVER_COMMAND,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -481,13 +481,21 @@ pub fn build_mosh_args(spec: &SshHostSpec) -> Vec<String> {
     args
 }
 
-pub fn build_mosh_fallback_spawn(spec: &SshHostSpec) -> SpawnCommand {
-    SpawnCommand {
+fn check_mosh_network(spec: &SshHostSpec) -> Result<()> {
+    if spec.network == SshNetwork::Tailnet {
+        bail!(crate::i18n::tr("ssh-error-tailnet-mosh"));
+    }
+    Ok(())
+}
+
+pub fn build_mosh_fallback_spawn(spec: &SshHostSpec) -> Result<SpawnCommand> {
+    check_mosh_network(spec)?;
+    Ok(SpawnCommand {
         label: Some(format!("mosh {}", spec.label)),
         args: Some(build_mosh_args(spec)),
         domain: crate::local_sessions::local_spawn_domain(),
         ..Default::default()
-    }
+    })
 }
 
 fn parse_mosh_connect(output: &str) -> Option<(u16, String)> {
@@ -586,6 +594,7 @@ async fn connect_mosh_bootstrap_session(spec: &SshHostSpec) -> Result<(Session, 
 }
 
 pub async fn build_integrated_mosh_spawn(spec: &SshHostSpec) -> Result<SpawnCommand> {
+    check_mosh_network(spec)?;
     let command = spec.mosh_server_command.trim();
     if command.is_empty() {
         bail!("Mosh server command is empty");
@@ -675,16 +684,55 @@ pub fn register_saved_hosts() {
     }
 }
 
+/// What a host on the embedded tailnet names its ThinkTerm Connect domain
+/// after: its address, so that saving it on the other network makes a new
+/// domain rather than finding the old one, connected the old way.
+const TAILNET_CONNECT_PREFIX: &str = "tailnet:";
+
+pub fn connect_domain_name(spec: &SshHostSpec) -> String {
+    match spec.network {
+        SshNetwork::System => spec.label.clone(),
+        SshNetwork::Tailnet => format!("{TAILNET_CONNECT_PREFIX}{}", endpoint(spec)),
+    }
+}
+
+/// What a ThinkTerm Connect domain is called on screen: the name of the host
+/// it belongs to. Only a domain of the embedded tailnet is named otherwise,
+/// and only a host saved here can be on it -- `~/.ssh/config` has none.
+pub fn connect_domain_label(domain_name: &str) -> String {
+    if domain_name.starts_with(TAILNET_CONNECT_PREFIX) {
+        if let Ok(store) = host_store() {
+            let specs = store.hosts.iter().map(|record| &record.spec);
+            if let Some(label) = label_for_connect_domain(specs, domain_name) {
+                return label;
+            }
+        }
+    }
+    domain_name.to_string()
+}
+
+fn label_for_connect_domain<'a>(
+    mut specs: impl Iterator<Item = &'a SshHostSpec>,
+    domain_name: &str,
+) -> Option<String> {
+    specs
+        .find(|spec| connect_domain_name(spec) == domain_name)
+        .map(|spec| spec.label.trim().to_string())
+        .filter(|label| !label.is_empty())
+}
+
 /// Every name this host can be connected under.
 ///
 /// A ThinkTerm Connect host attaches its persistent mux domain under the
-/// user's label; a direct host registers as `ssh:user@host`. A Space mirrored
+/// user's label (on the embedded tailnet, under its address: see
+/// `connect_domain_name`); a direct host registers as `ssh:user@host`. A Space mirrored
 /// from that machine is tagged with whichever one it arrived through.
 pub fn domain_names_for_host(spec: &SshHostSpec) -> Vec<String> {
     let mut names = vec![ssh_domain_name(spec)];
-    let label = spec.label.trim();
-    if !label.is_empty() && !names.iter().any(|name| name == label) {
-        names.push(label.to_string());
+    let name = connect_domain_name(spec);
+    let name = name.trim();
+    if !name.is_empty() && !names.iter().any(|other| other == name) {
+        names.push(name.to_string());
     }
     names
 }
@@ -701,7 +749,7 @@ fn domain_name_is_reachable(domain_name: &str) -> bool {
     }
     list_all_hosts()
         .into_iter()
-        .any(|entry| entry.spec.label == domain_name || entry.id == domain_name)
+        .any(|entry| connect_domain_name(&entry.spec) == domain_name || entry.id == domain_name)
 }
 
 /// Drop this device's copy of every Space whose mux server it can no longer
@@ -800,6 +848,7 @@ fn parse_system_ssh_config_str(content: &str) -> Vec<SshHostEntry> {
                 host: alias.clone(),
                 port: block.port,
                 other_addresses: Vec::new(),
+                network: Default::default(),
                 username: block.user.clone(),
                 identity_file: block.identity_file.clone(),
                 password: None,
@@ -903,7 +952,7 @@ fn fnv1a(input: &str) -> u64 {
     hash
 }
 
-/// The record id for a host, derived from `user@host:port` alone -- so two
+/// The record id for a host, derived from its network and `user@host:port`: two
 /// hosts that dial the same endpoint are the same record no matter what they
 /// are named. Both save paths lean on that: see `try_create_host` and
 /// `try_update_host`.
@@ -914,6 +963,10 @@ pub fn host_id_for_host(spec: &SshHostSpec) -> SshHostId {
         spec.host,
         spec.port.unwrap_or(22)
     );
+    let key = match spec.network {
+        SshNetwork::System => key,
+        SshNetwork::Tailnet => format!("tailnet:{key}"),
+    };
     format!("ssh-{:x}", fnv1a(&key))
 }
 
@@ -924,6 +977,41 @@ fn system_host_id(alias: &str) -> SshHostId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_same_address_on_two_networks_has_distinct_records_and_domains() {
+        let mut spec = spec_with_options(HashMap::new());
+        spec.label = "server-a".into();
+        spec.host = "100.64.0.2".into();
+        let id = host_id_for_host(&spec);
+        let domains = domain_names_for_host(&spec);
+        spec.network = SshNetwork::Tailnet;
+        assert_ne!(host_id_for_host(&spec), id);
+        assert!(domain_names_for_host(&spec)
+            .iter()
+            .all(|name| !domains.contains(name)));
+        assert!(build_mosh_fallback_spawn(&spec).is_err());
+    }
+
+    #[test]
+    fn a_tailnet_connect_domain_is_shown_by_its_hosts_name() {
+        let mut spec = spec_with_options(HashMap::new());
+        spec.label = "server-a".into();
+        spec.host = "100.64.0.2".into();
+        spec.network = SshNetwork::Tailnet;
+        let domain = connect_domain_name(&spec);
+        assert_ne!(domain, "server-a");
+        assert_eq!(
+            label_for_connect_domain(std::iter::once(&spec), &domain).as_deref(),
+            Some("server-a")
+        );
+        assert_eq!(
+            label_for_connect_domain(std::iter::once(&spec), "tailnet:server-b"),
+            None
+        );
+        // Any other domain is already called what it is named.
+        assert_eq!(connect_domain_label("server-b"), "server-b");
+    }
 
     #[test]
     fn a_failed_catalog_load_is_retried_before_editing() {
@@ -1065,6 +1153,7 @@ Host prod *.internal
             host: "example.com".to_string(),
             port: None,
             other_addresses: Vec::new(),
+            network: Default::default(),
             username: None,
             identity_file: None,
             password: None,

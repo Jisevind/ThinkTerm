@@ -7,9 +7,14 @@
 //! [`SshViewOutcome`] so `TermWindow` integration stays minimal.
 
 use crate::quad::{HeapQuadAllocator, QuadClipRect, TripleLayerQuadAllocator};
-use crate::ssh_hosts::{self, ShellIntegrationFailure, SshHostEntry, SshHostSource, SshHostSpec};
+use crate::ssh_hosts::{
+    self, ShellIntegrationFailure, SshHostEntry, SshHostSource, SshHostSpec, SshNetwork,
+};
+use crate::tailnet::{
+    Device, Machine as TailnetMachine, State as TailnetState, View as TailnetView,
+};
 use crate::termwindow::content_view::{ContentView, ContentViewResponse, RemoteHostCommand};
-use crate::termwindow::ui::icons::{distro_to_icon, SvgIcon};
+use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, SvgIcon};
 use crate::termwindow::ui::right_sidebar::wrap_snippet_text_for_width;
 use crate::termwindow::TermWindow;
 use crate::ui::anim::Easing;
@@ -25,11 +30,11 @@ use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use fluent_bundle::FluentArgs;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
 use window::color::LinearRgba;
-use window::{MouseEvent, MouseEventKind as WMEK, MousePress, RectF};
+use window::{MouseEvent, MouseEventKind as WMEK, MousePress, RectF, Window};
 
 pub(crate) const SSH_HOSTS_CONTENT_VIEW_KEY: &str = "ssh-hosts";
 
@@ -138,6 +143,21 @@ const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
 /// How far the pointer may drift between the two clicks of a double click.
 const DOUBLE_CLICK_SLOP: f32 = 6.0;
 
+/// The Tailscale panel's fields, in tab order.
+const TAILNET_AUTH_KEY: usize = 0;
+const TAILNET_CONTROL_URL: usize = 1;
+const TAILNET_HOSTNAME: usize = 2;
+const TAILNET_FIELD_COUNT: usize = 3;
+/// A machine of the tailnet that is online, and the tailnet while it is up:
+/// the system's green.
+const ONLINE_GREEN: (u8, u8, u8) = (0x30, 0xD1, 0x58);
+/// The tailnet on its way up, or waiting for someone to log in.
+const WAITING_ORANGE: (u8, u8, u8) = (0xFF, 0x9F, 0x0A);
+/// How long the login link's button says it was copied.
+const COPIED_FOR: Duration = Duration::from_millis(1400);
+/// The gear at the end of the Tailscale group's caption.
+const TAILNET_GEAR: f32 = 36.0;
+
 /// Clickable targets inside the view. `usize` payloads index into the current
 /// filtered host list, so the action type stays `Copy` (needed by `UiContext`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,6 +169,7 @@ enum SshViewAction {
     /// Connect to the host the inspector is showing.
     Connect,
     FocusField(usize),
+    SetNetwork(SshNetwork),
     ToggleDetect,
     ToggleMosh,
     ToggleMux,
@@ -165,6 +186,29 @@ enum SshViewAction {
     FocusOptionValue(usize),
     RemoveOption(usize),
     AddOption,
+    /// The Tailscale group's caption: folds the group away, or back.
+    ToggleTailnetGroup,
+    /// The gear by that caption: the Tailscale panel, opened or closed.
+    TailnetSettings,
+    /// A machine of the tailnet, by its place in the group as painted.
+    TailnetMachine(usize),
+    /// The button on the card the group shows instead of machines; what it
+    /// does is what it said when painted (see `TailnetGroup::notice`).
+    TailnetNotice,
+    /// The switch in the Tailscale panel's header.
+    ToggleTailnet,
+    OpenTailnetLogin,
+    CopyTailnetLogin,
+    FocusTailnetField(usize),
+    TailnetLogout,
+}
+
+/// What the button on the Tailscale group's card does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeButton {
+    TurnOn,
+    LogIn,
+    Settings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -175,6 +219,54 @@ enum Focus {
     OptionKey(usize),
     /// `ssh_options` row `n`, value column.
     OptionValue(usize),
+    /// One of the Tailscale panel's fields.
+    Tailnet(usize),
+}
+
+/// The Tailscale group: its panel's fields and what it painted last, for
+/// the clicks that come after.
+#[derive(Default)]
+struct TailnetGroup {
+    /// The panel shows in the inspector, in place of a host's form.
+    panel_open: bool,
+    collapsed: bool,
+    /// The machines as painted, those the search finds: cards name one by
+    /// its place here.
+    machines: Vec<TailnetMachine>,
+    /// The approval link as painted, for the buttons that open and copy it.
+    login_url: Option<String>,
+    /// What the card's button said when painted.
+    notice: Option<NoticeButton>,
+    /// The auth key, the control server and this machine's name in the
+    /// tailnet. The key's never shows a saved key, only one being typed,
+    /// and empties once that one is saved.
+    fields: [TextInputState; TAILNET_FIELD_COUNT],
+    /// Typed into since the field last went out.
+    dirty: [bool; TAILNET_FIELD_COUNT],
+    /// The change each field's text went out as: the text stays while it
+    /// is saved, or could not be (see crate::tailnet::saved).
+    changes: [Option<u64>; TAILNET_FIELD_COUNT],
+    /// The login link's button says "Copied" until then.
+    copied_until: Option<Instant>,
+}
+
+/// What the Tailscale group holds under its caption.
+enum TailnetBody {
+    /// Nothing yet: the page has not read how the tailnet is.
+    Pending,
+    /// Its machines, as `TailnetGroup::machines` holds them.
+    Machines,
+    /// One card instead: the tailnet off, on its way, or waiting.
+    Notice(TailnetNotice),
+}
+
+struct TailnetNotice {
+    icon: SvgIcon,
+    title: String,
+    subtitle: String,
+    button: Option<(String, NoticeButton)>,
+    /// The invitation to turn it on, drawn in the accent.
+    invite: bool,
 }
 
 #[derive(Default, Clone)]
@@ -187,6 +279,7 @@ struct HostForm {
     /// the user is still typing.
     options: Vec<(TextInputState, TextInputState)>,
     advanced_open: bool,
+    network: SshNetwork,
     detect_os: bool,
     use_mosh: bool,
     multiplexing: bool,
@@ -242,6 +335,14 @@ pub(crate) struct SshHostsView {
     /// paints for each scroll step and caret blink; the file is read again
     /// only when its stamp moves.
     system_hosts: Option<(ssh_hosts::SshConfigStamp, Vec<SshHostEntry>)>,
+    /// Every host saved here, whatever the search: what tells a machine of
+    /// the tailnet already saved as a host.
+    saved_hosts: Vec<SshHostEntry>,
+    /// The window the page is in, repainted when a read of the tailnet
+    /// lands. None in tests.
+    window: Option<Window>,
+    tailnet: TailnetGroup,
+    _tailnet_page: crate::tailnet::Page,
 }
 
 impl SshHostsView {
@@ -269,9 +370,19 @@ impl SshHostsView {
             scroll: ScrollState::new(),
             scroll_animating: false,
             system_hosts: None,
+            saved_hosts: Vec::new(),
+            window: None,
+            tailnet: TailnetGroup::default(),
+            _tailnet_page: crate::tailnet::Page::open(),
         };
         view.refresh();
         view
+    }
+
+    /// The page in `window`: what the tailnet's reads repaint.
+    pub(crate) fn in_window(mut self, window: Option<Window>) -> Self {
+        self.window = window;
+        self
     }
 
     /// A page that opens straight on a blank host form, for the "Add Remote
@@ -296,7 +407,13 @@ impl SshHostsView {
             self.system_hosts = stamp.map(|stamp| (stamp, hosts.clone()));
             hosts
         });
-        self.filtered = ssh_hosts::list_all_hosts_with(system_hosts)
+        let all = ssh_hosts::list_all_hosts_with(system_hosts);
+        self.saved_hosts = all
+            .iter()
+            .filter(|entry| entry.source == SshHostSource::ThinkTerm)
+            .cloned()
+            .collect();
+        self.filtered = all
             .into_iter()
             .filter(|entry| {
                 if needle.is_empty() {
@@ -338,6 +455,7 @@ impl SshHostsView {
     }
 
     fn open_new_form(&mut self) {
+        self.close_tailnet_panel();
         self.password_visible = false;
         let mut form = HostForm::default();
         form.fields[FIELD_PORT].set_text_end("22".to_string());
@@ -356,6 +474,7 @@ impl SshHostsView {
         let Some(spec) = ssh_hosts::host_spec(project_id) else {
             return;
         };
+        self.close_tailnet_panel();
         // Revealing a password is a decision about one host. Carrying it into
         // the next one would put a stored password on screen unasked.
         self.password_visible = false;
@@ -378,6 +497,7 @@ impl SshHostsView {
             input.set_text_end(text);
             input
         });
+        let network = spec.network;
         let detect_os = spec.detect_os;
         let use_mosh = spec.use_mosh;
         let multiplexing = spec.multiplexing;
@@ -401,6 +521,7 @@ impl SshHostsView {
             fields,
             options,
             advanced_open,
+            network,
             detect_os,
             use_mosh,
             multiplexing,
@@ -432,6 +553,10 @@ impl SshHostsView {
     /// the form; on error records the message and keeps the form open.
     fn persist_form(&mut self) -> Option<String> {
         let form = self.form.as_mut()?;
+        if form.network == SshNetwork::Tailnet && form.use_mosh {
+            form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
+            return None;
+        }
         let host = form.fields[FIELD_HOST].text().trim().to_string();
         if host.is_empty() {
             form.error = Some(crate::i18n::tr("ssh-error-host-required"));
@@ -458,6 +583,7 @@ impl SshHostsView {
             host: host.clone(),
             port,
             other_addresses: Vec::new(),
+            network: Default::default(),
             username: None,
             identity_file: None,
             password: None,
@@ -477,6 +603,7 @@ impl SshHostsView {
         spec.label = label;
         spec.host = host;
         spec.port = port;
+        spec.network = form.network;
         spec.other_addresses =
             ssh_hosts::parse_other_addresses(&form.fields[FIELD_OTHER_ADDRESSES].text());
         spec.username = opt(&form.fields[FIELD_USER].text());
@@ -602,6 +729,7 @@ impl SshHostsView {
                             SshViewAction::FocusField(n) => Some((Focus::Field(n), x)),
                             SshViewAction::FocusOptionKey(n) => Some((Focus::OptionKey(n), x)),
                             SshViewAction::FocusOptionValue(n) => Some((Focus::OptionValue(n), x)),
+                            SshViewAction::FocusTailnetField(n) => Some((Focus::Tailnet(n), x)),
                             _ => None,
                         };
                         return self.apply(a);
@@ -705,6 +833,17 @@ impl SshHostsView {
                 self.focus = Focus::Field(n.min(count - 1));
                 ContentViewResponse::Redraw
             }
+            SshViewAction::SetNetwork(network) => {
+                if let Some(form) = self.form.as_mut() {
+                    if network == SshNetwork::Tailnet && form.use_mosh {
+                        form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
+                    } else {
+                        form.network = network;
+                        form.error = None;
+                    }
+                }
+                ContentViewResponse::Redraw
+            }
             SshViewAction::ToggleDetect => {
                 if let Some(form) = self.form.as_mut() {
                     form.detect_os = !form.detect_os;
@@ -713,6 +852,10 @@ impl SshHostsView {
             }
             SshViewAction::ToggleMosh => {
                 if let Some(form) = self.form.as_mut() {
+                    if !form.use_mosh && form.network == SshNetwork::Tailnet {
+                        form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
+                        return ContentViewResponse::Redraw;
+                    }
                     form.use_mosh = !form.use_mosh;
                     if form.use_mosh {
                         // Mosh and ThinkTerm Connect are alternative
@@ -773,6 +916,68 @@ impl SshHostsView {
                 // the selection.
                 self.selection_active = false;
                 self.refresh();
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::ToggleTailnetGroup => {
+                self.tailnet.collapsed = !self.tailnet.collapsed;
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::TailnetSettings => {
+                if self.tailnet.panel_open {
+                    self.close_tailnet_panel();
+                } else {
+                    self.open_tailnet_panel();
+                }
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::TailnetMachine(index) => self.open_tailnet_machine(index),
+            SshViewAction::TailnetNotice => match self.tailnet.notice {
+                Some(NoticeButton::TurnOn) => {
+                    // What was typed into the panel goes first: a control
+                    // server is set before the node starts with it.
+                    self.commit_tailnet_fields(None);
+                    crate::tailnet::turn_on();
+                    self.open_tailnet_panel();
+                    ContentViewResponse::Redraw
+                }
+                Some(NoticeButton::LogIn) => self.apply(SshViewAction::OpenTailnetLogin),
+                Some(NoticeButton::Settings) => {
+                    self.open_tailnet_panel();
+                    ContentViewResponse::Redraw
+                }
+                None => ContentViewResponse::Redraw,
+            },
+            SshViewAction::ToggleTailnet => {
+                self.commit_tailnet_fields(None);
+                crate::tailnet::toggle();
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::OpenTailnetLogin => {
+                if let Some(url) = self.tailnet.login_url.as_deref() {
+                    wezterm_open_url::open_url(url);
+                }
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::CopyTailnetLogin => {
+                let Some(url) = self.tailnet.login_url.clone() else {
+                    return ContentViewResponse::Redraw;
+                };
+                self.tailnet.copied_until = Some(Instant::now() + COPIED_FOR);
+                ContentViewResponse::Run(Box::new(move |term_window| {
+                    term_window.copy_to_clipboard(
+                        config::keyassignment::ClipboardCopyDestination::Clipboard,
+                        url,
+                    );
+                    term_window.invalidate_window();
+                }))
+            }
+            SshViewAction::FocusTailnetField(field) => {
+                self.focus = Focus::Tailnet(field.min(TAILNET_FIELD_COUNT - 1));
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::TailnetLogout => {
+                self.commit_tailnet_fields(None);
+                crate::tailnet::logout();
                 ContentViewResponse::Redraw
             }
         }
@@ -957,6 +1162,34 @@ impl SshHostsView {
         if !matches!(key, KeyCode::UpArrow | KeyCode::DownArrow) {
             if let Some(response) = self.handle_text_editing_key(key, mods) {
                 return response;
+            }
+        }
+
+        if self.tailnet.panel_open {
+            if matches!(key, KeyCode::Escape) {
+                // Leaving without sending what was typed: a half-typed key
+                // or address would restart the node on it.
+                self.tailnet.dirty = [false; TAILNET_FIELD_COUNT];
+                self.close_tailnet_panel();
+                return ContentViewResponse::Redraw;
+            }
+            if let Focus::Tailnet(field) = self.focus {
+                match (key, mods) {
+                    (KeyCode::Enter, _) => {
+                        self.commit_tailnet_field(field);
+                        return ContentViewResponse::Redraw;
+                    }
+                    (KeyCode::Tab, KeyModifiers::NONE) => {
+                        self.focus = Focus::Tailnet((field + 1) % TAILNET_FIELD_COUNT);
+                        return ContentViewResponse::Redraw;
+                    }
+                    (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                        self.focus =
+                            Focus::Tailnet((field + TAILNET_FIELD_COUNT - 1) % TAILNET_FIELD_COUNT);
+                        return ContentViewResponse::Redraw;
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -1205,6 +1438,11 @@ impl SshHostsView {
                     .then(|| form.options.get(n).map(|(_, value)| value))
                     .flatten()
             }
+            Focus::Tailnet(n) => self
+                .tailnet
+                .panel_open
+                .then(|| self.tailnet.fields.get(n))
+                .flatten(),
         }
     }
 
@@ -1234,16 +1472,30 @@ impl SshHostsView {
                 form.error = None;
                 form.options.get_mut(n).map(|(_, value)| value)
             }
+            Focus::Tailnet(n) => {
+                if !self.tailnet.panel_open {
+                    return None;
+                }
+                self.tailnet.fields.get_mut(n)
+            }
         }
     }
 
     /// Run `f` against the focused field, then re-filter the host list if the
     /// search box was the one edited.
     fn edit_focused(&mut self, f: impl FnOnce(&mut TextInputState)) {
+        let focus = self.focus;
         let Some(input) = self.focused_input_mut() else {
             return;
         };
+        // A Tailscale field goes out once it is left, and only if what it
+        // says changed: moving the caret through it is no edit.
+        let before = matches!(focus, Focus::Tailnet(_)).then(|| input.text().to_string());
         f(input);
+        let changed = before.is_some_and(|before| before != input.text());
+        if let (true, Focus::Tailnet(field)) = (changed, focus) {
+            self.tailnet.dirty[field] = true;
+        }
         if matches!(self.focus, Focus::Search) {
             // Typing in the search box reshuffles the list under the
             // highlight, so the old choice no longer means anything.
@@ -1332,6 +1584,7 @@ impl SshHostsView {
     ) -> anyhow::Result<()> {
         let tokens = UiTokens::for_dpi(ctx.dimensions.dpi);
         self.refresh();
+        let tailnet = self.read_tailnet();
         self.widgets.clear();
         self.card_rects.clear();
 
@@ -1361,7 +1614,7 @@ impl SshHostsView {
         // out in what is left. That is the whole responsive story: widen the
         // window and the leftover width becomes more columns, not a wider
         // form floating in the middle of the page.
-        let inspector_w = if self.form.is_some() {
+        let inspector_w = if self.form.is_some() || self.tailnet.panel_open {
             ctx.px(INSPECTOR_W).min(((w - pad * 2.0) * 0.6).max(0.0))
         } else {
             0.0
@@ -1392,6 +1645,7 @@ impl SshHostsView {
             font,
             section_font,
             palette,
+            &tailnet,
             content_x,
             content_w,
             list_top,
@@ -1434,19 +1688,36 @@ impl SshHostsView {
                 inspector_w,
                 (h - pad * 2.0).max(0.0),
             );
-            self.paint_inspector(
-                ctx,
-                &title_ctx,
-                &section_ctx,
-                layers,
-                font,
-                title_font,
-                section_font,
-                palette,
-                tokens,
-                cursor_on,
-                inspector,
-            )?;
+            if self.tailnet.panel_open {
+                self.paint_tailnet_panel(
+                    ctx,
+                    &title_ctx,
+                    &section_ctx,
+                    layers,
+                    font,
+                    title_font,
+                    section_font,
+                    palette,
+                    tokens,
+                    cursor_on,
+                    inspector,
+                    &tailnet,
+                )?;
+            } else {
+                self.paint_inspector(
+                    ctx,
+                    &title_ctx,
+                    &section_ctx,
+                    layers,
+                    font,
+                    title_font,
+                    section_font,
+                    palette,
+                    tokens,
+                    cursor_on,
+                    inspector,
+                )?;
+            }
         } else {
             self.form_area = rect(0.0, 0.0, 0.0, 0.0);
         }
@@ -1555,6 +1826,7 @@ impl SshHostsView {
         font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
         palette: UiPalette,
+        tailnet: &TailnetView,
         content_x: f32,
         content_w: f32,
         list_top: f32,
@@ -1566,7 +1838,9 @@ impl SshHostsView {
             content_w,
             (list_bottom - list_top).max(0.0),
         );
-        if self.filtered.is_empty() && self.system_host_count == 0 {
+        let tailnet_body = self.tailnet_body(tailnet);
+        self.tailnet.notice = None;
+        if self.filtered.is_empty() && self.system_host_count == 0 && tailnet_body.is_none() {
             self.scroll.set_extents(viewport.size.height, 0.0);
             return self.paint_empty_state(ctx, layers, font, palette, viewport);
         }
@@ -1574,9 +1848,15 @@ impl SshHostsView {
         let (own, system) = self.grouped_indices();
         // A lone "Hosts" caption over the only group on the page is noise;
         // the captions earn their place once there is a second group to tell
-        // apart from the first.
-        let grouped = self.system_host_count > 0;
-        let counts = [own.len(), system.len()];
+        // apart from the first -- and the Tailscale group always has one, for
+        // its caption carries the tailnet's state and its gear.
+        let grouped = self.system_host_count > 0 || tailnet_body.is_some();
+        // Its cards, while it shows them.
+        let machines = match &tailnet_body {
+            Some(TailnetBody::Machines) if !self.tailnet.collapsed => self.tailnet.machines.len(),
+            _ => 0,
+        };
+        let counts = [own.len(), machines, system.len()];
         let columns = Self::card_columns(ctx, &counts, content_w);
         let gap = ctx.px(CARD_GAP);
         let card_h = Self::card_height(ctx);
@@ -1584,38 +1864,128 @@ impl SshHostsView {
         let max_w = ctx.px(CARD_MAX_W);
 
         let own_grid = card_grid(own.len(), content_w, columns, max_w, gap, card_h);
+        let tailnet_grid = card_grid(machines, content_w, columns, max_w, gap, card_h);
         let system_grid = card_grid(system.len(), content_w, columns, max_w, gap, card_h);
 
         let title_gap = ctx.px(GROUP_TITLE_GAP);
-        let mut content_h = own_grid.height(gap);
-        if grouped {
-            content_h += (header_h + title_gap) * 2.0 + ctx.px(GROUP_GAP) + system_grid.height(gap);
+        let caption_h = if grouped { header_h + title_gap } else { 0.0 };
+        // An empty Hosts group has nothing to say under its caption.
+        let show_own = !own.is_empty();
+        let tailnet_h = match &tailnet_body {
+            _ if self.tailnet.collapsed => 0.0,
+            Some(TailnetBody::Machines) => tailnet_grid.height(gap),
+            Some(TailnetBody::Notice(_)) => card_h,
+            Some(TailnetBody::Pending) | None => 0.0,
+        };
+        let mut blocks = Vec::new();
+        if show_own {
+            blocks.push(caption_h + own_grid.height(gap));
         }
+        if tailnet_body.is_some() {
+            blocks.push(caption_h + tailnet_h);
+        }
+        if self.system_host_count > 0 {
+            blocks.push(caption_h + system_grid.height(gap));
+        }
+        let content_h =
+            blocks.iter().sum::<f32>() + ctx.px(GROUP_GAP) * blocks.len().saturating_sub(1) as f32;
         self.scroll.set_extents(viewport.size.height, content_h);
 
         let mut y = list_top - self.scroll.offset;
-        if grouped {
+        let mut first = true;
+        if show_own {
+            first = false;
+            if grouped {
+                self.paint_group_header(
+                    section_ctx,
+                    layers,
+                    section_font,
+                    palette,
+                    &crate::i18n::tr("ssh-group-hosts"),
+                    None,
+                    content_x,
+                    y,
+                    content_w,
+                    0.0,
+                    viewport,
+                )?;
+                y += header_h + title_gap;
+            }
+            self.paint_cards(
+                ctx, layers, font, palette, &own, own_grid, content_x, content_w, y, gap, viewport,
+            )?;
+            y += own_grid.height(gap);
+        }
+
+        if let Some(body) = &tailnet_body {
+            if !std::mem::take(&mut first) {
+                y += ctx.px(GROUP_GAP);
+            }
+            let label = match body {
+                TailnetBody::Machines => {
+                    let mut args = FluentArgs::new();
+                    args.set("count", self.tailnet.machines.len());
+                    crate::i18n::tr_args("ssh-group-tailscale-count", &args)
+                }
+                TailnetBody::Notice(_) | TailnetBody::Pending => {
+                    crate::i18n::tr("ssh-group-tailscale")
+                }
+            };
+            let status_w = self.tailnet_status_width(ctx, font, tailnet);
             self.paint_group_header(
                 section_ctx,
                 layers,
                 section_font,
                 palette,
-                &crate::i18n::tr("ssh-group-hosts"),
-                None,
+                &label,
+                Some((SshViewAction::ToggleTailnetGroup, !self.tailnet.collapsed)),
                 content_x,
                 y,
                 content_w,
+                status_w,
                 viewport,
             )?;
+            self.paint_tailnet_status(
+                ctx, layers, font, palette, tailnet, content_x, y, content_w, viewport,
+            )?;
             y += header_h + title_gap;
+            if !self.tailnet.collapsed {
+                match body {
+                    TailnetBody::Machines => {
+                        for slot in 0..machines {
+                            let card = card_rect(
+                                slot,
+                                machines,
+                                tailnet_grid,
+                                content_x,
+                                content_w,
+                                y,
+                                gap,
+                                RowAlign::Justify,
+                            );
+                            if card_is_warm(card, viewport, 0.0) {
+                                self.paint_tailnet_card(
+                                    ctx, layers, font, palette, slot, card, viewport,
+                                )?;
+                            }
+                        }
+                    }
+                    TailnetBody::Notice(notice) => {
+                        let card = rect(content_x, y, content_w, card_h);
+                        self.paint_tailnet_notice(
+                            ctx, layers, font, palette, notice, card, viewport,
+                        )?;
+                    }
+                    TailnetBody::Pending => {}
+                }
+                y += tailnet_h;
+            }
         }
-        self.paint_cards(
-            ctx, layers, font, palette, &own, own_grid, content_x, content_w, y, gap, viewport,
-        )?;
-        y += own_grid.height(gap);
 
-        if grouped {
-            y += ctx.px(GROUP_GAP);
+        if self.system_host_count > 0 {
+            if !first {
+                y += ctx.px(GROUP_GAP);
+            }
             let mut args = FluentArgs::new();
             args.set("count", self.system_host_count);
             let label = crate::i18n::tr_args("ssh-system-hosts", &args);
@@ -1625,10 +1995,14 @@ impl SshHostsView {
                 section_font,
                 palette,
                 &label,
-                Some(SshViewAction::ToggleSystemHosts),
+                Some((
+                    SshViewAction::ToggleSystemHosts,
+                    self.system_group_expanded(),
+                )),
                 content_x,
                 y,
                 content_w,
+                0.0,
                 viewport,
             )?;
             y += header_h + title_gap;
@@ -1799,6 +2173,9 @@ impl SshHostsView {
         Ok(())
     }
 
+    /// A group's caption. One that folds carries its action and whether it
+    /// is open; `trailing` is kept clear at the right end for what the
+    /// caller draws there.
     #[allow(clippy::too_many_arguments)]
     fn paint_group_header(
         &mut self,
@@ -1807,10 +2184,11 @@ impl SshHostsView {
         section_font: &Rc<LoadedFont>,
         palette: UiPalette,
         label: &str,
-        toggle: Option<SshViewAction>,
+        toggle: Option<(SshViewAction, bool)>,
         x: f32,
         y: f32,
         width: f32,
+        trailing: f32,
         viewport: RectF,
     ) -> anyhow::Result<()> {
         let height = section_ctx.px(GROUP_HEADER_H);
@@ -1819,7 +2197,7 @@ impl SshHostsView {
         }
         let line_h = section_ctx.metrics.cell_size.height as f32;
         let mut text_x = x;
-        if let Some(action) = toggle {
+        if let Some((action, expanded)) = toggle {
             let hit_h = (y + height).min(viewport.max_y()) - y.max(viewport.min_y());
             self.widgets.push(
                 rect(x, y.max(viewport.min_y()), width, hit_h.max(0.0)),
@@ -1827,7 +2205,7 @@ impl SshHostsView {
                 action,
             );
             let chevron = section_ctx.px(18.0);
-            let icon = if self.system_group_expanded() {
+            let icon = if expanded {
                 SvgIcon::ChevronDown
             } else {
                 SvgIcon::ChevronRight
@@ -1849,7 +2227,7 @@ impl SshHostsView {
             y + ((height - line_h) / 2.0).max(0.0),
             label,
             palette.secondary_text,
-            (width - (text_x - x)).max(0.0),
+            (width - trailing - (text_x - x)).max(0.0),
         )?;
         Ok(())
     }
@@ -2049,34 +2427,22 @@ impl SshHostsView {
         y: f32,
         width: f32,
     ) -> anyhow::Result<f32> {
-        let line_h = ctx.metrics.cell_size.height as f32;
-        ctx.draw_text(layers, font, x, y, label, palette.muted_text, width)?;
-        let input_y = y + line_h + ctx.px(LABEL_GAP);
-        let text_pad = ctx.px(12.0);
-        self.resolve_pending_caret_click(ctx, font, Focus::Field(index), shown, x + text_pad);
-        let caret = self.caret_for(Focus::Field(index));
-        let focused = self.focus == Focus::Field(index);
-        draw_text_input(
+        self.paint_input_row(
             ctx,
             layers,
             font,
-            &mut self.widgets,
-            &self.interaction,
             palette,
             tokens,
-            text_pad,
             cursor_on,
-            TextInputSpec {
-                placeholder,
-                text: shown,
-                rect: rect(x, input_y, width, ctx.px(INPUT_H)),
-                focused,
-                selected_all: false,
-                action: SshViewAction::FocusField(index),
-            },
-            caret,
-        )?;
-        Ok(input_y + ctx.px(INPUT_H))
+            label,
+            Focus::Field(index),
+            SshViewAction::FocusField(index),
+            shown,
+            placeholder,
+            x,
+            y,
+            width,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2218,6 +2584,7 @@ impl SshHostsView {
             return Ok(());
         };
         let editing = form.editing.clone();
+        let network = form.network;
         let detect_os = form.detect_os;
         let use_mosh = form.use_mosh;
         let multiplexing = form.multiplexing;
@@ -2301,8 +2668,11 @@ impl SshHostsView {
             let mut body_layers = TripleLayerQuadAllocator::Heap(&mut heap);
 
             // ---- Connection
-            let conn_h =
-                Self::inspector_card_height(ctx, section_h, &[field_h, field_h, field_h, field_h]);
+            let conn_h = Self::inspector_card_height(
+                ctx,
+                section_h,
+                &[field_h, field_h, field_h, field_h, field_h],
+            );
             let mut fy = Self::paint_inspector_card(
                 ctx,
                 section_ctx,
@@ -2327,6 +2697,52 @@ impl SshHostsView {
                 fy,
                 inner,
             )? + gap;
+            ctx.draw_text(
+                &mut body_layers,
+                font,
+                x + pad,
+                fy,
+                &crate::i18n::tr("ssh-field-network"),
+                palette.text,
+                inner,
+            )?;
+            let each = (inner - ctx.px(8.0)) / 2.0;
+            for (index, (choice, label)) in [
+                (SshNetwork::System, "ssh-network-system"),
+                (SshNetwork::Tailnet, "ssh-network-tailnet"),
+            ]
+            .iter()
+            .copied()
+            .enumerate()
+            {
+                let action = SshViewAction::SetNetwork(choice);
+                let state = self.button_state(action);
+                draw_button(
+                    ctx,
+                    &mut body_layers,
+                    font,
+                    &mut self.widgets,
+                    palette,
+                    ButtonSpec {
+                        label: &crate::i18n::tr(label),
+                        action,
+                        rect: rect(
+                            x + pad + index as f32 * (each + ctx.px(8.0)),
+                            fy + line_h + ctx.px(LABEL_GAP),
+                            each,
+                            ctx.px(INPUT_H),
+                        ),
+                        state,
+                        kind: WidgetKind::Button,
+                        variant: if network == choice {
+                            ButtonVariant::Primary
+                        } else {
+                            ButtonVariant::Secondary
+                        },
+                    },
+                )?;
+            }
+            fy += field_h + gap;
             // Host and Port share a row: a port needs four characters, not a
             // column of its own.
             let port_w = ctx.px(96.0).min(inner * 0.32);
@@ -2901,6 +3317,1214 @@ impl SshHostsView {
     }
 }
 
+/// How the Tailscale group's caption reads the tailnet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Off,
+    Waiting,
+    Up,
+    Trouble,
+}
+
+impl Tone {
+    fn color(self, palette: UiPalette) -> LinearRgba {
+        let (r, g, b) = match self {
+            Self::Off => return palette.muted_text,
+            Self::Trouble => return palette.danger,
+            Self::Waiting => WAITING_ORANGE,
+            Self::Up => ONLINE_GREEN,
+        };
+        LinearRgba::with_srgba(r, g, b, 0xFF)
+    }
+}
+
+/// The tailnet in a word or two, for the group's caption: nothing until
+/// the page has read how it is.
+fn tailnet_status(view: &TailnetView) -> Option<(&'static str, Tone)> {
+    if view.error.is_some() {
+        return Some(("ssh-tailscale-not-saved", Tone::Trouble));
+    }
+    if view.read_error.is_some() {
+        return Some(("ssh-tailscale-unreadable", Tone::Trouble));
+    }
+    if !view.known {
+        return None;
+    }
+    if !view.enabled {
+        return Some(("ssh-tailscale-off", Tone::Off));
+    }
+    if !view.server_running {
+        return Some(("ssh-tailscale-starting", Tone::Waiting));
+    }
+    Some(match &view.state {
+        TailnetState::Connected { .. } => ("ssh-tailscale-connected", Tone::Up),
+        TailnetState::NeedsLogin(_) => ("ssh-tailscale-login", Tone::Waiting),
+        TailnetState::Failed(_) => ("ssh-tailscale-failed", Tone::Trouble),
+        TailnetState::HeldElsewhere => ("ssh-tailscale-elsewhere", Tone::Waiting),
+        TailnetState::Off | TailnetState::Starting => ("ssh-tailscale-starting", Tone::Waiting),
+    })
+}
+
+/// The panel's account of the tailnet: where the node is, or why not.
+fn tailnet_state_text(view: &TailnetView) -> String {
+    if !view.known {
+        return "…".to_string();
+    }
+    if !view.enabled {
+        return crate::i18n::tr("ssh-tailscale-state-off");
+    }
+    if !view.server_running {
+        return crate::i18n::tr("ssh-tailscale-server-not-running");
+    }
+    match &view.state {
+        TailnetState::Off | TailnetState::Starting => crate::i18n::tr("ssh-tailscale-starting"),
+        TailnetState::NeedsLogin(_) => crate::i18n::tr("ssh-tailscale-login"),
+        TailnetState::Connected {
+            name,
+            address: Some(address),
+        } => tr_named(
+            "ssh-tailscale-state-connected",
+            &[("name", name.clone()), ("address", address.clone())],
+        ),
+        TailnetState::Connected {
+            name,
+            address: None,
+        } => tr_named(
+            "ssh-tailscale-state-connected-no-address",
+            &[("name", name.clone())],
+        ),
+        TailnetState::Failed(error) => {
+            tr_named("ssh-tailscale-state-failed", &[("error", error.clone())])
+        }
+        TailnetState::HeldElsewhere => crate::i18n::tr("ssh-tailscale-state-elsewhere"),
+    }
+}
+
+fn tr_named(id: &str, named: &[(&str, String)]) -> String {
+    let mut args = FluentArgs::new();
+    for (name, value) in named {
+        args.set(*name, value.clone());
+    }
+    crate::i18n::tr_args(id, &args)
+}
+
+/// What a machine of the tailnet is drawn as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MachineIcon {
+    /// A maker's mark in its own colours.
+    Brand(BrandIcon),
+    /// A mark tinted like the page's text.
+    Plain(SvgIcon),
+}
+
+/// The maker's mark where there is one -- the distribution's, for Linux --
+/// and a plain picture where not.
+fn machine_icon(machine: &TailnetMachine) -> MachineIcon {
+    match machine.device {
+        Device::Mac | Device::IPhone | Device::IPad | Device::AppleTv => {
+            MachineIcon::Plain(SvgIcon::Apple)
+        }
+        Device::Android => MachineIcon::Brand(BrandIcon::Android),
+        Device::Linux => {
+            MachineIcon::Brand(distro_to_icon(&machine.distro).unwrap_or(BrandIcon::Linux))
+        }
+        // The app carries no Windows mark.
+        Device::Windows => MachineIcon::Plain(SvgIcon::Monitor),
+        Device::Unknown => MachineIcon::Plain(SvgIcon::Server),
+    }
+}
+
+/// Under a machine's name: what it is, and whether it is online.
+fn machine_subtitle(machine: &TailnetMachine) -> String {
+    let presence = match machine.online {
+        Some(true) => Some(crate::i18n::tr("ssh-tailscale-online")),
+        Some(false) => Some(crate::i18n::tr("ssh-tailscale-offline")),
+        None => None,
+    };
+    match (machine.device.name(), presence) {
+        (Some(device), Some(presence)) => format!("{device}  ·  {presence}"),
+        (Some(device), None) => device.to_string(),
+        (None, Some(presence)) => presence,
+        (None, None) => machine.target.clone(),
+    }
+}
+
+/// Whether the search box's text, lowercased, finds this machine.
+fn machine_matches(machine: &TailnetMachine, needle: &str) -> bool {
+    let addresses = machine
+        .addresses
+        .iter()
+        .map(|address| address.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{} {} {} {addresses}",
+        machine.name,
+        machine.target,
+        machine.device.name().unwrap_or_default()
+    )
+    .to_ascii_lowercase()
+    .contains(needle)
+}
+
+/// Whether a Tailscale field keeps the text it went out with (`change`)
+/// rather than show the file: while that change is saved, and while the
+/// panel says why it could not be. Forgets the change once it is in.
+fn keeps_typed_text(change: &mut Option<u64>) -> bool {
+    match change.map(crate::tailnet::saved) {
+        Some(None) | Some(Some(false)) => true,
+        Some(Some(true)) => {
+            *change = None;
+            false
+        }
+        None => false,
+    }
+}
+
+impl SshHostsView {
+    /// The tailnet as last read -- read again when that is due -- with the
+    /// group's fields and machines brought up to it.
+    fn read_tailnet(&mut self) -> TailnetView {
+        if !crate::tailnet::available() {
+            return TailnetView::default();
+        }
+        if let Some(window) = self.window.clone() {
+            if crate::tailnet::poll_is_due() {
+                crate::tailnet::refresh(window);
+            }
+        }
+        let view = crate::tailnet::view();
+        self.sync_tailnet_fields(&view);
+        self.tailnet.login_url = view.login_url().map(str::to_string);
+        let needle = self.search.text().trim().to_ascii_lowercase();
+        self.tailnet.machines = view
+            .machines
+            .iter()
+            .filter(|machine| needle.is_empty() || machine_matches(machine, &needle))
+            .cloned()
+            .collect();
+        view
+    }
+
+    /// Fields nobody is editing show what the settings file says, which
+    /// `thinkterm tailnet` may have changed meanwhile -- once what was typed
+    /// into them is saved. Text that could not be saved stays, for the
+    /// panel says why, until another change is saved.
+    fn sync_tailnet_fields(&mut self, view: &TailnetView) {
+        for field in 0..TAILNET_FIELD_COUNT {
+            if self.focus == Focus::Tailnet(field)
+                || self.tailnet.dirty[field]
+                || keeps_typed_text(&mut self.tailnet.changes[field])
+            {
+                continue;
+            }
+            let file = match field {
+                // A saved key never shows: the field empties once it is in.
+                TAILNET_AUTH_KEY => "",
+                TAILNET_CONTROL_URL => view.control_url.as_str(),
+                _ => view.hostname.as_str(),
+            };
+            if self.tailnet.fields[field].text() != file {
+                self.tailnet.fields[field].set_text_end(file.to_string());
+            }
+        }
+    }
+
+    /// Sends a Tailscale field that was typed into. The node restarts with
+    /// it once it is saved (see thinkterm_tailnet::update).
+    fn commit_tailnet_field(&mut self, field: usize) {
+        if !std::mem::take(&mut self.tailnet.dirty[field]) {
+            return;
+        }
+        let text = self.tailnet.fields[field].text().to_string();
+        self.tailnet.changes[field] = match field {
+            TAILNET_AUTH_KEY => crate::tailnet::set_auth_key(&text),
+            TAILNET_CONTROL_URL => Some(crate::tailnet::set_control_url(&text)),
+            _ => Some(crate::tailnet::set_hostname(&text)),
+        };
+    }
+
+    /// Sends every Tailscale field typed into but `keep`, the one still
+    /// being typed in.
+    fn commit_tailnet_fields(&mut self, keep: Option<usize>) {
+        for field in 0..TAILNET_FIELD_COUNT {
+            if Some(field) != keep {
+                self.commit_tailnet_field(field);
+            }
+        }
+    }
+
+    /// After a click or a key: a Tailscale field goes out once it is left,
+    /// as Settings' fields did.
+    fn commit_left_tailnet_fields(&mut self) {
+        let keep = match self.focus {
+            Focus::Tailnet(field) if self.tailnet.panel_open => Some(field),
+            _ => None,
+        };
+        self.commit_tailnet_fields(keep);
+    }
+
+    fn open_tailnet_panel(&mut self) {
+        if !crate::tailnet::available() {
+            return;
+        }
+        // One inspector: a host's form gives way, as it does to another
+        // host's.
+        self.close_form();
+        self.tailnet.panel_open = true;
+        self.reset_form_scroll();
+    }
+
+    fn close_tailnet_panel(&mut self) {
+        if !self.tailnet.panel_open {
+            return;
+        }
+        self.commit_tailnet_fields(None);
+        self.tailnet.panel_open = false;
+        if matches!(self.focus, Focus::Tailnet(_)) {
+            self.focus = Focus::Search;
+        }
+        self.reset_form_scroll();
+    }
+
+    /// The saved host that is this machine of the tailnet, if one is: its
+    /// address, or one of its other addresses, names the machine.
+    fn saved_host_for(&self, machine: &TailnetMachine) -> Option<&SshHostEntry> {
+        self.saved_hosts.iter().find(|entry| {
+            entry.spec.network == SshNetwork::Tailnet
+                && (machine.answers_to(&entry.spec.host)
+                    || entry
+                        .spec
+                        .other_addresses
+                        .iter()
+                        .any(|address| machine.answers_to(address)))
+        })
+    }
+
+    /// A machine of the tailnet: one saved as a host connects the way it
+    /// was saved; another opens a new host's form with its name and address
+    /// filled in, for whom to sign in as -- saved, it is a host like any
+    /// other, in Hosts.
+    fn open_tailnet_machine(&mut self, index: usize) -> ContentViewResponse {
+        let Some(machine) = self.tailnet.machines.get(index).cloned() else {
+            return ContentViewResponse::Redraw;
+        };
+        if let Some(entry) = self.saved_host_for(&machine) {
+            return open_thread_response(entry.id.clone());
+        }
+        self.open_new_form();
+        if let Some(form) = self.form.as_mut() {
+            form.network = SshNetwork::Tailnet;
+            form.fields[FIELD_NAME].set_text_end(machine.name.clone());
+            form.fields[FIELD_HOST].set_text_end(machine.target.clone());
+        }
+        // Where it is, the tailnet said; whom to sign in as is left.
+        self.focus = Focus::Field(FIELD_USER);
+        self.selection_active = false;
+        ContentViewResponse::Redraw
+    }
+
+    /// What the Tailscale group holds, or None when it does not show: in a
+    /// build that cannot join a tailnet, and in a search that finds none of
+    /// its machines.
+    fn tailnet_body(&self, view: &TailnetView) -> Option<TailnetBody> {
+        if !crate::tailnet::available() {
+            return None;
+        }
+        if !self.search.text().trim().is_empty() {
+            return (!self.tailnet.machines.is_empty()).then_some(TailnetBody::Machines);
+        }
+        if !view.known {
+            return Some(TailnetBody::Pending);
+        }
+        let tr = crate::i18n::tr;
+        let notice = |icon, title: &str, subtitle: String, button: Option<(&str, NoticeButton)>| {
+            TailnetBody::Notice(TailnetNotice {
+                icon,
+                title: tr(title),
+                subtitle,
+                button: button.map(|(label, which)| (tr(label), which)),
+                invite: false,
+            })
+        };
+        if !view.enabled {
+            return Some(TailnetBody::Notice(TailnetNotice {
+                icon: SvgIcon::Network,
+                title: tr("ssh-tailscale-off-title"),
+                subtitle: tr("ssh-tailscale-off-subtitle"),
+                button: Some((tr("ssh-tailscale-turn-on"), NoticeButton::TurnOn)),
+                invite: true,
+            }));
+        }
+        if !view.server_running {
+            return Some(notice(
+                SvgIcon::Network,
+                "ssh-tailscale-starting",
+                tr("ssh-tailscale-server-not-running"),
+                None,
+            ));
+        }
+        Some(match &view.state {
+            TailnetState::Connected { .. } if !self.tailnet.machines.is_empty() => {
+                TailnetBody::Machines
+            }
+            TailnetState::Connected { .. } => notice(
+                SvgIcon::Network,
+                "ssh-tailscale-empty-title",
+                tr("ssh-tailscale-empty-subtitle"),
+                None,
+            ),
+            TailnetState::NeedsLogin(_) => notice(
+                SvgIcon::KeyRound,
+                "ssh-tailscale-login",
+                tr("ssh-tailscale-login-description"),
+                Some(("ssh-tailscale-login-button", NoticeButton::LogIn)),
+            ),
+            TailnetState::Failed(error) => notice(
+                SvgIcon::CircleAlert,
+                "ssh-tailscale-failed",
+                error.clone(),
+                Some(("ssh-tailscale-settings-button", NoticeButton::Settings)),
+            ),
+            TailnetState::HeldElsewhere => notice(
+                SvgIcon::Network,
+                "ssh-tailscale-elsewhere",
+                tr("ssh-tailscale-state-elsewhere"),
+                None,
+            ),
+            TailnetState::Off | TailnetState::Starting => notice(
+                SvgIcon::Network,
+                "ssh-tailscale-starting",
+                tr("ssh-tailscale-starting-subtitle"),
+                None,
+            ),
+        })
+    }
+
+    /// The room the caption's status and gear take at its right end.
+    fn tailnet_status_width(
+        &self,
+        ctx: &DrawContext,
+        font: &Rc<LoadedFont>,
+        view: &TailnetView,
+    ) -> f32 {
+        let gear = ctx.px(TAILNET_GEAR + 12.0);
+        match tailnet_status(view) {
+            Some((status, _)) => {
+                gear + ctx.px(10.0 + 7.0 + 8.0)
+                    + ctx.measure_text_width(font, &crate::i18n::tr(status))
+            }
+            None => gear,
+        }
+    }
+
+    /// The right end of the Tailscale caption: the tailnet's state by its
+    /// dot, and the gear that opens the panel. Either opens it.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tailnet_status(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        view: &TailnetView,
+        x: f32,
+        y: f32,
+        width: f32,
+        viewport: RectF,
+    ) -> anyhow::Result<()> {
+        let height = ctx.px(GROUP_HEADER_H);
+        if !row_visible(y, height, viewport) {
+            return Ok(());
+        }
+        let widgets_start = self.widgets.len();
+        let action = SshViewAction::TailnetSettings;
+        let hovered = self.button_state(action) != ControlState::Normal;
+        let gear = ctx.px(TAILNET_GEAR).min(height);
+        let gear_x = x + width - gear;
+        let gear_y = y + (height - gear) / 2.0;
+        let status = tailnet_status(view).map(|(id, tone)| (crate::i18n::tr(id), tone));
+        let line_h = ctx.metrics.cell_size.height as f32;
+        let status_w = status
+            .as_ref()
+            .map(|(text, _)| ctx.measure_text_width(font, text))
+            .unwrap_or_default();
+        let status_x = gear_x - ctx.px(10.0) - status_w;
+        let dot = ctx.px(8.0);
+        let dot_x = status_x - ctx.px(7.0) - dot;
+        let hit_x = if status.is_some() { dot_x } else { gear_x };
+        self.widgets.push(
+            rect(hit_x, y, x + width - hit_x, height),
+            WidgetKind::Button,
+            action,
+        );
+        // A quiet gear, open panel or not: a lit square beside the
+        // caption outshouted everything on the page.
+        if hovered {
+            ctx.draw_rounded_rect(
+                layers,
+                0,
+                gear_x,
+                gear_y,
+                gear,
+                gear,
+                palette.control_hover_bg,
+                ctx.px(8.0),
+            )?;
+        }
+        // As large as an icon button's, next to the caption's text.
+        let glyph = (line_h + ctx.px(4.0))
+            .clamp(ctx.px(20.0), ctx.px(30.0))
+            .min(gear - ctx.px(6.0))
+            .round();
+        ctx.draw_svg_icon(
+            layers,
+            SvgIcon::Settings,
+            gear_x + (gear - glyph) / 2.0,
+            gear_y + (gear - glyph) / 2.0,
+            glyph,
+            if hovered {
+                palette.text
+            } else {
+                palette.muted_text
+            },
+        )?;
+        if let Some((status, tone)) = &status {
+            ctx.draw_disc(
+                layers,
+                1,
+                dot_x + dot / 2.0,
+                y + height / 2.0,
+                dot,
+                tone.color(palette),
+            )?;
+            ctx.draw_text(
+                layers,
+                font,
+                status_x,
+                y + ((height - line_h) / 2.0).max(0.0),
+                status,
+                if *tone == Tone::Trouble {
+                    palette.danger
+                } else {
+                    palette.secondary_text
+                },
+                status_w,
+            )?;
+        }
+        self.widgets.clip_since(widgets_start, viewport);
+        Ok(())
+    }
+
+    /// One machine of the tailnet: its mark, its name, what it is and
+    /// whether it is online -- and, when it is saved as a host already,
+    /// that it is.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tailnet_card(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        index: usize,
+        card: RectF,
+        viewport: RectF,
+    ) -> anyhow::Result<()> {
+        let Some(machine) = self.tailnet.machines.get(index).cloned() else {
+            return Ok(());
+        };
+        let action = SshViewAction::TailnetMachine(index);
+        let Some(visible) = card.intersection(&viewport) else {
+            return Ok(());
+        };
+        self.widgets.push(visible, WidgetKind::SidebarRow, action);
+        let hovered = self.interaction.hovered == Some(action);
+        let bg = if hovered {
+            palette.sidebar_row_hover_bg
+        } else {
+            palette.card_bg
+        };
+        ctx.draw_rounded_frame(
+            layers,
+            0,
+            card.origin.x,
+            card.origin.y,
+            card.size.width,
+            card.size.height,
+            bg,
+            palette.separator,
+            ctx.px(CARD_RADIUS),
+        )?;
+
+        let online = machine.online == Some(true);
+        let offline = machine.online == Some(false);
+        let pad = ctx.px(CARD_PAD);
+        let line_h = ctx.metrics.cell_size.height as f32;
+        // The same size a host's logo gets.
+        let icon = (line_h * 2.2).clamp(ctx.px(50.0), ctx.px(64.0));
+        let icon_x = card.origin.x + pad;
+        let icon_y = card.origin.y + (card.size.height - icon) / 2.0;
+        match machine_icon(&machine) {
+            MachineIcon::Brand(brand) => {
+                ctx.draw_brand_icon(layers, brand, icon_x, icon_y, icon)?
+            }
+            MachineIcon::Plain(mark) => ctx.draw_svg_icon(
+                layers,
+                mark,
+                icon_x,
+                icon_y,
+                icon,
+                if offline {
+                    palette.muted_text
+                } else {
+                    palette.secondary_text
+                },
+            )?,
+        }
+        if offline {
+            // A machine that is away fades: its mark under a veil of the
+            // card's own colour.
+            ctx.draw_rect(layers, 2, icon_x, icon_y, icon, icon, bg.mul_alpha(0.55))?;
+        }
+
+        let text_x = icon_x + icon + ctx.px(14.0);
+        let right = card.max_x() - pad;
+        let mut title_w = (right - text_x).max(0.0);
+        let stack = line_h * 2.0 + ctx.px(4.0);
+        let title_y = card.origin.y + ((card.size.height - stack) / 2.0).max(ctx.px(8.0));
+        // Saved already: clicking it connects the way it was saved. The
+        // name comes first: where both do not fit, the word goes and the
+        // check stays.
+        if self.saved_host_for(&machine).is_some() {
+            let label = crate::i18n::tr("ssh-tailscale-added");
+            let check = (line_h * 0.85).round();
+            let gap = ctx.px(10.0);
+            let label_w = ctx.measure_text_width(font, &label);
+            let worded = check + ctx.px(4.0) + label_w;
+            let name_w = ctx.measure_text_width(font, &machine.name);
+            let word = name_w + gap + worded <= title_w;
+            let tag_x = right - if word { worded } else { check };
+            ctx.draw_svg_icon(
+                layers,
+                SvgIcon::Check,
+                tag_x,
+                title_y + (line_h - check) / 2.0,
+                check,
+                palette.muted_text,
+            )?;
+            if word {
+                ctx.draw_text(
+                    layers,
+                    font,
+                    tag_x + check + ctx.px(4.0),
+                    title_y,
+                    &label,
+                    palette.muted_text,
+                    label_w,
+                )?;
+            }
+            title_w = (tag_x - gap - text_x).max(0.0);
+        }
+        ctx.draw_text(
+            layers,
+            font,
+            text_x,
+            title_y,
+            &machine.name,
+            if offline {
+                palette.secondary_text
+            } else {
+                palette.text
+            },
+            title_w,
+        )?;
+        let subtitle_y = title_y + line_h + ctx.px(4.0);
+        let mut subtitle_x = text_x;
+        if online {
+            let dot = ctx.px(8.0);
+            ctx.draw_disc(
+                layers,
+                1,
+                subtitle_x + dot / 2.0,
+                subtitle_y + line_h / 2.0,
+                dot,
+                Tone::Up.color(palette),
+            )?;
+            subtitle_x += dot + ctx.px(7.0);
+        }
+        ctx.draw_text(
+            layers,
+            font,
+            subtitle_x,
+            subtitle_y,
+            &machine_subtitle(&machine),
+            palette.muted_text,
+            (right - subtitle_x).max(0.0),
+        )?;
+        Ok(())
+    }
+
+    /// The card the Tailscale group shows instead of machines: the tailnet
+    /// off -- an invitation to turn it on -- or on its way, or waiting.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tailnet_notice(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        notice: &TailnetNotice,
+        card: RectF,
+        viewport: RectF,
+    ) -> anyhow::Result<()> {
+        if !row_visible(card.origin.y, card.size.height, viewport) {
+            return Ok(());
+        }
+        let widgets_start = self.widgets.len();
+        let (fill, border, mark) = if notice.invite {
+            (
+                palette.accent.mul_alpha(0.06),
+                palette.accent.mul_alpha(0.55),
+                palette.accent,
+            )
+        } else {
+            (palette.card_bg, palette.separator, palette.muted_text)
+        };
+        ctx.draw_rounded_frame(
+            layers,
+            0,
+            card.origin.x,
+            card.origin.y,
+            card.size.width,
+            card.size.height,
+            fill,
+            border,
+            ctx.px(CARD_RADIUS),
+        )?;
+        let pad = ctx.px(CARD_PAD);
+        let line_h = ctx.metrics.cell_size.height as f32;
+        let icon = (line_h * 1.8).clamp(ctx.px(40.0), ctx.px(52.0));
+        let icon_x = card.origin.x + pad;
+        ctx.draw_svg_icon(
+            layers,
+            notice.icon,
+            icon_x,
+            card.origin.y + (card.size.height - icon) / 2.0,
+            icon,
+            mark,
+        )?;
+
+        let mut right = card.max_x() - pad;
+        if let Some((label, which)) = &notice.button {
+            let button_w = ctx.measure_text_width(font, label) + ctx.px(56.0);
+            let button_h = ctx.px(BTN_H).min(card.size.height - ctx.px(16.0));
+            let button_x = right - button_w;
+            self.tailnet.notice = Some(*which);
+            let state = self.button_state(SshViewAction::TailnetNotice);
+            draw_button(
+                ctx,
+                layers,
+                font,
+                &mut self.widgets,
+                palette,
+                ButtonSpec {
+                    label,
+                    action: SshViewAction::TailnetNotice,
+                    rect: rect(
+                        button_x,
+                        card.origin.y + (card.size.height - button_h) / 2.0,
+                        button_w,
+                        button_h,
+                    ),
+                    state,
+                    kind: WidgetKind::Button,
+                    variant: if *which == NoticeButton::Settings {
+                        ButtonVariant::Secondary
+                    } else {
+                        ButtonVariant::Primary
+                    },
+                },
+            )?;
+            right = button_x - ctx.px(14.0);
+        }
+        let text_x = icon_x + icon + ctx.px(16.0);
+        let text_w = (right - text_x).max(0.0);
+        let stack = line_h * 2.0 + ctx.px(4.0);
+        let title_y = card.origin.y + ((card.size.height - stack) / 2.0).max(ctx.px(8.0));
+        ctx.draw_text(
+            layers,
+            font,
+            text_x,
+            title_y,
+            &notice.title,
+            palette.text,
+            text_w,
+        )?;
+        ctx.draw_text(
+            layers,
+            font,
+            text_x,
+            title_y + line_h + ctx.px(4.0),
+            &notice.subtitle,
+            palette.muted_text,
+            text_w,
+        )?;
+        self.widgets.clip_since(widgets_start, viewport);
+        Ok(())
+    }
+
+    /// A labelled text field: the host form's, or the Tailscale panel's.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_input_row(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        tokens: UiTokens,
+        cursor_on: bool,
+        label: &str,
+        focus: Focus,
+        action: SshViewAction,
+        shown: &str,
+        placeholder: &str,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<f32> {
+        let line_h = ctx.metrics.cell_size.height as f32;
+        ctx.draw_text(layers, font, x, y, label, palette.muted_text, width)?;
+        let input_y = y + line_h + ctx.px(LABEL_GAP);
+        let text_pad = ctx.px(12.0);
+        self.resolve_pending_caret_click(ctx, font, focus, shown, x + text_pad);
+        let caret = self.caret_for(focus);
+        let focused = self.focus == focus;
+        draw_text_input(
+            ctx,
+            layers,
+            font,
+            &mut self.widgets,
+            &self.interaction,
+            palette,
+            tokens,
+            text_pad,
+            cursor_on,
+            TextInputSpec {
+                placeholder,
+                text: shown,
+                rect: rect(x, input_y, width, ctx.px(INPUT_H)),
+                focused,
+                selected_all: false,
+                action,
+            },
+            caret,
+        )?;
+        Ok(input_y + ctx.px(INPUT_H))
+    }
+
+    /// The Tailscale panel, in the inspector's place: the switch, how the
+    /// node is doing, how it logs in, where it connects and under what
+    /// name, and leaving for good.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tailnet_panel(
+        &mut self,
+        ctx: &DrawContext,
+        title_ctx: &DrawContext,
+        section_ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        title_font: &Rc<LoadedFont>,
+        section_font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        tokens: UiTokens,
+        cursor_on: bool,
+        area: RectF,
+        view: &TailnetView,
+    ) -> anyhow::Result<()> {
+        let tr = crate::i18n::tr;
+        self.form_area = area;
+        let x = area.origin.x;
+        let w = area.size.width;
+        let pad = ctx.px(20.0);
+        let inner = (w - pad * 2.0).max(0.0);
+        let line_h = ctx.metrics.cell_size.height as f32;
+        let section_h = section_ctx.metrics.cell_size.height as f32;
+        let title_h = title_ctx.metrics.cell_size.height as f32;
+        let field_h = Self::field_row_height(ctx);
+        let gap = ctx.px(FIELD_GAP);
+        let card_gap = ctx.px(INSPECTOR_CARD_GAP);
+        let toggle_w = ctx.px(64.0);
+        let toggle_h = ctx.px(36.0);
+
+        // The header does not scroll: the switch is what the panel is for.
+        let band = title_h.max(toggle_h);
+        let header_h = band + ctx.px(18.0);
+        let body_top = area.origin.y + header_h;
+        let body_height = (area.max_y() - body_top).max(0.0);
+        self.form_scroll
+            .set_extents(body_height, self.form_content_h);
+        let top = body_top - self.form_scroll.offset;
+        let mut y = top;
+
+        let fields: [String; TAILNET_FIELD_COUNT] =
+            std::array::from_fn(|field| self.tailnet.fields[field].text().to_string());
+        let login = self.tailnet.login_url.is_some();
+        let copied = self
+            .tailnet
+            .copied_until
+            .is_some_and(|until| Instant::now() < until);
+        let wrap = |text: &str, width: f32| -> Vec<String> {
+            if width <= 0.0 {
+                return Vec::new();
+            }
+            wrap_snippet_text_for_width(text, 6, false, |segment| {
+                ctx.measure_text_width(font, segment) / width
+            })
+        };
+        // The state by its dot, then what else holds.
+        let tone = tailnet_status(view).map_or(Tone::Off, |(_, tone)| tone);
+        let dot = ctx.px(9.0);
+        let dot_room = dot + ctx.px(8.0);
+        let state_lines = wrap(&tailnet_state_text(view), inner - dot_room);
+        let mut notes: Vec<(Vec<String>, LinearRgba)> = Vec::new();
+        if view.enabled && view.serves_ssh {
+            notes.push((
+                wrap(&tr("ssh-tailscale-serving-ssh"), inner),
+                palette.muted_text,
+            ));
+        }
+        if let Some(error) = &view.error {
+            notes.push((
+                wrap(
+                    &tr_named("ssh-tailscale-save-error", &[("error", error.clone())]),
+                    inner,
+                ),
+                palette.danger,
+            ));
+        }
+        if let Some(error) = &view.read_error {
+            notes.push((
+                wrap(
+                    &tr_named("ssh-tailscale-read-error", &[("error", error.clone())]),
+                    inner,
+                ),
+                palette.danger,
+            ));
+        }
+        let note_gap = ctx.px(6.0);
+        let status_rows = state_lines.len() as f32 * line_h
+            + notes
+                .iter()
+                .map(|(lines, _)| note_gap + lines.len() as f32 * line_h)
+                .sum::<f32>();
+        let login_lines = if login {
+            wrap(&tr("ssh-tailscale-login-description"), inner)
+        } else {
+            Vec::new()
+        };
+        // Only with something to forget.
+        let logout = view.has_identity || view.has_auth_key;
+        let logout_lines = if logout {
+            wrap(&tr("ssh-tailscale-logout-description"), inner)
+        } else {
+            Vec::new()
+        };
+
+        // Recorded and replayed clipped to the body, as the host form is.
+        let mut heap = HeapQuadAllocator::default();
+        let body_widgets_start = self.widgets.len();
+        {
+            let mut body_layers = TripleLayerQuadAllocator::Heap(&mut heap);
+
+            // ---- Status
+            let status_h = Self::inspector_card_height(ctx, section_h, &[status_rows]);
+            let mut fy = Self::paint_inspector_card(
+                ctx,
+                section_ctx,
+                &mut body_layers,
+                section_font,
+                palette,
+                tokens,
+                &tr("ssh-tailscale-status"),
+                rect(x, y, w, status_h),
+            )?;
+            ctx.draw_disc(
+                &mut body_layers,
+                1,
+                x + pad + dot / 2.0,
+                fy + line_h / 2.0,
+                dot,
+                tone.color(palette),
+            )?;
+            for line in &state_lines {
+                ctx.draw_text(
+                    &mut body_layers,
+                    font,
+                    x + pad + dot_room,
+                    fy,
+                    line,
+                    palette.text,
+                    inner - dot_room,
+                )?;
+                fy += line_h;
+            }
+            for (lines, color) in &notes {
+                fy += note_gap;
+                for line in lines {
+                    ctx.draw_text(&mut body_layers, font, x + pad, fy, line, *color, inner)?;
+                    fy += line_h;
+                }
+            }
+            y += status_h + card_gap;
+
+            // ---- Log in: the link while the control server waits for
+            // someone to approve this machine, and a key instead of it.
+            let mut login_rows = Vec::new();
+            if login {
+                login_rows
+                    .push(login_lines.len() as f32 * line_h + ctx.px(LABEL_GAP) + ctx.px(BTN_H));
+            }
+            login_rows.push(field_h);
+            let login_h = Self::inspector_card_height(ctx, section_h, &login_rows);
+            let mut fy = Self::paint_inspector_card(
+                ctx,
+                section_ctx,
+                &mut body_layers,
+                section_font,
+                palette,
+                tokens,
+                &tr("ssh-tailscale-login-section"),
+                rect(x, y, w, login_h),
+            )?;
+            if login {
+                for line in &login_lines {
+                    ctx.draw_text(
+                        &mut body_layers,
+                        font,
+                        x + pad,
+                        fy,
+                        line,
+                        palette.muted_text,
+                        inner,
+                    )?;
+                    fy += line_h;
+                }
+                fy += ctx.px(LABEL_GAP);
+                let open_label = tr("ssh-tailscale-login-open");
+                let copy_label = tr(if copied {
+                    "ssh-tailscale-copied"
+                } else {
+                    "ssh-tailscale-login-copy"
+                });
+                let button_gap = ctx.px(10.0);
+                let open_w = (ctx.measure_text_width(font, &open_label) + ctx.px(56.0)).min(inner);
+                let copy_w = (ctx.measure_text_width(font, &copy_label) + ctx.px(56.0))
+                    .min((inner - open_w - button_gap).max(0.0));
+                for (label, action, variant, button_x, button_w) in [
+                    (
+                        &open_label,
+                        SshViewAction::OpenTailnetLogin,
+                        ButtonVariant::Primary,
+                        x + pad,
+                        open_w,
+                    ),
+                    (
+                        &copy_label,
+                        SshViewAction::CopyTailnetLogin,
+                        ButtonVariant::Secondary,
+                        x + pad + open_w + button_gap,
+                        copy_w,
+                    ),
+                ] {
+                    if button_w <= 0.0 {
+                        continue;
+                    }
+                    let state = self.button_state(action);
+                    draw_button(
+                        ctx,
+                        &mut body_layers,
+                        font,
+                        &mut self.widgets,
+                        palette,
+                        ButtonSpec {
+                            label,
+                            action,
+                            rect: rect(button_x, fy, button_w, ctx.px(BTN_H)),
+                            state,
+                            kind: WidgetKind::Button,
+                            variant,
+                        },
+                    )?;
+                }
+                fy += ctx.px(BTN_H) + gap;
+            }
+            // Typed characters show as dots, one each, so the caret and the
+            // selection still land between them.
+            let typed_key = "\u{2022}".repeat(fields[TAILNET_AUTH_KEY].chars().count());
+            let key_hint = tr(if view.has_auth_key {
+                "ssh-tailscale-auth-key-saved"
+            } else {
+                "ssh-tailscale-auth-key-placeholder"
+            });
+            self.paint_input_row(
+                ctx,
+                &mut body_layers,
+                font,
+                palette,
+                tokens,
+                cursor_on,
+                &tr("ssh-tailscale-auth-key"),
+                Focus::Tailnet(TAILNET_AUTH_KEY),
+                SshViewAction::FocusTailnetField(TAILNET_AUTH_KEY),
+                &typed_key,
+                &key_hint,
+                x + pad,
+                fy,
+                inner,
+            )?;
+            y += login_h + card_gap;
+
+            // ---- Connection: where the node signs in, and as what.
+            let connection_h = Self::inspector_card_height(ctx, section_h, &[field_h, field_h]);
+            let mut fy = Self::paint_inspector_card(
+                ctx,
+                section_ctx,
+                &mut body_layers,
+                section_font,
+                palette,
+                tokens,
+                &tr("ssh-group-connection"),
+                rect(x, y, w, connection_h),
+            )?;
+            fy = self.paint_input_row(
+                ctx,
+                &mut body_layers,
+                font,
+                palette,
+                tokens,
+                cursor_on,
+                &tr("ssh-tailscale-control"),
+                Focus::Tailnet(TAILNET_CONTROL_URL),
+                SshViewAction::FocusTailnetField(TAILNET_CONTROL_URL),
+                &fields[TAILNET_CONTROL_URL],
+                &tr("ssh-tailscale-control-placeholder"),
+                x + pad,
+                fy,
+                inner,
+            )? + gap;
+            self.paint_input_row(
+                ctx,
+                &mut body_layers,
+                font,
+                palette,
+                tokens,
+                cursor_on,
+                &tr("ssh-tailscale-hostname"),
+                Focus::Tailnet(TAILNET_HOSTNAME),
+                SshViewAction::FocusTailnetField(TAILNET_HOSTNAME),
+                &fields[TAILNET_HOSTNAME],
+                &tr("ssh-tailscale-hostname-placeholder"),
+                x + pad,
+                fy,
+                inner,
+            )?;
+            y += connection_h + card_gap;
+
+            // ---- Log out
+            if logout {
+                let label = tr("ssh-tailscale-logout");
+                let label_pad = ctx.px(12.0);
+                let label_w = ctx.measure_text_width(font, &label);
+                let action = SshViewAction::TailnetLogout;
+                let hit = rect(
+                    x,
+                    y,
+                    (label_w + label_pad * 2.0).min(w),
+                    line_h + ctx.px(14.0),
+                );
+                self.widgets.push(hit, WidgetKind::Button, action);
+                if self.button_state(action) != ControlState::Normal {
+                    ctx.draw_rounded_rect(
+                        &mut body_layers,
+                        0,
+                        hit.origin.x,
+                        hit.origin.y,
+                        hit.size.width,
+                        hit.size.height,
+                        palette.control_hover_bg,
+                        ctx.px(8.0),
+                    )?;
+                }
+                ctx.draw_text(
+                    &mut body_layers,
+                    font,
+                    x + label_pad,
+                    y + ctx.px(7.0),
+                    &label,
+                    palette.danger,
+                    label_w,
+                )?;
+                y += hit.size.height + ctx.px(4.0);
+                for line in &logout_lines {
+                    ctx.draw_text(
+                        &mut body_layers,
+                        font,
+                        x + label_pad,
+                        y,
+                        line,
+                        palette.muted_text,
+                        inner,
+                    )?;
+                    y += line_h;
+                }
+            }
+            y += ctx.px(PAD);
+        }
+        self.form_content_h = y - top;
+        let clip = QuadClipRect::from_top_left_pixels(
+            area.origin.x,
+            body_top,
+            area.max_x(),
+            area.max_y(),
+            &ctx.dimensions,
+        );
+        self.widgets.clip_since(
+            body_widgets_start,
+            rect(area.origin.x, body_top, area.size.width, body_height),
+        );
+        heap.apply_to_clipped(layers, clip, 1.0)?;
+
+        // The header: the name, and the switch.
+        let hy = area.origin.y;
+        title_ctx.draw_text_on_layer(
+            layers,
+            2,
+            title_font,
+            x,
+            hy + (band - title_h) / 2.0,
+            &tr("ssh-group-tailscale"),
+            palette.text,
+            (w - toggle_w - ctx.px(12.0)).max(0.0),
+        )?;
+        draw_toggle(
+            ctx,
+            layers,
+            &mut self.widgets,
+            &self.interaction,
+            palette,
+            rect(
+                x + w - toggle_w,
+                hy + (band - toggle_h) / 2.0,
+                toggle_w,
+                toggle_h,
+            ),
+            view.enabled,
+            SshViewAction::ToggleTailnet,
+        )?;
+        Ok(())
+    }
+}
+
 /// Close the view and open a disconnected remote thread on the main window.
 fn open_thread_response(project_id: String) -> ContentViewResponse {
     ContentViewResponse::Run(Box::new(move |tw: &mut TermWindow| {
@@ -2960,7 +4584,9 @@ impl ContentView for SshHostsView {
     }
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
-        self.on_mouse_impl(x, y, kind)
+        let response = self.on_mouse_impl(x, y, kind);
+        self.commit_left_tailnet_fields();
+        response
     }
 
     fn on_wheel(&mut self, x: f32, y: f32, event: &MouseEvent) -> ContentViewResponse {
@@ -2980,11 +4606,25 @@ impl ContentView for SshHostsView {
     }
 
     fn next_frame_time(&self) -> Option<Instant> {
-        self.scroll_animating.then(Instant::now)
+        if self.scroll_animating {
+            return Some(Instant::now());
+        }
+        // The tailnet changes elsewhere: the page reads it again every
+        // couple of seconds while it shows. And "Copied" goes back.
+        let poll = (self.window.is_some() && crate::tailnet::available())
+            .then(crate::tailnet::next_poll_at)
+            .flatten();
+        let copied = self
+            .tailnet
+            .copied_until
+            .filter(|until| *until > Instant::now());
+        poll.into_iter().chain(copied).min()
     }
 
     fn on_key(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse {
-        self.on_key_impl(key, mods)
+        let response = self.on_key_impl(key, mods);
+        self.commit_left_tailnet_fields();
+        response
     }
 
     fn on_paste(&mut self, text: &str) -> ContentViewResponse {
@@ -2996,7 +4636,15 @@ impl ContentView for SshHostsView {
         self.open_new_form();
     }
 
+    fn show_tailscale_panel(&mut self) {
+        self.open_tailnet_panel();
+    }
+
     fn copy_text(&self) -> Option<String> {
+        // A key typed into the Tailscale panel never leaves it.
+        if self.focus == Focus::Tailnet(TAILNET_AUTH_KEY) {
+            return None;
+        }
         let input = self.focused_input()?;
         let text = input
             .caret_selected_text()
@@ -3005,6 +4653,9 @@ impl ContentView for SshHostsView {
     }
 
     fn cut_text(&mut self) -> Option<String> {
+        if self.focus == Focus::Tailnet(TAILNET_AUTH_KEY) {
+            return None;
+        }
         self.take_focused_selection()
     }
 }
@@ -3014,9 +4665,11 @@ mod tests {
     use super::{
         focus_after_collapsing_advanced, ssh_options_from_rows, tab_stops_for, text_input_with,
         ContentViewResponse, Focus, HostForm, RemoteHostCommand, SshHostsView, BASE_FIELD_COUNT,
-        FIELD_HOST, FIELD_NAME, FIELD_PORT, FIELD_USER, FIELD_WORKSPACE,
+        FIELD_HOST, FIELD_NAME, FIELD_PORT, FIELD_USER, FIELD_WORKSPACE, TAILNET_AUTH_KEY,
+        TAILNET_CONTROL_URL, TAILNET_FIELD_COUNT, TAILNET_HOSTNAME,
     };
-    use crate::ssh_hosts::{SshHostEntry, SshHostSource, SshHostSpec};
+    use crate::ssh_hosts::{SshHostEntry, SshHostSource, SshHostSpec, SshNetwork};
+    use wezterm_term::{KeyCode, KeyModifiers};
 
     fn spec(label: &str, host: &str) -> SshHostSpec {
         SshHostSpec {
@@ -3024,6 +4677,7 @@ mod tests {
             host: host.to_string(),
             port: Some(2222),
             other_addresses: Vec::new(),
+            network: Default::default(),
             username: Some("deploy".to_string()),
             identity_file: Some("~/.ssh/id_ed25519".to_string()),
             password: None,
@@ -3195,6 +4849,158 @@ mod tests {
         // Tab order is the visible surface; a collapsed section contributes
         // nothing, which is the same invariant `focused_input_mut` enforces.
         assert_eq!(tab_stops_for(&form).len(), BASE_FIELD_COUNT);
+    }
+
+    fn tailnet_machine(name: &str, address: &str) -> crate::tailnet::Machine {
+        crate::tailnet::Machine {
+            name: name.to_string(),
+            target: format!("{name}.example.ts.net"),
+            fqdn: format!("{name}.example.ts.net"),
+            addresses: vec![address.parse().unwrap()],
+            online: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_machine_saved_as_a_host_connects_the_way_it_was_saved() {
+        let mut view = SshHostsView::new();
+        view.saved_hosts = vec![SshHostEntry {
+            id: "ssh-saved".to_string(),
+            source: SshHostSource::ThinkTerm,
+            spec: spec("server-b", "100.64.0.7"),
+        }];
+        view.tailnet.machines = vec![
+            tailnet_machine("server-b", "100.64.0.7"),
+            tailnet_machine("build-box", "100.64.0.8"),
+        ];
+        assert!(view.saved_host_for(&view.tailnet.machines[0]).is_none());
+        view.saved_hosts[0].spec.network = SshNetwork::Tailnet;
+        assert!(view.saved_host_for(&view.tailnet.machines[0]).is_some());
+        assert!(view.saved_host_for(&view.tailnet.machines[1]).is_none());
+
+        // Saved: straight to it, no form to fill in again.
+        assert!(matches!(
+            view.open_tailnet_machine(0),
+            ContentViewResponse::Run(_)
+        ));
+        assert!(view.form.is_none());
+
+        // Not saved: a new host, its name and address filled in, waiting
+        // for whom to sign in as.
+        assert!(matches!(
+            view.open_tailnet_machine(1),
+            ContentViewResponse::Redraw
+        ));
+        let form = view.form.as_ref().expect("a new host's form");
+        assert!(form.editing.is_none());
+        assert_eq!(form.network, SshNetwork::Tailnet);
+        assert_eq!(form.fields[FIELD_NAME].text(), "build-box");
+        assert_eq!(form.fields[FIELD_HOST].text(), "build-box.example.ts.net");
+        assert_eq!(view.focus, Focus::Field(FIELD_USER));
+
+        // A host that reaches it by one of its other addresses is it too.
+        let mut devbox = spec("devbox", "192.0.2.5");
+        devbox.network = SshNetwork::Tailnet;
+        devbox.other_addresses = vec!["build-box".to_string()];
+        view.saved_hosts.push(SshHostEntry {
+            id: "ssh-devbox".to_string(),
+            source: SshHostSource::ThinkTerm,
+            spec: devbox,
+        });
+        assert_eq!(
+            view.saved_host_for(&view.tailnet.machines[1])
+                .map(|entry| entry.id.as_str()),
+            Some("ssh-devbox")
+        );
+    }
+
+    #[test]
+    fn a_new_host_uses_the_system_until_its_network_is_selected() {
+        let mut view = SshHostsView::new();
+        view.open_new_form();
+        assert_eq!(view.form.as_ref().unwrap().network, SshNetwork::System);
+        view.apply(super::SshViewAction::SetNetwork(SshNetwork::Tailnet));
+        assert_eq!(view.form.as_ref().unwrap().network, SshNetwork::Tailnet);
+        view.apply(super::SshViewAction::ToggleMosh);
+        let form = view.form.as_ref().unwrap();
+        assert!(!form.use_mosh);
+        assert!(form.error.is_some());
+        view.apply(super::SshViewAction::SetNetwork(SshNetwork::System));
+        view.apply(super::SshViewAction::ToggleMosh);
+        assert!(view.form.as_ref().unwrap().use_mosh);
+        view.apply(super::SshViewAction::SetNetwork(SshNetwork::Tailnet));
+        assert_eq!(view.form.as_ref().unwrap().network, SshNetwork::System);
+    }
+
+    #[test]
+    fn the_tailscale_panel_and_a_host_form_take_turns() {
+        use super::ContentView;
+        if !crate::tailnet::available() {
+            return;
+        }
+        let mut view = SshHostsView::new();
+        view.open_new_form();
+        view.show_tailscale_panel();
+        assert!(view.tailnet.panel_open);
+        assert!(view.form.is_none());
+        view.open_new_form();
+        assert!(!view.tailnet.panel_open);
+        assert!(view.form.is_some());
+
+        view.show_tailscale_panel();
+        view.focus = Focus::Tailnet(TAILNET_HOSTNAME);
+        // Escape closes the panel, not the page.
+        assert!(matches!(
+            view.on_key(KeyCode::Escape, KeyModifiers::NONE),
+            ContentViewResponse::Redraw
+        ));
+        assert!(!view.tailnet.panel_open);
+        assert_eq!(view.focus, Focus::Search);
+    }
+
+    #[test]
+    fn a_tailscale_field_goes_out_only_once_typed_into() {
+        if !crate::tailnet::available() {
+            return;
+        }
+        let mut view = SshHostsView::new();
+        view.open_tailnet_panel();
+        view.focus = Focus::Tailnet(TAILNET_CONTROL_URL);
+        // Moving the caret through it is no edit.
+        view.edit_focused(|input| input.caret_move_home(false));
+        assert_eq!(view.tailnet.dirty, [false; TAILNET_FIELD_COUNT]);
+        view.edit_focused(|input| input.caret_insert("https://headscale.example", false));
+        assert!(view.tailnet.dirty[TAILNET_CONTROL_URL]);
+        // Escape leaves without sending it.
+        use super::ContentView;
+        view.on_key(KeyCode::Escape, KeyModifiers::NONE);
+        assert!(!view.tailnet.panel_open);
+        assert_eq!(view.tailnet.dirty, [false; TAILNET_FIELD_COUNT]);
+        assert_eq!(view.tailnet.changes, [None; TAILNET_FIELD_COUNT]);
+    }
+
+    #[test]
+    fn an_auth_key_typed_into_the_panel_is_never_copied() {
+        use super::ContentView;
+        if !crate::tailnet::available() {
+            return;
+        }
+        let mut view = SshHostsView::new();
+        view.open_tailnet_panel();
+        view.focus = Focus::Tailnet(TAILNET_AUTH_KEY);
+        view.tailnet.fields[TAILNET_AUTH_KEY].set_text_end("tskey-auth-example".to_string());
+        view.tailnet.fields[TAILNET_AUTH_KEY].caret_select_all();
+        assert_eq!(view.copy_text(), None);
+        assert_eq!(view.cut_text(), None);
+        assert_eq!(
+            view.tailnet.fields[TAILNET_AUTH_KEY].text(),
+            "tskey-auth-example"
+        );
+        // The other fields copy as any field does.
+        view.focus = Focus::Tailnet(TAILNET_HOSTNAME);
+        view.tailnet.fields[TAILNET_HOSTNAME].set_text_end("devbox".to_string());
+        assert_eq!(view.copy_text().as_deref(), Some("devbox"));
     }
 
     #[test]

@@ -118,6 +118,13 @@ pub enum SvgIcon {
     Timer,
     Type,
     Laptop,
+    KeyRound,
+    LogOut,
+    Monitor,
+    Network,
+    /// Apple's mark, tinted like the rest rather than painted in its own
+    /// black: drawn white, it vanishes on a light theme.
+    Apple,
     QrCode,
     Smartphone,
     Upload,
@@ -386,6 +393,11 @@ impl SvgIcon {
             Self::Timer => include_bytes!("../../../../third_party/lucide/icons/timer.svg"),
             Self::Type => include_bytes!("../../../../third_party/lucide/icons/type.svg"),
             Self::Laptop => include_bytes!("../../../../third_party/lucide/icons/laptop.svg"),
+            Self::KeyRound => include_bytes!("../../../../third_party/lucide/icons/key-round.svg"),
+            Self::LogOut => include_bytes!("../../../../third_party/lucide/icons/log-out.svg"),
+            Self::Monitor => include_bytes!("../../../../third_party/lucide/icons/monitor.svg"),
+            Self::Apple => include_bytes!("../../../../third_party/simple-icons/icons/apple.svg"),
+            Self::Network => include_bytes!("../../../../third_party/lucide/icons/network.svg"),
             Self::QrCode => include_bytes!("../../../../third_party/lucide/icons/qr-code.svg"),
             Self::Smartphone => {
                 include_bytes!("../../../../third_party/lucide/icons/smartphone.svg")
@@ -415,7 +427,11 @@ impl SvgIcon {
     pub fn rasterize_with_rotation(self, size: usize, degrees: f32) -> Result<Image> {
         let svg = std::str::from_utf8(self.bytes()).context("SVG asset is not UTF-8")?;
         // Lucide icons use `currentColor`; tint them white for the dark UI.
-        let svg = svg.replace("currentColor", "#ffffff");
+        let mut svg = svg.replace("currentColor", "#ffffff");
+        // A simple-icons mark names no colour at all, which is black.
+        if self == Self::Apple {
+            svg = svg.replacen("<path ", "<path fill=\"#ffffff\" ", 1);
+        }
         rasterize_svg_str(&svg, size, degrees)
     }
 }
@@ -541,6 +557,7 @@ pub enum BrandIcon {
     AgentCopilot,
     AgentKimi,
     Alpine,
+    Android,
     Anthropic,
     Apple,
     ArchLinux,
@@ -591,6 +608,9 @@ impl BrandIcon {
             }
             Self::Alpine => {
                 include_bytes!("../../../../third_party/simple-icons/icons/alpinelinux.svg")
+            }
+            Self::Android => {
+                include_bytes!("../../../../third_party/simple-icons/icons/android.svg")
             }
             Self::Anthropic => {
                 include_bytes!("../../../../third_party/simple-icons/icons/anthropic.svg")
@@ -649,6 +669,7 @@ impl BrandIcon {
             Self::AgentCopilot => (0x24, 0x96, 0xED),
             Self::AgentKimi => (0x17, 0x83, 0xFF),
             Self::Alpine => (0x0D, 0x59, 0x7F),
+            Self::Android => (0x3D, 0xDC, 0x84),
             Self::Anthropic => (0x19, 0x19, 0x19),
             Self::Apple => (0x00, 0x00, 0x00),
             Self::ArchLinux => (0x17, 0x93, 0xD1),
@@ -888,6 +909,10 @@ mod tests {
             SvgIcon::Terminal,
             SvgIcon::Trash2,
             SvgIcon::X,
+            // Remote Hosts' Tailscale group: the tailnet and its machines.
+            SvgIcon::Apple,
+            SvgIcon::Monitor,
+            SvgIcon::Network,
             // What a plugin's panel is shown by in the selector.
             SvgIcon::Activity,
             SvgIcon::Bug,
@@ -918,6 +943,15 @@ mod tests {
     }
 
     #[test]
+    fn the_apple_mark_is_white_to_be_tinted() {
+        // Black, the tint it is drawn in would not show.
+        let data: Vec<u8> = SvgIcon::Apple.rasterize(24).unwrap().into();
+        assert!(data
+            .chunks_exact(4)
+            .any(|pixel| pixel.iter().all(|channel| *channel > 200)));
+    }
+
+    #[test]
     fn brand_icons_rasterize() {
         for icon in [
             // These three take the embedded-color path, where a stray
@@ -927,6 +961,7 @@ mod tests {
             BrandIcon::AgentCopilot,
             BrandIcon::AgentKimi,
             BrandIcon::Alpine,
+            BrandIcon::Android,
             BrandIcon::Anthropic,
             BrandIcon::Apple,
             BrandIcon::ArchLinux,

@@ -6685,7 +6685,7 @@ impl super::TermWindow {
         // in its dedicated Space — the same flow as `thinkterm connect
         // <name>` — rather than opening a direct-ssh remote thread.
         if spec.multiplexing && !spec.use_mosh {
-            let name = spec.label.clone();
+            let name = crate::ssh_hosts::connect_domain_name(&spec);
             // These hosts used to skip OS detection entirely: the branch
             // returned before anything read `detect_os`, and both detection
             // call sites downcast to `RemoteSshDomain`, which a mux client
@@ -6699,7 +6699,7 @@ impl super::TermWindow {
             promise::spawn::spawn(async move {
                 let domain = match Mux::get().get_domain_by_name(&name) {
                     Some(domain) => domain,
-                    None => match crate::connect_domain_from_ssh_host(&name) {
+                    None => match crate::connect_domain_from_ssh_host(&host_id) {
                         Ok(domain) => domain,
                         Err(err) => {
                             log::error!("connect {name}: {err:#}");
@@ -6802,6 +6802,18 @@ impl super::TermWindow {
             return false;
         };
 
+        let fallback_spawn = match crate::ssh_hosts::build_mosh_fallback_spawn(&spec) {
+            Ok(spawn) => spawn,
+            Err(err) => {
+                if let Some(view_id) = view_id {
+                    self.fail_remote_connect(view_id, &format!("{err:#}"));
+                } else {
+                    log::error!("cannot connect with Mosh: {err:#}");
+                }
+                return true;
+            }
+        };
+
         self.snapshot_active_workspace_thread_layout();
         if view_id.is_none() {
             self.workspace_sidebar_pending_thread_selection = None;
@@ -6842,7 +6854,6 @@ impl super::TermWindow {
         let window = self.window.clone();
         let thread_id_for_task = thread_id.clone();
         let label = spec.label.clone();
-        let fallback_spawn = crate::ssh_hosts::build_mosh_fallback_spawn(&spec);
         let bootstrap_spec = spec.clone();
         let cancel_token_for_task = cancel_token.clone();
 

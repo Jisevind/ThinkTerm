@@ -626,6 +626,10 @@ enum SettingsSection {
     Workspaces,
     Agents,
     Web,
+    /// Not a page: what a search for it finds, which leads to the Tailscale
+    /// group in Remote Hosts, where the tailnet is set up beside its
+    /// machines.
+    Tailscale,
     Archived,
     Keymap,
     CommandPalette,
@@ -759,6 +763,7 @@ impl SettingsSection {
             Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
             Self::Agents => crate::i18n::tr("settings-section-agents"),
             Self::Web => crate::i18n::tr("settings-section-web"),
+            Self::Tailscale => crate::i18n::tr("settings-section-tailscale"),
             Self::Archived => crate::i18n::tr("settings-section-archived"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
             Self::CommandPalette => crate::i18n::tr("settings-section-command-palette"),
@@ -782,6 +787,7 @@ impl SettingsSection {
             Self::Workspaces => SettingsIcon::Workspaces,
             Self::Agents => SettingsIcon::Agents,
             Self::Web => SettingsIcon::Web,
+            Self::Tailscale => SettingsIcon::Tailscale,
             Self::Archived => SettingsIcon::Archived,
             Self::Keymap => SettingsIcon::Keymap,
             Self::CommandPalette => SettingsIcon::CommandPalette,
@@ -807,6 +813,7 @@ impl SettingsSection {
             Self::Workspaces => TileColor::Yellow,
             Self::Agents => TileColor::Orange,
             Self::Web => TileColor::Teal,
+            Self::Tailscale => TileColor::Blue,
             Self::Archived => TileColor::Indigo,
             Self::Keymap => TileColor::Gray,
             Self::CommandPalette => TileColor::Blue,
@@ -849,6 +856,14 @@ impl SettingsSection {
                 "HTTP",
                 "Port",
                 "Listener",
+            ],
+            Self::Tailscale => &[
+                "Tailscale",
+                "Tailnet",
+                "Headscale",
+                "VPN",
+                "Auth Key",
+                "Control Server",
             ],
             Self::TabIcons => &[
                 "Tab Icons",
@@ -1040,6 +1055,12 @@ impl SettingsSection {
         }
     }
 
+    /// A section that is no page here: picking it goes to where the thing
+    /// is set up instead.
+    fn leads_elsewhere(self) -> bool {
+        self == Self::Tailscale
+    }
+
     fn matches_search(self, query: &str) -> bool {
         self.label().to_lowercase().contains(query)
             || self
@@ -1066,6 +1087,19 @@ mod settings_search_tests {
         assert!(SettingsSection::General.matches_search("language"));
         let localized_label = crate::i18n::tr("settings-language").to_lowercase();
         assert!(SettingsSection::General.matches_search(&localized_label));
+    }
+
+    #[test]
+    fn tailscale_is_found_by_a_search_but_listed_nowhere() {
+        // Its settings are in Remote Hosts; a search for them leads there.
+        assert!(!BASE_SECTIONS.contains(&SettingsSection::Tailscale));
+        assert!(!DEVELOPER_SECTIONS.contains(&SettingsSection::Tailscale));
+        assert!(SettingsSection::Tailscale.leads_elsewhere());
+        assert!(SettingsSection::Tailscale.matches_search("tailscale"));
+        assert!(SettingsSection::Tailscale.matches_search("headscale"));
+        assert!(BASE_SECTIONS
+            .iter()
+            .all(|section| !section.leads_elsewhere()));
     }
 }
 
@@ -4310,7 +4344,12 @@ impl SettingsWindow {
     }
 
     fn sync_selected_section_with_search(&mut self) {
-        let sections = self.filtered_sections();
+        // A result that leads elsewhere is no page to show in the meantime.
+        let sections: Vec<SettingsSection> = self
+            .filtered_sections()
+            .into_iter()
+            .filter(|section| !section.leads_elsewhere())
+            .collect();
         if !sections.is_empty() && !sections.contains(&self.selected) {
             self.selected = sections[0];
             if self.selected == SettingsSection::Terminal {
@@ -5046,6 +5085,22 @@ impl SettingsWindow {
             .or_else(|| windows.into_iter().next())
     }
 
+    /// Where a search for Tailscale leads: Remote Hosts with its Tailscale
+    /// panel open, in the window Settings was opened from -- brought
+    /// forward, for the page opens behind this window otherwise.
+    fn open_tailscale_in_remote_hosts(&mut self) {
+        let Some(gui_window) = self.color_scheme_picker_target() else {
+            self.status = crate::i18n::tr("settings-tailscale-needs-a-window");
+            return;
+        };
+        gui_window.window.focus();
+        gui_window
+            .window
+            .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                |term_window| term_window.open_ssh_hosts_view_tailscale(),
+            )));
+    }
+
     fn refresh_chrome(&mut self) {
         // The standalone window has no per-window overrides of its own, so it
         // reads the configuration file's `ui_colors` rather than a terminal
@@ -5404,6 +5459,10 @@ impl SettingsWindow {
                 // pointing at a dead window.
                 self.cleanup();
                 window.close();
+            }
+            SettingsAction::Select(section) if section.leads_elsewhere() => {
+                self.commit_focused_input();
+                self.open_tailscale_in_remote_hosts();
             }
             SettingsAction::Select(section) => {
                 self.commit_focused_input();
@@ -7592,6 +7651,8 @@ impl SettingsWindow {
             SettingsSection::Workspaces => self.paint_workspaces(layers, x, max_width)?,
             SettingsSection::Agents => self.paint_agents(layers, x, max_width)?,
             SettingsSection::Web => self.paint_web(layers, x, max_width)?,
+            // Never selected: picking it opens Remote Hosts instead.
+            SettingsSection::Tailscale => {}
             SettingsSection::Archived => self.paint_archived(layers, x, max_width)?,
             SettingsSection::Keymap => self.paint_keymap(layers, x, max_width)?,
             SettingsSection::CommandPalette => {
@@ -17709,10 +17770,16 @@ impl SettingsWindow {
         if query.is_empty() {
             return sections;
         }
-        sections
+        let mut found: Vec<SettingsSection> = sections
             .into_iter()
             .filter(|section| section.matches_search(&query))
-            .collect()
+            .collect();
+        // Listed nowhere, found by a search: its settings moved to Remote
+        // Hosts, and someone looking here is shown the way.
+        if crate::tailnet::available() && SettingsSection::Tailscale.matches_search(&query) {
+            found.push(SettingsSection::Tailscale);
+        }
+        found
     }
 
     /// `layer_num` is the layer the whole field paints on -- frame, selection,

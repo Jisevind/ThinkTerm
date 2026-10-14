@@ -1726,6 +1726,7 @@ pub fn create_space_on_domain(domain_name: &str, name: Option<String>) -> Result
         remote_tree_mutation_allowed(Some(domain_name)),
         "{domain_name} is disconnected"
     );
+    let project_name = crate::ssh_hosts::connect_domain_label(domain_name);
     let mut store = THREAD_STORE.lock();
     store.normalize_after_load();
     let name = name.unwrap_or_else(|| next_space_name(&store.spaces));
@@ -1737,7 +1738,7 @@ pub fn create_space_on_domain(domain_name: &str, name: Option<String>) -> Result
     store.projects.push(Project {
         id: project_id.clone(),
         space_id: space_id.clone(),
-        name: domain_name.to_string(),
+        name: project_name,
         path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
         threads: vec![thread],
         active_thread_id: Some(thread_id),
@@ -9485,7 +9486,9 @@ fn is_remote_project(project: &Project, spaces: &[Space]) -> bool {
 /// misses it — same three-way test as `is_remote_project`), or this device.
 fn origin_machine_for_project(project: &Project, spaces: &[Space]) -> (String, bool) {
     let host_id = match project_machine(project, spaces) {
-        ProjectMachine::Domain(domain) => return (domain, false),
+        ProjectMachine::Domain(domain) => {
+            return (crate::ssh_hosts::connect_domain_label(&domain), false)
+        }
         ProjectMachine::Local => return ("Local".to_string(), true),
         ProjectMachine::Ssh(host_id) => host_id,
     };
@@ -9835,6 +9838,7 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
     }
 
     let mux_project_id = remote_project_id_for_space(space_id, &mux_domain_host_id(&domain_name));
+    let mux_project_name = crate::ssh_hosts::connect_domain_label(&domain_name);
 
     let mut store = THREAD_STORE.lock();
     let mut changed = false;
@@ -9896,7 +9900,7 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
                     store.projects.push(Project {
                         id: mux_project_id.clone(),
                         space_id: space_id.to_string(),
-                        name: domain_name.clone(),
+                        name: mux_project_name.clone(),
                         path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
                         threads: vec![],
                         active_thread_id: None,
@@ -10010,6 +10014,7 @@ pub fn ensure_mux_domain_space(domain_name: &str) -> MuxDomainSpacePlan {
 impl WorkspaceThreadStore {
     fn ensure_mux_domain_space(&mut self, domain_name: &str) -> MuxDomainSpacePlan {
         let store = self;
+        let label = crate::ssh_hosts::connect_domain_label(domain_name);
 
         // A server can host several Spaces. Land on the one this device was last
         // using; failing that its first Space; and only create one when we have
@@ -10017,10 +10022,7 @@ impl WorkspaceThreadStore {
         let space_id = store
             .preferred_space_for_domain(domain_name)
             .unwrap_or_else(|| {
-                store.create_space_record_for_domain(
-                    domain_name.to_string(),
-                    Some(domain_name.to_string()),
-                )
+                store.create_space_record_for_domain(label.clone(), Some(domain_name.to_string()))
             });
 
         let host_id = mux_domain_host_id(domain_name);
@@ -10029,7 +10031,7 @@ impl WorkspaceThreadStore {
             store.projects.push(Project {
                 id: project_id.clone(),
                 space_id: space_id.clone(),
-                name: domain_name.to_string(),
+                name: label,
                 path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
                 threads: vec![],
                 active_thread_id: None,

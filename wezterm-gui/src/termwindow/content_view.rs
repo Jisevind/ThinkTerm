@@ -554,6 +554,11 @@ pub(crate) trait ContentView {
     /// Default is a no-op; only the SSH hosts view reacts.
     fn begin_new_remote_host(&mut self) {}
 
+    /// Send an already-open hosts page to its Tailscale panel: where a
+    /// search for Tailscale in Settings leads. Default is a no-op; only the
+    /// SSH hosts view reacts.
+    fn show_tailscale_panel(&mut self) {}
+
     /// Run one entry of that page's card menu. Default is a no-op; only the
     /// remote hosts page reacts.
     fn run_remote_host_command(

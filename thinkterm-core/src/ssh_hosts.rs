@@ -12,12 +12,32 @@ pub type SshHostId = String;
 /// The ssh option carrying a host's other addresses to the connection:
 /// wezterm-ssh's `OTHER_ADDRESSES`.
 pub const OTHER_ADDRESSES_OPTION: &str = "thinkterm_other_addresses";
+pub const NETWORK_OPTION: &str = "thinkterm_network";
 pub const DEFAULT_MOSH_SERVER_COMMAND: &str = "mosh-server new -s -l LANG=en_US.UTF-8";
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SshNetwork {
+    #[default]
+    System,
+    Tailnet,
+}
+
+impl SshNetwork {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Tailnet => "tailnet",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SshHostSpec {
     pub label: String,
     pub host: String,
+    #[serde(default)]
+    pub network: SshNetwork,
     #[serde(default)]
     pub port: Option<u16>,
     /// Other addresses the host answers at -- a LAN name, a Tailscale name,
@@ -193,6 +213,7 @@ pub fn parse_system_ssh_config(content: &str) -> Vec<SshHostEntry> {
                     host: alias,
                     port: block.port,
                     other_addresses: Vec::new(),
+                    network: Default::default(),
                     username: block.user.clone(),
                     identity_file: block.identity_file.clone(),
                     password: None,
@@ -294,7 +315,10 @@ pub fn endpoint(spec: &SshHostSpec) -> String {
 }
 
 pub fn ssh_domain_name(spec: &SshHostSpec) -> String {
-    format!("ssh:{}", endpoint(spec))
+    match spec.network {
+        SshNetwork::System => format!("ssh:{}", endpoint(spec)),
+        SshNetwork::Tailnet => format!("ssh:tailnet:{}", endpoint(spec)),
+    }
 }
 
 /// The host's other addresses as they are tried: trimmed, without blanks,
@@ -325,6 +349,7 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
         .iter()
         .map(|(key, value)| (key.to_lowercase(), value.clone()))
         .collect::<HashMap<_, _>>();
+    ssh_option.insert(NETWORK_OPTION.into(), spec.network.as_str().into());
     if let Some(identity) = &spec.identity_file {
         if !identity.trim().is_empty() {
             ssh_option.insert("identityfile".into(), identity.clone());
@@ -359,6 +384,34 @@ pub fn build_ssh_domain(spec: &SshHostSpec) -> SshDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_host_selects_one_network_for_all_its_addresses() {
+        assert_eq!(NETWORK_OPTION, wezterm_ssh::NETWORK);
+        let mut spec: SshHostSpec = serde_json::from_value(serde_json::json!({
+            "label": "server-a", "host": "100.64.0.2"
+        }))
+        .unwrap();
+        assert_eq!(spec.network, SshNetwork::System);
+        let system = build_ssh_domain(&spec);
+        assert_eq!(system.ssh_option[NETWORK_OPTION], "system");
+        spec.network = SshNetwork::Tailnet;
+        spec.other_addresses.push("server-a.example.ts.net".into());
+        spec.ssh_options
+            .insert(NETWORK_OPTION.into(), "system".into());
+        let tailnet = build_ssh_domain(&spec);
+        assert_eq!(tailnet.ssh_option[NETWORK_OPTION], "tailnet");
+        assert_eq!(
+            tailnet.ssh_option[OTHER_ADDRESSES_OPTION],
+            "server-a.example.ts.net"
+        );
+        assert_ne!(system.name, tailnet.name);
+        let saved = serde_json::to_string(&spec).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SshHostSpec>(&saved).unwrap().network,
+            SshNetwork::Tailnet
+        );
+    }
 
     #[test]
     fn the_option_is_the_one_the_connection_reads() {
@@ -432,6 +485,7 @@ mod tests {
             host: "example.test".into(),
             port: Some(22),
             other_addresses: Vec::new(),
+            network: Default::default(),
             username: Some("root".into()),
             identity_file: None,
             password: None,

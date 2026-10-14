@@ -8,6 +8,7 @@
 //! One cache for the process: there is one mux connection, and a second
 //! settings window would be asking the same server the same questions.
 
+use crate::page_poll::PollTimer;
 use codec::{WebServerStatus, WebTokenInfo};
 use mux::Mux;
 use std::sync::Mutex;
@@ -47,9 +48,6 @@ pub struct WebState {
     pub loaded: bool,
     /// When the last answer landed, so the page can go and ask again.
     pub refreshed_at: Option<Instant>,
-    /// A wake-up is already scheduled; a second would double the rate
-    /// every time the window repainted for an unrelated reason.
-    pub poll_armed: bool,
     /// Bumped by every user action that lands. A poll that was already in
     /// flight when it did carries a picture from before the click, and is
     /// thrown away rather than painted over the result.
@@ -214,8 +212,12 @@ pub fn arm_poll(window: Window) {
     // would wake, paint, find the poll not due, and arm again at display
     // rate for as long as the request took. `finish` repaints when the
     // answer lands, and that paint arms the next wait.
+    //
+    // One wake-up at a time: a second would double the rate every time the
+    // window repainted for an unrelated reason.
+    static POLL: PollTimer = PollTimer::new();
     let due_in = with_state(|s| {
-        if s.busy || s.polling || std::mem::replace(&mut s.poll_armed, true) {
+        if s.busy || s.polling {
             return None;
         }
         Some(
@@ -224,15 +226,9 @@ pub fn arm_poll(window: Window) {
                 .unwrap_or(POLL_INTERVAL),
         )
     });
-    let Some(due_in) = due_in else {
-        return;
-    };
-    promise::spawn::spawn_into_main_thread(async move {
-        smol::Timer::after(due_in).await;
-        with_state(|s| s.poll_armed = false);
-        window.invalidate();
-    })
-    .detach();
+    if let Some(due_in) = due_in {
+        POLL.arm(window, due_in);
+    }
 }
 
 /// Read the listener's state and the token list.
