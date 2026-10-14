@@ -119,6 +119,15 @@ pub fn model(
                 e.title.clone()
             }
         };
+        // A label someone gave a pane names the pane, as in the desktop's
+        // pane bar; a tab goes on reading as the desktop's tab does.
+        let name_of = |e: &PaneEntry| {
+            layout
+                .pane_labels
+                .get(&e.pane_id)
+                .cloned()
+                .unwrap_or_else(|| title_of(e))
+        };
         let title = layout
             .tab_titles
             .get(i)
@@ -131,7 +140,7 @@ pub fn model(
                 .iter()
                 .map(|e| PaneView {
                     pane_id: e.pane_id,
-                    title: title_of(e),
+                    title: name_of(e),
                     current: e.pane_id == current,
                 })
                 .collect()
@@ -215,6 +224,7 @@ mod tests {
             ],
             tab_titles: vec!["".to_string(), "work".to_string(), "".to_string()],
             window_titles: Default::default(),
+            pane_labels: Default::default(),
         }
     }
 
@@ -247,6 +257,19 @@ mod tests {
     }
 
     #[test]
+    fn a_label_names_its_pane_but_not_its_tab() {
+        let mut labelled = layout();
+        labelled.pane_labels.insert(10, "build".to_string());
+        labelled.pane_labels.insert(21, "reviewer".to_string());
+        let tabs = model(&labelled, 10, "zsh · ~", None);
+        assert_eq!(tabs[0].title, "zsh · ~", "a tab reads as on the desktop");
+        assert_eq!(tabs[1].title, "work");
+        let tabs = model(&labelled, 20, "vim", None);
+        assert_eq!(tabs[1].panes[0].title, "vim");
+        assert_eq!(tabs[1].panes[1].title, "reviewer");
+    }
+
+    #[test]
     fn a_pane_is_found_wherever_it_is_and_the_first_tab_is_the_default() {
         assert_eq!(entry(&layout(), 21).map(|e| e.tab_id), Some(2));
         assert!(entry(&layout(), 99).is_none());
@@ -259,6 +282,7 @@ mod tests {
             })],
             tab_titles: vec![],
             window_titles: Default::default(),
+            pane_labels: Default::default(),
         };
         assert_eq!(first_choice(&stack).map(|e| e.pane_id), Some(31));
     }
