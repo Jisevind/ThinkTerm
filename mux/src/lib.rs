@@ -111,10 +111,23 @@ pub enum MuxNotification {
         tab_id: TabId,
         title: String,
     },
+    /// A pane was labelled, relabelled or had its label taken away.
+    PaneLabelChanged {
+        pane_id: PaneId,
+        label: Option<String>,
+        /// Set on a mirror without telling the server that owns the pane:
+        /// the label came from it, or is told to it another way.
+        from_server: bool,
+    },
     WindowTitleChanged {
         window_id: WindowId,
         title: String,
     },
+    /// A client began showing panes: it set a viewport for the first time
+    /// since it connected. A command that only asks things never does.
+    ClientJoined(Arc<ClientId>),
+    /// A client that had shown panes disconnected.
+    ClientLeft(Arc<ClientId>),
     WorkspaceRenamed {
         old_workspace: String,
         new_workspace: String,
@@ -489,6 +502,27 @@ pub struct Mux {
     /// removed first, so that `PaneExited` always precedes `PaneRemoved`.
     /// Payloads stay here until announced even if exit history evicts them.
     unannounced_pane_exits: Mutex<HashMap<PaneId, thinkterm_proto::PaneExit>>,
+    /// The labels panes were given, by `cli set-pane-label` or by renaming
+    /// a pane tab. One per live pane at most: removing a pane drops its own.
+    pane_labels: RwLock<HashMap<PaneId, String>>,
+}
+
+/// How many characters a pane label keeps; the rest are cut.
+const PANE_LABEL_MAX_CHARS: usize = 128;
+
+/// `text` as a pane label: without control characters, since labels are
+/// printed to terminals, trimmed and capped -- and trimmed again after the
+/// cut, as `--pane` trims the name it is given. `None` when nothing is
+/// left.
+pub fn normalized_pane_label(text: &str) -> Option<String> {
+    let printable: String = text.chars().filter(|c| !c.is_control()).collect();
+    let capped: String = printable
+        .trim()
+        .chars()
+        .take(PANE_LABEL_MAX_CHARS)
+        .collect();
+    let label = capped.trim_end();
+    (!label.is_empty()).then(|| label.to_string())
 }
 
 /// How many ended panes `Mux::recent_pane_exit` remembers, and for how long.
@@ -1338,6 +1372,7 @@ impl Mux {
             palette_advisories: Mutex::new(PaletteAdvisoryState::default()),
             recent_pane_exits: Mutex::new(std::collections::VecDeque::new()),
             unannounced_pane_exits: Mutex::new(HashMap::new()),
+            pane_labels: RwLock::new(HashMap::new()),
             identity: RwLock::new(None),
             num_panes_by_workspace: RwLock::new(HashMap::new()),
             main_thread_id: std::thread::current().id(),
@@ -1612,9 +1647,9 @@ impl Mux {
         viewport: FrontendViewport,
     ) -> anyhow::Result<FrontendViewportState> {
         self.validate_frontend_viewport(tab_id, &viewport)?;
-        let (should_apply, should_publish, access_changed) = {
+        let (should_apply, should_publish, access_changed, joined) = {
             let mut lease = self.frontend_lease.lock();
-            lease.ever_rendered.insert(client_id.clone());
+            let joined = lease.ever_rendered.insert(client_id.clone());
             let mut access_changed = false;
             if lease.access_mode == FrontendAccessMode::Handoff
                 && lease.handoff_owner.is_none()
@@ -1659,8 +1694,11 @@ impl Mux {
                 state.view = None;
             }
             let should_apply = can_drive && (owner_changed || viewport_changed || access_changed);
-            (should_apply, should_apply, access_changed)
+            (should_apply, should_apply, access_changed, joined)
         };
+        if joined {
+            Mux::notify_from_any_thread(MuxNotification::ClientJoined(Arc::new(client_id.clone())));
+        }
         if should_apply {
             if let Err(err) = self.apply_frontend_viewport(tab_id, &viewport) {
                 return Err(self.fail_closed_frontend_geometry(tab_id, None, err));
@@ -1691,8 +1729,27 @@ impl Mux {
             return Ok(None);
         }
         drop(registrations);
-        self.set_client_viewport(client_id, tab_id, viewport)
-            .map(Some)
+        let state = self.set_client_viewport(client_id, tab_id, viewport);
+        self.forget_renderer_if_unregistered(client_id);
+        state.map(Some)
+    }
+
+    /// A client that unregistered while its report was under way can be
+    /// counted as showing panes after `unregister_client` already let it
+    /// go: no `ClientLeft` would follow its `ClientJoined`, and the entry
+    /// would stay. Unregistering drops the registration before that
+    /// entry, so checking after the report catches every interleaving.
+    fn forget_renderer_if_unregistered(&self, client_id: &ClientId) {
+        if self.drop_unregistered_renderer(client_id) {
+            Mux::notify_from_any_thread(MuxNotification::ClientLeft(Arc::new(client_id.clone())));
+        }
+    }
+
+    /// Whether `client_id` was counted as showing panes though it is no
+    /// longer registered. The count is dropped.
+    fn drop_unregistered_renderer(&self, client_id: &ClientId) -> bool {
+        !self.client_registrations.read().contains_key(client_id)
+            && self.frontend_lease.lock().ever_rendered.remove(client_id)
     }
 
     pub fn client_owns_frontend_lease(&self, client_id: &ClientId, tab_id: TabId) -> bool {
@@ -1790,6 +1847,7 @@ impl Mux {
                     if let Err(err) = self.claim_frontend_viewport(client_id, tab_id, viewport) {
                         log::error!("failed to apply claimed viewport for tab {tab_id}: {err:#}");
                     }
+                    self.forget_renderer_if_unregistered(client_id);
                 }
                 true
             }
@@ -1812,8 +1870,9 @@ impl Mux {
         }
         drop(registrations);
         self.client_had_input(client_id);
-        self.claim_frontend_viewport(client_id, tab_id, viewport)
-            .map(Some)
+        let state = self.claim_frontend_viewport(client_id, tab_id, viewport);
+        self.forget_renderer_if_unregistered(client_id);
+        state.map(Some)
     }
 
     fn claim_frontend_viewport(
@@ -1846,9 +1905,9 @@ impl Mux {
                 .viewport_state(tab_id)
                 .ok_or_else(|| anyhow!("viewport state for tab {tab_id} disappeared"));
         }
-        let (access_changed, mut affected_tabs) = {
+        let (access_changed, mut affected_tabs, joined) = {
             let mut lease = self.frontend_lease.lock();
-            lease.ever_rendered.insert(client_id.clone());
+            let joined = lease.ever_rendered.insert(client_id.clone());
             let mode = lease.access_mode;
             let mut access_changed = false;
             let mut affected_tabs = vec![tab_id];
@@ -1871,8 +1930,11 @@ impl Mux {
             state.viewports.insert(client_id.clone(), viewport.clone());
             state.owner = Some(client_id.clone());
             state.view = None;
-            (access_changed, affected_tabs)
+            (access_changed, affected_tabs, joined)
         };
+        if joined {
+            Mux::notify_from_any_thread(MuxNotification::ClientJoined(Arc::new(client_id.clone())));
+        }
         if access_changed {
             self.publish_frontend_access_state();
         }
@@ -2561,9 +2623,9 @@ impl Mux {
             self.clients.write().remove(client_id);
             registrations.remove(client_id);
         }
-        let (affected, access_changed) = {
+        let (affected, access_changed, left) = {
             let mut lease = self.frontend_lease.lock();
-            lease.ever_rendered.remove(client_id);
+            let left = lease.ever_rendered.remove(client_id);
             let mut affected = Vec::new();
             for (tab_id, state) in &mut lease.tabs {
                 state.viewports.remove(client_id);
@@ -2585,9 +2647,13 @@ impl Mux {
                 lease.handoff_ever_owned = true;
                 lease.handoff_last_owner = Some(client_id.clone());
             }
-            (affected, access_changed)
+            (affected, access_changed, left)
         };
 
+        if left {
+            // A connection is dropped on its own thread.
+            Mux::notify_from_any_thread(MuxNotification::ClientLeft(Arc::new(client_id.clone())));
+        }
         if access_changed {
             self.publish_frontend_access_state();
         }
@@ -2842,6 +2908,55 @@ impl Mux {
             .map(|(_, exit, _)| exit.clone())
     }
 
+    /// The label `pane_id` was given, if any.
+    pub fn pane_label(&self, pane_id: PaneId) -> Option<String> {
+        self.pane_labels.read().get(&pane_id).cloned()
+    }
+
+    /// Every label, by pane.
+    pub fn pane_labels(&self) -> HashMap<PaneId, String> {
+        self.pane_labels.read().clone()
+    }
+
+    /// Label `pane_id`, or with `None` or blank text take its label away;
+    /// see `normalized_pane_label`. Only a pane the mux has can be
+    /// labelled. Says whether anything changed; only a change is
+    /// announced, so a client and a server that tell each other about the
+    /// same label stop at once.
+    pub fn set_pane_label(&self, pane_id: PaneId, label: Option<&str>) -> bool {
+        self.change_pane_label(pane_id, label, false)
+    }
+
+    /// `set_pane_label` for a mirror, without telling the server that owns
+    /// the pane: what it reported, or a label told to it another way.
+    pub fn set_pane_label_from_server(&self, pane_id: PaneId, label: Option<&str>) -> bool {
+        self.change_pane_label(pane_id, label, true)
+    }
+
+    fn change_pane_label(&self, pane_id: PaneId, label: Option<&str>, from_server: bool) -> bool {
+        let label = label.and_then(normalized_pane_label);
+        let changed = {
+            let mut labels = self.pane_labels.write();
+            match &label {
+                Some(label) => {
+                    if !self.panes.read().contains_key(&pane_id) {
+                        return false;
+                    }
+                    labels.insert(pane_id, label.clone()).as_ref() != Some(label)
+                }
+                None => labels.remove(&pane_id).is_some(),
+            }
+        };
+        if changed {
+            self.notify(MuxNotification::PaneLabelChanged {
+                pane_id,
+                label,
+                from_server,
+            });
+        }
+        changed
+    }
+
     pub fn get_tab(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         self.tabs.read().get(&tab_id).map(Arc::clone)
     }
@@ -2897,6 +3012,7 @@ impl Mux {
         // temporary (the panes write guard) would otherwise live across the
         // notify below, deadlocking any subscriber that touches the pane map.
         let removed = self.panes.write().remove(&pane_id);
+        self.pane_labels.write().remove(&pane_id);
         if let Some(pane) = removed {
             log::debug!("killing pane {}", pane_id);
             pane.kill();
@@ -4066,6 +4182,48 @@ mod tests {
             id,
             ssh_auth_sock: None,
         }
+    }
+
+    #[test]
+    fn a_renderer_counted_after_it_unregistered_is_let_go() {
+        let mux = Mux::new(None);
+        let stays = client_id(1);
+        let gone = client_id(2);
+        let registration = mux.register_client(Arc::new(stays.clone()));
+        {
+            let mut lease = mux.frontend_lease.lock();
+            lease.ever_rendered.insert(stays.clone());
+            lease.ever_rendered.insert(gone.clone());
+        }
+        assert!(!mux.drop_unregistered_renderer(&stays));
+        assert!(mux.drop_unregistered_renderer(&gone));
+        assert!(!mux.drop_unregistered_renderer(&gone), "it leaves once");
+        let lease = mux.frontend_lease.lock();
+        assert!(lease.ever_rendered.contains(&stays));
+        assert!(!lease.ever_rendered.contains(&gone));
+        drop(lease);
+        mux.frontend_lease.lock().ever_rendered.clear();
+        mux.unregister_client(&stays, registration);
+    }
+
+    #[test]
+    fn labels_lose_control_characters_and_blank_is_none() {
+        assert_eq!(normalized_pane_label("  build "), Some("build".to_string()));
+        assert_eq!(
+            normalized_pane_label("\x1b]52;c;aGk=\x07bad\nname"),
+            Some("]52;c;aGk=badname".to_string())
+        );
+        assert_eq!(normalized_pane_label(" \x1b\t "), None);
+        assert_eq!(
+            normalized_pane_label(&"x".repeat(200)).map(|l| l.len()),
+            Some(128)
+        );
+        let cut_at_a_space = format!("{} suffix", "x".repeat(127));
+        assert_eq!(
+            normalized_pane_label(&cut_at_a_space),
+            Some("x".repeat(127)),
+            "no blank is left at the cut"
+        );
     }
 
     fn frontend_test_size(cols: usize, rows: usize) -> TerminalSize {

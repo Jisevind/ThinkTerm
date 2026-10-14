@@ -1690,6 +1690,7 @@ impl SessionHandler {
                                 tabs,
                                 tab_titles,
                                 window_titles,
+                                pane_labels: mux.pane_labels(),
                             }))
                         },
                         send_response,
@@ -2541,6 +2542,12 @@ impl SessionHandler {
                             let mut lines_and_indices = vec![];
 
                             for range in lines {
+                                // One that ends before it starts holds no
+                                // rows, and the screen's arithmetic would
+                                // overflow on it.
+                                if range.start > range.end {
+                                    continue;
+                                }
                                 let (first_row, lines) = pane.get_lines(range);
                                 for (idx, mut line) in lines.into_iter().enumerate() {
                                     let stable_row = first_row + idx as StableRowIndex;
@@ -2876,6 +2883,37 @@ impl SessionHandler {
                 })
                 .detach();
             }
+            Pdu::PaneLabelChanged(PaneLabelChanged { pane_id, label }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            mux.get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {pane_id}"))?;
+                            mux.set_pane_label(pane_id, label.as_deref());
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+            Pdu::GetWorkspaceNames(GetWorkspaceNames {}) => {
+                // The desktop's namer reads its own store, which its main
+                // thread keeps.
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let workspaces = Mux::get().iter_workspaces();
+                            Ok(Pdu::GetWorkspaceNamesResponse(GetWorkspaceNamesResponse {
+                                names: crate::thinkterm_tree::workspace_names(&workspaces),
+                            }))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
             Pdu::SetPalette(SetPalette { pane_id, palette }) => {
                 spawn_into_main_thread(async move {
                     catch(
@@ -2947,6 +2985,9 @@ impl SessionHandler {
             | Pdu::GetPaneRunStateResponse { .. }
             | Pdu::PaneExited { .. }
             | Pdu::PaneAdded { .. }
+            | Pdu::GetWorkspaceNamesResponse { .. }
+            | Pdu::ClientJoined { .. }
+            | Pdu::ClientLeft { .. }
             | Pdu::GetAgentStatusesResponse { .. }
             | Pdu::ForegroundProgramChanged { .. }
             | Pdu::GetForegroundProgramsResponse { .. }

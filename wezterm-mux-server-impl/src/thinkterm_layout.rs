@@ -64,6 +64,10 @@ struct StoredTerminalSpec {
     /// binaries after a downgrade.
     #[serde(default)]
     title: String,
+    /// The label the pane was given; it is put back on the pane that
+    /// replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
 }
 
 #[derive(Debug)]
@@ -206,6 +210,7 @@ fn notification_changes_layout(notification: &MuxNotification) -> bool {
             | MuxNotification::PaneFocused(_)
             | MuxNotification::TabResized(_)
             | MuxNotification::WorkspaceRenamed { .. }
+            | MuxNotification::PaneLabelChanged { .. }
             | MuxNotification::Empty
     )
 }
@@ -417,6 +422,7 @@ fn collect_terminal_spec(
         cwd: working_dir_from_entry(entry),
         domain,
         title: entry.title.clone(),
+        label: mux.pane_label(entry.pane_id),
     });
 }
 
@@ -588,6 +594,11 @@ async fn restore_decoded_layout(
             &mut pane_map,
         )
         .await?;
+        for (saved, restored) in &pane_map {
+            if let Some(label) = specs.get(saved).and_then(|spec| spec.label.as_deref()) {
+                mux.set_pane_label(*restored, Some(label));
+            }
+        }
         if let Some(active) = active_pane_entry(node)
             .and_then(|entry| pane_map.get(&entry.pane_id))
             .and_then(|pane_id| mux.get_pane(*pane_id))
@@ -865,6 +876,7 @@ mod tests {
                 cwd: Some("/tmp".to_string()),
                 domain: Some("local".to_string()),
                 title: "shell".to_string(),
+                label: None,
             }],
         }
     }
@@ -1075,6 +1087,7 @@ mod tests {
             cwd: None,
             domain: Some("local".to_string()),
             title: "shell".to_string(),
+            label: None,
         };
         let merged = merge_workspace_snapshots(
             "workspace-1",

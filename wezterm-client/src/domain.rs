@@ -2039,6 +2039,44 @@ struct EarlyRemoteState {
     viewports: Vec<codec::ClientViewportState>,
 }
 
+/// Numbers for the labels given to mirrors here. Telling the server one
+/// that fails keeps it for the next sync only while it is the latest:
+/// told after a later one, it would undo that. The mirror cannot say which
+/// is the latest, as the server telling back an earlier one may have
+/// landed over it.
+#[derive(Default)]
+struct LabelEdits {
+    last: u64,
+    /// Each mirror's latest number, until the server takes that label.
+    latest: HashMap<PaneId, u64>,
+}
+
+impl LabelEdits {
+    /// Number the label just given to `pane_id`: the latest now.
+    fn number(&mut self, pane_id: PaneId) -> u64 {
+        self.last += 1;
+        self.latest.insert(pane_id, self.last);
+        self.last
+    }
+
+    /// Whether the label numbered `number`, after telling the server it,
+    /// is to be kept for the next sync: one not `taken`, while still the
+    /// latest. One taken lets its number go.
+    fn settle(&mut self, pane_id: PaneId, number: u64, taken: bool) -> bool {
+        if self.latest.get(&pane_id) != Some(&number) {
+            return false;
+        }
+        if taken {
+            self.latest.remove(&pane_id);
+        }
+        !taken
+    }
+
+    fn forget(&mut self, pane_id: PaneId) {
+        self.latest.remove(&pane_id);
+    }
+}
+
 pub struct ClientDomain {
     config: ClientDomainConfig,
     label: String,
@@ -2055,6 +2093,11 @@ pub struct ClientDomain {
     /// Serializes topology snapshots. Immediate callers join an active
     /// generation; background pushes coalesce behind one trailing pass.
     resync_coordinator: Mutex<ResyncCoordinatorState>,
+    /// Labels given to mirrors here that the server has not heard of: given
+    /// while detached, or telling it failed. Told on the next sync; one per
+    /// mirror at most, dropped with it.
+    unsent_labels: Mutex<HashMap<PaneId, Option<String>>>,
+    label_edits: Mutex<LabelEdits>,
     local_domain_id: DomainId,
 }
 
@@ -2065,6 +2108,67 @@ async fn update_remote_workspace(
     let inner = ClientDomain::get_client_inner_for_domain(local_domain_id)?;
     inner.client.set_window_workspace(pdu).await?;
     Ok(())
+}
+
+/// After telling the server the label numbered `number` for the mirror
+/// `pane_id`: one it did not take is kept for the next sync while it is
+/// the latest, and shown on the mirror again, where the server telling
+/// back an earlier one may have landed over it.
+fn settle_label(
+    local_domain_id: DomainId,
+    pane_id: PaneId,
+    label: Option<String>,
+    number: u64,
+    taken: bool,
+) {
+    let Some(mux) = Mux::try_get() else {
+        return;
+    };
+    let Some(domain) = mux.get_domain(local_domain_id) else {
+        return;
+    };
+    let Some(domain) = domain.downcast_ref::<ClientDomain>() else {
+        return;
+    };
+    if !domain
+        .label_edits
+        .lock()
+        .unwrap()
+        .settle(pane_id, number, taken)
+    {
+        return;
+    }
+    domain
+        .unsent_labels
+        .lock()
+        .unwrap()
+        .insert(pane_id, label.clone());
+    mux.set_pane_label_from_server(pane_id, label.as_deref());
+}
+
+/// Tell the server the label numbered `number` given to its pane
+/// `remote_pane_id`, mirrored here as `pane_id`.
+fn send_label(
+    inner: Arc<ClientInner>,
+    pane_id: PaneId,
+    remote_pane_id: PaneId,
+    label: Option<String>,
+    number: u64,
+) {
+    promise::spawn::spawn(async move {
+        let sent = inner
+            .client
+            .set_pane_label(codec::PaneLabelChanged {
+                pane_id: remote_pane_id,
+                label: label.clone(),
+            })
+            .await;
+        if let Err(err) = &sent {
+            log::debug!("pane {pane_id}: the server did not take its label: {err:#}");
+        }
+        settle_label(inner.local_domain_id, pane_id, label, number, sent.is_ok());
+    })
+    .detach();
 }
 
 fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -> bool {
@@ -2138,6 +2242,44 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
                 }
             })
             .detach();
+        }
+        // The server is where a label lives: one it told is not told back,
+        // where an old one could undo a rename on its way there.
+        MuxNotification::PaneLabelChanged {
+            pane_id,
+            label,
+            from_server: false,
+        } => {
+            let Some(pane) = mux
+                .get_pane(pane_id)
+                .filter(|pane| pane.domain_id() == local_domain_id)
+            else {
+                return true;
+            };
+            let Some(mirror) = pane.downcast_ref::<ClientPane>() else {
+                return true;
+            };
+            let number = client_domain.label_edits.lock().unwrap().number(pane_id);
+            let Some(inner) = client_domain.inner() else {
+                client_domain
+                    .unsent_labels
+                    .lock()
+                    .unwrap()
+                    .insert(pane_id, label);
+                return true;
+            };
+            // This label is the one to tell: one kept from before would
+            // follow it on the next sync and undo it.
+            client_domain.unsent_labels.lock().unwrap().remove(&pane_id);
+            // Not for a mirror left from a server runtime since replaced:
+            // its remote id could name another pane now.
+            if mirror.belongs_to_remote_server(inner.client.remote_server_id().as_deref()) {
+                send_label(inner, pane_id, mirror.remote_pane_id(), label, number);
+            }
+        }
+        MuxNotification::PaneRemoved(pane_id) => {
+            client_domain.unsent_labels.lock().unwrap().remove(&pane_id);
+            client_domain.label_edits.lock().unwrap().forget(pane_id);
         }
         MuxNotification::TabTitleChanged { tab_id, title } => {
             if let Some(remote_tab_id) = client_domain.local_to_remote_tab_id(tab_id) {
@@ -2413,6 +2555,8 @@ impl ClientDomain {
             attaching: std::sync::atomic::AtomicBool::new(false),
             attach_retries: std::sync::atomic::AtomicUsize::new(0),
             resync_coordinator: Mutex::new(ResyncCoordinatorState::default()),
+            unsent_labels: Mutex::new(HashMap::new()),
+            label_edits: Mutex::new(LabelEdits::default()),
             local_domain_id,
         }
     }
@@ -3868,6 +4012,14 @@ impl ClientDomain {
         Ok(state)
     }
 
+    pub fn process_remote_pane_label_change(&self, remote_pane_id: PaneId, label: Option<String>) {
+        if let Some(inner) = self.inner() {
+            if let Some(local_pane_id) = inner.remote_to_local_pane_id(remote_pane_id) {
+                Mux::get().set_pane_label_from_server(local_pane_id, label.as_deref());
+            }
+        }
+    }
+
     pub fn process_remote_window_title_change(&self, remote_window_id: WindowId, title: String) {
         if let Some(inner) = self.inner() {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
@@ -4326,6 +4478,61 @@ impl ClientDomain {
                 .retain(|_workspace, window_id| mux.get_window(*window_id).is_some());
         }
 
+        // Each mirror takes the label the server holds, or loses its own:
+        // one taken away while this side could not hear of it would stay
+        // for good. Set in this sync, so a push handled after it is not
+        // undone by it. A label given here that the server has not heard
+        // of is told instead.
+        let domain = mux.get_domain(inner.local_domain_id);
+        let client_domain = domain
+            .as_ref()
+            .and_then(|domain| domain.downcast_ref::<ClientDomain>());
+        let mut unsent = client_domain
+            .map(|domain| std::mem::take(&mut *domain.unsent_labels.lock().unwrap()))
+            .unwrap_or_default();
+        let server_id = inner.client.remote_server_id();
+        for pane in mux.iter_panes() {
+            if pane.domain_id() != inner.local_domain_id {
+                continue;
+            }
+            let Some(mirror) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            let remote_pane_id = mirror.remote_pane_id();
+            if !mirror.belongs_to_remote_server(server_id.as_deref())
+                || inner.remote_to_local_pane_id(remote_pane_id) != Some(pane.pane_id())
+            {
+                continue;
+            }
+            match (client_domain, unsent.remove(&pane.pane_id())) {
+                // Shown again, as the server telling back an earlier one
+                // may have landed over it, and told under a new number: a
+                // telling of it failing late on the old connection is not
+                // to keep it again.
+                (Some(client_domain), Some(label)) => {
+                    mux.set_pane_label_from_server(pane.pane_id(), label.as_deref());
+                    let number = client_domain
+                        .label_edits
+                        .lock()
+                        .unwrap()
+                        .number(pane.pane_id());
+                    send_label(
+                        Arc::clone(&inner),
+                        pane.pane_id(),
+                        remote_pane_id,
+                        label,
+                        number,
+                    );
+                }
+                _ => {
+                    mux.set_pane_label_from_server(
+                        pane.pane_id(),
+                        panes.pane_labels.get(&remote_pane_id).map(String::as_str),
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -4402,7 +4609,7 @@ mod tests {
         remote_frontend_gate_from_state, remote_move_pane_id, server_runtime_replaced,
         stale_mirrors_to_reap, thread_id_for_workspace, AttachRetryOutcome, AttachRetryTiming,
         AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
-        FrontendRecoverySlot, MirrorOrigin, RemoteFrontendGate, ResyncCoordinatorState,
+        FrontendRecoverySlot, LabelEdits, MirrorOrigin, RemoteFrontendGate, ResyncCoordinatorState,
         ResyncDriverAction, ResyncOutcome, ResyncRequestKind, SharedResyncCompletion,
         ViewportLatencyState,
     };
@@ -5303,6 +5510,29 @@ mod tests {
         )
         .is_empty());
         assert!(stale_mirrors_to_reap([(1, mirror("srv-a"))], None, None, 1).is_empty());
+    }
+
+    #[test]
+    fn only_the_latest_label_that_failed_is_kept() {
+        let mut edits = LabelEdits::default();
+        let first = edits.number(1);
+        let second = edits.number(1);
+        assert!(
+            !edits.settle(1, first, false),
+            "an earlier one failing late"
+        );
+        assert!(edits.settle(1, second, false), "the latest failing");
+        // Told again on the next sync, under a new number.
+        let again = edits.number(1);
+        assert!(
+            !edits.settle(1, second, false),
+            "the old telling failing late"
+        );
+        assert!(!edits.settle(1, again, true));
+        let gone = edits.number(2);
+        edits.forget(2);
+        assert!(!edits.settle(2, gone, false), "a mirror since removed");
+        assert!(edits.latest.is_empty(), "numbers are let go");
     }
 }
 

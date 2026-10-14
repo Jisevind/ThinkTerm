@@ -824,7 +824,10 @@ macro_rules! pdu {
 /// 80: How far a pane's programs have got (GetPaneRunState, PaneExited, and
 ///     the CommandFinished alert from OSC 133), and SubscribeEvents for a
 ///     connection that wants events rather than pane contents.
-pub const CODEC_VERSION: usize = 80;
+/// 81: Pane labels (PaneLabelChanged, ListPanesResponse::pane_labels), the
+///     threads behind workspaces (GetWorkspaceNames), and
+///     ClientJoined/ClientLeft.
+pub const CODEC_VERSION: usize = 81;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -939,6 +942,11 @@ pdu! {
     PaneExited: 114,
     PaneAdded: 115,
     SubscribeEvents: 116,
+    PaneLabelChanged: 117,
+    GetWorkspaceNames: 118,
+    GetWorkspaceNamesResponse: 119,
+    ClientJoined: 120,
+    ClientLeft: 121,
 }
 
 impl Pdu {
@@ -1231,6 +1239,9 @@ pub struct ListPanesResponse {
     pub tabs: Vec<PaneNode>,
     pub tab_titles: Vec<String>,
     pub window_titles: HashMap<WindowId, String>,
+    /// The labels of the panes that have one.
+    #[serde(default)]
+    pub pane_labels: HashMap<PaneId, String>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1916,9 +1927,50 @@ pub struct PaneAdded {
 /// This connection wants to hear what happens -- panes appearing and
 /// closing, programs ending, bells, notifications, titles -- and not what
 /// the panes show: the server stops pushing their contents to it, and adds
-/// `PaneAdded`. For `thinkterm cli events` and anything like it.
+/// `PaneAdded`, `ClientJoined` and `ClientLeft`. For `thinkterm cli events`
+/// and anything like it.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
 pub struct SubscribeEvents {}
+
+/// Label `pane_id`, or with `None` take its label away: a request that
+/// returns `UnitResponse`, and unilateral to every client when a label
+/// changes.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct PaneLabelChanged {
+    pub pane_id: PaneId,
+    pub label: Option<String>,
+}
+
+/// Ask which thread each workspace backs, for the names the CLI accepts.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct GetWorkspaceNames {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct WorkspaceName {
+    pub workspace: String,
+    pub project: String,
+    pub thread: String,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct GetWorkspaceNamesResponse {
+    pub names: Vec<WorkspaceName>,
+}
+
+/// Unilateral, to a connection that sent `SubscribeEvents`: a client began
+/// showing panes -- a window, a browser, a phone. A command that only asks
+/// the server something is not one.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ClientJoined {
+    pub client_id: ClientId,
+}
+
+/// Unilateral, to a connection that sent `SubscribeEvents`: a client that
+/// showed panes went away.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ClientLeft {
+    pub client_id: ClientId,
+}
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetPaneZoomed {
@@ -2400,6 +2452,7 @@ mod golden {
             ],
             tab_titles: vec!["main".to_string()],
             window_titles,
+            pane_labels: HashMap::new(),
         }
     }
 
@@ -2544,9 +2597,18 @@ mod golden {
         assert_eq!(back, command_spec());
     }
 
+    /// LIST_PANES as codec 81 writes it: the pane labels went on the end,
+    /// and an empty map is one zero byte after the bytes captured before.
+    fn list_panes_with_labels() -> Vec<u8> {
+        [LIST_PANES, &[0]].concat()
+    }
+
     #[test]
     fn wire_bytes_are_stable() {
-        assert_eq!(varbincode_bytes(&list_panes_response()), LIST_PANES);
+        assert_eq!(
+            varbincode_bytes(&list_panes_response()),
+            list_panes_with_labels()
+        );
         assert_eq!(varbincode_bytes(&split_pane()), SPLIT_PANE);
         assert_eq!(varbincode_bytes(&search_request()), SEARCH);
         assert_eq!(varbincode_bytes(&client_list_response()), CLIENT_LIST);
@@ -2560,7 +2622,10 @@ mod golden {
             let mut de = varbincode::Deserializer::new(&mut r);
             serde::Deserialize::deserialize(&mut de).unwrap()
         }
-        assert_eq!(back::<ListPanesResponse>(LIST_PANES), list_panes_response());
+        assert_eq!(
+            back::<ListPanesResponse>(&list_panes_with_labels()),
+            list_panes_response()
+        );
         assert_eq!(back::<SplitPane>(SPLIT_PANE), split_pane());
         assert_eq!(back::<SearchScrollbackRequest>(SEARCH), search_request());
         assert_eq!(
@@ -3100,7 +3165,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 80);
+        assert_eq!(CODEC_VERSION, 81);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3170,7 +3235,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 80);
+        assert_eq!(CODEC_VERSION, 81);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3271,12 +3336,20 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 80);
+        assert_eq!(CODEC_VERSION, 81);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
             code: Some(2),
             signal: Some("Terminated".to_string()),
+        };
+        let client_id = ClientId {
+            hostname: "myhost".to_string(),
+            username: "user".to_string(),
+            pid: 4,
+            epoch: 5,
+            id: 6,
+            ssh_auth_sock: None,
         };
         for pdu in [
             Pdu::GetPaneRunState(GetPaneRunState { pane_id: 7 }),
@@ -3313,6 +3386,32 @@ mod test {
             }),
             Pdu::PaneAdded(PaneAdded { pane_id: 10 }),
             Pdu::SubscribeEvents(SubscribeEvents {}),
+            Pdu::PaneLabelChanged(PaneLabelChanged {
+                pane_id: 10,
+                label: Some("reviewer".to_string()),
+            }),
+            Pdu::PaneLabelChanged(PaneLabelChanged {
+                pane_id: 10,
+                label: None,
+            }),
+            Pdu::ListPanesResponse(ListPanesResponse {
+                tabs: vec![],
+                tab_titles: vec![],
+                window_titles: HashMap::new(),
+                pane_labels: HashMap::from([(10, "reviewer".to_string())]),
+            }),
+            Pdu::GetWorkspaceNames(GetWorkspaceNames {}),
+            Pdu::GetWorkspaceNamesResponse(GetWorkspaceNamesResponse {
+                names: vec![WorkspaceName {
+                    workspace: "thinkterm:p1:t1".to_string(),
+                    project: "project".to_string(),
+                    thread: "fix login".to_string(),
+                }],
+            }),
+            Pdu::ClientJoined(ClientJoined {
+                client_id: client_id.clone(),
+            }),
+            Pdu::ClientLeft(ClientLeft { client_id }),
             Pdu::NotifyAlert(NotifyAlert {
                 pane_id: 7,
                 alert: Alert::CommandFinished {
@@ -3336,7 +3435,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 80);
+        assert_eq!(CODEC_VERSION, 81);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

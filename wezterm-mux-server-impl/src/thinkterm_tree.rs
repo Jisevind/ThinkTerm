@@ -112,6 +112,47 @@ pub fn snapshot() -> ThinkTermTree {
     TREE.lock().unwrap().clone()
 }
 
+/// How a desktop names the workspaces of its own threads, as a project and
+/// a thread. A desktop's threads live in its store, not in this tree, and
+/// it serves the CLI from its own mux.
+static WORKSPACE_NAMER: std::sync::OnceLock<fn(&str) -> Option<(String, String)>> =
+    std::sync::OnceLock::new();
+
+pub fn set_workspace_namer(namer: fn(&str) -> Option<(String, String)>) {
+    let _ = WORKSPACE_NAMER.set(namer);
+}
+
+/// The project and thread behind each of `workspaces` that a thread
+/// backs: the desktop's word for it first, then this tree's.
+pub fn workspace_names(workspaces: &[String]) -> Vec<codec::WorkspaceName> {
+    let tree = snapshot();
+    workspaces
+        .iter()
+        .filter_map(|workspace| {
+            let (project, thread) = WORKSPACE_NAMER
+                .get()
+                .and_then(|namer| namer(workspace))
+                .or_else(|| tree_names_for_workspace(&tree, workspace))?;
+            Some(codec::WorkspaceName {
+                workspace: workspace.clone(),
+                project,
+                thread,
+            })
+        })
+        .collect()
+}
+
+fn tree_names_for_workspace(tree: &ThinkTermTree, workspace: &str) -> Option<(String, String)> {
+    tree.projects.iter().find_map(|project| {
+        let thread = project.threads.iter().find(|thread| {
+            thread.materialized_workspace_name.as_deref() == Some(workspace)
+                || thread.planned_workspace_name.as_deref() == Some(workspace)
+                || workspace_name(&project.id, &thread.id) == workspace
+        })?;
+        Some((project.name.clone(), thread.name.clone()))
+    })
+}
+
 fn new_id(kind: &str) -> String {
     format!("{kind}-{}", Uuid::new_v4())
 }
