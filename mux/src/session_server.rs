@@ -6,6 +6,12 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// The exit status of a `--takeover` that could not start at all: no
+/// running server that hands over (one from before the handoff), a
+/// refusal, another handoff version. Trying again would meet the same; one
+/// that failed part way through exits otherwise and may not.
+pub const TAKEOVER_CANNOT_HAND_OVER: i32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopOutcome {
     /// Nothing holds the pid file: no server to stop.

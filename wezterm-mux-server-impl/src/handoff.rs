@@ -205,11 +205,44 @@ fn placeholder(what: &str) -> HandoffMessage {
     }
 }
 
+/// macOS refuses a descriptor at once (EMSGSIZE) while the stream has less
+/// room left than the descriptor takes, where a write would wait for the
+/// reader -- and a pane's message can end just short of filling it. Wait
+/// for the reader here too, as long as a step may take.
 fn send_fd(stream: &UnixStream, fd: RawFd) -> anyhow::Result<()> {
-    stream
-        .as_raw_fd()
-        .send_fd(fd)
-        .context("passing a file descriptor")
+    let started = Instant::now();
+    let mut tries = 1;
+    loop {
+        match stream.as_raw_fd().send_fd(fd) {
+            // A signal: with a send timeout set, the call is not restarted.
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err)
+                if err.raw_os_error() == Some(libc::EMSGSIZE)
+                    && started.elapsed() < STEP_TIMEOUT =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+                tries += 1;
+            }
+            Ok(()) => {
+                if tries > 1 {
+                    log::info!(
+                        "a descriptor waited {:?} for room in the handoff stream ({tries} tries)",
+                        started.elapsed()
+                    );
+                }
+                return Ok(());
+            }
+            Err(err) if tries > 1 => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "passing a file descriptor, after waiting {:?} for the reader to make room",
+                        started.elapsed()
+                    )
+                });
+            }
+            Err(err) => return Err(err).context("passing a file descriptor"),
+        }
+    }
 }
 
 fn recv_owned_fd(stream: &UnixStream) -> anyhow::Result<OwnedFd> {
@@ -374,17 +407,49 @@ pub fn remember_report_fd(fd: RawFd) {
 /// nothing happens when it was not asked. The line is `ok` or
 /// `error: <why>`, and the pipe closes with it.
 pub fn report_takeover(outcome: Result<(), &str>) {
+    write_report(match outcome {
+        Ok(()) => "ok\n".to_string(),
+        Err(why) => format!("error: {}\n", why.replace('\n', " ")),
+    });
+}
+
+/// `report_takeover` for this process failing with `err`, and the status
+/// it exits with: a takeover that could not start at all reports
+/// `refused: <why>` and exits `TAKEOVER_CANNOT_HAND_OVER`, as trying again
+/// would be no use; anything else is an error, and 1.
+pub fn report_takeover_failure(err: &anyhow::Error) -> i32 {
+    let why = format!("{err:#}").replace('\n', " ");
+    if err.downcast_ref::<CannotHandOver>().is_some() {
+        write_report(format!("refused: {why}\n"));
+        mux::session_server::TAKEOVER_CANNOT_HAND_OVER
+    } else {
+        write_report(format!("error: {why}\n"));
+        1
+    }
+}
+
+fn write_report(line: String) {
     let fd = REPORT_FD.swap(-1, Ordering::SeqCst);
     if fd < 0 {
         return;
     }
     let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
-    let line = match outcome {
-        Ok(()) => "ok\n".to_string(),
-        Err(why) => format!("error: {}\n", why.replace('\n', " ")),
-    };
     pipe.write_all(line.as_bytes()).ok();
 }
+
+/// Why a takeover could not start at all: nothing listens for a successor
+/// (a server from before the handoff), the running server refused, or it
+/// speaks another handoff version.
+#[derive(Debug)]
+pub struct CannotHandOver(String);
+
+impl std::fmt::Display for CannotHandOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CannotHandOver {}
 
 /// Listen for a successor at `<socket_path>.handoff`. One takeover at a
 /// time; a failed one leaves this server as it was.
@@ -705,10 +770,10 @@ pub struct Takeover {
 pub fn begin(socket_path: &Path) -> anyhow::Result<Takeover> {
     let path = handoff_socket_path(socket_path);
     let mut stream = UnixStream::connect(&path).with_context(|| {
-        format!(
+        CannotHandOver(format!(
             "connecting to {}: is a server that can hand over running?",
             path.display()
-        )
+        ))
     })?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     stream.set_write_timeout(Some(STEP_TIMEOUT))?;
@@ -720,14 +785,17 @@ pub fn begin(socket_path: &Path) -> anyhow::Result<Takeover> {
     )?;
     let hello = match read_message(&mut stream)? {
         HandoffMessage::Hello(hello) => hello,
-        HandoffMessage::Refused(why) => bail!("the running server refused: {why}"),
+        HandoffMessage::Refused(why) => {
+            return Err(CannotHandOver(format!("the running server refused: {why}")).into())
+        }
         other => bail!("expected Hello, got {other:?}"),
     };
     if hello.version != HANDOFF_VERSION {
-        bail!(
+        return Err(CannotHandOver(format!(
             "the running server speaks handoff version {}, this one speaks {HANDOFF_VERSION}",
             hello.version
-        );
+        ))
+        .into());
     }
     let pid_file_fd = if hello.pid_file {
         Some(recv_owned_fd(&stream)?)
@@ -1069,6 +1137,51 @@ mod tests {
         ensure_blocking(&fd).unwrap();
         let flags = rustix::fs::fcntl_getfl(&fd).unwrap();
         assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK));
+    }
+
+    #[test]
+    fn a_descriptor_waits_for_room_in_a_full_stream() {
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.set_write_timeout(Some(STEP_TIMEOUT)).unwrap();
+        receiver.set_read_timeout(Some(STEP_TIMEOUT)).unwrap();
+        // Full to the last byte, as a pane's message can leave it.
+        sender.set_nonblocking(true).unwrap();
+        let mut filled = 0;
+        for chunk in [65536, 4096, 256, 16, 1] {
+            let bytes = vec![0u8; chunk];
+            loop {
+                match (&sender).write(&bytes) {
+                    Ok(len) => filled += len,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("filling the stream: {}", err),
+                }
+            }
+        }
+        sender.set_nonblocking(false).unwrap();
+        let (passed, mut other_end) = UnixStream::pair().unwrap();
+        // What a single try meets on macOS, and the wait is for; elsewhere
+        // the send waits for the reader by itself.
+        #[cfg(target_os = "macos")]
+        {
+            // Briefly: should a later macOS wait instead, this fails at once
+            // rather than after a whole step.
+            sender.set_write_timeout(Some(Duration::from_millis(200))).unwrap();
+            let refused = sender.as_raw_fd().send_fd(passed.as_raw_fd()).unwrap_err();
+            assert_eq!(refused.raw_os_error(), Some(libc::EMSGSIZE));
+            sender.set_write_timeout(Some(STEP_TIMEOUT)).unwrap();
+        }
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut bytes = vec![0u8; filled];
+            receiver.read_exact(&mut bytes).unwrap();
+            recv_owned_fd(&receiver).unwrap()
+        });
+        send_fd(&sender, passed.as_raw_fd()).unwrap();
+        let mut received = UnixStream::from(reader.join().unwrap());
+        received.write_all(b"ok").unwrap();
+        let mut reply = [0u8; 2];
+        other_end.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ok");
     }
     use thinkterm_proto::{PaneEntry, PaneStackEntry, SplitDirection, SplitDirectionAndSize};
 

@@ -12,7 +12,44 @@ use anyhow::Context as _;
 use config::UnixDomain;
 use mux::connui::ConnectionUI;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+/// How often, and for how long, a takeover is tried before the running
+/// server is kept (here and on a remote host after an update). One that
+/// fails before the successor owns the panes leaves that server as it was,
+/// and the failure need not recur: on macOS a server built before the
+/// handoff learned to wait for room in its stream gives up on a pane whose
+/// message left the stream all but full -- though a pane whose message
+/// comes out the same each time can fail every time. A failure that came
+/// slowly, a step timing out, would only be as slow again.
+pub(crate) const TAKEOVER_ATTEMPTS: u32 = 3;
+pub(crate) const TAKEOVER_RETRY_WINDOW: Duration = Duration::from_secs(30);
+pub(crate) const TAKEOVER_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Whether a takeover that failed with exit status `code` is tried again,
+/// `elapsed` after the first one started. One that could not start at all
+/// would meet the same again.
+pub(crate) fn worth_retrying(code: Option<i32>, attempts_made: u32, elapsed: Duration) -> bool {
+    code != Some(mux::session_server::TAKEOVER_CANNOT_HAND_OVER)
+        && attempts_made < TAKEOVER_ATTEMPTS
+        && elapsed < TAKEOVER_RETRY_WINDOW
+}
+
+/// The pid file that names the server on `unix`'s socket, when it does: the
+/// pid file is one per profile, the socket path is per domain, so a domain
+/// on a custom path may be another server's.
+fn pid_file_for(unix: &UnixDomain) -> Option<std::path::PathBuf> {
+    (unix.socket_path() == config::RUNTIME_DIR.join(config::runtime_file_name("sock")))
+        .then(|| config::configuration().daemon_options.pid_file())
+}
+
+/// Whether the server holding the pid file is no longer the one that held
+/// it before the takeover: another client's successor took it over, or it
+/// is gone. Unknown before, it cannot be told.
+fn replaced(before: Option<u32>, now: Option<u32>) -> bool {
+    before.is_some() && now != before
+}
 
 /// Whether this process started (or took over) the local session server,
 /// as opposed to finding one already running. The GUI only ever stops a
@@ -29,15 +66,60 @@ pub fn local_session_host_started_by_us() -> bool {
 }
 
 /// Run the server this client ships with as a successor of the one
-/// listening on `unix`'s socket. `Ok(true)` when it now serves; `Ok(false)`
-/// when the running server refused or the takeover failed (its output was
-/// relayed to the UI); `Err` when the command could not be run at all.
+/// listening on `unix`'s socket. `Ok(true)` when that one no longer serves
+/// -- this build's successor does, or another client's that took it over
+/// between tries -- and the caller reconnects; `Ok(false)` when the running
+/// server refused or the takeover failed every try (its output was relayed
+/// to the UI); `Err` when the command could not be run at all.
 pub fn take_over_local_server(unix: &UnixDomain, ui: &ConnectionUI) -> anyhow::Result<bool> {
     let argv = takeover_argv(unix)?;
     ui.output_str(&format!(
         "Handing the sessions of the running mux server to this build ({})...\n",
         config::wezterm_version()
     ));
+    let pid_file = pid_file_for(unix);
+    let holder = || pid_file.as_deref().and_then(mux::session_server::pid_holding);
+    let running = holder();
+    let started = Instant::now();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let status = run_takeover(&argv, ui)?;
+        if status.success() {
+            note_local_session_host_started();
+            ui.output_str("Handed over; reconnecting.\n");
+            return Ok(true);
+        }
+        let again = worth_retrying(status.code(), attempts, started.elapsed());
+        if again {
+            std::thread::sleep(TAKEOVER_RETRY_DELAY);
+        }
+        // Another client's successor took it over meanwhile: that one
+        // serves, and taking it over would only hand the same sessions over
+        // once more.
+        if replaced(running, holder()) {
+            ui.output_str(&format!(
+                "The running server could not hand over ({status}) and has been replaced \
+                 since; reconnecting.\n"
+            ));
+            return Ok(true);
+        }
+        if !again {
+            ui.output_str(&format!(
+                "The running server could not hand over ({status}); keeping it.\n"
+            ));
+            return Ok(false);
+        }
+        ui.output_str(&format!(
+            "The running server could not hand over ({status}); trying again ({} of \
+             {TAKEOVER_ATTEMPTS})...\n",
+            attempts + 1
+        ));
+    }
+}
+
+/// Run the takeover command once and wait for how it went.
+fn run_takeover(argv: &[std::ffi::OsString], ui: &ConnectionUI) -> anyhow::Result<ExitStatus> {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
@@ -93,16 +175,7 @@ pub fn take_over_local_server(unix: &UnixDomain, ui: &ConnectionUI) -> anyhow::R
     if let Some(thread) = err_thread {
         let _ = thread.join();
     }
-    if status.success() {
-        note_local_session_host_started();
-        ui.output_str("Handed over; reconnecting.\n");
-        Ok(true)
-    } else {
-        ui.output_str(&format!(
-            "The running server could not hand over ({status}); keeping it.\n"
-        ));
-        Ok(false)
-    }
+    Ok(status)
 }
 
 /// The serve command of the domain (`thinkterm-mux-server --daemonize` next
@@ -120,8 +193,37 @@ fn takeover_argv(unix: &UnixDomain) -> anyhow::Result<Vec<std::ffi::OsString>> {
 
 #[cfg(test)]
 mod tests {
-    use super::takeover_argv;
+    use super::{
+        replaced, takeover_argv, worth_retrying, TAKEOVER_ATTEMPTS, TAKEOVER_RETRY_WINDOW,
+    };
     use config::UnixDomain;
+    use std::time::Duration;
+
+    #[test]
+    fn a_takeover_that_failed_quickly_is_tried_again_up_to_the_limit() {
+        let quick = Duration::from_secs(1);
+        let failed = Some(1);
+        assert!(worth_retrying(failed, 1, quick));
+        assert!(worth_retrying(failed, TAKEOVER_ATTEMPTS - 1, quick));
+        assert!(!worth_retrying(failed, TAKEOVER_ATTEMPTS, quick));
+        // A step that timed out would time out again.
+        assert!(!worth_retrying(failed, 1, TAKEOVER_RETRY_WINDOW));
+        // One that could not start at all would not start the next time.
+        let cannot = Some(mux::session_server::TAKEOVER_CANNOT_HAND_OVER);
+        assert!(!worth_retrying(cannot, 1, quick));
+    }
+
+    #[test]
+    fn a_server_replaced_between_tries_is_not_taken_over_again() {
+        assert!(!replaced(Some(500), Some(500)));
+        // Another client's successor holds the pid file now.
+        assert!(replaced(Some(500), Some(900)));
+        // Nothing holds it: the server is gone.
+        assert!(replaced(Some(500), None));
+        // No pid file held before: there is nothing to compare.
+        assert!(!replaced(None, Some(900)));
+        assert!(!replaced(None, None));
+    }
 
     #[test]
     fn the_takeover_is_the_serve_command_plus_the_flag() {

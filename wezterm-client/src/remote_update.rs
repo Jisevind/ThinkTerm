@@ -26,6 +26,7 @@ use anyhow::Context;
 use config::SshDomain;
 use mux::connui::ConnectionUI;
 use portable_pty::Child as _;
+use std::convert::TryFrom;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wezterm_ssh::Session;
@@ -198,7 +199,35 @@ pub fn offer_remote_update(
         ui.output_str(&format!(
             "\nHanding the sessions of the running mux server on {host} to {local}...\n"
         ));
-        match run_and_relay(&session, ui, &thinkterm_update::takeover_command()) {
+        // Tried again as the local takeover is. Whether someone else took
+        // the server over meanwhile is not looked into: a host is updated
+        // from one place at a time.
+        let started = std::time::Instant::now();
+        let mut attempts = 0;
+        let outcome = loop {
+            attempts += 1;
+            match run_and_relay_status(&session, ui, &thinkterm_update::takeover_command()) {
+                Ok(status) if status.success() => break Ok(true),
+                Ok(status)
+                    if crate::local_update::worth_retrying(
+                        i32::try_from(status.exit_code()).ok(),
+                        attempts,
+                        started.elapsed(),
+                    ) =>
+                {
+                    std::thread::sleep(crate::local_update::TAKEOVER_RETRY_DELAY);
+                    ui.output_str(&format!(
+                        "\nThe running server on {host} could not hand over; trying again ({} of \
+                         {})...\n",
+                        attempts + 1,
+                        crate::local_update::TAKEOVER_ATTEMPTS
+                    ));
+                }
+                Ok(_) => break Ok(false),
+                Err(err) => break Err(err),
+            }
+        };
+        match outcome {
             Ok(true) => {
                 ui.output_str("Handed over; reconnecting.\n");
                 return Ok(RemoteUpdateOutcome::Updated { restarted: true });
@@ -343,6 +372,15 @@ fn is_not_published(err: &anyhow::Error) -> bool {
 /// Run `command` on the session, copying its stdout and stderr into the UI
 /// as they arrive, and return whether it exited successfully.
 fn run_and_relay(session: &Session, ui: &ConnectionUI, command: &str) -> anyhow::Result<bool> {
+    Ok(run_and_relay_status(session, ui, command)?.success())
+}
+
+/// `run_and_relay`, with how the command exited.
+fn run_and_relay_status(
+    session: &Session,
+    ui: &ConnectionUI,
+    command: &str,
+) -> anyhow::Result<portable_pty::ExitStatus> {
     let exec = smol::block_on(session.exec(&without_input(command), None))
         .with_context(|| format!("running `{command}` over ssh"))?;
     // Held until the command has finished; see `without_input`.
@@ -371,7 +409,7 @@ fn run_and_relay(session: &Session, ui: &ConnectionUI, command: &str) -> anyhow:
     let _ = stderr_thread.join();
     let status = child.wait().with_context(|| format!("waiting for `{command}`"));
     drop(stdin);
-    Ok(status?.success())
+    status
 }
 
 #[cfg(test)]

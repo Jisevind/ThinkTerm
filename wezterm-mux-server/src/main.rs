@@ -103,8 +103,10 @@ fn main() {
         wezterm_blob_leases::clear_storage();
         log::error!("{:#}", err);
         #[cfg(unix)]
-        wezterm_mux_server_impl::handoff::report_takeover(Err(&format!("{err:#}")));
-        std::process::exit(1);
+        let status = wezterm_mux_server_impl::handoff::report_takeover_failure(&err);
+        #[cfg(not(unix))]
+        let status = 1;
+        std::process::exit(status);
     }
     wezterm_blob_leases::clear_storage();
 }

@@ -169,8 +169,9 @@ pub fn daemonize(
 }
 
 /// Wait for the daemon's one-line report and turn it into an exit status:
-/// `ok` is 0 and silent, `error: <why>` prints why and is 1, nothing at
-/// all (the daemon died first) is 1 too.
+/// `ok` is 0 and silent, `error: <why>` prints why and is 1, `refused:
+/// <why>` (it could not start at all) prints why and is
+/// `TAKEOVER_CANNOT_HAND_OVER`, nothing at all (the daemon died first) is 1.
 fn relay_takeover_report(read_fd: RawFd) -> i32 {
     use std::io::Read;
     let mut report = String::new();
@@ -179,6 +180,10 @@ fn relay_takeover_report(read_fd: RawFd) -> i32 {
     let line = report.lines().next().unwrap_or("").trim();
     if line == "ok" {
         return 0;
+    }
+    if let Some(why) = line.strip_prefix("refused: ") {
+        eprintln!("takeover failed: {why}");
+        return mux::session_server::TAKEOVER_CANNOT_HAND_OVER;
     }
     if let Some(why) = line.strip_prefix("error: ") {
         eprintln!("takeover failed: {why}");
