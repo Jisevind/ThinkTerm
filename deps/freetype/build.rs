@@ -76,9 +76,10 @@ fn libpng() {
 
     if let Ok(arch) = env::var("CARGO_CFG_TARGET_ARCH") {
         match arch.as_str() {
+            // arm/filter_neon.S is left out: libpng ships it as an empty
+            // stub, and MSVC hands a .S file to cl.exe, which skips it.
             "aarch64" | "arm" => {
                 cfg.file("libpng/arm/arm_init.c")
-                    .file("libpng/arm/filter_neon.S")
                     .file("libpng/arm/filter_neon_intrinsics.c")
                     .file("libpng/arm/palette_neon_intrinsics.c");
             }

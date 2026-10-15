@@ -45,12 +45,31 @@ fn main() {
         let exe_output_dir = exe_output_dir(&repo_dir);
         let windows_dir = repo_dir.join("assets").join("windows");
 
-        let conhost_dir = windows_dir.join("conhost");
+        // The checked-in copies are x86_64. The arm64 ones are fetched by
+        // ci/windows-arm64-assets.sh, and there is no arm64 ANGLE. Without
+        // them an arm64 build still runs: it falls back to the system ConPTY.
+        // Watching the parent notices the directory once it appears.
+        let arm64 = std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64");
+        let dll_dir = if arm64 {
+            println!("cargo:rerun-if-changed={}", windows_dir.display());
+            let dir = windows_dir.join("arm64");
+            if !dir.exists() {
+                println!(
+                    "cargo:warning={} is missing; run ci/windows-arm64-assets.sh",
+                    dir.display()
+                );
+            }
+            dir
+        } else {
+            windows_dir.clone()
+        };
+
+        let conhost_dir = dll_dir.join("conhost");
         for name in &["conpty.dll", "OpenConsole.exe"] {
             let dest_name = exe_output_dir.join(name);
             let src_name = conhost_dir.join(name);
 
-            if !dest_name.exists() {
+            if !dest_name.exists() && (!arm64 || src_name.exists()) {
                 std::fs::copy(&src_name, &dest_name)
                     .context(format!(
                         "copy {} -> {}",
@@ -61,12 +80,12 @@ fn main() {
             }
         }
 
-        let angle_dir = windows_dir.join("angle");
+        let angle_dir = dll_dir.join("angle");
         for name in &["libEGL.dll", "libGLESv2.dll"] {
             let dest_name = exe_output_dir.join(name);
             let src_name = angle_dir.join(name);
 
-            if !dest_name.exists() {
+            if !arm64 && !dest_name.exists() {
                 std::fs::copy(&src_name, &dest_name)
                     .context(format!(
                         "copy {} -> {}",
@@ -81,8 +100,8 @@ fn main() {
             let dest_mesa = exe_output_dir.join("mesa");
             let _ = std::fs::create_dir(&dest_mesa);
             let dest_name = dest_mesa.join("opengl32.dll");
-            let src_name = windows_dir.join("mesa").join("opengl32.dll");
-            if !dest_name.exists() {
+            let src_name = dll_dir.join("mesa").join("opengl32.dll");
+            if !dest_name.exists() && (!arm64 || src_name.exists()) {
                 std::fs::copy(&src_name, &dest_name)
                     .context(format!(
                         "copy {} -> {}",

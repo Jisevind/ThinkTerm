@@ -13,6 +13,8 @@ dhat-heap.json
 /wezterm*.tar.xz
 /pkg
 /target/
+# Fetched by ci/windows-arm64-assets.sh
+/assets/windows/arm64/
 /wezterm-char-props/codegen/target
 /wezterm-char-props/codegen/Cargo.lock
 /termwiz/codegen/target
