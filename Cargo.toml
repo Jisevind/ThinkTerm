@@ -47,10 +47,7 @@ resolver = "2"
 exclude = [
   "termwiz/codegen",
   "wezterm-char-props/codegen",
-  "deps/tailscale",
-  "deps/ts_control",
-  "deps/ts_netstack_smoltcp_core",
-  "deps/ts_runtime",
+  "deps/tailscale-rs",
 ]
 
 [profile.release]
@@ -459,13 +456,13 @@ varbincode = {path="deps/varbincode", version="0.1.0"}
 # Vendored to list every peer in the tailnet (Device::peers), which 0.6.1
 # only offers as lookups by name or address, and so that a forward to an
 # actor that is gone is an error rather than a panic.
-tailscale = {path="deps/tailscale", version="0.6.1"}
-ts_runtime = {path="deps/ts_runtime", version="0.6.1"}
+tailscale = {path="deps/tailscale-rs/tailscale", version="0.6.1"}
+ts_runtime = {path="deps/tailscale-rs/ts_runtime", version="0.6.1"}
 # Vendored so that a connection notices a peer gone without a word, and a
 # connect nobody waits for any more ends: 0.6.1 sets neither a timeout nor
 # keep-alives on its TCP sockets.
-ts_netstack_smoltcp_core = {path="deps/ts_netstack_smoltcp_core", version="0.6.1"}
+ts_netstack_smoltcp_core = {path="deps/tailscale-rs/ts_netstack_smoltcp_core", version="0.6.1"}
 # Vendored so that a peer keeps what it says about its device -- its system,
 # distribution and model -- which 0.6.1 drops: Remote Hosts draws a machine
 # of the tailnet by it.
-ts_control = {path="deps/ts_control", version="0.6.1"}
+ts_control = {path="deps/tailscale-rs/ts_control", version="0.6.1"}
