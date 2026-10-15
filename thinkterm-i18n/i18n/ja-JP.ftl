@@ -879,6 +879,7 @@ settings-update-current = ThinkTerm は最新です。
 settings-update-current-detail = ThinkTerm { $version }
 settings-update-available = アップデートがあります。
 settings-update-available-detail = ThinkTerm { $latest } — 現在は { $current }
+settings-update-available-build-detail = お使いのものより新しい ThinkTerm { $latest } のビルドがあります
 settings-update-local-build = ローカルビルドで実行中です。
 settings-update-local-build-detail = { $version } — リリースビルドではありません
 settings-update-unknown = まだ確認していません。
@@ -928,8 +929,10 @@ settings-sidebar-snippets-description = 保存したコマンドやテキスト�
 
 # 更新通知(トースト)と「ソフトウェアアップデート」ページのインストール処理。
 update-toast-title = ThinkTerm の新しいバージョンがあります
+update-toast-new-build-title = ThinkTerm の新しいビルドがあります
 update-toast-body = クリックして更新内容を表示
 update-capsule-available = アップデートがあります
+update-capsule-new-build = 新しいビルドがあります
 update-capsule-downloading = ダウンロード中
 update-capsule-installing = インストール中
 update-capsule-restart = 再起動してアップデート

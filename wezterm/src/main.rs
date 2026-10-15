@@ -809,7 +809,7 @@ impl UpdateCommand {
         let current = thinkterm_update::running_release_version();
         let method = InstallMethod::detect();
 
-        let target = match &self.version {
+        let mut target = match &self.version {
             Some(tag) => thinkterm_update::get_release_by_tag(tag.trim_start_matches('v'))
                 .or_else(|_| thinkterm_update::get_release_by_tag(tag))
                 .with_context(|| format!("release {tag} not found"))?,
@@ -826,7 +826,10 @@ impl UpdateCommand {
         }
         println!("install:  {}", method.how_to_update());
 
-        let newer = thinkterm_update::is_newer_release(&target.tag_name, &current);
+        // A package made by hand with the release's own version is behind it
+        // once the release's code is the later one.
+        let verdict = thinkterm_update::judge_release(&mut target, &current, None);
+        let newer = verdict.newer;
         if self.version.is_none() && !newer {
             if thinkterm_update::is_release_version(&current) {
                 println!("You are on the latest release.");
@@ -840,7 +843,9 @@ impl UpdateCommand {
             return Ok(());
         }
         if self.check {
-            if newer {
+            if verdict.new_build {
+                println!("A newer build of {target_version} is available: {}", target.html_url);
+            } else if newer {
                 println!("A newer release is available: {}", target.html_url);
             } else {
                 println!("Release page: {}", target.html_url);

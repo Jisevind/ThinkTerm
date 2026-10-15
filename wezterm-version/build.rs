@@ -30,6 +30,10 @@ fn main() {
         .unwrap_or_default()
         .trim()
         .to_string();
+    // When the commit being built was made: its committer time, which a
+    // rebase or a squash moves on to the moment it was rewritten. Seconds
+    // since the epoch, so time zones and daylight saving never enter into it.
+    let mut commit_time = String::new();
 
     if let Ok(repo) = git2::Repository::discover(".") {
         // HEAD can switch branches without changing the ref that the old
@@ -40,6 +44,9 @@ fn main() {
         if let Ok(head) = repo.head() {
             if let Some(name) = head.name() {
                 watch_git_path(name);
+            }
+            if let Ok(commit) = head.peel_to_commit() {
+                commit_time = commit.committer().when().seconds().to_string();
             }
         }
         // Index mtimes do not change for unstaged edits. Watch tracked inputs
@@ -82,4 +89,5 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=WEZTERM_TARGET_TRIPLE={target}");
     println!("cargo:rustc-env=WEZTERM_CI_TAG={ci_tag}");
+    println!("cargo:rustc-env=THINKTERM_COMMIT_TIME={commit_time}");
 }

@@ -9,8 +9,8 @@ use wezterm_toast_notification::*;
 // shared with `thinkterm update` and the mux client's remote update; the GUI
 // keeps its names for them so the Settings pages and the toast read the same.
 pub use thinkterm_update::{
-    get_latest_release_info, is_newer_release, release_tag_url, releases_url,
-    running_release_version, Release, REPO_URL,
+    get_latest_release_info, is_newer_build, judge_release, release_tag_url, releases_url,
+    running_build_commit_time, running_release_version, same_release_version, Release, REPO_URL,
 };
 
 lazy_static::lazy_static! {
@@ -47,6 +47,16 @@ pub fn available_release() -> Option<Release> {
     AVAILABLE_RELEASE.lock().ok()?.clone()
 }
 
+/// Whether the update on offer carries the running build's own version: a
+/// release made from later code than this hand-made package of it. A flag
+/// for the same reason `UPDATE_AVAILABLE` is one: the capsule reads it on
+/// every paint, and on macOS the running version comes from a file.
+static AVAILABLE_IS_NEW_BUILD: AtomicBool = AtomicBool::new(false);
+
+pub fn available_is_new_build() -> bool {
+    update_available() && AVAILABLE_IS_NEW_BUILD.load(Ordering::Relaxed)
+}
+
 /// The newer release's version, without its `v`, while one is known.
 pub fn available_version() -> Option<String> {
     if !update_available() {
@@ -63,7 +73,8 @@ pub fn available_version() -> Option<String> {
 /// names the new release. Only the checker thread and a check asked for
 /// from Settings call this: both run once the GUI is up, and spawning onto
 /// the main thread needs its scheduler.
-fn set_update_available(available: bool, latest: &Release) {
+fn set_update_available(available: bool, new_build: bool, latest: &Release) {
+    AVAILABLE_IS_NEW_BUILD.store(new_build, Ordering::Relaxed);
     let renamed = AVAILABLE_RELEASE
         .lock()
         .map(|mut release| {
@@ -90,6 +101,14 @@ pub fn load_last_release_info() {
         return;
     }
     let status = cached_update_status();
+    AVAILABLE_IS_NEW_BUILD.store(
+        status.update_available
+            && status
+                .latest
+                .as_ref()
+                .is_some_and(|latest| same_release_version(&latest.tag_name, &status.current_version)),
+        Ordering::Relaxed,
+    );
     if let Ok(mut release) = AVAILABLE_RELEASE.lock() {
         release.clone_from(&status.latest);
     }
@@ -127,20 +146,30 @@ impl CachedUpdateStatus {
     /// stamp. A commit-stamped build has no ordering against any release, so
     /// the UI must say so instead of claiming to be up to date.
     pub fn running_a_release_build(&self) -> bool {
-        semver::Version::parse(self.current_version.trim_start_matches('v')).is_ok()
+        thinkterm_update::is_release_version(&self.current_version)
     }
+}
+
+/// The release the last check recorded, if it could be read back.
+fn cached_release() -> Option<Release> {
+    std::fs::read(config::DATA_DIR.join("check_update"))
+        .ok()
+        .and_then(|data| serde_json::from_slice::<Release>(&data).ok())
 }
 
 pub fn cached_update_status() -> CachedUpdateStatus {
     let current_version = running_release_version();
     let path = config::DATA_DIR.join("check_update");
     let last_checked = path.metadata().and_then(|meta| meta.modified()).ok();
-    let latest = std::fs::read(&path)
-        .ok()
-        .and_then(|data| serde_json::from_slice::<Release>(&data).ok());
-    let update_available = latest
-        .as_ref()
-        .is_some_and(|latest| is_newer_release(&latest.tag_name, &current_version));
+    let latest = cached_release();
+    let update_available = latest.as_ref().is_some_and(|latest| {
+        is_newer_build(
+            &latest.tag_name,
+            latest.thinkterm_commit_time,
+            &current_version,
+            running_build_commit_time(),
+        )
+    });
 
     CachedUpdateStatus {
         current_version,
@@ -152,7 +181,7 @@ pub fn cached_update_status() -> CachedUpdateStatus {
 
 #[cfg(test)]
 mod update_version_tests {
-    use super::is_newer_release;
+    use thinkterm_update::is_newer_release;
 
     const STAMP: &str = "20260819-153532-9d50c4cc";
 
@@ -185,9 +214,13 @@ mod update_version_tests {
 /// network, so callers run it off the UI thread. No toast: whoever asked is
 /// looking at the answer.
 pub fn check_now() -> anyhow::Result<()> {
-    let latest = get_latest_release_info()?;
-    let newer = is_newer_release(&latest.tag_name, &running_release_version());
-    set_update_available(newer || always_show_update_ui(), &latest);
+    let mut latest = get_latest_release_info()?;
+    let verdict = judge_release(&mut latest, &running_release_version(), cached_release().as_ref());
+    set_update_available(
+        verdict.newer || always_show_update_ui(),
+        verdict.new_build,
+        &latest,
+    );
     // Settings shows what it reads back from the cache: an answer that could
     // not be kept there is, as far as the page can tell, no answer.
     record_latest_release(&latest)
@@ -232,10 +265,13 @@ fn update_checker() {
         let socks = wezterm_client::discovery::discover_gui_socks();
 
         if configuration().check_for_updates {
-            if let Ok(latest) = get_latest_release_info() {
+            if let Ok(mut latest) = get_latest_release_info() {
                 let current = running_release_version();
-                let newer = is_newer_release(&latest.tag_name, &current);
-                set_update_available(newer || force_ui, &latest);
+                // A package made by hand with this release's version is told
+                // about the release once its code is the later one.
+                let verdict = judge_release(&mut latest, &current, cached_release().as_ref());
+                let newer = verdict.newer;
+                set_update_available(newer || force_ui, verdict.new_build, &latest);
                 if newer || force_ui {
                     log::info!(
                         "latest release {} is newer than current build {}",
@@ -247,7 +283,11 @@ fn update_checker() {
 
                     if force_ui || socks.is_empty() || socks[0] == my_sock {
                         persistent_toast_notification_with_click_to_open_url(
-                            &crate::i18n::tr("update-toast-title"),
+                            &crate::i18n::tr(if verdict.new_build {
+                                "update-toast-new-build-title"
+                            } else {
+                                "update-toast-title"
+                            }),
                             &crate::i18n::tr("update-toast-body"),
                             &url,
                         );

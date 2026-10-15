@@ -593,7 +593,9 @@ pub(crate) fn installs_updates_itself() -> bool {
 /// Where an update stands, as the update capsule shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum UpdateCapsuleStatus {
-    Available { version: String },
+    /// `new_build`: the release has the running build's own version, made
+    /// from later code than this hand-made package of it.
+    Available { version: String, new_build: bool },
     /// `fraction` is None before the first report and once the download is
     /// in and the installer runs.
     Installing { fraction: Option<f32> },
@@ -620,6 +622,7 @@ pub(crate) fn update_capsule_status() -> Option<UpdateCapsuleStatus> {
         Some(UpdateInstall::Failed { .. }) => UpdateCapsuleStatus::Failed,
         None => UpdateCapsuleStatus::Available {
             version: crate::update::available_version()?,
+            new_build: crate::update::available_is_new_build(),
         },
     })
 }
@@ -739,8 +742,11 @@ enum UpdateHero {
     /// unreadable. Either way there is nothing to compare against.
     Unknown,
     UpToDate,
+    /// `new_build`: the release carries this build's own version, made from
+    /// later code than this hand-made package of it.
     Available {
         tag: String,
+        new_build: bool,
     },
     /// A commit-stamped build from a plain checkout. It has no ordering
     /// against any release tag, so releases simply do not apply to it.
@@ -14527,6 +14533,10 @@ impl SettingsWindow {
         match (&status.latest, status.update_available) {
             (Some(latest), true) => UpdateHero::Available {
                 tag: latest.tag_name.clone(),
+                new_build: crate::update::same_release_version(
+                    &latest.tag_name,
+                    &status.current_version,
+                ),
             },
             (Some(_), false) => UpdateHero::UpToDate,
             (None, _) => UpdateHero::Unknown,
@@ -15384,10 +15394,14 @@ impl SettingsWindow {
                 crate::i18n::tr("settings-update-current"),
                 settings_tr("settings-update-current-detail", &[("version", version)]),
             ),
-            UpdateHero::Available { tag } => (
+            UpdateHero::Available { tag, new_build } => (
                 crate::i18n::tr("settings-update-available"),
                 settings_tr(
-                    "settings-update-available-detail",
+                    if *new_build {
+                        "settings-update-available-build-detail"
+                    } else {
+                        "settings-update-available-detail"
+                    },
                     &[("latest", tag.clone()), ("current", version)],
                 ),
             ),

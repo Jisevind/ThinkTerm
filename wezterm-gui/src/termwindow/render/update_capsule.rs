@@ -190,8 +190,12 @@ impl crate::TermWindow {
 
         let kind = Kind::of(&status);
         let (main, sub, sub_room) = match &status {
-            UpdateCapsuleStatus::Available { version } => (
-                crate::i18n::tr("update-capsule-available"),
+            UpdateCapsuleStatus::Available { version, new_build } => (
+                crate::i18n::tr(if *new_build {
+                    "update-capsule-new-build"
+                } else {
+                    "update-capsule-available"
+                }),
                 version.clone(),
                 None,
             ),
@@ -954,7 +958,10 @@ mod tests {
     fn the_capsule_reads_each_status_as_its_kind() {
         let version = || "1.2.3".to_string();
         assert_eq!(
-            Kind::of(&UpdateCapsuleStatus::Available { version: version() }),
+            Kind::of(&UpdateCapsuleStatus::Available {
+                version: version(),
+                new_build: false,
+            }),
             Kind::Available
         );
         assert_eq!(

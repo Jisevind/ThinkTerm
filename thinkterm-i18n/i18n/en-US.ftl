@@ -909,6 +909,7 @@ settings-update-current = ThinkTerm is up to date.
 settings-update-current-detail = ThinkTerm { $version }
 settings-update-available = An update is available.
 settings-update-available-detail = ThinkTerm { $latest } — you have { $current }
+settings-update-available-build-detail = A newer build of ThinkTerm { $latest } than the one you have
 settings-update-local-build = Running a local build.
 settings-update-local-build-detail = { $version } — not a release build
 settings-update-unknown = No update check has run yet.
@@ -958,8 +959,10 @@ settings-sidebar-snippets-description = Saved commands and text you can paste in
 
 # Update notice (toast) and the Software Update page's install flow.
 update-toast-title = ThinkTerm update available
+update-toast-new-build-title = New ThinkTerm build available
 update-toast-body = Click to see what's new
 update-capsule-available = Update available
+update-capsule-new-build = New build available
 update-capsule-downloading = Downloading
 update-capsule-installing = Installing
 update-capsule-restart = Restart to update

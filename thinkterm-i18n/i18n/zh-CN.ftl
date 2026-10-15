@@ -879,6 +879,7 @@ settings-update-current = ThinkTerm 已是最新版本。
 settings-update-current-detail = ThinkTerm { $version }
 settings-update-available = 有可用更新。
 settings-update-available-detail = ThinkTerm { $latest } — 当前版本 { $current }
+settings-update-available-build-detail = ThinkTerm { $latest } 有比你这份更新的构建
 settings-update-local-build = 正在运行本地构建。
 settings-update-local-build-detail = { $version } — 非发布版本
 settings-update-unknown = 尚未检查过更新。
@@ -928,8 +929,10 @@ settings-sidebar-snippets-description = 保存的命令和文本，可以粘贴�
 
 # 更新提醒(系统通知)与"软件更新"页的安装流程。
 update-toast-title = ThinkTerm 有新版本
+update-toast-new-build-title = ThinkTerm 有新构建
 update-toast-body = 点击查看更新内容
 update-capsule-available = 有新版本
+update-capsule-new-build = 有新构建
 update-capsule-downloading = 正在下载
 update-capsule-installing = 正在安装
 update-capsule-restart = 重启以完成更新

@@ -33,6 +33,7 @@ pub const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh";
 
 const API_RELEASES: &str = "https://api.github.com/repos/RoversX/thinkterm/releases";
+const API_COMMITS: &str = "https://api.github.com/repos/RoversX/thinkterm/commits";
 
 /// The oldest glibc the Linux release binaries run on: the Ubuntu 22.04 base
 /// they are built in. `install.sh` carries the same number and refuses
@@ -82,6 +83,11 @@ pub struct Release {
     pub html_url: String,
     pub tag_name: String,
     pub assets: Vec<Asset>,
+    /// When the commit the release was made from was committed, in seconds
+    /// since the epoch. Not part of GitHub's answer: looked up, and kept in
+    /// the cached copy, only when it is what decides -- see `is_newer_build`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinkterm_commit_time: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -511,7 +517,12 @@ fn version_from_info_plist(path: PathBuf) -> Option<String> {
 /// `<date>-<hash>` commit stamp a plain checkout builds with. Only a release
 /// has a tag on GitHub, so only a release can be fetched by name.
 pub fn is_release_version(version: &str) -> bool {
-    semver::Version::parse(version.trim_start_matches('v')).is_ok()
+    parse_release(version).is_some()
+}
+
+/// A release version, with or without the `v` older tags carried.
+fn parse_release(version: &str) -> Option<semver::Version> {
+    semver::Version::parse(version.trim_start_matches('v')).ok()
 }
 
 /// Is `latest` a release the running build should be told about?
@@ -523,8 +534,7 @@ pub fn is_release_version(version: &str) -> bool {
 /// with `>` is what made every `v*` release look permanently newer than every
 /// local build: 'v' sorts above every digit, so the banner never went away.
 pub fn is_newer_release(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| semver::Version::parse(s.trim_start_matches('v')).ok();
-    match (parse(latest), parse(current)) {
+    match (parse_release(latest), parse_release(current)) {
         (Some(latest), Some(current)) => latest > current,
         // Both on the commit-stamp scheme, which upstream still uses for its
         // own tags. It starts with a zero-padded date, so lexicographic order
@@ -534,6 +544,165 @@ pub fn is_newer_release(latest: &str, current: &str) -> bool {
         // that never came from a release is not something to nag about.
         _ => false,
     }
+}
+
+/// Is `latest` -- a release made from a commit committed at
+/// `latest_commit_time` -- something the running build, `current` committed
+/// at `current_commit_time`, should be told about?
+///
+/// The versions decide, as `is_newer_release` has them. Only a tie goes on to
+/// the commits: a package made by hand from a checkout can carry the version
+/// of a release that does not exist yet, and when that release comes out its
+/// code is the later one. Committer times, in seconds since the epoch, so
+/// time zones and daylight saving never reorder them. A rebase or a squash
+/// dates its commits to when it ran, and a package made from a branch that
+/// missed some of the release's commits looks as new as its last commit:
+/// both only ever mislead a package made by hand, never a release's.
+pub fn is_newer_build(
+    latest: &str,
+    latest_commit_time: Option<i64>,
+    current: &str,
+    current_commit_time: Option<i64>,
+) -> bool {
+    if is_newer_release(latest, current) {
+        return true;
+    }
+    same_release_version(latest, current)
+        && matches!(
+            (latest_commit_time, current_commit_time),
+            (Some(latest), Some(current)) if latest > current
+        )
+}
+
+/// Whether two versions name the same release.
+pub fn same_release_version(a: &str, b: &str) -> bool {
+    matches!((parse_release(a), parse_release(b)), (Some(a), Some(b)) if a == b)
+}
+
+/// The commit time of the running build when that can tell it apart from a
+/// release of the same version: a package made by hand, whose binary carries
+/// the commit stamp of a checkout. None for a release package, which is the
+/// release whatever commit its tag points at -- so its users are never told
+/// about the very release they run.
+pub fn running_build_commit_time() -> Option<i64> {
+    #[cfg(target_os = "macos")]
+    if macos_bundle_is_release_package() {
+        return None;
+    }
+    build_commit_time(config::wezterm_version(), config::wezterm_commit_time())
+}
+
+fn build_commit_time(stamp: &str, time: Option<i64>) -> Option<i64> {
+    if is_release_version(stamp) {
+        None
+    } else {
+        time
+    }
+}
+
+/// The Info.plist key a package signed for a release carries (ci/deploy.sh
+/// writes it). A laptop-built one has a commit stamp in its binaries like
+/// any hand-made package, so the stamp alone cannot tell them apart.
+#[cfg(target_os = "macos")]
+const RELEASE_PACKAGE_KEY: &str = "ThinkTermReleasePackage";
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_is_release_package() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("Info.plist")))
+        .and_then(|path| plist::Value::from_file(path).ok())
+        .and_then(|value| value.as_dictionary()?.get(RELEASE_PACKAGE_KEY)?.as_boolean())
+        .unwrap_or(false)
+}
+
+/// What a release is to the running build.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateVerdict {
+    /// Something to tell the person about.
+    pub newer: bool,
+    /// And it carries the running build's own version: the same release,
+    /// made from later code than this hand-made package of it.
+    pub new_build: bool,
+}
+
+/// Judge `latest` against the running build, `current`: by version, and on
+/// a tie by commit time (see `is_newer_build`). The tag's commit time, which
+/// only a tie needs, comes from `cached` -- the last check's copy of the
+/// same release -- before GitHub is asked, and is kept in `latest` for the
+/// next check: a published tag does not move, and every request counts
+/// against the anonymous API limit.
+pub fn judge_release(latest: &mut Release, current: &str, cached: Option<&Release>) -> UpdateVerdict {
+    judge_release_with(latest, current, cached, running_build_commit_time(), get_tag_commit_time)
+}
+
+fn judge_release_with(
+    latest: &mut Release,
+    current: &str,
+    cached: Option<&Release>,
+    build_time: Option<i64>,
+    lookup: impl FnOnce(&str) -> anyhow::Result<i64>,
+) -> UpdateVerdict {
+    let tie = same_release_version(&latest.tag_name, current);
+    if tie && build_time.is_some() && latest.thinkterm_commit_time.is_none() {
+        latest.thinkterm_commit_time = cached
+            .filter(|cached| cached.tag_name == latest.tag_name)
+            .and_then(|cached| cached.thinkterm_commit_time)
+            .or_else(|| match lookup(&latest.tag_name) {
+                Ok(time) => Some(time),
+                Err(err) => {
+                    log::debug!("looking up the commit of {}: {err:#}", latest.tag_name);
+                    None
+                }
+            });
+    }
+    let newer = is_newer_build(
+        &latest.tag_name,
+        latest.thinkterm_commit_time,
+        current,
+        build_time,
+    );
+    UpdateVerdict {
+        newer,
+        new_build: newer && tie,
+    }
+}
+
+/// When the commit tag `tag` points at was committed, from the commits API:
+/// the list form, which leaves out the changed files, started from the tag
+/// itself so that a branch of the same name cannot answer instead.
+pub fn get_tag_commit_time(tag: &str) -> anyhow::Result<i64> {
+    let uri = format!("{API_COMMITS}?sha=refs/tags/{}&per_page=1", percent_encode(tag));
+    let body = http_get(&uri)?;
+    let commits: serde_json::Value = serde_json::from_slice(&body)
+        .with_context(|| format!("parsing the GitHub commit list from {uri}"))?;
+    let date = commits
+        .get(0)
+        .and_then(|commit| commit.pointer("/commit/committer/date"))
+        .and_then(|date| date.as_str())
+        .ok_or_else(|| anyhow!("no commit date for {tag} in {uri}"))?;
+    parse_github_utc(date).ok_or_else(|| anyhow!("unexpected commit date {date:?} for {tag}"))
+}
+
+/// `text` safe inside a query string: everything but unreserved characters
+/// percent-encoded.
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// Seconds since the epoch for a GitHub timestamp, which is always UTC:
+/// `2026-10-15T07:12:34Z`.
+fn parse_github_utc(date: &str) -> Option<i64> {
+    let time = humantime::parse_rfc3339(date).ok()?;
+    let seconds = time.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(seconds).ok()
 }
 
 /// The shell one-liner that installs release `version` of `variant` for the
@@ -749,6 +918,99 @@ mod tests {
         assert!(is_newer_release("20260904-120000-abcdef12", "20260903-120000-abcdef12"));
         assert!(!is_newer_release("0.2.0", "20260903-120000-abcdef12"));
         assert!(!is_newer_release("20260903-120000-abcdef12", "0.2.0"));
+    }
+
+    #[test]
+    fn the_version_decides_and_only_a_tie_goes_on_to_the_commits() {
+        // A higher or lower version settles it, whatever the commits.
+        assert!(is_newer_build("0.2.1", None, "0.2.0", None));
+        assert!(!is_newer_build("0.1.9", Some(900), "0.2.0", Some(100)));
+        // The same version, made from a later commit: a newer build.
+        assert!(is_newer_build("0.2.0", Some(200), "0.2.0", Some(100)));
+        assert!(is_newer_build("v0.2.0", Some(200), "0.2.0", Some(100)));
+        // The same commit, or an earlier one, is nothing to offer.
+        assert!(!is_newer_build("0.2.0", Some(100), "0.2.0", Some(100)));
+        assert!(!is_newer_build("0.2.0", Some(50), "0.2.0", Some(100)));
+        // Either time unknown: the versions alone, as before.
+        assert!(!is_newer_build("0.2.0", None, "0.2.0", Some(100)));
+        assert!(!is_newer_build("0.2.0", Some(200), "0.2.0", None));
+        // A commit stamp is not the release's version.
+        assert!(!is_newer_build("0.2.0", Some(200), "20261015-023205-79a8bed2", Some(100)));
+    }
+
+    #[test]
+    fn only_a_build_stamped_with_a_commit_has_a_commit_time_to_compare() {
+        assert_eq!(build_commit_time("20261015-023205-79a8bed2", Some(100)), Some(100));
+        assert_eq!(build_commit_time("20261015-023205-79a8bed2-dirty", Some(100)), Some(100));
+        // A release package is the release: never told about itself.
+        assert_eq!(build_commit_time("0.2.0", Some(100)), None);
+    }
+
+    fn release(tag: &str, commit_time: Option<i64>) -> Release {
+        let mut release: Release = serde_json::from_value(serde_json::json!({
+            "url": "", "body": "", "html_url": "", "tag_name": tag, "assets": []
+        }))
+        .unwrap();
+        release.thinkterm_commit_time = commit_time;
+        release
+    }
+
+    #[test]
+    fn a_tie_is_settled_by_the_tag_s_commit_time_asked_once() {
+        let asked = std::cell::Cell::new(0);
+        let lookup = |time: i64| {
+            let asked = &asked;
+            move |_: &str| {
+                asked.set(asked.get() + 1);
+                Ok(time)
+            }
+        };
+        // A later commit behind the same version: a new build, asked once.
+        let mut latest = release("0.2.0", None);
+        let verdict = judge_release_with(&mut latest, "0.2.0", None, Some(100), lookup(200));
+        assert_eq!(verdict, UpdateVerdict { newer: true, new_build: true });
+        assert_eq!((latest.thinkterm_commit_time, asked.get()), (Some(200), 1));
+        // The next check takes it from the cached copy of the same tag.
+        let cached = latest.clone();
+        let mut latest = release("0.2.0", None);
+        judge_release_with(&mut latest, "0.2.0", Some(&cached), Some(100), lookup(999));
+        assert_eq!((latest.thinkterm_commit_time, asked.get()), (Some(200), 1));
+        // A different version, or a release package: nothing to ask.
+        let mut latest = release("0.2.1", None);
+        let verdict = judge_release_with(&mut latest, "0.2.0", None, Some(100), lookup(50));
+        assert_eq!(verdict, UpdateVerdict { newer: true, new_build: false });
+        let mut latest = release("0.2.0", None);
+        let verdict = judge_release_with(&mut latest, "0.2.0", None, None, lookup(200));
+        assert_eq!(verdict, UpdateVerdict::default());
+        assert_eq!(asked.get(), 1);
+    }
+
+    #[test]
+    fn a_tag_commit_github_cannot_date_leaves_the_versions_to_decide() {
+        let mut latest = release("0.2.0", None);
+        let verdict = judge_release_with(&mut latest, "0.2.0", None, Some(100), |_: &str| {
+            Err(anyhow!("rate limited"))
+        });
+        assert_eq!(verdict, UpdateVerdict::default());
+        assert_eq!(latest.thinkterm_commit_time, None);
+    }
+
+    #[test]
+    fn a_tag_goes_into_the_query_string_encoded() {
+        assert_eq!(percent_encode("0.2.0"), "0.2.0");
+        assert_eq!(percent_encode("1.0.0+build.5"), "1.0.0%2Bbuild.5");
+        assert_eq!(percent_encode("a b/c"), "a%20b%2Fc");
+    }
+
+    #[test]
+    fn github_timestamps_are_read_as_utc() {
+        assert_eq!(parse_github_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_github_utc("2000-02-29T12:00:00Z"), Some(951_825_600));
+        // A commit made at 02:32:05 +11:00 on the 15th.
+        assert_eq!(parse_github_utc("2026-10-14T15:32:05Z"), Some(1_791_991_925));
+        assert_eq!(parse_github_utc("2026-10-14T15:32:05+11:00"), None);
+        assert_eq!(parse_github_utc("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_github_utc("not a date"), None);
     }
 
     #[test]

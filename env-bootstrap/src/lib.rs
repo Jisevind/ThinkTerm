@@ -246,6 +246,7 @@ pub fn bootstrap() {
         wezterm_version::wezterm_version(),
         wezterm_version::wezterm_target_triple(),
     );
+    config::assign_commit_time(wezterm_version::wezterm_commit_time());
     setup_logger();
     register_panic_hook();
 

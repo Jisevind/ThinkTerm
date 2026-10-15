@@ -9631,6 +9631,7 @@ dependencies = [
  "config",
  "hex",
  "http_req",
+ "humantime",
  "log",
  "plist",
  "semver",

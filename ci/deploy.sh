@@ -83,6 +83,12 @@ case $OSTYPE in
       plutil -replace CFBundleShortVersionString -string "$MACOS_BUNDLE_VERSION" \
         "$zipdir/ThinkTerm.app/Contents/Info.plist"
     fi
+    # A package signed for distribution says so. Built on a laptop, its
+    # binaries carry a commit stamp like any package made by hand, and the
+    # update check must not take it for one and offer it its own release.
+    if [[ "${MACOS_SIGNING_MODE:-}" == developerid || ( -z "${MACOS_SIGNING_MODE:-}" && -n "${MACOS_TEAM_ID:-}" ) ]] ; then
+      plutil -replace ThinkTermReleasePackage -bool YES "$zipdir/ThinkTerm.app/Contents/Info.plist"
+    fi
     # Omit MetalANGLE for now; it's a bit laggy compared to CGL,
     # and on M1/Big Sur, CGL is implemented in terms of Metal anyway
     rm $zipdir/ThinkTerm.app/*.dylib
