@@ -19,18 +19,20 @@ version="${tag#v}"
 
 base="https://github.com/RoversX/thinkterm/releases/download/$tag"
 
-# Every Linux package we build is one of these two. Anything unrecognized is
-# labelled 64-bit rather than dropped, so a new architecture shows up wrong
-# rather than silently going missing.
+# Every Linux and Windows package we build is one of these two. Anything
+# unrecognized gets the x86_64 label rather than being dropped, so a new
+# architecture shows up wrong rather than silently going missing. Windows
+# passes "x64": ARM64 there is 64-bit too, and is what that word means.
 arch_label() {
   case "$1" in
     *arm64* | *aarch64*) echo "ARM64" ;;
-    *) echo "64-bit" ;;
+    *) echo "${2:-64-bit}" ;;
   esac
 }
 
-# "[64-bit](url) · [ARM64](url)" for every file matching a glob. Returns 1 when
-# the release contains none of them, so the caller can drop the whole row.
+# "[64-bit](url) · [ARM64](url)" for every file matching a glob; a second
+# argument replaces "64-bit". Returns 1 when the release contains none of
+# them, so the caller can drop the whole row.
 #
 # Two passes so that 64-bit leads, whatever the filenames sort as: it is what
 # most people want, and a row reads as a recommendation followed by the
@@ -46,23 +48,11 @@ links_by_arch() {
         *) [ "$want" = x86 ] || continue ;;
       esac
       [ -z "$out" ] || out="$out · "
-      out="$out[$(arch_label "$f")]($base/$f)"
+      out="$out[$(arch_label "$f" "${2:-}")]($base/$f)"
     done
   done
   [ -n "$out" ] || return 1
   printf '%s\n' "$out"
-}
-
-# One named file. Used where the architecture is not what distinguishes the
-# download -- the Windows installer against the portable zip, say.
-link_to() {
-  local f
-  for f in "$dist"/$2; do
-    [ -f "$f" ] || continue
-    printf '[%s](%s/%s)' "$1" "$base" "$(basename "$f")"
-    return 0
-  done
-  return 1
 }
 
 # The same header on every release, from main: the tag does not exist until
@@ -90,17 +80,13 @@ echo
 echo "[Apple silicon]($base/ThinkTerm-macos-arm64-$version.zip) · [Intel]($base/ThinkTerm-macos-x86_64-$version.zip) — or \`curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh\`, which picks the right one, verifies it and puts the command-line tools on PATH"
 echo
 
-win_setup=$(link_to "Installer" 'ThinkTerm-*-setup.exe') || win_setup=''
-win_zip=$(link_to "Portable zip" 'ThinkTerm-windows-*.zip') || win_zip=''
+win_setup=$(links_by_arch 'ThinkTerm-*-setup.exe' x64) || win_setup=''
+win_zip=$(links_by_arch 'ThinkTerm-windows-*.zip' x64) || win_zip=''
 if [ -n "$win_setup$win_zip" ]; then
   echo "### Windows"
   echo
-  if [ -n "$win_setup" ] && [ -n "$win_zip" ]; then
-    echo "$win_setup · $win_zip"
-  else
-    echo "$win_setup$win_zip"
-  fi
-  echo
+  [ -z "$win_setup" ] || { echo "Installer: $win_setup"; echo; }
+  [ -z "$win_zip" ] || { echo "Portable zip: $win_zip"; echo; }
 fi
 
 linux=''

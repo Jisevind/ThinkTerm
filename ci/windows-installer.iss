@@ -10,11 +10,20 @@
 #ifndef MyAppSourceDir
   #error MyAppSourceDir must name the directory containing the built executables
 #endif
+; x64 or arm64: the architecture of the executables in MyAppSourceDir
+#ifndef MyAppArch
+  #define MyAppArch "x64"
+#endif
 
 [Setup]
 AppId={{56CBA99B-8F65-4EC0-8CE4-F13BFCB70274}
+#if MyAppArch == "arm64"
+ArchitecturesAllowed=arm64
+ArchitecturesInstallIn64BitMode=arm64
+#else
 ArchitecturesAllowed=x64 arm64
 ArchitecturesInstallIn64BitMode=x64 arm64
+#endif
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 ;AppVerName={#MyAppName} {#MyAppVersion}
@@ -52,8 +61,11 @@ Source: "{#MyAppSourceDir}\thinkterm-gui.exe"; DestDir: "{app}"; Flags: ignoreve
 Source: "{#MyAppSourceDir}\thinkterm-mux-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\thinkterm-plugin-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\mesa\opengl32.dll"; DestDir: "{app}\mesa"; Flags: ignoreversion
+; ANGLE has no arm64 build here
+#if MyAppArch != "arm64"
 Source: "{#MyAppSourceDir}\libEGL.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\libGLESv2.dll"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 Source: "{#MyAppSourceDir}\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\thinkterm-web\www\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
@@ -63,6 +75,13 @@ Source: "..\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
+#if MyAppArch == "arm64"
+[InstallDelete]
+; Left behind by an x64 install in the same place; an arm64 process cannot load them
+Type: files; Name: "{app}\libEGL.dll"
+Type: files; Name: "{app}\libGLESv2.dll"
+
+#endif
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "com.roversx.thinkterm"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; AppUserModelID: "com.roversx.thinkterm"
@@ -85,6 +104,10 @@ Root: HKA; Subkey: "Software\Classes\Directory\shell\Open ThinkTerm here\command
 { https://stackoverflow.com/a/46609047/149111 }
 const EnvironmentKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
 
+// The x64 package also installs on arm64, where it runs under emulation;
+// these check that the machine can emulate x64. The arm64 package runs
+// natively and needs none of it.
+#if MyAppArch != "arm64"
 const IMAGE_FILE_MACHINE_AMD64 = $8664;
 
 function GetMachineTypeAttributes(
@@ -132,6 +155,7 @@ function InitializeSetupCheckArchitecture(): Boolean;
 begin
   Result := IsSupportedArch();
 end;
+#endif
 
 procedure EnvAddPath(instlPath: string);
 var

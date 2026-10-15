@@ -49,6 +49,11 @@ on:
         description: Windows x86_64
         type: boolean
         default: true
+      # Same terms as linux_arm64 below: free on public repos only.
+      windows_arm64:
+        description: Windows arm64
+        type: boolean
+        default: false
       linux_x86_64:
         description: Linux x86_64 (deb + rpm + AppImage + tarballs)
         type: boolean
@@ -84,7 +89,7 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       release_tag: ${{ steps.plan.outputs.release_tag }}
       publish: ${{ steps.plan.outputs.publish }}
-      windows: ${{ steps.plan.outputs.windows }}
+      windows_matrix: ${{ steps.plan.outputs.windows_matrix }}
       macos_matrix: ${{ steps.plan.outputs.macos_matrix }}
       linux_matrix: ${{ steps.plan.outputs.linux_matrix }}
 
@@ -127,7 +132,8 @@ jobs:
           publish='${{ inputs.publish }}'
           macos_arm64='${{ inputs.macos_arm64 }}'
           macos_x86_64='${{ inputs.macos_x86_64 }}'
-          windows='${{ inputs.windows_x86_64 }}'
+          windows_x86_64='${{ inputs.windows_x86_64 }}'
+          windows_arm64='${{ inputs.windows_arm64 }}'
           linux_x86_64='${{ inputs.linux_x86_64 }}'
           linux_arm64='${{ inputs.linux_arm64 }}'
 
@@ -135,6 +141,11 @@ jobs:
             --argjson a "$macos_arm64" --argjson x "$macos_x86_64" '
             [ if $a then {arch: "arm64",  target: "aarch64-apple-darwin"} else empty end,
               if $x then {arch: "x86_64", target: "x86_64-apple-darwin"}  else empty end ]')"
+
+          windows_matrix="$(jq -nc \
+            --argjson x "$windows_x86_64" --argjson a "$windows_arm64" '
+            [ if $x then {arch: "x86_64", runs_on: "windows-2022",   target: "x86_64-pc-windows-msvc"}  else empty end,
+              if $a then {arch: "arm64",  runs_on: "windows-11-arm", target: "aarch64-pc-windows-msvc"} else empty end ]')"
 
           linux_matrix="$(jq -nc \
             --argjson x "$linux_x86_64" --argjson a "$linux_arm64" '
@@ -153,7 +164,7 @@ jobs:
             echo "version=$version"
             echo "release_tag=$release_tag"
             echo "publish=$publish"
-            echo "windows=$windows"
+            echo "windows_matrix=$windows_matrix"
             echo "macos_matrix=$macos_matrix"
             echo "linux_matrix=$linux_matrix"
           } >> "$GITHUB_OUTPUT"
@@ -167,7 +178,7 @@ jobs:
             echo "| release tag | \`$release_tag\` |"
             echo "| publish | \`$publish\` |"
             echo "| macOS | \`$(jq -r 'if length == 0 then "none" else [.[].arch] | join(", ") end' <<<"$macos_matrix")\` |"
-            echo "| Windows | \`$windows\` |"
+            echo "| Windows | \`$(jq -r 'if length == 0 then "none" else [.[].arch] | join(", ") end' <<<"$windows_matrix")\` |"
             echo "| Linux | \`$(jq -r 'if length == 0 then "none" else [.[] | "\(.name)/\(.arch)"] | join(", ") end' <<<"$linux_matrix")\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -394,15 +405,20 @@ jobs:
           retention-days: 3
 
   windows:
-    name: windows x86_64
+    name: windows ${{ matrix.arch }}
     needs: [prepare, web]
-    if: needs.prepare.outputs.windows == 'true'
-    runs-on: windows-2022
+    if: needs.prepare.outputs.windows_matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.windows_matrix) }}
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 90
 
     env:
       RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
       TAG_NAME: ${{ needs.prepare.outputs.version }}
+      WINDOWS_ARCH: ${{ matrix.arch }}
       # Build, packaging, cache selection and symbol upload share this value.
       CARGO_PROFILE: ${{ inputs.profile || 'release' }}
 
@@ -429,12 +445,20 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned
         with:
           toolchain: stable
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
+
+      # The build below targets the host, so an x86_64 toolchain on the arm
+      # runner would quietly package the emulated build instead.
+      - name: Check host
+        shell: bash
+        run: |
+          rustc -vV
+          [ "$(rustc -vV | sed -n 's/^host: //p')" = '${{ matrix.target }}' ]
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: windows-x86_64-${{ env.CARGO_PROFILE }}
+          key: windows-${{ matrix.arch }}-${{ env.CARGO_PROFILE }}
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
@@ -450,6 +474,13 @@ jobs:
             }
             Add-Content -Path $env:GITHUB_PATH -Value $inno
           }
+
+      # Before the build: wezterm-gui's build script stages these next to the
+      # executables, and the installer takes them from there.
+      - name: Fetch the arm64 DLLs
+        if: matrix.arch == 'arm64'
+        shell: bash
+        run: bash ci/windows-arm64-assets.sh
 
       # openssl-src needs perl; Strawberry Perl ships on the runner but is not
       # on PATH by default.
@@ -472,7 +503,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
-          name: windows-x86_64
+          name: windows-${{ matrix.arch }}
           path: |
             ThinkTerm-*.zip
             !ThinkTerm-*-pdb.zip
@@ -485,7 +516,7 @@ jobs:
         if: env.CARGO_PROFILE == 'dist'
         uses: actions/upload-artifact@v7
         with:
-          name: windows-x86_64-symbols
+          name: windows-${{ matrix.arch }}-symbols
           path: ThinkTerm-*-pdb.zip
           if-no-files-found: error
           retention-days: 3

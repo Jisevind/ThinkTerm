@@ -19,8 +19,8 @@ CATEGORIZE = {
     r"^wezterm-\d+-\d+-[a-f0-9]+.tar.xz$": "linux_raw_bin",
     r"src.tar.gz$": "src",
     r"^ThinkTerm-macos-.*.zip$": "macos_zip",
-    r"^ThinkTerm-windows-.*.zip$": "windows_zip",
-    r"^ThinkTerm-.*.setup.exe$": "windows_exe",
+    r"^ThinkTerm-windows-(?!arm64-).*.zip$": "windows_zip",
+    r"^ThinkTerm-(?!.*-arm64-setup).*.setup.exe$": "windows_exe",
     r"alpine(\d+)\.(\d+)(:?-\S+)?.apk": "alpine\\1_\\2_apk",
 }
 

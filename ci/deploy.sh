@@ -279,13 +279,41 @@ case $OSTYPE in
   # a bare `msys)` silently fell through to the catch-all on GitHub's runner,
   # producing no package at all while still exiting 0.
   msys* | cygwin* | mingw* | win32*)
-    zipdir=ThinkTerm-windows-$TAG_NAME
+    # x86_64 keeps the names it has always had: the update check of every
+    # copy already installed looks for its installer by that name. arm64
+    # takes its files from ci/windows-arm64-assets.sh and has no ANGLE.
+    # Unset, WINDOWS_ARCH is whatever this machine built, as the build is
+    # native: an arm64 package must never go out under the x86_64 names.
+    windows_arch=${WINDOWS_ARCH:-}
+    if [[ -z "$windows_arch" ]] ; then
+      case "$(rustc -vV | sed -n 's/^host: //p')" in
+        aarch64-*) windows_arch=arm64 ;;
+        *) windows_arch=x86_64 ;;
+      esac
+    fi
+    case "$windows_arch" in
+      arm64)
+        win_arch=-arm64
+        win_assets=assets/windows/arm64
+        iss_arch=arm64
+        ;;
+      x86_64)
+        win_arch=
+        win_assets=assets/windows
+        iss_arch=x64
+        ;;
+      *)
+        echo "WINDOWS_ARCH is '$windows_arch'; expected x86_64 or arm64" >&2
+        exit 1
+        ;;
+    esac
+    zipdir=ThinkTerm-windows$win_arch-$TAG_NAME
     if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-      zipname=ThinkTerm-windows-nightly.zip
-      instname=ThinkTerm-nightly-setup
+      zipname=ThinkTerm-windows$win_arch-nightly.zip
+      instname=ThinkTerm-nightly$win_arch-setup
     else
       zipname=$zipdir.zip
-      instname=ThinkTerm-${TAG_NAME}-setup
+      instname=ThinkTerm-${TAG_NAME}$win_arch-setup
     fi
     rm -rf $zipdir $zipname
     mkdir $zipdir
@@ -296,14 +324,15 @@ case $OSTYPE in
       "$artifact_dir/thinkterm-gui.exe" \
       "$artifact_dir/thinkterm-plugin-server.exe" \
       "$artifact_dir/strip-ansi-escapes.exe" \
-      assets/windows/conhost/conpty.dll \
-      assets/windows/conhost/OpenConsole.exe \
-      assets/windows/angle/libEGL.dll \
-      assets/windows/angle/libGLESv2.dll \
+      $win_assets/conhost/conpty.dll \
+      $win_assets/conhost/OpenConsole.exe \
       LICENSE.md \
       LICENSE-MIT \
       NOTICE \
       $zipdir
+    if [[ -z "$win_arch" ]] ; then
+      cp assets/windows/angle/libEGL.dll assets/windows/angle/libGLESv2.dll $zipdir
+    fi
 
     # The dist profile writes a PDB per binary; `release` writes none. They
     # go into a zip of their own next to the package, not into it: they are
@@ -316,10 +345,10 @@ case $OSTYPE in
       rm -rf $zipdir-pdb
     fi
 
-    # Same source as the four DLLs above -- wezterm-gui's build script only
+    # Same source as the DLLs above -- wezterm-gui's build script only
     # stages a copy of it next to the exe, so take it from assets directly.
     mkdir $zipdir/mesa
-    cp assets/windows/mesa/opengl32.dll $zipdir/mesa
+    cp $win_assets/mesa/opengl32.dll $zipdir/mesa
     # The browser client, beside the executables: the server looks for
     # <exe>/web on a flat layout like this one. -p keeps the modification
     # times the .gz freshness check reads.
@@ -333,7 +362,8 @@ case $OSTYPE in
     fi
     7z a -tzip $zipname $zipdir
     installer_source_dir=$(cygpath -w "$artifact_dir")
-    iscc.exe "-DMyAppVersion=${TAG_NAME#nightly}" "-DMyAppSourceDir=$installer_source_dir" "-F${instname}" ci/windows-installer.iss
+    iscc.exe "-DMyAppVersion=${TAG_NAME#nightly}" "-DMyAppSourceDir=$installer_source_dir" \
+      "-DMyAppArch=$iss_arch" "-F${instname}" ci/windows-installer.iss
     ;;
   linux-gnu|linux)
     distro=$(lsb_release -is 2>/dev/null || sh -c "source /etc/os-release && echo \$NAME")
