@@ -130,7 +130,7 @@ reload, without restarting the listener. Once both permissions are off,
 the tab lists nothing and existing relays end within two seconds.
 
 The machines are the ones the server knows: its `~/.ssh/config` (folded
-under "System SSH", as on the desktop), the desktop's saved remote hosts,
+under "From your SSH config", as on the desktop), the desktop's saved remote hosts,
 and any added in the browser, which are kept on the server. Opening one, the
 server signs in over SSH with its own settings and keys; a password, a host
 key or a one-time code is asked in the page, and a password can be kept on

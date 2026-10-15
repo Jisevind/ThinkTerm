@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use wezterm_font::LoadedFont;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex, TerminalSize};
-use window::{MouseEvent, MouseEventKind as WMEK, RectF};
+use window::{MouseCursor, MouseEvent, MouseEventKind as WMEK, RectF};
 
 pub(crate) type ContentViewId = u64;
 
@@ -369,6 +369,9 @@ pub(crate) enum ContentViewPresentation {
 pub(crate) enum ContentViewTypography {
     #[default]
     Default,
+    /// `Default`, with the caption in a regular weight: running text --
+    /// descriptions, notes -- set under the interface's bolder labels.
+    RegularCaption,
     Overview,
 }
 
@@ -702,6 +705,23 @@ pub(crate) trait ContentView {
     /// the coarse event.
     fn on_wheel(&mut self, x: f32, y: f32, event: &MouseEvent) -> ContentViewResponse {
         self.on_mouse(x, y, event.kind.clone())
+    }
+
+    /// Every other pointer event, whole: a view that drags something needs
+    /// to know the button is still held when the release went elsewhere.
+    fn on_pointer(&mut self, x: f32, y: f32, event: &MouseEvent) -> ContentViewResponse {
+        self.on_mouse(x, y, event.kind.clone())
+    }
+
+    /// The pointer's shape over `(x, y)`, when it is not the arrow.
+    fn cursor(&self, _x: f32, _y: f32) -> Option<MouseCursor> {
+        None
+    }
+
+    /// Something in the view is being dragged: every pointer event goes to
+    /// it, over the sidebars and outside the window too, until it lets go.
+    fn holds_pointer(&self) -> bool {
+        false
     }
 
     fn on_key(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse;

@@ -1523,19 +1523,23 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         })
         .detach();
     }
-    // And the Remote Hosts page; `tailscale` opens it on its Tailscale panel.
+    // And the Remote Hosts page; `tailscale` opens it on its Tailscale panel,
+    // `new` on a new host's form.
     if let Some(page) = std::env::var_os("THINKTERM_OPEN_REMOTE_HOSTS") {
         promise::spawn::spawn_into_main_thread(async move {
             smol::Timer::after(std::time::Duration::from_millis(2500)).await;
             if let Some(front_end) = crate::frontend::try_front_end() {
                 for gui_window in front_end.gui_windows() {
                     let tailscale = page == "tailscale";
+                    let new_host = page == "new";
                     gui_window
                         .window
                         .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                             move |term_window| {
                                 if tailscale {
                                     term_window.open_ssh_hosts_view_tailscale();
+                                } else if new_host {
+                                    term_window.open_ssh_hosts_view_new_host();
                                 } else {
                                     term_window.toggle_ssh_hosts_view();
                                 }

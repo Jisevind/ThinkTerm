@@ -13,7 +13,9 @@ use crate::ssh_hosts::{
 use crate::tailnet::{
     Device, Machine as TailnetMachine, State as TailnetState, View as TailnetView,
 };
-use crate::termwindow::content_view::{ContentView, ContentViewResponse, RemoteHostCommand};
+use crate::termwindow::content_view::{
+    ContentView, ContentViewResponse, ContentViewTypography, RemoteHostCommand,
+};
 use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, SvgIcon};
 use crate::termwindow::ui::right_sidebar::wrap_snippet_text_for_width;
 use crate::termwindow::TermWindow;
@@ -34,7 +36,9 @@ use std::time::{Duration, Instant};
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
 use window::color::LinearRgba;
-use window::{MouseEvent, MouseEventKind as WMEK, MousePress, RectF, Window};
+use window::{
+    MouseButtons, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress, RectF, Window,
+};
 
 pub(crate) const SSH_HOSTS_CONTENT_VIEW_KEY: &str = "ssh-hosts";
 
@@ -106,8 +110,11 @@ const TOOLBAR_H: f32 = 54.0;
 const TOOLBAR_GAP: f32 = 20.0;
 /// The inspector never grows with the window. A form wider than this is
 /// harder to read, not easier, so every extra pixel goes to the grid --
-/// which is the half that actually has more to show.
-const INSPECTOR_W: f32 = 480.0;
+/// which is the half that actually has more to show. Dragging its edge
+/// sets another width, within these bounds.
+const INSPECTOR_W: f32 = 640.0;
+const INSPECTOR_MIN_W: f32 = 480.0;
+const INSPECTOR_MAX_W: f32 = 1200.0;
 const INSPECTOR_GAP: f32 = 20.0;
 const CARD_MIN_W: f32 = 340.0;
 /// How wide a card may grow before the grid adds another column. Generous
@@ -117,6 +124,20 @@ const CARD_MAX_W: f32 = 560.0;
 const CARD_GAP: f32 = 18.0;
 const CARD_RADIUS: f32 = 36.0;
 const CARD_PAD: f32 = 22.0;
+/// The Connect card's margin at its sides.
+const TIP_PAD_X: f32 = 40.0;
+/// The Connect card's title to its body, and its body to its button.
+const TIP_TITLE_GAP: f32 = 14.0;
+const TIP_BUTTON_GAP: f32 = 28.0;
+/// Its picture at full size, the narrowest it is drawn whole, and the
+/// narrowest the words beside it may get.
+const TIP_PICTURE_W: f32 = 800.0;
+const TIP_PICTURE_MIN_W: f32 = 740.0;
+/// The host alone, the half of the picture kept when the rest does not fit.
+const TIP_HOST_W: f32 = 460.0;
+const TIP_TEXT_MIN_W: f32 = 600.0;
+/// Beside the host alone the words may narrow further, to keep it there.
+const TIP_TEXT_NARROW_W: f32 = 440.0;
 /// Past five across the cards are too narrow to hold a machine's name and
 /// its endpoint without truncating one of them, which is the only reason to
 /// have a card at all.
@@ -166,13 +187,15 @@ enum SshViewAction {
     /// A host card: first click selects it, a second one connects.
     Card(usize),
     New,
+    /// "Add a Server" on the card introducing Connect: `New`, lit on its own.
+    TipNew,
     /// Connect to the host the inspector is showing.
     Connect,
     FocusField(usize),
     SetNetwork(SshNetwork),
     ToggleDetect,
-    ToggleMosh,
-    ToggleMux,
+    /// One of the three ways to reach the host.
+    SetMode(HostMode),
     ToggleShellIntegration,
     /// The Files panel connects to the host by itself.
     ToggleFilesAutoConnect,
@@ -186,6 +209,11 @@ enum SshViewAction {
     FocusOptionValue(usize),
     RemoveOption(usize),
     AddOption,
+    /// "Switch to Connect" on a plain host's card: its form, on Connect.
+    SwitchToConnect(usize),
+    /// "Add with Connect" on a host from ~/.ssh/config: a new host made
+    /// from it, on Connect.
+    AddWithConnect(usize),
     /// The Tailscale group's caption: folds the group away, or back.
     ToggleTailnetGroup,
     /// The gear by that caption: the Tailscale panel, opened or closed.
@@ -201,6 +229,86 @@ enum SshViewAction {
     CopyTailnetLogin,
     FocusTailnetField(usize),
     TailnetLogout,
+}
+
+/// How a host is reached, as the form offers it: one choice of three where
+/// the spec keeps two flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HostMode {
+    /// ThinkTerm Connect: the host's own mux server keeps the sessions.
+    Connect,
+    Ssh,
+    Mosh,
+}
+
+impl HostMode {
+    fn of(use_mosh: bool, multiplexing: bool) -> Self {
+        if use_mosh {
+            Self::Mosh
+        } else if multiplexing {
+            Self::Connect
+        } else {
+            Self::Ssh
+        }
+    }
+}
+
+/// The mux server of the README's architecture diagram, in the page's
+/// theme, as (fill, edge, ink): how a host that keeps its sessions -- a
+/// ThinkTerm Connect host -- is drawn.
+fn mux_colors(palette: UiPalette) -> (LinearRgba, LinearRgba, LinearRgba) {
+    if palette.is_dark() {
+        (
+            LinearRgba::with_srgba(23, 52, 98, 255),
+            LinearRgba::with_srgba(43, 85, 146, 255),
+            LinearRgba::with_srgba(77, 163, 255, 255),
+        )
+    } else {
+        (
+            palette.accent.mul_alpha(0.08),
+            palette.accent.mul_alpha(0.45),
+            palette.accent,
+        )
+    }
+}
+
+/// The green of a check and of a running session.
+fn good_green(palette: UiPalette) -> LinearRgba {
+    if palette.is_dark() {
+        LinearRgba::with_srgba(50, 215, 75, 255)
+    } else {
+        LinearRgba::with_srgba(31, 157, 58, 255)
+    }
+}
+
+/// The card introducing ThinkTerm Connect laid out at one width: see
+/// `SshHostsView::connect_tip_layout`.
+struct ConnectTipLayout {
+    picture: TipPicture,
+    text_w: f32,
+    title: Vec<String>,
+    body: Vec<String>,
+    words_h: f32,
+    picture_h: f32,
+    height: f32,
+}
+
+/// Where the Connect card's picture goes, how wide it is drawn, and whether
+/// it has room for this computer beside the host.
+#[derive(Clone, Copy, PartialEq)]
+enum TipPicture {
+    Beside { width: f32, computer: bool },
+    /// Under the words, on a page too narrow for both side by side.
+    Below { width: f32, computer: bool },
+    /// Not even room under them.
+    None,
+}
+
+/// One way of reaching a host as its card in the form wraps it: each fact's
+/// lines with whether it counts for the host, then the note's lines.
+struct ModeWords {
+    facts: Vec<(Vec<String>, bool)>,
+    note: Vec<String>,
 }
 
 /// What the button on the Tailscale group's card does.
@@ -302,6 +410,18 @@ pub(crate) struct SshHostsView {
     /// ui scale captured at paint time so mouse handlers (no DrawContext)
     /// can convert pointer pixels back into design pixels.
     last_ui_scale: f32,
+    /// The inspector's width in design pixels: the saved one, or the one a
+    /// drag of its edge is making.
+    inspector_width: f32,
+    /// The widest the inspector could be on the page as last painted, in
+    /// design pixels.
+    inspector_max_width: f32,
+    /// Where the inspector's edge can be grabbed, as last painted; empty
+    /// while it is closed.
+    inspector_edge: RectF,
+    inspector_edge_hovered: bool,
+    /// A drag of that edge: the pointer's x and the width it started from.
+    inspector_drag: Option<(f32, f32)>,
     /// Scrollable region holding the host grid.
     list_area: RectF,
     /// Rect of each painted card, in the same order as `filtered`, so a
@@ -333,6 +453,8 @@ pub(crate) struct SshHostsView {
     scroll: ScrollState,
     /// Either scroll state was still gliding after the last paint.
     scroll_animating: bool,
+    /// The built-in tailnet is on, as last painted: a host can be put on it.
+    tailnet_on: bool,
     /// `~/.ssh/config` as last read, with the stamp it had then. The list is
     /// rebuilt on every paint so hosts saved elsewhere show up, and the page
     /// paints for each scroll step and caret blink; the file is read again
@@ -359,6 +481,13 @@ impl SshHostsView {
             system_host_count: 0,
             system_hosts_collapsed: true,
             last_ui_scale: 1.0,
+            inspector_width: crate::native_settings::remote_hosts_inspector_width()
+                .map_or(INSPECTOR_W, |width| width as f32)
+                .clamp(INSPECTOR_MIN_W, INSPECTOR_MAX_W),
+            inspector_max_width: INSPECTOR_MAX_W,
+            inspector_edge: rect(0.0, 0.0, 0.0, 0.0),
+            inspector_edge_hovered: false,
+            inspector_drag: None,
             list_area: rect(0.0, 0.0, 0.0, 0.0),
             card_rects: Vec::new(),
             password_visible: false,
@@ -372,6 +501,7 @@ impl SshHostsView {
             interaction: InteractionState::default(),
             scroll: ScrollState::new(),
             scroll_animating: false,
+            tailnet_on: false,
             system_hosts: None,
             saved_hosts: Vec::new(),
             window: None,
@@ -466,9 +596,43 @@ impl SshHostsView {
         form.fields[FIELD_MOSH_SERVER]
             .set_text_end(ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string());
         form.detect_os = true;
+        // Files opened with the host, and its programs shown on the tabs:
+        // on unless turned off.
+        form.files_auto_connect = true;
+        form.shell_integration = true;
+        // ThinkTerm Connect unless the person picks otherwise: it is the way
+        // the host keeps its sessions, and the one people miss when the
+        // choice starts on plain ssh.
+        form.multiplexing = true;
         self.form = Some(form);
         self.focus = Focus::Field(FIELD_HOST);
         self.reset_form_scroll();
+    }
+
+    /// A new host on Connect, filled in from `spec`: a host ~/.ssh/config
+    /// knows, to be saved here.
+    fn open_connect_form_from(&mut self, spec: &SshHostSpec) {
+        self.open_new_form();
+        if let Some(form) = self.form.as_mut() {
+            form.fields[FIELD_NAME].set_text_end(spec.label.clone());
+            form.fields[FIELD_HOST].set_text_end(spec.host.clone());
+            // No port of its own leaves the field empty, so that the one
+            // ~/.ssh/config gives the host (`Host *`, `Match`) still counts.
+            form.fields[FIELD_PORT] =
+                text_input_with(spec.port.map(|port| port.to_string()).unwrap_or_default());
+            if let Some(user) = &spec.username {
+                form.fields[FIELD_USER].set_text_end(user.clone());
+            }
+            if let Some(identity) = &spec.identity_file {
+                form.fields[FIELD_IDENTITY].set_text_end(identity.clone());
+            }
+        }
+    }
+
+    /// Whether the card introducing ThinkTerm Connect heads the page: always,
+    /// but while a search narrows the list.
+    fn connect_tip_shown(&self) -> bool {
+        self.search.text().trim().is_empty()
     }
 
     fn open_edit_form(&mut self, project_id: &str) {
@@ -695,6 +859,56 @@ impl SshHostsView {
 
     // ---- input ------------------------------------------------------------
 
+    /// The inspector's edge, grabbed and dragged to make it wider or
+    /// narrower; None leaves the event to the page.
+    fn drag_inspector_edge(
+        &mut self,
+        x: f32,
+        y: f32,
+        event: &MouseEvent,
+    ) -> Option<ContentViewResponse> {
+        let widest = INSPECTOR_MAX_W.min(self.inspector_max_width).max(INSPECTOR_MIN_W);
+        if let Some((start_x, start_width)) = self.inspector_drag {
+            let held = event.mouse_buttons.contains(MouseButtons::LEFT);
+            if matches!(event.kind, WMEK::Move) && held {
+                self.inspector_width = (start_width + (start_x - x) / self.last_ui_scale)
+                    .clamp(INSPECTOR_MIN_W, widest);
+                return Some(ContentViewResponse::Redraw);
+            }
+            // Let go -- here, or outside the page, which the next event
+            // tells by the button no longer being held. A click that moved
+            // nothing keeps the saved width, even one the window is too
+            // narrow to show.
+            self.inspector_drag = None;
+            if (self.inspector_width - start_width).abs() >= 1.0 {
+                let width = self.inspector_width.round() as usize;
+                if let Err(err) = crate::native_settings::save_remote_hosts_inspector_width(width)
+                {
+                    log::warn!("failed to remember the Remote Hosts form's width: {err:#}");
+                }
+            }
+            if !matches!(event.kind, WMEK::Press(_)) {
+                self.inspector_edge_hovered = contains(self.inspector_edge, x, y);
+                return Some(ContentViewResponse::Redraw);
+            }
+        }
+        let on_edge = contains(self.inspector_edge, x, y);
+        match event.kind {
+            WMEK::Press(MousePress::Left) if on_edge => {
+                self.interaction.pressed = None;
+                self.inspector_width = self.inspector_width.min(widest);
+                self.inspector_drag = Some((x, self.inspector_width));
+                Some(ContentViewResponse::Redraw)
+            }
+            WMEK::Move if on_edge != self.inspector_edge_hovered => {
+                self.inspector_edge_hovered = on_edge;
+                let _ = self.on_mouse(x, y, event.kind.clone());
+                Some(ContentViewResponse::Redraw)
+            }
+            _ => None,
+        }
+    }
+
     fn on_mouse_impl(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
         let hit = self.widgets.hit_test(x, y).map(|t| t.action);
         match kind {
@@ -821,7 +1035,7 @@ impl SshHostsView {
                 }
                 ContentViewResponse::Redraw
             }
-            SshViewAction::New => {
+            SshViewAction::New | SshViewAction::TipNew => {
                 self.open_new_form();
                 ContentViewResponse::Redraw
             }
@@ -853,7 +1067,15 @@ impl SshHostsView {
                 ContentViewResponse::Redraw
             }
             SshViewAction::SetNetwork(network) => {
+                let tailnet_on = self.tailnet_on;
                 if let Some(form) = self.form.as_mut() {
+                    // Greyed out until Tailscale is turned on on this page.
+                    if network == SshNetwork::Tailnet
+                        && !tailnet_on
+                        && form.network != SshNetwork::Tailnet
+                    {
+                        return ContentViewResponse::Redraw;
+                    }
                     if network == SshNetwork::Tailnet && form.use_mosh {
                         form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
                     } else {
@@ -869,18 +1091,17 @@ impl SshHostsView {
                 }
                 ContentViewResponse::Redraw
             }
-            SshViewAction::ToggleMosh => {
+            SshViewAction::SetMode(mode) => {
                 if let Some(form) = self.form.as_mut() {
-                    if !form.use_mosh && form.network == SshNetwork::Tailnet {
-                        form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
+                    if mode == HostMode::Mosh && form.network == SshNetwork::Tailnet {
+                        form.error = Some(crate::i18n::tr("ssh-error-mosh-tailnet"));
                         return ContentViewResponse::Redraw;
                     }
-                    form.use_mosh = !form.use_mosh;
-                    if form.use_mosh {
-                        // Mosh and ThinkTerm Connect are alternative
-                        // transports; only one can drive the connection.
-                        form.multiplexing = false;
-                    }
+                    form.error = None;
+                    // Mosh and ThinkTerm Connect are alternative transports;
+                    // only one can drive the connection.
+                    form.use_mosh = mode == HostMode::Mosh;
+                    form.multiplexing = mode == HostMode::Connect;
                     if form.use_mosh && form.fields[FIELD_MOSH_SERVER].text().trim().is_empty() {
                         form.fields[FIELD_MOSH_SERVER]
                             .set_text_end(ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string());
@@ -891,16 +1112,43 @@ impl SshHostsView {
                 }
                 ContentViewResponse::Redraw
             }
-            SshViewAction::ToggleMux => {
+            SshViewAction::SwitchToConnect(index) => {
+                // Saved on the spot: a choice left waiting in the form would
+                // be lost to the next Connect, which dials what is on disk.
+                // The host's form then opens as a click on the card would; one
+                // already open on it keeps what was typed into it.
+                let Some(host_id) = self.filtered.get(index).map(|entry| entry.id.clone()) else {
+                    return ContentViewResponse::Redraw;
+                };
+                let Some(mut spec) = ssh_hosts::host_spec(&host_id) else {
+                    return ContentViewResponse::Redraw;
+                };
+                spec.multiplexing = true;
+                spec.use_mosh = false;
+                if let Err(err) = ssh_hosts::try_update_host(&host_id, spec) {
+                    log::warn!("failed to switch {host_id} to ThinkTerm Connect: {err:#}");
+                    return ContentViewResponse::Redraw;
+                }
+                self.refresh();
+                if let Some(index) = self.filtered.iter().position(|entry| entry.id == host_id) {
+                    self.select_host(index);
+                }
                 if let Some(form) = self.form.as_mut() {
-                    form.multiplexing = !form.multiplexing;
-                    if form.multiplexing {
+                    if form.editing.as_deref() == Some(host_id.as_str()) {
+                        form.multiplexing = true;
                         form.use_mosh = false;
-                        if self.focus == Focus::Field(FIELD_MOSH_SERVER) {
-                            self.focus = Focus::Field(FIELD_WORKSPACE);
-                        }
+                        form.error = None;
                     }
                 }
+                ContentViewResponse::Redraw
+            }
+            SshViewAction::AddWithConnect(index) => {
+                let Some(entry) = self.filtered.get(index).cloned() else {
+                    return ContentViewResponse::Redraw;
+                };
+                self.open_connect_form_from(&entry.spec);
+                // The form is a new host's, not the selected card's.
+                self.selection_active = false;
                 ContentViewResponse::Redraw
             }
             SshViewAction::ToggleShellIntegration => {
@@ -1540,6 +1788,91 @@ impl SshHostsView {
         (ctx.metrics.cell_size.height as f32 * 2.05 + ctx.px(50.0)).max(ctx.px(104.0))
     }
 
+    /// The card introducing ThinkTerm Connect, `width` wide: its words --
+    /// title, body and button, one under the other -- down the left, and a
+    /// picture of what it means beside them, or under them when the page is
+    /// too narrow for both.
+    fn connect_tip_layout(
+        ctx: &DrawContext,
+        section_ctx: &DrawContext,
+        caption_ctx: &DrawContext,
+        section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
+        width: f32,
+    ) -> ConnectTipLayout {
+        let section_h = section_ctx.metrics.cell_size.height as f32;
+        let body_h = caption_ctx.metrics.cell_size.height as f32;
+        let line_h = ctx.metrics.cell_size.height as f32;
+        // A wider margin at the sides than the host cards': a banner reads
+        // better with room around its words.
+        let pad = ctx.px(TIP_PAD_X);
+        let gap = ctx.px(48.0);
+        let words_end = width - pad;
+        // The whole picture beside the words; then the host alone, which is
+        // the half that says what Connect keeps; then the host under them.
+        let beside = words_end - gap - pad - ctx.px(TIP_TEXT_MIN_W);
+        let host_w = ctx.px(TIP_HOST_W);
+        let picture = if beside >= ctx.px(TIP_PICTURE_MIN_W) {
+            TipPicture::Beside {
+                width: beside.min(ctx.px(TIP_PICTURE_W)),
+                computer: true,
+            }
+        } else if words_end - gap - pad - ctx.px(TIP_TEXT_NARROW_W) >= host_w {
+            TipPicture::Beside {
+                width: host_w,
+                computer: false,
+            }
+        } else if width - pad * 2.0 >= host_w {
+            // Under the words it spans the card, this computer too when
+            // there is room.
+            let width = width - pad * 2.0;
+            TipPicture::Below {
+                width,
+                computer: width >= ctx.px(TIP_PICTURE_MIN_W),
+            }
+        } else {
+            TipPicture::None
+        };
+        let text_w = match picture {
+            TipPicture::Beside { width, .. } => words_end - width - gap - pad,
+            TipPicture::Below { .. } | TipPicture::None => words_end - pad,
+        }
+        .max(0.0);
+        // The words beside the picture can be narrower than the title.
+        let title = wrap_snippet_text_for_width(
+            &crate::i18n::tr("ssh-connect-tip-title"),
+            2,
+            false,
+            |segment| section_ctx.measure_text_width(section_font, segment) / text_w.max(1.0),
+        );
+        let body = wrap_snippet_text_for_width(
+            &crate::i18n::tr("ssh-connect-tip-body"),
+            5,
+            false,
+            |segment| caption_ctx.measure_text_width(caption_font, segment) / text_w.max(1.0),
+        );
+        let words_h = section_h * title.len() as f32
+            + ctx.px(TIP_TITLE_GAP)
+            + body_h * body.len() as f32
+            + ctx.px(TIP_BUTTON_GAP)
+            + ctx.px(BTN_H);
+        let picture_h = line_h * 4.0 + ctx.px(92.0);
+        let inside = match picture {
+            TipPicture::Beside { .. } => words_h.max(picture_h),
+            TipPicture::Below { .. } => words_h + ctx.px(TIP_BUTTON_GAP) + picture_h,
+            TipPicture::None => words_h,
+        };
+        ConnectTipLayout {
+            picture,
+            text_w,
+            title,
+            body,
+            words_h,
+            picture_h,
+            height: ctx.px(CARD_PAD) * 2.0 + inside,
+        }
+    }
+
     /// One column count shared by both groups, so the two grids line up with
     /// each other instead of each picking its own width.
     fn card_columns(ctx: &DrawContext, counts: &[usize], content_width: f32) -> usize {
@@ -1571,25 +1904,22 @@ impl SshHostsView {
         !self.system_hosts_collapsed || !self.search.text().trim().is_empty()
     }
 
-    /// What a card says under the host name: where it connects, and -- only
-    /// when it is not plain SSH -- how.
+    /// What a card says under the host name: where it connects, and -- unless
+    /// it is a saved Connect host, whose whole card says so -- how.
     ///
     /// Spelled out after the endpoint rather than shown as a corner tag: a
     /// two-word tag next to the title has to be read as a label anyway, and
     /// "connect" as a tag collides with the verb.
     fn card_subtitle(entry: &SshHostEntry) -> String {
         let endpoint = ssh_hosts::endpoint(&entry.spec);
-        let mode = if entry.spec.use_mosh {
-            Some(crate::i18n::tr("ssh-mode-mosh"))
-        } else if entry.spec.multiplexing {
-            Some(crate::i18n::tr("ssh-mode-connect"))
-        } else {
-            None
+        // A Connect host says so with its whole card; the endpoint gets the
+        // room.
+        let mode = match HostMode::of(entry.spec.use_mosh, entry.spec.multiplexing) {
+            HostMode::Connect if entry.source != SshHostSource::System => return endpoint,
+            HostMode::Connect | HostMode::Ssh => "ssh-mode-ssh-title",
+            HostMode::Mosh => "ssh-mode-mosh-title",
         };
-        match mode {
-            Some(mode) => format!("{endpoint}  ·  {mode}"),
-            None => endpoint,
-        }
+        format!("{endpoint}  ·  {}", crate::i18n::tr(mode))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1602,11 +1932,13 @@ impl SshHostsView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
         cursor_on: bool,
     ) -> anyhow::Result<()> {
         let tokens = UiTokens::for_dpi(ctx.dimensions.dpi);
         self.refresh();
         let tailnet = self.read_tailnet();
+        self.tailnet_on = tailnet.enabled;
         self.widgets.clear();
         self.card_rects.clear();
 
@@ -1616,8 +1948,10 @@ impl SshHostsView {
         // baseline and looks a few pixels high.
         let title_metrics = RenderMetrics::with_font_metrics(&title_font.metrics());
         let section_metrics = RenderMetrics::with_font_metrics(&section_font.metrics());
+        let caption_metrics = RenderMetrics::with_font_metrics(&caption_font.metrics());
         let title_ctx = ctx.with_metrics(&title_metrics);
         let section_ctx = ctx.with_metrics(&section_metrics);
+        let caption_ctx = ctx.with_metrics(&caption_metrics);
 
         let ox = area.origin.x;
         let oy = area.origin.y;
@@ -1636,8 +1970,10 @@ impl SshHostsView {
         // out in what is left. That is the whole responsive story: widen the
         // window and the leftover width becomes more columns, not a wider
         // form floating in the middle of the page.
+        let inspector_room = ((w - pad * 2.0) * 0.6).max(0.0);
+        self.inspector_max_width = inspector_room / self.last_ui_scale;
         let inspector_w = if self.form.is_some() || self.tailnet.panel_open {
-            ctx.px(INSPECTOR_W).min(((w - pad * 2.0) * 0.6).max(0.0))
+            ctx.px(self.inspector_width).min(inspector_room)
         } else {
             0.0
         };
@@ -1645,6 +1981,19 @@ impl SshHostsView {
             ctx.px(INSPECTOR_GAP)
         } else {
             0.0
+        };
+        // The gap before the inspector is its edge, to drag.
+        self.inspector_edge = if inspector_w > 0.0 {
+            rect(
+                ox + w - pad - inspector_w - inspector_gap,
+                oy + pad,
+                inspector_gap + ctx.px(6.0),
+                (h - pad).max(0.0),
+            )
+        } else {
+            self.inspector_drag = None;
+            self.inspector_edge_hovered = false;
+            rect(0.0, 0.0, 0.0, 0.0)
         };
         let content_x = ox + pad;
         let content_w = (w - pad * 2.0 - inspector_w - inspector_gap).max(0.0);
@@ -1663,9 +2012,11 @@ impl SshHostsView {
         self.paint_grid(
             ctx,
             &section_ctx,
+            &caption_ctx,
             layers,
             font,
             section_font,
+            caption_font,
             palette,
             &tailnet,
             content_x,
@@ -1703,12 +2054,27 @@ impl SshHostsView {
             draw_scrollbar(ctx, layers, palette, tokens, self.list_area, self.scroll)?;
         }
 
+        if inspector_w > 0.0 && (self.inspector_edge_hovered || self.inspector_drag.is_some()) {
+            let line = ctx.px(2.0);
+            ctx.draw_rect(
+                layers,
+                1,
+                ox + w - pad - inspector_w - (inspector_gap + line) / 2.0,
+                oy + pad,
+                line,
+                (h - pad).max(0.0),
+                palette.accent.mul_alpha(0.7),
+            )?;
+        }
         if inspector_w > 0.0 {
+            // Down to the window's edge: what does not fit scrolls off the
+            // bottom of the window, not off a line drawn above it. The body
+            // already ends in a pad of its own.
             let inspector = rect(
                 ox + w - pad - inspector_w,
                 oy + pad,
                 inspector_w,
-                (h - pad * 2.0).max(0.0),
+                (h - pad).max(0.0),
             );
             if self.tailnet.panel_open {
                 self.paint_tailnet_panel(
@@ -1730,10 +2096,12 @@ impl SshHostsView {
                     ctx,
                     &title_ctx,
                     &section_ctx,
+                    &caption_ctx,
                     layers,
                     font,
                     title_font,
                     section_font,
+                    caption_font,
                     palette,
                     tokens,
                     cursor_on,
@@ -1844,9 +2212,11 @@ impl SshHostsView {
         &mut self,
         ctx: &DrawContext,
         section_ctx: &DrawContext,
+        caption_ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
         font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
         palette: UiPalette,
         tailnet: &TailnetView,
         content_x: f32,
@@ -1862,7 +2232,12 @@ impl SshHostsView {
         );
         let tailnet_body = self.tailnet_body(tailnet);
         self.tailnet.notice = None;
-        if self.filtered.is_empty() && self.system_host_count == 0 && tailnet_body.is_none() {
+        let tip = self.connect_tip_shown();
+        if self.filtered.is_empty()
+            && self.system_host_count == 0
+            && tailnet_body.is_none()
+            && !tip
+        {
             self.scroll.set_extents(viewport.size.height, 0.0);
             return self.paint_empty_state(ctx, layers, font, palette, viewport);
         }
@@ -1896,10 +2271,24 @@ impl SshHostsView {
         let tailnet_h = match &tailnet_body {
             _ if self.tailnet.collapsed => 0.0,
             Some(TailnetBody::Machines) => tailnet_grid.height(gap),
-            Some(TailnetBody::Notice(_)) => card_h,
+            Some(TailnetBody::Notice(notice)) => Self::tailnet_notice_height(ctx, notice),
             Some(TailnetBody::Pending) | None => 0.0,
         };
+        let tip = tip.then(|| {
+            Self::connect_tip_layout(
+                ctx,
+                section_ctx,
+                caption_ctx,
+                section_font,
+                caption_font,
+                content_w,
+            )
+        });
+        let tip_h = tip.as_ref().map_or(0.0, |tip| tip.height);
         let mut blocks = Vec::new();
+        if tip.is_some() {
+            blocks.push(tip_h);
+        }
         if show_own {
             blocks.push(caption_h + own_grid.height(gap));
         }
@@ -1915,8 +2304,27 @@ impl SshHostsView {
 
         let mut y = list_top - self.scroll.offset;
         let mut first = true;
-        if show_own {
+        if let Some(tip) = &tip {
             first = false;
+            self.paint_connect_tip(
+                ctx,
+                section_ctx,
+                caption_ctx,
+                layers,
+                font,
+                section_font,
+                caption_font,
+                palette,
+                tip,
+                rect(content_x, y, content_w, tip_h),
+                viewport,
+            )?;
+            y += tip_h;
+        }
+        if show_own {
+            if !std::mem::take(&mut first) {
+                y += ctx.px(GROUP_GAP);
+            }
             if grouped {
                 self.paint_group_header(
                     section_ctx,
@@ -1934,7 +2342,18 @@ impl SshHostsView {
                 y += header_h + title_gap;
             }
             self.paint_cards(
-                ctx, layers, font, palette, &own, own_grid, content_x, content_w, y, gap, viewport,
+                ctx,
+                (caption_ctx, caption_font),
+                layers,
+                font,
+                palette,
+                &own,
+                own_grid,
+                content_x,
+                content_w,
+                y,
+                gap,
+                viewport,
             )?;
             y += own_grid.height(gap);
         }
@@ -1993,7 +2412,7 @@ impl SshHostsView {
                         }
                     }
                     TailnetBody::Notice(notice) => {
-                        let card = rect(content_x, y, content_w, card_h);
+                        let card = rect(content_x, y, content_w, tailnet_h);
                         self.paint_tailnet_notice(
                             ctx, layers, font, palette, notice, card, viewport,
                         )?;
@@ -2030,6 +2449,7 @@ impl SshHostsView {
             y += header_h + title_gap;
             self.paint_cards(
                 ctx,
+                (caption_ctx, caption_font),
                 layers,
                 font,
                 palette,
@@ -2049,6 +2469,7 @@ impl SshHostsView {
     fn paint_cards(
         &mut self,
         ctx: &DrawContext,
+        caption: (&DrawContext, &Rc<LoadedFont>),
         layers: &mut TripleLayerQuadAllocator<'_>,
         font: &Rc<LoadedFont>,
         palette: UiPalette,
@@ -2077,7 +2498,7 @@ impl SshHostsView {
             if !card_is_warm(card, viewport, 0.0) {
                 continue;
             }
-            self.paint_host_card(ctx, layers, font, palette, index, card, viewport)?;
+            self.paint_host_card(ctx, caption, layers, font, palette, index, card, viewport)?;
         }
         Ok(())
     }
@@ -2086,6 +2507,7 @@ impl SshHostsView {
     fn paint_host_card(
         &mut self,
         ctx: &DrawContext,
+        (caption_ctx, caption_font): (&DrawContext, &Rc<LoadedFont>),
         layers: &mut TripleLayerQuadAllocator<'_>,
         font: &Rc<LoadedFont>,
         palette: UiPalette,
@@ -2107,29 +2529,55 @@ impl SshHostsView {
 
         let selected = self.selection_active && self.selected == index;
         let hovered = self.interaction.hovered == Some(action);
-        // Selection is a ring, not a wash: the card already carries a logo
-        // and two lines of text, and lightening it as well says the same
-        // thing twice.
-        let bg = if hovered {
-            palette.sidebar_row_hover_bg
-        } else {
-            palette.card_bg
-        };
-        ctx.draw_rounded_frame(
-            layers,
-            0,
-            card.origin.x,
-            card.origin.y,
-            card.size.width,
-            card.size.height,
-            bg,
-            if selected {
-                palette.accent
+        let system = entry.source == SshHostSource::System;
+        let connect = !system && HostMode::of(entry.spec.use_mosh, entry.spec.multiplexing)
+            == HostMode::Connect;
+        let (mux_fill, mux_edge, mux_ink) = mux_colors(palette);
+        let radius = ctx.px(CARD_RADIUS);
+        // A Connect host is drawn as the diagram's mux server, a host
+        // reached over plain ssh or Mosh as a plain card. Selection is a
+        // ring, not a wash: the card already carries a logo and two
+        // lines of text, and lightening it as well says the same thing
+        // twice.
+        if connect {
+            let fill = if hovered {
+                crate::ui::color::mix(mux_fill, mux_ink, 0.08)
             } else {
-                palette.separator
-            },
-            ctx.px(CARD_RADIUS),
-        )?;
+                mux_fill
+            };
+            ctx.draw_rounded_frame(
+                layers,
+                0,
+                card.origin.x,
+                card.origin.y,
+                card.size.width,
+                card.size.height,
+                fill,
+                if selected { palette.accent } else { mux_edge },
+                radius,
+            )?;
+        } else {
+            let bg = if hovered {
+                palette.sidebar_row_hover_bg
+            } else {
+                palette.card_bg
+            };
+            ctx.draw_rounded_frame(
+                layers,
+                0,
+                card.origin.x,
+                card.origin.y,
+                card.size.width,
+                card.size.height,
+                bg,
+                if selected {
+                    palette.accent
+                } else {
+                    palette.separator
+                },
+                radius,
+            )?;
+        }
         if selected {
             // A second ring just inside the first: one device pixel of accent
             // disappears on a retina display.
@@ -2142,7 +2590,7 @@ impl SshHostsView {
                 card.size.height - 2.0,
                 LinearRgba::TRANSPARENT,
                 palette.accent,
-                ctx.px(CARD_RADIUS) - 1.0,
+                radius - 1.0,
             )?;
         }
 
@@ -2160,6 +2608,9 @@ impl SshHostsView {
             .and_then(distro_to_icon)
         {
             Some(brand) => ctx.draw_brand_icon(layers, brand, icon_x, icon_y, icon)?,
+            None if connect => {
+                ctx.draw_svg_icon(layers, SvgIcon::MuxServer, icon_x, icon_y, icon, mux_ink)?
+            }
             None => ctx.draw_svg_icon(
                 layers,
                 SvgIcon::Server,
@@ -2172,8 +2623,56 @@ impl SshHostsView {
 
         let text_x = icon_x + icon + ctx.px(14.0);
         let text_w = (card.max_x() - pad - text_x).max(0.0);
-        let stack = line_h * 2.0 + ctx.px(4.0);
+        let line_gap = ctx.px(4.0);
+        let stack = line_h * 2.0 + line_gap;
         let title_y = card.origin.y + ((card.size.height - stack) / 2.0).max(ctx.px(8.0));
+
+        // A host that keeps nothing offers the way to the kind that does,
+        // as a pill level with its name: the name rarely fills its line.
+        let mut title_w = text_w;
+        if !connect {
+            let (label, link_action) = if system {
+                ("ssh-card-system-add", SshViewAction::AddWithConnect(index))
+            } else {
+                ("ssh-card-switch", SshViewAction::SwitchToConnect(index))
+            };
+            // A tag beside the name, a step quieter than it.
+            let label = crate::i18n::tr(label);
+            let pill_pad = ctx.px(12.0);
+            let pill_w = caption_ctx.measure_text_width(caption_font, &label) + pill_pad * 2.0;
+            let caption_h = caption_ctx.metrics.cell_size.height as f32;
+            let pill_h = caption_h + ctx.px(6.0);
+            let pill_x = card.max_x() - pad - pill_w;
+            let pill_y = title_y + (line_h - pill_h) / 2.0;
+            if pill_x - text_x >= ctx.px(120.0) {
+                let pill_hovered = self.interaction.hovered == Some(link_action);
+                ctx.draw_rounded_frame(
+                    layers,
+                    1,
+                    pill_x,
+                    pill_y,
+                    pill_w,
+                    pill_h,
+                    mux_ink.mul_alpha(if pill_hovered { 0.22 } else { 0.12 }),
+                    mux_edge,
+                    pill_h / 2.0,
+                )?;
+                caption_ctx.draw_text(
+                    layers,
+                    caption_font,
+                    pill_x + pill_pad,
+                    pill_y + ctx.px(3.0),
+                    &label,
+                    mux_ink,
+                    pill_w,
+                )?;
+                // Pushed after the card, so it is the target on top.
+                if let Some(target) = rect(pill_x, pill_y, pill_w, pill_h).intersection(&viewport) {
+                    self.widgets.push(target, WidgetKind::Button, link_action);
+                }
+                title_w = (pill_x - ctx.px(12.0) - text_x).max(0.0);
+            }
+        }
         ctx.draw_text(
             layers,
             font,
@@ -2181,17 +2680,352 @@ impl SshHostsView {
             title_y,
             &entry.spec.label,
             palette.text,
-            text_w,
+            title_w,
         )?;
         ctx.draw_text(
             layers,
             font,
             text_x,
-            title_y + line_h + ctx.px(4.0),
+            title_y + line_h + line_gap,
             &Self::card_subtitle(&entry),
             palette.muted_text,
             text_w,
         )?;
+        Ok(())
+    }
+
+    /// The card that heads the page: what ThinkTerm Connect is, beside a
+    /// picture of it -- the README diagram's mux server, still running while
+    /// the computer that reached it is away.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_connect_tip(
+        &mut self,
+        ctx: &DrawContext,
+        section_ctx: &DrawContext,
+        caption_ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        tip: &ConnectTipLayout,
+        card: RectF,
+        viewport: RectF,
+    ) -> anyhow::Result<()> {
+        if !row_visible(card.origin.y, card.size.height, viewport) {
+            return Ok(());
+        }
+        let widgets_start = self.widgets.len();
+        let (mux_fill, mux_edge, mux_ink) = mux_colors(palette);
+        ctx.draw_rounded_frame(
+            layers,
+            0,
+            card.origin.x,
+            card.origin.y,
+            card.size.width,
+            card.size.height,
+            mux_fill,
+            mux_edge,
+            ctx.px(CARD_RADIUS),
+        )?;
+        let pad = ctx.px(CARD_PAD);
+        let section_h = section_ctx.metrics.cell_size.height as f32;
+        let body_h = caption_ctx.metrics.cell_size.height as f32;
+        Self::paint_card_mesh(ctx, layers, mux_ink, card, 0.3, 0.7)?;
+
+        let pad_x = ctx.px(TIP_PAD_X);
+        let text_x = card.origin.x + pad_x;
+        let words_top = match tip.picture {
+            TipPicture::Beside { .. } => card.origin.y + (card.size.height - tip.words_h) / 2.0,
+            TipPicture::Below { .. } | TipPicture::None => card.origin.y + pad,
+        };
+        match tip.picture {
+            TipPicture::Beside { width, computer } => self.paint_connect_picture(
+                ctx,
+                layers,
+                font,
+                palette,
+                card.max_x() - pad_x - width,
+                card.origin.y,
+                width,
+                card.size.height,
+                computer,
+            )?,
+            TipPicture::Below { width, computer } => self.paint_connect_picture(
+                ctx,
+                layers,
+                font,
+                palette,
+                text_x,
+                words_top + tip.words_h + ctx.px(TIP_BUTTON_GAP),
+                width,
+                tip.picture_h,
+                computer,
+            )?,
+            TipPicture::None => {}
+        }
+
+        // The words, then what to do about them.
+        let mut ty = words_top;
+        for line in &tip.title {
+            section_ctx.draw_text(
+                layers,
+                section_font,
+                text_x,
+                ty,
+                line,
+                palette.text,
+                tip.text_w,
+            )?;
+            ty += section_h;
+        }
+        ty += ctx.px(TIP_TITLE_GAP);
+        for line in &tip.body {
+            caption_ctx.draw_text(
+                layers,
+                caption_font,
+                text_x,
+                ty,
+                line,
+                palette.secondary_text,
+                tip.text_w,
+            )?;
+            ty += body_h;
+        }
+        ty += ctx.px(TIP_BUTTON_GAP);
+        let label = crate::i18n::tr("ssh-connect-tip-add");
+        let button_w = ctx.measure_text_width(font, &label) + ctx.px(56.0);
+        let state = self.button_state(SshViewAction::TipNew);
+        draw_button(
+            ctx,
+            layers,
+            font,
+            &mut self.widgets,
+            palette,
+            ButtonSpec {
+                label: &label,
+                action: SshViewAction::TipNew,
+                rect: rect(text_x, ty, button_w, ctx.px(BTN_H)),
+                state,
+                kind: WidgetKind::Button,
+                variant: ButtonVariant::Primary,
+            },
+        )?;
+        self.widgets.clip_since(widgets_start, viewport);
+        Ok(())
+    }
+
+    /// The picture on the Connect card, drawn as the README diagram draws
+    /// it: this computer away (its line dashed), and the host's mux server
+    /// with the sessions it keeps running meanwhile. Without `computer`,
+    /// the host alone fills `w`.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_connect_picture(
+        &self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        computer: bool,
+    ) -> anyhow::Result<()> {
+        let (mux_fill, mux_edge, mux_ink) = mux_colors(palette);
+        let line_h = ctx.metrics.cell_size.height as f32;
+        let green = good_green(palette);
+
+        // The host: a platter holding the mux server and two sessions.
+        let platter_w = if computer {
+            ctx.px(TIP_HOST_W).min(w * 0.62)
+        } else {
+            w
+        };
+        let platter_h = line_h * 4.0 + ctx.px(92.0);
+        let platter_x = x + w - platter_w;
+        let platter_y = y + (h - platter_h) / 2.0;
+        ctx.draw_rounded_frame(
+            layers,
+            1,
+            platter_x,
+            platter_y,
+            platter_w,
+            platter_h,
+            palette.card_bg,
+            palette.separator,
+            ctx.px(36.0),
+        )?;
+        let inset = ctx.px(16.0);
+        let block_h = line_h * 2.0 + ctx.px(24.0);
+        let block_x = platter_x + inset;
+        let block_w = platter_w - inset * 2.0;
+        let block_y = platter_y + inset;
+        ctx.draw_rounded_frame(
+            layers,
+            1,
+            block_x,
+            block_y,
+            block_w,
+            block_h,
+            mux_fill,
+            mux_edge,
+            ctx.px(26.0),
+        )?;
+        let glyph = ctx.px(40.0);
+        ctx.draw_svg_icon(
+            layers,
+            SvgIcon::MuxServer,
+            block_x + ctx.px(20.0),
+            block_y + (block_h - glyph) / 2.0,
+            glyph,
+            mux_ink,
+        )?;
+        let words_x = block_x + ctx.px(20.0) + glyph + ctx.px(20.0);
+        let words_w = (block_x + block_w - words_x - ctx.px(16.0)).max(0.0);
+        ctx.draw_text(
+            layers,
+            font,
+            words_x,
+            block_y + ctx.px(12.0),
+            &crate::i18n::tr("ssh-connect-tip-mux"),
+            palette.text,
+            words_w,
+        )?;
+        ctx.draw_text(
+            layers,
+            font,
+            words_x,
+            block_y + ctx.px(12.0) + line_h,
+            &crate::i18n::tr("ssh-connect-tip-sessions"),
+            palette.muted_text,
+            words_w,
+        )?;
+        let mut ry = block_y + block_h + ctx.px(16.0);
+        for (command, state) in [
+            ("cargo build", "ssh-connect-tip-running"),
+            ("claude", "ssh-connect-tip-working"),
+        ] {
+            let dot = ctx.px(16.0);
+            ctx.draw_disc(
+                layers,
+                1,
+                block_x + ctx.px(16.0) + dot / 2.0,
+                ry + line_h / 2.0,
+                dot,
+                green,
+            )?;
+            let state = crate::i18n::tr(state);
+            let state_w = ctx.measure_text_width(font, &state);
+            let state_x = block_x + block_w - ctx.px(12.0) - state_w;
+            let cmd_x = block_x + ctx.px(16.0) + dot + ctx.px(20.0);
+            ctx.draw_text(
+                layers,
+                font,
+                cmd_x,
+                ry,
+                command,
+                palette.text,
+                (state_x - cmd_x - ctx.px(16.0)).max(0.0),
+            )?;
+            ctx.draw_text(
+                layers,
+                font,
+                state_x,
+                ry,
+                &state,
+                palette.muted_text,
+                state_w + ctx.px(4.0),
+            )?;
+            ry += line_h + ctx.px(12.0);
+        }
+
+        if !computer {
+            return Ok(());
+        }
+
+        // This computer, away: its tile, its name and "offline".
+        let tile = ctx.px(96.0);
+        let column_w = ctx.px(220.0);
+        let tile_x = x + (column_w - tile) / 2.0;
+        let column_h = tile + ctx.px(16.0) + line_h * 2.0 + ctx.px(12.0);
+        let tile_y = y + (h - column_h) / 2.0;
+        ctx.draw_rounded_frame(
+            layers,
+            1,
+            tile_x,
+            tile_y,
+            tile,
+            tile,
+            palette.control_bg,
+            palette.control_border,
+            ctx.px(26.0),
+        )?;
+        let laptop = ctx.px(48.0);
+        ctx.draw_svg_icon(
+            layers,
+            SvgIcon::Laptop,
+            tile_x + (tile - laptop) / 2.0,
+            tile_y + (tile - laptop) / 2.0,
+            laptop,
+            palette.text,
+        )?;
+        let name = crate::i18n::tr("ssh-connect-tip-this-computer");
+        let name_w = ctx.measure_text_width(font, &name).min(column_w);
+        let name_y = tile_y + tile + ctx.px(16.0);
+        ctx.draw_text(
+            layers,
+            font,
+            x + (column_w - name_w) / 2.0,
+            name_y,
+            &name,
+            palette.text,
+            column_w,
+        )?;
+        let away = crate::i18n::tr("ssh-connect-tip-offline");
+        let away_w = ctx.measure_text_width(font, &away);
+        let pill_pad = ctx.px(16.0);
+        let pill_w = away_w + pill_pad * 2.0;
+        let pill_x = x + (column_w - pill_w) / 2.0;
+        let pill_y = name_y + line_h + ctx.px(12.0);
+        ctx.draw_rounded_frame(
+            layers,
+            1,
+            pill_x,
+            pill_y,
+            pill_w,
+            line_h,
+            palette.control_bg,
+            palette.control_border,
+            line_h / 2.0,
+        )?;
+        ctx.draw_text(
+            layers,
+            font,
+            pill_x + pill_pad,
+            pill_y,
+            &away,
+            palette.muted_text,
+            away_w + ctx.px(4.0),
+        )?;
+
+        // The line between them, dashed: nothing is connected.
+        let line_y = tile_y + tile / 2.0;
+        let mut dx = x + column_w + ctx.px(12.0);
+        let end = platter_x - ctx.px(20.0);
+        let dash = ctx.px(16.0);
+        while dx < end {
+            ctx.draw_rect(
+                layers,
+                1,
+                dx,
+                line_y - ctx.px(2.0),
+                dash.min(end - dx),
+                ctx.px(4.0),
+                palette.muted_text.mul_alpha(0.7),
+            )?;
+            dx += dash + ctx.px(12.0);
+        }
         Ok(())
     }
 
@@ -2512,6 +3346,247 @@ impl SshHostsView {
         Ok(y + height)
     }
 
+    /// The "Connect with" card: each way to reach the host, with what it
+    /// keeps and what it costs, the chosen one ringed. The words wrap rather
+    /// than run out: the form's column is narrow. Returns its height.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_mode_card(
+        &mut self,
+        ctx: &DrawContext,
+        section_ctx: &DrawContext,
+        caption_ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        tokens: UiTokens,
+        chosen: HostMode,
+        area: RectF,
+    ) -> anyhow::Result<f32> {
+        let line_h = ctx.metrics.cell_size.height as f32;
+        // What each way does is read after its name, a step down from it.
+        let fact_h = caption_ctx.metrics.cell_size.height as f32;
+        let section_h = section_ctx.metrics.cell_size.height as f32;
+        let pad = ctx.px(20.0);
+        let inner = (area.size.width - pad * 2.0).max(0.0);
+        let row_pad = ctx.px(22.0);
+        let line_gap = ctx.px(6.0);
+        let tile = ctx.px(60.0);
+        let glyph = ctx.px(34.0);
+        let fact_icon = ctx.px(22.0);
+        let fact_gap = ctx.px(10.0);
+        let text_w = (inner - row_pad * 2.0 - tile - ctx.px(22.0)).max(ctx.px(40.0));
+        let fact_w = (text_w - fact_icon - fact_gap).max(ctx.px(40.0));
+        let wrap = |text: &str, width: f32| -> Vec<String> {
+            wrap_snippet_text_for_width(text, 3, false, |segment| {
+                caption_ctx.measure_text_width(caption_font, segment) / width
+            })
+        };
+        let modes = [
+            (
+                HostMode::Connect,
+                "ssh-mode-connect-title",
+                [("ssh-mode-connect-keeps", true), ("ssh-mode-connect-server", true)],
+                Some("ssh-mode-connect-install"),
+            ),
+            (
+                HostMode::Ssh,
+                "ssh-mode-ssh-title",
+                [("ssh-mode-ssh-ends", false), ("ssh-mode-ssh-nothing", true)],
+                None,
+            ),
+            (
+                HostMode::Mosh,
+                "ssh-mode-mosh-title",
+                [("ssh-mode-mosh-roams", true), ("ssh-mode-mosh-needs", false)],
+                None,
+            ),
+        ];
+        let laid: Vec<ModeWords> = modes
+            .iter()
+            .map(|(_, _, facts, note)| ModeWords {
+                facts: facts
+                    .iter()
+                    .map(|(fact, good)| (wrap(&crate::i18n::tr(fact), fact_w), *good))
+                    .collect(),
+                note: note
+                    .map(|note| wrap(&crate::i18n::tr(note), text_w))
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let rows: Vec<f32> = laid
+            .iter()
+            .map(|ModeWords { facts, note }| {
+                let lines = facts.iter().map(|(lines, _)| lines.len()).sum::<usize>()
+                    + note.len();
+                let words = line_h + (fact_h + line_gap) * lines as f32;
+                row_pad * 2.0 + words.max(tile)
+            })
+            .collect();
+        let height = Self::inspector_card_height(ctx, section_h, &rows);
+        let mut y = Self::paint_inspector_card(
+            ctx,
+            section_ctx,
+            layers,
+            section_font,
+            palette,
+            tokens,
+            &crate::i18n::tr("ssh-group-connect-with"),
+            rect(area.origin.x, area.origin.y, area.size.width, height),
+        )?;
+
+        let green = good_green(palette);
+        let (mux_fill, mux_edge, mux_ink) = mux_colors(palette);
+        let x = area.origin.x + pad;
+        for (((mode, title, _, _), ModeWords { facts, note }), row_h) in
+            modes.iter().zip(laid.iter()).zip(rows.iter().copied())
+        {
+            let on = *mode == chosen;
+            let radius = ctx.px(24.0);
+            // The chosen one is ringed and tinted; the rest sit quiet.
+            if on {
+                let ring = ctx.px(4.0);
+                ctx.draw_rounded_rect(layers, 0, x, y, inner, row_h, palette.accent, radius)?;
+                for fill in [palette.control_bg, palette.accent.mul_alpha(0.08)] {
+                    ctx.draw_rounded_rect(
+                        layers,
+                        0,
+                        x + ring,
+                        y + ring,
+                        inner - ring * 2.0,
+                        row_h - ring * 2.0,
+                        fill,
+                        radius - ring,
+                    )?;
+                }
+            } else {
+                ctx.draw_rounded_frame(
+                    layers,
+                    0,
+                    x,
+                    y,
+                    inner,
+                    row_h,
+                    palette.control_bg,
+                    palette.control_border,
+                    radius,
+                )?;
+            }
+            self.widgets.push(
+                rect(x, y, inner, row_h),
+                WidgetKind::Button,
+                SshViewAction::SetMode(*mode),
+            );
+
+            // The host as the diagram draws it: a mux server for Connect, a
+            // plain machine for the rest.
+            let tile_x = x + row_pad;
+            let tile_y = y + row_pad;
+            let (fill, edge, ink, icon) = if *mode == HostMode::Connect {
+                (mux_fill, mux_edge, mux_ink, SvgIcon::MuxServer)
+            } else {
+                (
+                    palette.control_bg,
+                    palette.control_border,
+                    palette.secondary_text,
+                    SvgIcon::Server,
+                )
+            };
+            ctx.draw_rounded_frame(layers, 1, tile_x, tile_y, tile, tile, fill, edge, ctx.px(16.0))?;
+            ctx.draw_svg_icon(
+                layers,
+                icon,
+                tile_x + (tile - glyph) / 2.0,
+                tile_y + (tile - glyph) / 2.0,
+                glyph,
+                ink,
+            )?;
+
+            let text_x = tile_x + tile + ctx.px(22.0);
+            let mut ty = y + row_pad;
+            let title = crate::i18n::tr(title);
+            ctx.draw_text(layers, font, text_x, ty, &title, palette.text, text_w)?;
+            if *mode == HostMode::Connect {
+                // A tag, a step quieter than the name it follows.
+                let label = crate::i18n::tr("ssh-mode-recommended");
+                let title_w = ctx.measure_text_width(font, &title);
+                let pill_x = text_x + title_w + ctx.px(12.0);
+                let pill_pad = ctx.px(10.0);
+                let pill_w = caption_ctx.measure_text_width(caption_font, &label) + pill_pad * 2.0;
+                let pill_h = fact_h + ctx.px(2.0);
+                let pill_y = ty + (line_h - pill_h) / 2.0;
+                if pill_x + pill_w <= text_x + text_w {
+                    ctx.draw_rounded_frame(
+                        layers,
+                        1,
+                        pill_x,
+                        pill_y,
+                        pill_w,
+                        pill_h,
+                        mux_ink.mul_alpha(0.12),
+                        mux_edge,
+                        pill_h / 2.0,
+                    )?;
+                    caption_ctx.draw_text(
+                        layers,
+                        caption_font,
+                        pill_x + pill_pad,
+                        pill_y + ctx.px(1.0),
+                        &label,
+                        mux_ink,
+                        pill_w,
+                    )?;
+                }
+            }
+            ty += line_h - fact_h;
+            for (lines, good) in facts {
+                ty += fact_h + line_gap;
+                let (icon, color) = if *good {
+                    (SvgIcon::Check, green)
+                } else {
+                    (SvgIcon::X, palette.danger)
+                };
+                ctx.draw_svg_icon(
+                    layers,
+                    icon,
+                    text_x,
+                    ty + (fact_h - fact_icon) / 2.0,
+                    fact_icon,
+                    color,
+                )?;
+                for (n, line) in lines.iter().enumerate() {
+                    if n > 0 {
+                        ty += fact_h + line_gap;
+                    }
+                    caption_ctx.draw_text(
+                        layers,
+                        caption_font,
+                        text_x + fact_icon + fact_gap,
+                        ty,
+                        line,
+                        palette.secondary_text,
+                        fact_w,
+                    )?;
+                }
+            }
+            for line in note {
+                ty += fact_h + line_gap;
+                caption_ctx.draw_text(
+                    layers,
+                    caption_font,
+                    text_x,
+                    ty,
+                    line,
+                    palette.muted_text,
+                    text_w,
+                )?;
+            }
+            y += row_h + ctx.px(FIELD_GAP);
+        }
+        Ok(height)
+    }
+
     /// The lines under the shell integration toggle: where it works, then
     /// what the next connection will do about it, what the last one found,
     /// or why it failed.
@@ -2593,10 +3668,12 @@ impl SshHostsView {
         ctx: &DrawContext,
         title_ctx: &DrawContext,
         section_ctx: &DrawContext,
+        caption_ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
         palette: UiPalette,
         tokens: UiTokens,
         cursor_on: bool,
@@ -2670,8 +3747,67 @@ impl SshHostsView {
             header_h += ctx.px(BTN_H) + card_gap;
         }
 
+        // ---- footer. Creating a host offers "Save & Open" as the primary
+        // action, since there is no Connect button above yet. The buttons
+        // float in a capsule at the bottom of the panel while the body
+        // scrolls under it, so that Save is always in sight and an edit is
+        // not left behind unsaved. The primary one comes last, at the right
+        // end of a capsule centred on the panel.
+        let button_gap = ctx.px(10.0);
+        let mut buttons: Vec<(String, SshViewAction, ButtonVariant)> = vec![(
+            crate::i18n::tr("ssh-cancel"),
+            SshViewAction::Cancel,
+            ButtonVariant::Secondary,
+        )];
+        if editing.is_none() {
+            buttons.push((
+                crate::i18n::tr("ssh-save"),
+                SshViewAction::Save,
+                ButtonVariant::Secondary,
+            ));
+            buttons.push((
+                crate::i18n::tr("ssh-save-open"),
+                SshViewAction::SaveAndConnect,
+                ButtonVariant::Primary,
+            ));
+        } else {
+            buttons.push((
+                crate::i18n::tr("ssh-save"),
+                SshViewAction::Save,
+                ButtonVariant::Primary,
+            ));
+        }
+        // Natural widths while they fit in one row; stacked full width when
+        // they do not, rather than squeezed until the labels ellipsize.
+        let natural: Vec<f32> = buttons
+            .iter()
+            .map(|(label, _, _)| ctx.measure_text_width(font, label) + ctx.px(56.0))
+            .collect();
+        let capsule_pad = ctx.px(8.0);
+        let row_w = natural.iter().sum::<f32>()
+            + button_gap * buttons.len().saturating_sub(1) as f32
+            + capsule_pad * 2.0;
+        let row_fits = row_w <= w;
+        let stack_gap = ctx.px(8.0);
+        let capsule_w = if row_fits { row_w } else { w };
+        let capsule_h = capsule_pad * 2.0
+            + if row_fits {
+                ctx.px(BTN_H)
+            } else {
+                (ctx.px(BTN_H) + stack_gap) * buttons.len() as f32 - stack_gap
+            };
+        let capsule = rect(
+            x + (w - capsule_w) / 2.0,
+            area.max_y() - ctx.px(PAD) - capsule_h,
+            capsule_w,
+            capsule_h,
+        );
+        // The body's last row can scroll clear of it.
+        let footer_room = capsule_h + ctx.px(PAD) + ctx.px(16.0);
+        let footer_top = area.max_y();
+
         let body_top = area.origin.y + header_h;
-        let body_height = (area.max_y() - body_top).max(0.0);
+        let body_height = (footer_top - body_top).max(0.0);
         self.form_scroll
             .set_extents(body_height, self.form_content_h);
         let top = body_top - self.form_scroll.offset;
@@ -2690,10 +3826,33 @@ impl SshHostsView {
             let mut body_layers = TripleLayerQuadAllocator::Heap(&mut heap);
 
             // ---- Connection
+            // The built-in tailnet can be chosen once Tailscale is on; a host
+            // already on it keeps showing so.
+            let tailnet_locked = !self.tailnet_on && network != SshNetwork::Tailnet;
+            let caption_h = caption_ctx.metrics.cell_size.height as f32;
+            let lock_note = if !tailnet_locked {
+                Vec::new()
+            } else {
+                // A build without the built-in tailnet has no Tailscale
+                // group on the page to turn it on in.
+                let note = if crate::tailnet::available() {
+                    crate::i18n::tr("ssh-network-tailnet-off")
+                } else {
+                    crate::i18n::tr("ssh-network-tailnet-unavailable")
+                };
+                wrap_snippet_text_for_width(&note, 3, false, |segment| {
+                    caption_ctx.measure_text_width(caption_font, segment) / inner.max(1.0)
+                })
+            };
+            let lock_note_h = if lock_note.is_empty() {
+                0.0
+            } else {
+                ctx.px(6.0) + caption_h * lock_note.len() as f32
+            };
             let conn_h = Self::inspector_card_height(
                 ctx,
                 section_h,
-                &[field_h, field_h, field_h, field_h, field_h],
+                &[field_h, field_h + lock_note_h, field_h, field_h, field_h],
             );
             let mut fy = Self::paint_inspector_card(
                 ctx,
@@ -2738,7 +3897,11 @@ impl SshHostsView {
             .enumerate()
             {
                 let action = SshViewAction::SetNetwork(choice);
-                let state = self.button_state(action);
+                let state = if choice == SshNetwork::Tailnet && tailnet_locked {
+                    ControlState::Disabled
+                } else {
+                    self.button_state(action)
+                };
                 draw_button(
                     ctx,
                     &mut body_layers,
@@ -2764,7 +3927,20 @@ impl SshHostsView {
                     },
                 )?;
             }
-            fy += field_h + gap;
+            let mut note_y = fy + line_h + ctx.px(LABEL_GAP) + ctx.px(INPUT_H) + ctx.px(6.0);
+            for line in &lock_note {
+                caption_ctx.draw_text(
+                    &mut body_layers,
+                    caption_font,
+                    x + pad,
+                    note_y,
+                    line,
+                    palette.muted_text,
+                    inner,
+                )?;
+                note_y += caption_h;
+            }
+            fy += field_h + lock_note_h + gap;
             // Host and Port share a row: a port needs four characters, not a
             // column of its own.
             let port_w = ctx.px(96.0).min(inner * 0.32);
@@ -2828,6 +4004,22 @@ impl SshHostsView {
                 inner,
             )?;
             y += conn_h + card_gap;
+
+            // ---- Connect with: the choice that decides what the host keeps.
+            let mode_h = self.paint_mode_card(
+                ctx,
+                section_ctx,
+                caption_ctx,
+                &mut body_layers,
+                font,
+                section_font,
+                caption_font,
+                palette,
+                tokens,
+                HostMode::of(use_mosh, multiplexing),
+                rect(x, y, w, 0.0),
+            )?;
+            y += mode_h + card_gap;
 
             // ---- Authentication
             let auth_h = Self::inspector_card_height(ctx, section_h, &[field_h, field_h]);
@@ -2909,7 +4101,7 @@ impl SshHostsView {
                     inner,
                 )
             });
-            let mut session_rows = vec![field_h, toggle_h, toggle_h, toggle_h, toggle_h];
+            let mut session_rows = vec![field_h, toggle_h, toggle_h];
             if use_mosh {
                 session_rows.push(field_h);
             }
@@ -2950,30 +4142,6 @@ impl SshHostsView {
                 &crate::i18n::tr("ssh-detect-os"),
                 detect_os,
                 SshViewAction::ToggleDetect,
-                x + pad,
-                fy,
-                inner,
-            )? + gap;
-            fy = self.paint_toggle_row(
-                ctx,
-                &mut body_layers,
-                font,
-                palette,
-                &crate::i18n::tr("ssh-use-mosh"),
-                use_mosh,
-                SshViewAction::ToggleMosh,
-                x + pad,
-                fy,
-                inner,
-            )? + gap;
-            fy = self.paint_toggle_row(
-                ctx,
-                &mut body_layers,
-                font,
-                palette,
-                &crate::i18n::tr("ssh-use-mux"),
-                multiplexing,
-                SshViewAction::ToggleMux,
                 x + pad,
                 fy,
                 inner,
@@ -3204,88 +4372,97 @@ impl SshHostsView {
                 y += line_h + ctx.px(12.0);
             }
 
-            // ---- footer. Creating a host offers "Save & Open" as the primary
-            // action, since there is no Connect button above yet.
-            let button_gap = ctx.px(10.0);
-            let mut buttons: Vec<(String, SshViewAction, ButtonVariant)> = Vec::new();
-            if editing.is_none() {
-                buttons.push((
-                    crate::i18n::tr("ssh-save-open"),
-                    SshViewAction::SaveAndConnect,
-                    ButtonVariant::Primary,
-                ));
-                buttons.push((
-                    crate::i18n::tr("ssh-save"),
-                    SshViewAction::Save,
-                    ButtonVariant::Secondary,
-                ));
-            } else {
-                buttons.push((
-                    crate::i18n::tr("ssh-save"),
-                    SshViewAction::Save,
-                    ButtonVariant::Primary,
-                ));
-            }
-            buttons.push((
-                crate::i18n::tr("ssh-cancel"),
-                SshViewAction::Cancel,
-                ButtonVariant::Secondary,
-            ));
-            // The column is narrow and fixed. Rather than squeeze the labels
-            // until they ellipsize -- which is how a button stops saying what it
-            // does -- lay them out at their natural width while they fit, and
-            // stack them full-width when they do not.
-            let natural: Vec<f32> = buttons
-                .iter()
-                .map(|(label, _, _)| ctx.measure_text_width(font, label) + ctx.px(56.0))
-                .collect();
-            let row_fits = natural.iter().sum::<f32>()
-                + button_gap * buttons.len().saturating_sub(1) as f32
-                <= w;
-            let mut bx = x;
-            for ((label, action, variant), natural_w) in buttons.iter().zip(natural.iter()) {
-                let each = if row_fits { *natural_w } else { w };
-                let state = self.button_state(*action);
-                draw_button(
-                    ctx,
-                    &mut body_layers,
-                    font,
-                    &mut self.widgets,
-                    palette,
-                    ButtonSpec {
-                        label,
-                        action: *action,
-                        rect: rect(bx, y, each, ctx.px(BTN_H)),
-                        state,
-                        kind: WidgetKind::Button,
-                        variant: *variant,
-                    },
-                )?;
-                if row_fits {
-                    bx += each + button_gap;
-                } else {
-                    y += ctx.px(BTN_H) + ctx.px(8.0);
-                }
-            }
-            // A stacked column already advanced past its last button.
-            if row_fits {
-                y += ctx.px(BTN_H);
-            }
-            y += ctx.px(PAD);
+            y += footer_room;
         }
         self.form_content_h = y - top;
         let clip = QuadClipRect::from_top_left_pixels(
             area.origin.x,
             body_top,
             area.max_x(),
-            area.max_y(),
+            footer_top,
             &ctx.dimensions,
         );
+        // The body shows under the capsule, but takes no clicks there: one
+        // between its buttons must not reach a switch scrolled out of sight.
         self.widgets.clip_since(
             body_widgets_start,
-            rect(area.origin.x, body_top, area.size.width, body_height),
+            rect(
+                area.origin.x,
+                body_top,
+                area.size.width,
+                (capsule.origin.y - body_top).max(0.0),
+            ),
         );
         heap.apply_to_clipped(layers, clip, 1.0)?;
+
+        // The capsule, above the body scrolling under it.
+        let radius = if row_fits {
+            capsule_h / 2.0
+        } else {
+            ctx.px(24.0)
+        };
+        ctx.draw_shadow(
+            layers,
+            2,
+            capsule,
+            radius,
+            ctx.px(16.0),
+            ctx.px(4.0),
+            LinearRgba::with_components(0.0, 0.0, 0.0, 0.35),
+        )?;
+        // The card colour is translucent; the body must not show through.
+        ctx.draw_rounded_rect(
+            layers,
+            2,
+            capsule.origin.x,
+            capsule.origin.y,
+            capsule.size.width,
+            capsule.size.height,
+            palette.window_bg,
+            radius,
+        )?;
+        ctx.draw_rounded_frame(
+            layers,
+            2,
+            capsule.origin.x,
+            capsule.origin.y,
+            capsule.size.width,
+            capsule.size.height,
+            palette.card_bg,
+            palette.separator,
+            radius,
+        )?;
+        let mut bx = capsule.origin.x + capsule_pad;
+        let mut by = capsule.origin.y + capsule_pad;
+        for ((label, action, variant), natural_w) in buttons.iter().zip(natural.iter()) {
+            let each = if row_fits {
+                *natural_w
+            } else {
+                capsule_w - capsule_pad * 2.0
+            };
+            let state = self.button_state(*action);
+            draw_button_on_layer(
+                ctx,
+                layers,
+                font,
+                &mut self.widgets,
+                palette,
+                ButtonSpec {
+                    label,
+                    action: *action,
+                    rect: rect(bx, by, each, ctx.px(BTN_H)),
+                    state,
+                    kind: WidgetKind::Button,
+                    variant: *variant,
+                },
+                2,
+            )?;
+            if row_fits {
+                bx += each + button_gap;
+            } else {
+                by += ctx.px(BTN_H) + stack_gap;
+            }
+        }
 
         // The header sits above the clip, so the band it occupies is simply
         // never drawn into by the body -- no mask needed.
@@ -4006,6 +5183,67 @@ impl SshHostsView {
         Ok(())
     }
 
+    /// The notice's height: its two lines, or its button beside them when
+    /// that is taller.
+    fn tailnet_notice_height(ctx: &DrawContext, notice: &TailnetNotice) -> f32 {
+        let line_h = ctx.metrics.cell_size.height as f32;
+        let words = line_h * 2.0 + ctx.px(4.0);
+        let button = if notice.button.is_some() {
+            ctx.px(BTN_H)
+        } else {
+            0.0
+        };
+        ctx.px(CARD_PAD) * 2.0 + words.max(button)
+    }
+
+    /// A faint mesh of nodes behind a card, its machines as it were: over
+    /// the card from `from` (a fraction of its width) to its right end,
+    /// fading in towards the right, and `strength` at its strongest.
+    fn paint_card_mesh(
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        color: LinearRgba,
+        card: RectF,
+        from: f32,
+        strength: f32,
+    ) -> anyhow::Result<()> {
+        let step = ctx.px(28.0);
+        let inset = ctx.px(18.0);
+        let start = card.origin.x + card.size.width * from;
+        let end = card.max_x() - inset;
+        if end <= start || card.size.height <= inset * 2.0 {
+            return Ok(());
+        }
+        // Rows spread over the whole height, the grid centred in it.
+        let rows = ((card.size.height - inset * 2.0) / step).floor() as usize;
+        let top = card.origin.y + (card.size.height - rows as f32 * step) / 2.0;
+        let columns = ((end - start) / step).floor() as usize;
+        for row in 0..=rows {
+            for column in 0..=columns {
+                let x = end - column as f32 * step;
+                let y = top + row as f32 * step;
+                let fade = strength * (1.0 - column as f32 / columns.max(1) as f32);
+                // Every few dots a node, linked to the one at its right.
+                let node = (row * 7 + column * 3) % 5 == 0;
+                let size = if node { ctx.px(9.0) } else { ctx.px(4.0) };
+                let alpha = if node { 0.32 } else { 0.18 } * fade;
+                ctx.draw_disc(layers, 0, x, y, size, color.mul_alpha(alpha))?;
+                if node && column > 0 {
+                    ctx.draw_rect(
+                        layers,
+                        0,
+                        x,
+                        y - ctx.px(1.0),
+                        step,
+                        ctx.px(2.0),
+                        color.mul_alpha(0.16 * fade),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The card the Tailscale group shows instead of machines: the tailnet
     /// off -- an invitation to turn it on -- or on its way, or waiting.
     #[allow(clippy::too_many_arguments)]
@@ -4047,19 +5285,24 @@ impl SshHostsView {
         let line_h = ctx.metrics.cell_size.height as f32;
         let icon = (line_h * 1.8).clamp(ctx.px(40.0), ctx.px(52.0));
         let icon_x = card.origin.x + pad;
+        let words = line_h * 2.0 + ctx.px(4.0);
+        let title_y = card.origin.y + (card.size.height - words) / 2.0;
+        if notice.invite {
+            Self::paint_card_mesh(ctx, layers, palette.accent, card, 0.4, 1.0)?;
+        }
+        // The icon beside the two lines, and the button at the right, all
+        // centred on the card's height.
         ctx.draw_svg_icon(
             layers,
             notice.icon,
             icon_x,
-            card.origin.y + (card.size.height - icon) / 2.0,
+            title_y + (words - icon) / 2.0,
             icon,
             mark,
         )?;
-
         let mut right = card.max_x() - pad;
         if let Some((label, which)) = &notice.button {
             let button_w = ctx.measure_text_width(font, label) + ctx.px(56.0);
-            let button_h = ctx.px(BTN_H).min(card.size.height - ctx.px(16.0));
             let button_x = right - button_w;
             self.tailnet.notice = Some(*which);
             let state = self.button_state(SshViewAction::TailnetNotice);
@@ -4074,9 +5317,9 @@ impl SshHostsView {
                     action: SshViewAction::TailnetNotice,
                     rect: rect(
                         button_x,
-                        card.origin.y + (card.size.height - button_h) / 2.0,
+                        card.origin.y + (card.size.height - ctx.px(BTN_H)) / 2.0,
                         button_w,
-                        button_h,
+                        ctx.px(BTN_H),
                     ),
                     state,
                     kind: WidgetKind::Button,
@@ -4087,12 +5330,10 @@ impl SshHostsView {
                     },
                 },
             )?;
-            right = button_x - ctx.px(14.0);
+            right = button_x - ctx.px(16.0);
         }
         let text_x = icon_x + icon + ctx.px(16.0);
         let text_w = (right - text_x).max(0.0);
-        let stack = line_h * 2.0 + ctx.px(4.0);
-        let title_y = card.origin.y + ((card.size.height - stack) / 2.0).max(ctx.px(8.0));
         ctx.draw_text(
             layers,
             font,
@@ -4593,6 +5834,12 @@ impl ContentView for SshHostsView {
         true
     }
 
+    /// What each way to connect does, and the card introducing Connect, read
+    /// as text under the labels rather than as more labels.
+    fn typography(&self) -> ContentViewTypography {
+        ContentViewTypography::RegularCaption
+    }
+
     fn paint(
         &mut self,
         ctx: &DrawContext,
@@ -4602,7 +5849,7 @@ impl ContentView for SshHostsView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
-        _caption_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
         cursor_on: bool,
     ) -> anyhow::Result<()> {
         self.paint_impl(
@@ -4613,6 +5860,7 @@ impl ContentView for SshHostsView {
             font,
             title_font,
             section_font,
+            caption_font,
             cursor_on,
         )
     }
@@ -4629,6 +5877,22 @@ impl ContentView for SshHostsView {
         let response = self.on_mouse_impl(x, y, kind);
         self.commit_left_tailnet_fields();
         response
+    }
+
+    fn on_pointer(&mut self, x: f32, y: f32, event: &MouseEvent) -> ContentViewResponse {
+        if let Some(response) = self.drag_inspector_edge(x, y, event) {
+            return response;
+        }
+        self.on_mouse(x, y, event.kind.clone())
+    }
+
+    fn cursor(&self, x: f32, y: f32) -> Option<MouseCursor> {
+        (self.inspector_drag.is_some() || contains(self.inspector_edge, x, y))
+            .then_some(MouseCursor::SizeLeftRight)
+    }
+
+    fn holds_pointer(&self) -> bool {
+        self.inspector_drag.is_some()
     }
 
     fn on_wheel(&mut self, x: f32, y: f32, event: &MouseEvent) -> ContentViewResponse {
@@ -4973,17 +6237,86 @@ mod tests {
         let mut view = SshHostsView::new();
         view.open_new_form();
         assert_eq!(view.form.as_ref().unwrap().network, SshNetwork::System);
+        // Greyed out while Tailscale is off.
+        view.apply(super::SshViewAction::SetNetwork(SshNetwork::Tailnet));
+        assert_eq!(view.form.as_ref().unwrap().network, SshNetwork::System);
+        view.tailnet_on = true;
         view.apply(super::SshViewAction::SetNetwork(SshNetwork::Tailnet));
         assert_eq!(view.form.as_ref().unwrap().network, SshNetwork::Tailnet);
-        view.apply(super::SshViewAction::ToggleMosh);
+        view.apply(super::SshViewAction::SetMode(super::HostMode::Mosh));
         let form = view.form.as_ref().unwrap();
         assert!(!form.use_mosh);
         assert!(form.error.is_some());
         view.apply(super::SshViewAction::SetNetwork(SshNetwork::System));
-        view.apply(super::SshViewAction::ToggleMosh);
+        view.apply(super::SshViewAction::SetMode(super::HostMode::Mosh));
         assert!(view.form.as_ref().unwrap().use_mosh);
         view.apply(super::SshViewAction::SetNetwork(SshNetwork::Tailnet));
         assert_eq!(view.form.as_ref().unwrap().network, SshNetwork::System);
+    }
+
+    #[test]
+    fn a_new_host_connects_with_thinkterm_until_told_otherwise() {
+        use super::HostMode;
+        let mut view = SshHostsView::new();
+        view.open_new_form();
+        let form = view.form.as_ref().unwrap();
+        assert_eq!(HostMode::of(form.use_mosh, form.multiplexing), HostMode::Connect);
+        assert!(form.files_auto_connect && form.shell_integration && form.detect_os);
+        for mode in [HostMode::Ssh, HostMode::Mosh, HostMode::Connect] {
+            view.apply(super::SshViewAction::SetMode(mode));
+            let form = view.form.as_ref().unwrap();
+            assert_eq!(HostMode::of(form.use_mosh, form.multiplexing), mode);
+            assert!(!(form.use_mosh && form.multiplexing));
+        }
+    }
+
+    #[test]
+    fn a_host_from_ssh_config_is_added_on_connect() {
+        use super::HostMode;
+        let mut view = SshHostsView::new();
+        let mut system = spec("staging", "198.51.100.20");
+        system.username = Some("user".into());
+        system.port = Some(2222);
+        view.open_connect_form_from(&system);
+        let form = view.form.as_ref().unwrap();
+        assert!(form.editing.is_none());
+        assert_eq!(form.fields[super::FIELD_NAME].text(), "staging");
+        assert_eq!(form.fields[super::FIELD_HOST].text(), "198.51.100.20");
+        assert_eq!(form.fields[super::FIELD_USER].text(), "user");
+        assert_eq!(form.fields[super::FIELD_PORT].text(), "2222");
+        assert_eq!(HostMode::of(form.use_mosh, form.multiplexing), HostMode::Connect);
+    }
+
+    #[test]
+    fn a_host_from_ssh_config_without_a_port_leaves_it_to_the_config() {
+        let mut view = SshHostsView::new();
+        let mut system = spec("backup", "backup.example");
+        system.port = None;
+        view.filtered = vec![SshHostEntry {
+            id: "system-backup".to_string(),
+            source: SshHostSource::System,
+            spec: system,
+        }];
+        view.selection_active = true;
+        view.apply(super::SshViewAction::AddWithConnect(0));
+        let form = view.form.as_ref().unwrap();
+        assert_eq!(form.fields[super::FIELD_HOST].text(), "backup.example");
+        assert_eq!(form.fields[super::FIELD_PORT].text(), "");
+        assert!(!view.selection_active);
+    }
+
+    #[test]
+    fn choosing_a_mode_clears_the_error_of_the_last_one() {
+        use super::HostMode;
+        let mut view = SshHostsView::new();
+        view.open_new_form();
+        view.form.as_mut().unwrap().network = SshNetwork::Tailnet;
+        view.apply(super::SshViewAction::SetMode(HostMode::Mosh));
+        let form = view.form.as_ref().unwrap();
+        assert!(form.error.is_some());
+        assert_eq!(HostMode::of(form.use_mosh, form.multiplexing), HostMode::Connect);
+        view.apply(super::SshViewAction::SetMode(HostMode::Ssh));
+        assert!(view.form.as_ref().unwrap().error.is_none());
     }
 
     #[test]

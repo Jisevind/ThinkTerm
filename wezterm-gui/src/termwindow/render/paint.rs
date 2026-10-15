@@ -1901,8 +1901,13 @@ impl crate::TermWindow {
             .unwrap_or_default();
         // The caption is the smallest step: what sits under a title, a count.
         let (ui_font, title_font, section_font, caption_font) = match typography {
-            ContentViewTypography::Default => {
+            ContentViewTypography::Default | ContentViewTypography::RegularCaption => {
                 let font_size = crate::native_settings::home_font_size(&settings);
+                let caption_weight = if typography == ContentViewTypography::RegularCaption {
+                    font_weight.min(400)
+                } else {
+                    font_weight
+                };
                 (
                     self.fonts
                         .command_palette_font_with_size_and_weight(font_size, font_weight)?,
@@ -1912,7 +1917,7 @@ impl crate::TermWindow {
                         .title_font_with_size_and_weight(font_size + 2.0, font_weight.max(700))?,
                     self.fonts.command_palette_font_with_size_and_weight(
                         (font_size - 2.0).max(9.0),
-                        font_weight,
+                        caption_weight,
                     )?,
                 )
             }

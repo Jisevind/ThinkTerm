@@ -779,6 +779,9 @@ pub(crate) struct NativeChromeSettings {
     /// How wide the user made each plugin's extended view, by plugin, in
     /// unscaled pixels. A plugin's goes when the host lists it no more.
     pub(crate) plugin_extended_widths: BTreeMap<String, usize>,
+    /// How wide the user made the Remote Hosts page's form, in unscaled
+    /// pixels.
+    pub(crate) remote_hosts_inspector_width: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2660,6 +2663,16 @@ pub(crate) fn agents_panel_view() -> NativeAgentsPanelView {
 
 pub(crate) fn save_agents_panel_view(view: NativeAgentsPanelView) -> anyhow::Result<()> {
     update_ui_state_and_settings_window(|settings| settings.chrome.agents_panel_view = view)
+}
+
+pub(crate) fn remote_hosts_inspector_width() -> Option<usize> {
+    load_shared().chrome.remote_hosts_inspector_width
+}
+
+pub(crate) fn save_remote_hosts_inspector_width(width: usize) -> anyhow::Result<()> {
+    update_ui_state_and_settings_window(|settings| {
+        settings.chrome.remote_hosts_inspector_width = Some(width)
+    })
 }
 
 pub(crate) fn remote_update_keeps_sessions() -> bool {

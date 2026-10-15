@@ -124,6 +124,9 @@ pub enum SvgIcon {
     LogOut,
     Monitor,
     Network,
+    /// The mux server of the README's architecture diagram: a host whose
+    /// sessions live on it, which is what ThinkTerm Connect means.
+    MuxServer,
     /// Apple's mark, tinted like the rest rather than painted in its own
     /// black: drawn white, it vanishes on a light theme.
     Apple,
@@ -406,6 +409,7 @@ impl SvgIcon {
             Self::Monitor => include_bytes!("../../../../third_party/lucide/icons/monitor.svg"),
             Self::Apple => include_bytes!("../../../../third_party/simple-icons/icons/apple.svg"),
             Self::Network => include_bytes!("../../../../third_party/lucide/icons/network.svg"),
+            Self::MuxServer => include_bytes!("../../../../assets/ui/mux-server.svg"),
             Self::QrCode => include_bytes!("../../../../third_party/lucide/icons/qr-code.svg"),
             Self::Smartphone => {
                 include_bytes!("../../../../third_party/lucide/icons/smartphone.svg")
@@ -866,6 +870,7 @@ mod tests {
             SvgIcon::BellRing,
             SvgIcon::Braces,
             SvgIcon::Server,
+            SvgIcon::MuxServer,
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,
             SvgIcon::ChevronRight,

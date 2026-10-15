@@ -2010,6 +2010,24 @@ impl super::TermWindow {
                 return;
             }
         }
+        // A page dragging something of its own -- the Remote Hosts form's
+        // edge -- keeps the pointer until it lets go, wherever it goes.
+        if self.content_view_foreground()
+            && self
+                .active_content_view()
+                .is_some_and(|view| view.holds_pointer())
+        {
+            let px = event.coords.x as f32;
+            let py = event.coords.y as f32;
+            let resp = self
+                .active_content_view_mut()
+                .map(|view| (view.on_pointer(px, py, &event), view.cursor(px, py)));
+            if let Some((resp, cursor)) = resp {
+                context.set_cursor(Some(cursor.unwrap_or(MouseCursor::Arrow)));
+                self.handle_content_response(resp);
+            }
+            return;
+        }
         let pane = self.get_active_pane_or_overlay();
 
         if self.frontend_handoff_consumed_press && matches!(event.kind, WMEK::Release(_)) {
@@ -2530,16 +2548,20 @@ impl super::TermWindow {
             let area = self.content_view_area();
             if px >= area.min_x() && px < area.max_x() && py >= area.min_y() && py < area.max_y() {
                 let resp = self.active_content_view_mut().map(|v| {
-                    if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)) {
+                    let resp = if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)) {
                         // Pixel deltas and scroll phases do not survive the
                         // trip through `MouseEventKind`; hand the view the
                         // whole event so it can scroll like a trackpad.
                         v.on_wheel(px, py, &event)
                     } else {
-                        v.on_mouse(px, py, event.kind)
-                    }
+                        v.on_pointer(px, py, &event)
+                    };
+                    (resp, v.cursor(px, py))
                 });
-                if let Some(resp) = resp {
+                if let Some((resp, cursor)) = resp {
+                    if let Some(cursor) = cursor {
+                        context.set_cursor(Some(cursor));
+                    }
                     self.handle_content_response(resp);
                 }
             }
