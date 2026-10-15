@@ -284,6 +284,17 @@ pub fn download_asset_to(
     }
 }
 
+/// The installer ci/deploy.sh builds for `arch`. x86_64 keeps the name it
+/// had before there was an arm64 one, which every copy installed since
+/// looks for. An arm64 copy must not take that one: it installs over the
+/// native build in the same place, and the machine then runs it emulated.
+fn windows_installer_name(arch: &str, version: &str) -> String {
+    match arch {
+        "aarch64" => format!("ThinkTerm-{version}-arm64-setup.exe"),
+        _ => format!("ThinkTerm-{version}-setup.exe"),
+    }
+}
+
 /// Windows: fetch the release's installer and hand over to it. Inno Setup
 /// closes the running ThinkTerm, replaces the files and restarts it, so
 /// this process must not wait for it -- it is one of the files.
@@ -297,7 +308,7 @@ pub fn run_windows_installer(
     progress: &mut dyn FnMut(InstallProgress),
 ) -> anyhow::Result<()> {
     let version = release.tag_name.trim_start_matches('v');
-    let wanted = format!("ThinkTerm-{version}-setup.exe");
+    let wanted = windows_installer_name(std::env::consts::ARCH, version);
     let asset = release
         .assets
         .iter()
@@ -1137,6 +1148,12 @@ mod tests {
             );
         }
         assert_eq!(asset_name_for("windows", "x86_64", "desktop", "1.2.3"), None);
+    }
+
+    #[test]
+    fn windows_installer_follows_the_architecture() {
+        assert_eq!(windows_installer_name("x86_64", "1.2.3"), "ThinkTerm-1.2.3-setup.exe");
+        assert_eq!(windows_installer_name("aarch64", "1.2.3"), "ThinkTerm-1.2.3-arm64-setup.exe");
     }
 
     #[test]
