@@ -8,7 +8,7 @@ use finl_unicode::grapheme_clusters::Graphemes;
 use log::error;
 use ordered_float::NotNan;
 use std::cell::{RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use termwiz::cell::{unicode_column_width, Presentation};
 use wezterm_bidi::Direction;
@@ -80,9 +80,22 @@ struct MetricsKey {
     dpi: u32,
 }
 
+/// How many characters each font remembers lacking: more than the CJK text
+/// of a page, and the set starts over once it is full.
+const MISSING_CHARS_LIMIT: usize = 4096;
+
 pub struct HarfbuzzShaper {
     handles: Vec<ParsedFont>,
     fonts: Vec<RefCell<Option<FontPair>>>,
+    /// For each font, characters it was asked to shape and had no glyph for.
+    /// A run made only of them goes straight on to the next font. Without
+    /// this, every run of CJK text in a UI font loaded each fallback ahead
+    /// of the CJK font again -- face, size, cell metrics -- since a fallback
+    /// that shapes nothing is unloaded after each pass (see `do_shape`).
+    missing: Vec<RefCell<HashSet<char>>>,
+    /// How many times each font has been loaded.
+    #[cfg(test)]
+    loads: Vec<std::cell::Cell<usize>>,
     lib: ftwrap::Library,
     metrics: RefCell<HashMap<MetricsKey, FontMetrics>>,
     features: Vec<harfbuzz::hb_feature_t>,
@@ -121,8 +134,14 @@ impl HarfbuzzShaper {
         let lib = ftwrap::Library::new()?;
         let handles = handles.to_vec();
         let mut fonts = vec![];
+        let mut missing = vec![];
+        #[cfg(test)]
+        let mut loads = vec![];
         for _ in 0..handles.len() {
             fonts.push(RefCell::new(None));
+            missing.push(RefCell::new(HashSet::new()));
+            #[cfg(test)]
+            loads.push(std::cell::Cell::new(0));
         }
 
         let lang = harfbuzz::language_from_string("en")?;
@@ -136,11 +155,42 @@ impl HarfbuzzShaper {
         Ok(Self {
             fonts,
             handles,
+            missing,
+            #[cfg(test)]
+            loads,
             lib,
             metrics: RefCell::new(HashMap::new()),
             features,
             lang,
         })
+    }
+
+    /// Whether `font_idx` has been seen to have no glyph for any character
+    /// of `text`, each a grapheme of its own. Characters that combine can
+    /// shape into a glyph none of them has alone -- conjoining Hangul jamo
+    /// into a syllable -- so a run with any is tried as before.
+    fn lacks_all(&self, font_idx: FallbackIdx, text: &str) -> bool {
+        let Some(missing) = self.missing.get(font_idx) else {
+            return false;
+        };
+        let missing = missing.borrow();
+        !text.is_empty()
+            && !missing.is_empty()
+            && text.chars().all(|c| missing.contains(&c))
+            && Graphemes::new(text).all(|grapheme| get_only_char(grapheme).is_some())
+    }
+
+    fn note_missing(&self, font_idx: FallbackIdx, c: char) {
+        if let Some(missing) = self.missing.get(font_idx) {
+            let mut missing = missing.borrow_mut();
+            if missing.contains(&c) {
+                return;
+            }
+            if missing.len() >= MISSING_CHARS_LIMIT {
+                missing.clear();
+            }
+            missing.insert(c);
+        }
     }
 
     fn load_fallback(
@@ -158,6 +208,8 @@ impl HarfbuzzShaper {
                 if opt_pair.is_none() {
                     let handle = &self.handles[font_idx];
                     log::trace!("shaper wants {} {:?}", font_idx, handle);
+                    #[cfg(test)]
+                    self.loads[font_idx].set(self.loads[font_idx].get() + 1);
                     let face = self.lib.face_from_locator(&handle.handle)?;
 
                     let font = if USE_OT_FACE {
@@ -242,6 +294,15 @@ impl HarfbuzzShaper {
         let mut no_more_fallbacks = false;
 
         loop {
+            // A font already seen without any of these characters would only
+            // hand them all on to the next one. (`get`: the retry with a
+            // question string below keeps the range of the original text.)
+            if !no_more_fallbacks
+                && s.get(range.clone()).is_some_and(|text| self.lacks_all(font_idx, text))
+            {
+                font_idx += 1;
+                continue;
+            }
             match self.load_fallback(font_idx, dpi).context("load_fallback")? {
                 Some(mut pair) => {
                     if let Some(p) = presentation {
@@ -412,6 +473,12 @@ impl HarfbuzzShaper {
 
             if info.codepoint == 0 && !no_more_fallbacks {
                 cluster_info.incomplete = true;
+                // A character that shaped on its own and got no glyph is
+                // one this font does not have.
+                let start = cluster_info.start;
+                if let Some(c) = get_only_char(&s[start..start + cluster_info.byte_len]) {
+                    self.note_missing(font_idx, c);
+                }
             }
 
             if let Some(ref mut cluster) = info_clusters.last_mut() {
@@ -839,6 +906,8 @@ mod test {
     use super::*;
     use crate::FontDatabase;
     use config::FontAttributes;
+    use termwiz::cell::CellAttributes;
+    use termwiz::surface::{Line, SEQ_ZERO};
 
     #[test]
     fn ligatures() {
@@ -1239,5 +1308,138 @@ mod test {
 "#
             );
         }
+    }
+
+    /// None of the first three has emoji; none of the four has CJK.
+    fn emoji_last() -> Vec<ParsedFont> {
+        let db = FontDatabase::with_built_in().unwrap();
+        [
+            "Roboto",
+            "JetBrains Mono",
+            "Symbols Nerd Font Mono",
+            "Noto Color Emoji",
+        ]
+        .iter()
+        .map(|family| db.resolve(&FontAttributes::new(family), 14).unwrap().clone())
+        .collect()
+    }
+
+    fn shape_with(
+        shaper: &HarfbuzzShaper,
+        text: &str,
+        presentation: Option<Presentation>,
+        presentation_width: Option<&PresentationWidth>,
+    ) -> (Vec<GlyphInfo>, Vec<char>) {
+        let mut no_glyphs = vec![];
+        let info = shaper
+            .shape(
+                text,
+                10.,
+                72,
+                &mut no_glyphs,
+                presentation,
+                Direction::LeftToRight,
+                None,
+                presentation_width,
+            )
+            .unwrap();
+        (info, no_glyphs)
+    }
+
+    /// Fallbacks seen without a run's characters are passed over the next
+    /// time -- not even loaded -- and the run shapes exactly as it does when
+    /// every font is tried.
+    #[test]
+    fn fallbacks_known_to_lack_a_run_are_passed_over() {
+        let handles = emoji_last();
+        let config = config::configuration();
+        let texts = ["x", "😀", "a😀b", "😀😀", "\u{f120}", "中", "a中"];
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        for text in texts {
+            shape_with(&shaper, text, None, None);
+        }
+        for font_idx in 0..3 {
+            assert!(shaper.lacks_all(font_idx, "😀😀"), "font {font_idx}");
+            assert!(!shaper.lacks_all(font_idx, "a😀"), "font {font_idx}");
+        }
+        assert!(!shaper.lacks_all(3, "😀"));
+        for font_idx in 0..4 {
+            assert!(shaper.lacks_all(font_idx, "中"), "font {font_idx}");
+        }
+
+        // Tried, JetBrains Mono would be loaded for the emoji and unloaded
+        // again, as it gives none of them a glyph.
+        let loads = |shaper: &HarfbuzzShaper| {
+            shaper
+                .loads
+                .iter()
+                .map(std::cell::Cell::get)
+                .collect::<Vec<_>>()
+        };
+        let before = loads(&shaper);
+        shape_with(&shaper, "😀😀", None, None);
+        shape_with(&shaper, "😀😀", None, None);
+        assert_eq!(loads(&shaper), before);
+
+        for text in texts {
+            for presentation in [None, Some(Presentation::Text), Some(Presentation::Emoji)] {
+                let fresh = HarfbuzzShaper::new(&config, &handles).unwrap();
+                assert_eq!(
+                    shape_with(&shaper, text, presentation, None),
+                    shape_with(&fresh, text, presentation, None),
+                    "{text} {presentation:?}"
+                );
+            }
+        }
+
+        // And cell by cell, the way the terminal shapes a line.
+        let line = Line::from_text(
+            "a😀b中\u{f120}x",
+            &CellAttributes::default(),
+            SEQ_ZERO,
+            None,
+        );
+        for cluster in line.cluster(None) {
+            let width = PresentationWidth::with_cluster(&cluster);
+            let fresh = HarfbuzzShaper::new(&config, &handles).unwrap();
+            assert_eq!(
+                shape_with(&shaper, &cluster.text, Some(cluster.presentation), Some(&width)),
+                shape_with(&fresh, &cluster.text, Some(cluster.presentation), Some(&width)),
+                "{}",
+                cluster.text
+            );
+        }
+    }
+
+    /// Characters that combine shape together, so the run is tried even when
+    /// the font lacks each alone; an empty run lacks nothing.
+    #[test]
+    fn only_runs_of_single_character_graphemes_are_passed_over() {
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
+        // Conjoining jamo: a font can have the syllable they make and
+        // neither of them.
+        shaper.note_missing(0, '\u{1100}');
+        shaper.note_missing(0, '\u{1161}');
+        assert!(shaper.lacks_all(0, "\u{1100}"));
+        assert!(shaper.lacks_all(0, "\u{1161}\u{1100}"));
+        assert!(!shaper.lacks_all(0, "\u{1100}\u{1161}"));
+        assert!(!shaper.lacks_all(0, ""));
+    }
+
+    /// Past the limit the set starts over, but only to take in a character
+    /// it does not hold yet.
+    #[test]
+    fn a_full_set_starts_over_only_for_a_new_character() {
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
+        let chars: Vec<char> = ('\u{4e00}'..).take(MISSING_CHARS_LIMIT + 1).collect();
+        for &c in &chars[..MISSING_CHARS_LIMIT] {
+            shaper.note_missing(0, c);
+        }
+        shaper.note_missing(0, chars[0]);
+        assert_eq!(shaper.missing[0].borrow().len(), MISSING_CHARS_LIMIT);
+        shaper.note_missing(0, chars[MISSING_CHARS_LIMIT]);
+        assert_eq!(shaper.missing[0].borrow().len(), 1);
     }
 }
