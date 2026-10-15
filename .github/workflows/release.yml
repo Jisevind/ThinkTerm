@@ -40,11 +40,11 @@ on:
       macos_arm64:
         description: macOS arm64 (signed and notarized)
         type: boolean
-        default: false
+        default: true
       macos_x86_64:
         description: macOS x86_64 (signed and notarized)
         type: boolean
-        default: false
+        default: true
       windows_x86_64:
         description: Windows x86_64
         type: boolean
@@ -53,7 +53,7 @@ on:
       windows_arm64:
         description: Windows arm64
         type: boolean
-        default: false
+        default: true
       linux_x86_64:
         description: Linux x86_64 (deb + rpm + AppImage + tarballs)
         type: boolean
