@@ -75,10 +75,23 @@ jobs:
       - name: Build and test
         run: cargo test --workspace --no-fail-fast
 
+  # Windows on arm64 builds natively on its own runner rather than cross
+  # from x86_64, so the tests run on the arch they were built for. That
+  # runner is free on public repos only; on a private one the leg fails.
   windows:
-    name: windows x86_64
-    runs-on: windows-2022
+    name: windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs_on: windows-2022
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
 
     env:
       RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
@@ -97,18 +110,34 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
+
+      # The build below targets the host, so an x86_64 toolchain on the arm
+      # runner would quietly test the emulated build instead.
+      - name: Check host
+        shell: bash
+        run: |
+          rustc -vV
+          [ "$(rustc -vV | sed -n 's/^host: //p')" = '${{ matrix.target }}' ]
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ci-windows-x86_64
+          key: ci-windows-${{ matrix.arch }}
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
+      # wezterm-gui's build script stages these next to the test binaries,
+      # as the x86_64 leg gets its checked-in copies.
+      - name: Fetch the arm64 DLLs
+        if: matrix.arch == 'arm64'
+        shell: bash
+        run: bash ci/windows-arm64-assets.sh
+
       # openssl-src needs perl; Strawberry Perl ships on the runner but is not
       # on PATH by default. `cmd`'s builtin `PATH <value>` form, as the
-      # release workflow uses.
+      # release workflow uses. On arm64, ring compiles its C with clang,
+      # which the runner image ships.
       - name: Build and test
         shell: cmd
         run: |
