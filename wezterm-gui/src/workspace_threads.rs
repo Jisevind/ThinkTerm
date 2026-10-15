@@ -4731,7 +4731,7 @@ fn notify_remote_tree_mutation_unavailable(domain_name: &str) {
     );
     if crate::frontend::try_front_end().is_some() {
         let mut args = FluentArgs::new();
-        args.set("name", domain_name.to_string());
+        args.set("name", crate::ssh_hosts::connect_domain_label(domain_name));
         wezterm_toast_notification::persistent_toast_notification(
             "ThinkTerm",
             &crate::i18n::tr_args("remote-tree-mutation-offline", &args),

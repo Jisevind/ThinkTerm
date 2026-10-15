@@ -484,31 +484,64 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 /// credentials, so hosts added in the UI are connectable (and reconnect
 /// silently) without a lua ssh_domains entry.
 pub(crate) fn connect_domain_from_ssh_host(name: &str) -> anyhow::Result<Arc<dyn Domain>> {
-    let entry = crate::ssh_hosts::list_all_hosts()
-        .into_iter()
-        .find(|entry| {
-            entry.spec.label == name
-                || entry.id == name
-                || crate::ssh_hosts::connect_domain_name(&entry.spec) == name
-        })
-        .ok_or_else(|| {
-            anyhow!("invalid domain {name}: not in ssh_domains and not a saved SSH host")
-        })?;
-    let mut dom = crate::ssh_hosts::build_ssh_domain(&entry.spec);
-    dom.name = match entry.spec.network {
+    let hosts = crate::ssh_hosts::list_all_hosts();
+    let entry = crate::ssh_hosts::host_for_connect_domain(&hosts, name).ok_or_else(|| {
+        anyhow!("invalid domain {name}: not in ssh_domains and not a saved SSH host")
+    })?;
+    let domain_name = match entry.spec.network {
         crate::ssh_hosts::SshNetwork::System => name.to_string(),
         crate::ssh_hosts::SshNetwork::Tailnet => crate::ssh_hosts::connect_domain_name(&entry.spec),
     };
+    Ok(add_ssh_host_client_domain(&entry.spec, domain_name))
+}
+
+/// The ThinkTerm Connect domain of the saved host `host_id`. The id picks
+/// that exact record even when another host shares its label, but the domain
+/// is still named the way its Space knows it (`connect_domain_name`): named
+/// after the id, it would get a Space of its own called `ssh-<hash>`.
+pub(crate) fn connect_domain_for_ssh_host_id(host_id: &str) -> anyhow::Result<Arc<dyn Domain>> {
+    let entry = crate::ssh_hosts::list_all_hosts()
+        .into_iter()
+        .find(|entry| entry.id == host_id)
+        .ok_or_else(|| anyhow!("no saved SSH host {host_id}"))?;
+    let domain_name = crate::ssh_hosts::connect_domain_name(&entry.spec);
+    Ok(add_ssh_host_client_domain(&entry.spec, domain_name))
+}
+
+/// Rebuild a saved host's Connect domain from its record after an edit: a
+/// client keeps the address, user and password it was built with, so one
+/// registered earlier would go on with the old ones until a restart. Only a
+/// domain doing nothing is replaced; one that is attached, attaching or
+/// retrying keeps going as it is.
+pub(crate) fn refresh_connect_domain_for_ssh_host(spec: &crate::ssh_hosts::SshHostSpec) {
+    let name = crate::ssh_hosts::connect_domain_name(spec);
+    let Some(domain) = Mux::get().get_domain_by_name(&name) else {
+        return;
+    };
+    let idle = domain.state() == mux::domain::DomainState::Detached
+        && domain
+            .downcast_ref::<ClientDomain>()
+            .is_some_and(|client| !client.is_attaching() && !client.is_attach_retrying());
+    if idle {
+        add_ssh_host_client_domain(spec, name);
+    }
+}
+
+fn add_ssh_host_client_domain(
+    spec: &crate::ssh_hosts::SshHostSpec,
+    domain_name: String,
+) -> Arc<dyn Domain> {
+    let mut dom = crate::ssh_hosts::build_ssh_domain(spec);
+    dom.name = domain_name;
     dom.multiplexing = SshMultiplexing::WezTerm;
-    dom.stored_password = entry
-        .spec
+    dom.stored_password = spec
         .password
         .as_deref()
         .map(crate::secret::reveal)
         .filter(|p| !p.is_empty());
     let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(ClientDomainConfig::Ssh(dom)));
     Mux::get().add_domain(&domain);
-    Ok(domain)
+    domain
 }
 
 async fn current_gui_terminal_size(

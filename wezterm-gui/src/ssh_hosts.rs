@@ -734,6 +734,22 @@ fn label_for_connect_domain<'a>(
         .filter(|label| !label.is_empty())
 }
 
+/// The saved host a ThinkTerm Connect domain name stands for. The name a
+/// Space keeps for its host is tried first: a host on the system network and
+/// one on the embedded tailnet may share a label, and only that name tells
+/// them apart. Then a record id, and a bare label (as typed for `thinkterm
+/// connect`) last.
+pub fn host_for_connect_domain<'a>(
+    hosts: &'a [SshHostEntry],
+    name: &str,
+) -> Option<&'a SshHostEntry> {
+    hosts
+        .iter()
+        .find(|entry| connect_domain_name(&entry.spec) == name)
+        .or_else(|| hosts.iter().find(|entry| entry.id == name))
+        .or_else(|| hosts.iter().find(|entry| entry.spec.label == name))
+}
+
 /// Every name this host can be connected under.
 ///
 /// A ThinkTerm Connect host attaches its persistent mux domain under the
@@ -750,19 +766,53 @@ pub fn domain_names_for_host(spec: &SshHostSpec) -> Vec<String> {
     names
 }
 
-/// Whether a mux domain of this name can still be reached.
-///
-/// Deliberately the same question `connect_domain_from_ssh_host` answers, so
-/// "reachable" here means exactly "something would happen if you clicked it":
-/// a lua-configured or already-attached domain, or a saved host that would be
-/// connected under this name.
+/// Whether a mux domain of this name can still be reached: a lua-configured
+/// or already-attached domain, or a saved host that is connected under this
+/// name. Not a host's record id, though `connect_domain_from_ssh_host` takes
+/// one: Remote Hosts once connected hosts under their ids, and a Space left
+/// under one is forgotten here so that the host's next connection brings it
+/// back under the host's own name.
 fn domain_name_is_reachable(domain_name: &str) -> bool {
     if Mux::get().get_domain_by_name(domain_name).is_some() {
         return true;
     }
     list_all_hosts()
         .into_iter()
-        .any(|entry| connect_domain_name(&entry.spec) == domain_name || entry.id == domain_name)
+        .any(|entry| connect_domain_name(&entry.spec) == domain_name)
+}
+
+/// The names a host could be connected under that an edit takes from it: its
+/// connection name, when it is renamed or moved to the other network.
+fn domain_names_dropped(old: &SshHostSpec, new: &SshHostSpec) -> Vec<String> {
+    let kept = domain_names_for_host(new);
+    domain_names_for_host(old)
+        .into_iter()
+        .filter(|name| !kept.contains(name))
+        .collect()
+}
+
+/// The names an edit of a host leaves with nothing to connect: those it no
+/// longer answers to that no other saved host answers to either. A domain
+/// registered under one earlier this session does not count, as it would for
+/// `domain_name_is_reachable`: the Mux keeps every domain it was given, and
+/// that one is the host as it was before the edit.
+pub fn domain_names_left_unreachable(old: &SshHostSpec, new: &SshHostSpec) -> Vec<String> {
+    names_left_unreachable(old, new, &list_all_hosts())
+}
+
+fn names_left_unreachable(
+    old: &SshHostSpec,
+    new: &SshHostSpec,
+    hosts: &[SshHostEntry],
+) -> Vec<String> {
+    domain_names_dropped(old, new)
+        .into_iter()
+        .filter(|name| {
+            !hosts
+                .iter()
+                .any(|entry| domain_names_for_host(&entry.spec).contains(name))
+        })
+        .collect()
 }
 
 /// Drop this device's copy of every Space whose mux server it can no longer
@@ -1024,6 +1074,81 @@ mod tests {
         );
         // Any other domain is already called what it is named.
         assert_eq!(connect_domain_label("server-b"), "server-b");
+    }
+
+    #[test]
+    fn a_label_on_both_networks_finds_the_host_its_space_was_connected_through() {
+        let mut system = spec_with_options(HashMap::new());
+        system.label = "server-a".into();
+        system.host = "192.0.2.10".into();
+        let mut tailnet = system.clone();
+        tailnet.host = "100.64.0.2".into();
+        tailnet.network = SshNetwork::Tailnet;
+        let entry = |spec: &SshHostSpec| SshHostEntry {
+            id: host_id_for_host(spec),
+            source: SshHostSource::ThinkTerm,
+            spec: spec.clone(),
+        };
+        let network = |hosts: &[SshHostEntry], name: &str| {
+            host_for_connect_domain(hosts, name).map(|entry| entry.spec.network)
+        };
+        // Listed first, the tailnet host shares the label but must not
+        // answer for the Spaces of the one on the system network.
+        let hosts = [entry(&tailnet), entry(&system)];
+        assert_eq!(network(&hosts, "server-a"), Some(SshNetwork::System));
+        assert_eq!(
+            network(&hosts, &connect_domain_name(&tailnet)),
+            Some(SshNetwork::Tailnet)
+        );
+        assert_eq!(
+            network(&hosts, &host_id_for_host(&tailnet)),
+            Some(SshNetwork::Tailnet)
+        );
+        // With nothing else called that, the label still finds its host.
+        let hosts = [entry(&tailnet)];
+        assert_eq!(network(&hosts, "server-a"), Some(SshNetwork::Tailnet));
+        assert_eq!(network(&hosts, "server-b"), None);
+    }
+
+    #[test]
+    fn a_rename_or_a_move_to_the_other_network_drops_the_name_its_spaces_know() {
+        let mut old = spec_with_options(HashMap::new());
+        old.label = "server-a".into();
+        old.host = "100.64.0.2".into();
+        let dropped = |new: &SshHostSpec| domain_names_dropped(&old, new);
+
+        let mut new = old.clone();
+        new.multiplexing = true;
+        new.detect_os = false;
+        assert!(dropped(&new).is_empty());
+
+        new.label = "server-b".into();
+        assert_eq!(dropped(&new), vec!["server-a".to_string()]);
+
+        let mut new = old.clone();
+        new.network = SshNetwork::Tailnet;
+        assert!(dropped(&new).contains(&"server-a".to_string()));
+
+        // Back again: the tailnet name goes, the label is the name once more.
+        let mut back = new.clone();
+        back.network = SshNetwork::System;
+        let names = domain_names_dropped(&new, &back);
+        assert!(names.contains(&connect_domain_name(&new)));
+        assert!(!names.contains(&"server-a".to_string()));
+
+        // A name another saved host still goes by is that host's to keep.
+        let entry = |spec: &SshHostSpec| SshHostEntry {
+            id: host_id_for_host(spec),
+            source: SshHostSource::ThinkTerm,
+            spec: spec.clone(),
+        };
+        let mut renamed = old.clone();
+        renamed.label = "server-b".into();
+        let mut other = old.clone();
+        other.host = "192.0.2.10".into();
+        let left = |hosts: &[SshHostEntry]| names_left_unreachable(&old, &renamed, hosts);
+        assert!(left(&[entry(&renamed)]).contains(&"server-a".to_string()));
+        assert!(!left(&[entry(&renamed), entry(&other)]).contains(&"server-a".to_string()));
     }
 
     #[test]

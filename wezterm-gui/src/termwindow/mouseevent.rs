@@ -6192,19 +6192,22 @@ impl super::TermWindow {
                 .find(|space| space.domain.as_deref() == Some(domain))
                 .map(|space| self.space_connection_state(&space.id))
                 .unwrap_or(SpaceConnectionState::Connected);
+            // The host's own name: one on the embedded tailnet is connected
+            // under its address.
+            let name = crate::ssh_hosts::connect_domain_label(domain);
             let header = match state {
-                SpaceConnectionState::Connected => tr_with_name("menu-space-server-group", domain),
+                SpaceConnectionState::Connected => tr_with_name("menu-space-server-group", &name),
                 SpaceConnectionState::Connecting => {
-                    tr_with_name("menu-space-server-group-connecting", domain)
+                    tr_with_name("menu-space-server-group-connecting", &name)
                 }
                 // Distinct from disconnected: the transport is being retried,
                 // and calling that "disconnected" reads as though the Spaces
                 // below are unreachable for good.
                 SpaceConnectionState::Reconnecting => {
-                    tr_with_name("menu-space-server-group-reconnecting", domain)
+                    tr_with_name("menu-space-server-group-reconnecting", &name)
                 }
                 SpaceConnectionState::Disconnected => {
-                    tr_with_name("menu-space-server-group-offline", domain)
+                    tr_with_name("menu-space-server-group-offline", &name)
                 }
             };
             // A server is a heading, not something to switch to. Saying that
@@ -6781,7 +6784,7 @@ impl super::TermWindow {
             promise::spawn::spawn(async move {
                 let domain = match Mux::get().get_domain_by_name(&name) {
                     Some(domain) => domain,
-                    None => match crate::connect_domain_from_ssh_host(&host_id) {
+                    None => match crate::connect_domain_for_ssh_host_id(&host_id) {
                         Ok(domain) => domain,
                         Err(err) => {
                             log::error!("connect {name}: {err:#}");
