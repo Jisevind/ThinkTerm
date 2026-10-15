@@ -1,0 +1,121 @@
+Patches to the vendored tailscale-rs crates
+===========================================
+
+What is here
+------------
+The folders here -- tailscale, ts_runtime, ts_control and ts_netstack_smoltcp_core -- are
+copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
+ThinkTerm's changes on top. The root Cargo.toml points crates.io's versions at them
+([patch.crates-io]) and keeps them out of the workspace (exclude). Every other tailscale-rs
+crate (ts_keys, ts_tunnel, ...) still comes from crates.io, held at the same version by
+Cargo.lock.
+
+Only thinkterm-tailnet/src/node.rs calls the library; the rest of ThinkTerm goes through
+thinkterm-tailnet.
+
+Finding our changes
+-------------------
+Every change is marked with a comment starting "ThinkTerm (<group>)", one of the groups
+below:
+
+    grep -rn "ThinkTerm (" deps/tailscale-rs --exclude=PATCHES.txt
+
+The whole difference from upstream, at any time, against a fresh copy of 0.6.1:
+
+    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core; do
+        curl -sL "https://static.crates.io/crates/$c/$c-0.6.1.crate" | tar xz -C /tmp
+        diff -ru "/tmp/$c-0.6.1" "deps/tailscale-rs/$c"
+    done
+
+Upstream files this copy does not carry (README.md, examples, tests, Cargo.lock,
+Cargo.toml.orig, .cargo_vcs_info.json) show up as "Only in", and so do the LICENSE and
+PATENTS that ts_runtime, ts_control and ts_netstack_smoltcp_core got from the tailscale
+crate, as they ship without them. All of that is expected.
+
+The changes
+-----------
+peer list (tailscale, ts_runtime)
+    Device::peers lists every peer in the tailnet; 0.6.1 only looks one up by name or
+    address. The peer tracker also answers at once when a netmap shows the tailnet has no
+    other peers, instead of leaving the question waiting.
+    Used by: the Tailscale group on the Remote Hosts page.
+    Drop when: upstream can list all peers without waiting.
+
+device info (ts_control; struct literals in ts_runtime's peer_db tests)
+    Node keeps, as DeviceInfo, the system, distribution and device model a peer reports in
+    its Hostinfo; 0.6.1 drops them.
+    Used by: the machine icons and subtitles on the Remote Hosts page.
+    Drop when: upstream keeps this on Node.
+
+sign-in state (tailscale, ts_runtime)
+    Device::current_auth_state, current_self_node and registration_error answer at once with
+    where signing in stands; 0.6.1's questions wait until it is done. When control turns the
+    device away, the control runner stays in a Failed state that says why, instead of
+    stopping with the reason only in the log.
+    Used by: the Tailscale panel's status, login link and error message.
+    Drop when: upstream offers status queries that do not wait, and reports a refused
+    registration.
+
+shutdown (tailscale)
+    Device::stop stops a device that is still shared: gracefully within a timeout, else
+    violently.
+    Used by: thinkterm-tailnet when it ends or replaces its node.
+    Drop when: upstream's shutdown works on a shared device.
+
+no panic (ts_runtime)
+    kameo 0.21 panics in Context::forward and try_forward when the target's mailbox is full
+    or closed. The registry and Env::forward ask from a task instead, so those cases come
+    back as errors. Env::ask backs off from 10 ms to 1 s when it retries an actor that has
+    stopped, instead of spinning.
+    Drop when: upstream moves to a kameo without the panic, or stops forwarding this way.
+
+lost peers (ts_netstack_smoltcp_core)
+    TCP sockets get a 10-minute timeout and a 2-minute keep-alive, so a peer that disappears
+    without a word (a laptop put to sleep) ends the connection instead of leaving it
+    retrying forever.
+    Drop when: upstream sets a timeout and a keep-alive on its sockets.
+
+build (all four)
+    #![doc = include_str!("../README.md")] became a one-line //! doc: the READMEs are not
+    vendored (the root .gitignore drops *.md). In Cargo.toml, tailscale loses its
+    [[example]], [[test]] and [profile.bench] sections, ts_netstack_smoltcp_core its
+    [dev-dependencies], and ts_runtime gains tokio's "time" feature. Upstream's proptest
+    module in ts_runtime/src/peer_tracker/peer_db.rs is switched off, as proptest is not a
+    dependency here.
+
+Tests
+-----
+The additions above are called from thinkterm-tailnet, so losing one in a merge fails the
+build. The changes in behaviour have tests:
+
+    cargo test -p ts_runtime -p ts_control -p ts_netstack_smoltcp_core --lib
+
+    lost peers     socket_impl::tcp::tests (connect and listen)
+    device info    node::tests
+    sign-in state  control_runner::tests (the reason given)
+    no panic       env::tests
+
+Not covered by a test: the peer tracker's answer for an empty tailnet, and the Failed state
+taking the place of the stop. Signing in to a real tailnet after an upgrade checks the
+first; signing in with a wrong auth key checks the second.
+
+Upgrading
+---------
+1. Read upstream's CHANGELOG.md for the new version: its security fixes, and anything that
+   touches the groups above. A group upstream now covers can be dropped instead of merged.
+2. For each of the four crates, merge three ways, file by file: the base is upstream's old
+   version, ours is deps/tailscale-rs/<crate>, theirs is upstream's new version. With both
+   versions unpacked in /tmp as above:
+
+       git merge-file deps/tailscale-rs/<crate>/src/<file> /tmp/<crate>-<old>/src/<file> \
+           /tmp/<crate>-<new>/src/<file>
+
+   Changes that do not overlap merge by themselves; overlapping ones are left between
+   conflict markers. Copy files upstream added; move by hand our changes in a file upstream
+   removed or renamed. For Cargo.toml, take upstream's new one and redo the build changes.
+3. Bump the version: the four entries under [patch.crates-io] in the root Cargo.toml and
+   the two in thinkterm-tailnet/Cargo.toml, then `cargo update` the other tailscale-rs
+   crates to the same version. All tailscale-rs crates move together.
+4. Build, run the tests above and thinkterm-tailnet's, then sign in to a real tailnet and
+   connect to a machine by name and by address.
+5. Update this file: the version above, and every group that changed or went away.

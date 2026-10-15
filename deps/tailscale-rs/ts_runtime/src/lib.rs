@@ -1,4 +1,5 @@
 //! Tailscale runtime.
+// ThinkTerm (build): was `#![doc = include_str!("../README.md")]`; the README is not vendored.
 
 extern crate ts_netstack_smoltcp as netstack;
 
@@ -165,6 +166,7 @@ macro_rules! forward {
                     msg: $msg,
                     ctx: &mut Context<Self, Self::Reply>,
                 ) -> RegForwarded<$actor, $msg> {
+                    // ThinkTerm (no panic): no longer async.
                     self.env.forward::<$actor, $msg>(ctx, None, msg)
                 }
             }
@@ -179,6 +181,7 @@ forward!(
     control_runner::Ipv6,
     control_runner::SelfNode,
     control_runner::AuthUrl,
+    // ThinkTerm (sign-in state): the next three.
     control_runner::CurrentSelfNode,
     control_runner::CurrentAuthUrl,
     control_runner::CurrentRegistrationError,
@@ -188,5 +191,6 @@ forward!(
     peer_tracker::PeerByName,
     peer_tracker::PeerByTailnetIp,
     peer_tracker::PeerByAcceptedRoute,
+    // ThinkTerm (peer list): added.
     peer_tracker::AllPeers
 );

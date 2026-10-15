@@ -20,6 +20,7 @@ use crate::{
     retained_bus::RetainedBus,
 };
 
+// ThinkTerm (no panic): added.
 /// How long `Env::ask` waits before its first retry at an actor that is not running, and the
 /// longest it waits between two.
 const ASK_RETRY_FIRST: Duration = Duration::from_millis(10);
@@ -179,15 +180,17 @@ impl Env {
         // but we throw away the result and just retry the forward for the previously discussed
         // reasons.
         //
-        // ThinkTerm: an actor that stopped for good keeps its name in the registry, so the lookup
-        // answers at once and the forward fails again; each retry waits a little longer, up to a
-        // second, rather than spin.
+        // ThinkTerm (no panic): an actor that stopped for good keeps its name in the registry, so
+        // the lookup answers at once and the forward fails again; each retry waits a little
+        // longer, up to a second, rather than spin.
         let mut pause = ASK_RETRY_FIRST;
         loop {
             let result = self.registry.ask(mk_forward(msg)).await;
 
             match result {
                 Ok(x) => return Ok(x),
+                // ThinkTerm (no panic): the registry answers with the actor's send error as its own
+                // handler error.
                 Err(SendError::HandlerError(SendError::ActorNotRunning(m))) if wait => {
                     msg = m;
                 }
@@ -225,6 +228,7 @@ impl Env {
             .with_actor_info(&self.registry)
     }
 
+    // ThinkTerm (no panic): rewritten.
     /// Forward a message to an actor through the registry.
     ///
     /// The reply comes from a task that asks on the caller's behalf, not from kameo's
@@ -275,9 +279,11 @@ impl Env {
     }
 }
 
+// ThinkTerm (no panic): was a `ForwardedReply`.
 pub type RegForwarded<A, M> =
     DelegatedReply<Result<<<A as Message<M>>::Reply as Reply>::Ok, Error>>;
 
+// ThinkTerm (no panic): the tests are ours.
 #[cfg(test)]
 mod tests {
     use kameo::{actor::Spawn, error::Infallible, mailbox};

@@ -163,6 +163,7 @@ mod msg_impl {
             deleg
         }
 
+        // ThinkTerm (peer list): added.
         /// Every peer we know of, or None before the first netmap. Unlike the lookups, this
         /// doesn't wait for one.
         #[message]
@@ -193,6 +194,7 @@ impl Message<Arc<ts_control::StateUpdate>> for PeerTracker {
         _ctx: &mut Context<Self, Self::Reply>,
     ) {
         let Some(peer_update) = &msg.peer_update else {
+            // ThinkTerm (peer list): added.
             // A whole netmap leaves the peers out when there are none: the tailnet is known to
             // have none from it. Only a whole one, with the DERP map every first netmap carries:
             // a tracker restarted mid-stream would take a later update of the node alone for

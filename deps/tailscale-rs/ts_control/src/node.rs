@@ -191,10 +191,12 @@ pub struct Node {
     /// The DERP region for this node, if known.
     pub derp_region: Option<ts_derp::RegionId>,
 
+    // ThinkTerm (device info): added.
     /// What the node reports about the device it runs on.
     pub device: DeviceInfo,
 }
 
+// ThinkTerm (device info): added.
 /// What a node reports about the device it runs on, from its Hostinfo. A field
 /// the node leaves out is empty.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
@@ -391,6 +393,7 @@ impl From<&ts_control_serde::Node<'_>> for Node {
                 .or_else(|| value.host_info.net_info.as_ref()?.preferred_derp)
                 .map(|x| ts_derp::RegionId(x.into())),
 
+            // ThinkTerm (device info): added.
             device: DeviceInfo {
                 os: value.host_info.os.to_owned(),
                 distro: value.host_info.distro.to_owned(),
@@ -467,5 +470,41 @@ impl From<&ts_control_serde::PeerChange<'_>> for NodeUpdate {
             tailnet_lock_key_signature: value.key_signature.map(|x| x.into()),
             underlay_addresses: value.endpoints.clone(),
         }
+    }
+}
+
+// ThinkTerm (device info): the tests are ours.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_node_keeps_what_it_says_about_its_device() {
+        let phone = ts_control_serde::Node {
+            name: "phone.example.ts.net.",
+            host_info: ts_control_serde::HostInfo {
+                os: "iOS",
+                device_model: "iPhone15,2",
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            Node::from(&phone).device,
+            DeviceInfo {
+                os: "iOS".into(),
+                distro: String::new(),
+                device_model: "iPhone15,2".into(),
+            }
+        );
+        let server = ts_control_serde::Node {
+            host_info: ts_control_serde::HostInfo {
+                os: "linux",
+                distro: "debian",
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(Node::from(&server).device.distro, "debian");
     }
 }

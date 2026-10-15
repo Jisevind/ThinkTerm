@@ -231,6 +231,7 @@ impl Device {
         })
     }
 
+    // ThinkTerm (sign-in state): the next three methods are ours.
     /// The current authorization state, or None while contacting control.
     /// This does not queue a request waiting for registration to finish.
     pub async fn current_auth_state(&self) -> Result<Option<AuthState>, Error> {
@@ -343,6 +344,7 @@ impl Device {
             .map_err(Into::into)
     }
 
+    // ThinkTerm (peer list): added.
     /// Every peer in the tailnet as of the latest update from control, or None before the first
     /// netmap.
     pub async fn peers(&self) -> Result<Option<Vec<NodeInfo>>, Error> {
@@ -362,6 +364,7 @@ impl Device {
             .map_err(Into::into)
     }
 
+    // ThinkTerm (shutdown): added.
     /// [`Device::shutdown`] for a device still shared: stops its runtime gracefully within
     /// `timeout`, else violently, and reports which.
     pub async fn stop(&self, timeout: Duration) -> bool {

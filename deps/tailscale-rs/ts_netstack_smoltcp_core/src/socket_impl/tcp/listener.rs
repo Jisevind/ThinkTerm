@@ -62,7 +62,7 @@ impl Netstack {
         match cmd {
             TcpListenCommand::Listen { local_endpoint } => {
                 let mut listener = tcp::Socket::new(self.tcp_buffer(), self.tcp_buffer());
-                super::notice_lost_peers(&mut listener);
+                super::notice_lost_peers(&mut listener); // ThinkTerm (lost peers)
 
                 if let Err(e) = listener.listen(local_endpoint) {
                     return Response::Error(e.into());
@@ -282,7 +282,7 @@ impl Netstack {
                 tcp::SocketBuffer::new(vec![0; self.config.tcp_buffer_size]),
                 tcp::SocketBuffer::new(vec![0; self.config.tcp_buffer_size]),
             );
-            super::notice_lost_peers(&mut new_listener);
+            super::notice_lost_peers(&mut new_listener); // ThinkTerm (lost peers)
 
             if let Err(e) = new_listener.listen(listener.local_endpoint) {
                 // invariant failure: the only variants for ListenError are

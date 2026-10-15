@@ -86,6 +86,7 @@ version = "1"
 features = [
     "rt-multi-thread",
     "macros",
+    # ThinkTerm (no panic): env.rs waits between retries.
     "time",
 ]
 default-features = false

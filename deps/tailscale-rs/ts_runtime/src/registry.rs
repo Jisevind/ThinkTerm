@@ -319,6 +319,7 @@ where
     }
 }
 
+// ThinkTerm (no panic): replaces the `RegistryForward` wrapper.
 /// The reply to a [`Forward`] that was asked: the actor's own reply, or why the message didn't
 /// reach it.
 pub type Forwarded<A, M> = Result<
@@ -331,6 +332,8 @@ where
     A: Message<M>,
     M: Send + 'static,
 {
+    // ThinkTerm (no panic): was `RegistryForward<M, A::Reply>`; the handler replies through
+    // `ctx` instead.
     type Reply = DelegatedReply<Forwarded<A, M>>;
 
     #[tracing::instrument(skip_all, fields(msgty = type_name::<M>(), actor = type_name::<A>(), name = %msg.id.name
@@ -350,9 +353,9 @@ where
             return ctx.reply(Err(SendError::ActorNotRunning(msg.message)));
         };
 
-        // Not `ctx.try_forward`: in kameo 0.21 it panics when the actor's mailbox is full or
-        // closed, as it takes the message back out as a (message, reply sender) pair. Asking from
-        // a task gets the same reply, and an error in those cases.
+        // ThinkTerm (no panic): not `ctx.try_forward`, which in kameo 0.21 panics when the
+        // actor's mailbox is full or closed, as it takes the message back out as a (message,
+        // reply sender) pair. Asking from a task gets the same reply, and an error in those cases.
         let (deleg, reply) = ctx.reply_sender();
         match reply {
             Some(reply) => {

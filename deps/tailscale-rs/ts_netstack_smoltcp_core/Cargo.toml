@@ -8,6 +8,10 @@
 # If you are reading this file be aware that the original Cargo.toml
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
+#
+# ThinkTerm (build): the [dev-dependencies] are removed: they serve upstream's tests/,
+# which the vendored copy does not carry, and cargo will not test a crate outside the
+# workspace that has any.
 
 [package]
 edition = "2024"
@@ -79,29 +83,6 @@ default-features = false
 version = "0.1"
 features = ["attributes"]
 default-features = false
-
-[dev-dependencies.smoltcp]
-version = "0.13"
-features = [
-    "alloc",
-    "proto-ipv6",
-    "proto-ipv6-fragmentation",
-    "proto-ipv4",
-    "proto-ipv4-fragmentation",
-    "medium-ip",
-    "socket-tcp",
-    "socket-udp",
-    "socket-icmp",
-    "socket-raw",
-    "iface-max-addr-count-4",
-    "log",
-    "verbose",
-]
-default-features = false
-
-[dev-dependencies.tracing-panic]
-version = "0.1"
-features = ["capture-backtrace"]
 
 [lints.clippy]
 multiple_crate_versions = "allow"

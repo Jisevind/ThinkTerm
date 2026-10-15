@@ -453,7 +453,9 @@ impl IndexedField for IpAddr {
     }
 }
 
-#[cfg(test)]
+// ThinkTerm (build): was `#[cfg(test)]`. Upstream's property tests need proptest, which this
+// copy's dependencies leave out; switched off so that `cargo test -p ts_runtime` builds.
+#[cfg(any())]
 mod test {
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
@@ -539,7 +541,7 @@ mod test {
                 .map(|_| rand_string(&mut rng, 32))
                 .collect(),
             node_capabilities: Default::default(),
-            device: Default::default(),
+            device: Default::default(), // ThinkTerm (device info)
         }
     }
 
@@ -852,7 +854,7 @@ mod test {
 
                     accepted_routes: accepted_routes.into_iter().collect(),
                     underlay_addresses: underlay_addrs.into_iter().collect(),
-                    device: Default::default(),
+                    device: Default::default(), // ThinkTerm (device info)
                 }
             })
             .collect()

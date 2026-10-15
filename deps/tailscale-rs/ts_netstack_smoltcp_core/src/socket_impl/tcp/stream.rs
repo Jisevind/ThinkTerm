@@ -38,7 +38,7 @@ impl Netstack {
                 }
 
                 let mut sock = tcp::Socket::new(self.tcp_buffer(), self.tcp_buffer());
-                super::notice_lost_peers(&mut sock);
+                super::notice_lost_peers(&mut sock); // ThinkTerm (lost peers)
 
                 if let Err(e) = sock.connect(self.iface.context(), remote_endpoint, local_endpoint)
                 {

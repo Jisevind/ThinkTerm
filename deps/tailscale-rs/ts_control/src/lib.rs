@@ -1,4 +1,5 @@
 //! Client for the Tailscale control plane.
+// ThinkTerm (build): was `#![doc = include_str!("../README.md")]`; the README is not vendored.
 
 extern crate alloc;
 
@@ -28,6 +29,7 @@ pub use control_dialer::{ControlDialer, TcpDialer, complete_connection};
 pub use derp::{Map as DerpMap, Region as DerpRegion, convert_derp_map};
 pub use dial_plan::{DialCandidate, DialMode, DialPlan};
 pub use map_request_builder::MapRequestBuilder;
+// ThinkTerm (device info): `DeviceInfo` is ours.
 pub use node::{
     DeviceInfo, Id as NodeId, Node, NodeLastSeen, NodeStatus, NodeUpdate, StableId as StableNodeId,
     TailnetAddress,

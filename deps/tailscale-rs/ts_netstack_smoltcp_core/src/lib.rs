@@ -1,4 +1,5 @@
 //! Command-channel-based userspace netstack built on smoltcp (core functionality).
+// ThinkTerm (build): was `#![doc = include_str!("../README.md")]`; the README is not vendored.
 #![no_std]
 
 extern crate alloc;

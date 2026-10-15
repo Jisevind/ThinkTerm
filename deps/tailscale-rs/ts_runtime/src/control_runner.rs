@@ -42,6 +42,7 @@ enum RegState {
     },
     AuthRequired(url::Url),
     Registered(HttpConn),
+    // ThinkTerm (sign-in state): added.
     /// Control turned the device away, for the reason given. The runner does not try again;
     /// it stays to say why (see `current_registration_error`) rather than stopping, which would
     /// leave every question to it unanswered and the reason only in the log.
@@ -228,6 +229,7 @@ impl ControlRunner {
         deleg
     }
 
+    // ThinkTerm (sign-in state): the next three messages are ours.
     /// The node from the latest netmap, without waiting for one to arrive.
     #[message]
     pub fn current_self_node(&mut self) -> Option<Node> {
@@ -274,6 +276,7 @@ impl ControlRunner {
 
                 deleg
             }
+            // ThinkTerm (sign-in state): added.
             // Turned away: no answer will come, and the request goes with its reply.
             RegState::Failed(..) => ctx.reply_sender().0,
         }
@@ -386,6 +389,7 @@ impl Message<RegisterResult> for ControlRunner {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!(error = %e, "unable to register with control server");
+                // ThinkTerm (sign-in state): was `ctx.stop()`.
                 // Pending auth requests go unanswered with it.
                 self.state = RegState::Failed(registration_failure(&e));
                 return;
@@ -418,6 +422,7 @@ impl Message<RegisterResult> for ControlRunner {
     }
 }
 
+// ThinkTerm (sign-in state): added.
 /// What a failed registration says to whoever looks at the device.
 fn registration_failure(err: &RegistrationError) -> String {
     match err {
@@ -567,5 +572,21 @@ impl DialerActor {
     #[message]
     fn update_dial_plan(&mut self, dial_plan: DialPlan) -> bool {
         self.dialer.update_dial_plan(&dial_plan)
+    }
+}
+
+// ThinkTerm (sign-in state): the tests are ours.
+#[cfg(test)]
+mod tests {
+    use ts_control::RegistrationError;
+
+    use super::registration_failure;
+
+    #[test]
+    fn a_sign_in_turned_away_says_why() {
+        let refused = registration_failure(&RegistrationError::MachineNotAuthorized(None));
+        assert!(refused.contains("auth key"), "{refused}");
+        let unreachable = registration_failure(&RegistrationError::NetworkError);
+        assert!(unreachable.contains("could not be reached"), "{unreachable}");
     }
 }
