@@ -29,8 +29,9 @@ wezterm-dynamic.workspace = true
 # Scoped to aarch64 so `sha2-asm` (a C crate) never enters the wasm sentinel
 # or cross-build dependency graphs. The aarch64 implementation is actually
 # pure-Rust intrinsics with runtime detection; sha2-asm just rides along as
-# the feature's carrier.
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+# the feature's carrier. Not on MSVC: sha2-asm's .S file is handed to cl.exe,
+# which cannot assemble it, so Windows on arm64 takes the software path.
+[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = {workspace=true, optional=true, features=["asm"]}
 
 [features]
