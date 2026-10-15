@@ -53,6 +53,7 @@ pub mod screen_line;
 pub mod selection_shape;
 pub mod split;
 pub mod tab_bar;
+pub mod update_capsule;
 pub mod window_buttons;
 
 /// The data that we associate with a line; we use this to cache it shape hash

@@ -907,6 +907,13 @@ settings-sidebar-snippets-description = 保存したコマンドやテキスト�
 # 更新通知(トースト)と「ソフトウェアアップデート」ページのインストール処理。
 update-toast-title = ThinkTerm の新しいバージョンがあります
 update-toast-body = クリックして更新内容を表示
+update-capsule-available = アップデートがあります
+update-capsule-downloading = ダウンロード中
+update-capsule-installing = インストール中
+update-capsule-restart = 再起動してアップデート
+update-capsule-installed = アップデート済み
+update-capsule-failed = アップデートに失敗
+update-capsule-retry = 再試行
 settings-update-install = アップデートをインストール
 settings-update-preparing = ThinkTerm { $version } のインストールを準備中…
 settings-update-installing = その間もこのウィンドウは使えます。

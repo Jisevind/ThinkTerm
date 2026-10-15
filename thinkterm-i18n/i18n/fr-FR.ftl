@@ -931,6 +931,13 @@ settings-sidebar-snippets-description = Commandes et textes enregistrés, à col
 # Notification de mise à jour et installation depuis la page Mise à jour logicielle.
 update-toast-title = Mise à jour de ThinkTerm disponible
 update-toast-body = Cliquez pour voir les nouveautés
+update-capsule-available = Mise à jour disponible
+update-capsule-downloading = Téléchargement
+update-capsule-installing = Installation
+update-capsule-restart = Redémarrer pour mettre à jour
+update-capsule-installed = Mise à jour installée
+update-capsule-failed = Échec de la mise à jour
+update-capsule-retry = Réessayer
 settings-update-install = Installer la mise à jour
 settings-update-preparing = Préparation de l'installation de ThinkTerm { $version }…
 settings-update-installing = Cette fenêtre reste utilisable pendant ce temps.

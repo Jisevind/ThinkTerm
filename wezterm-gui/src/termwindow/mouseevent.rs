@@ -48,6 +48,16 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
 
+/// The update capsule floats over the terminal's corner: a wheel turned over
+/// it scrolls the terminal underneath.
+fn update_capsule_wheel_passthrough(event: &MouseEvent, item: &UIItem) -> bool {
+    matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+        && matches!(
+            item.item_type,
+            UIItemType::UpdateCapsule | UIItemType::UpdateCapsuleDismiss
+        )
+}
+
 /// Consume the physical release without completing the action it would have
 /// performed. True asks the caller to cancel (not commit) divider preview RPCs.
 fn discard_blocked_pointer_release(
@@ -1633,6 +1643,8 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
+            | UIItemType::UpdateCapsule
+            | UIItemType::UpdateCapsuleDismiss
             | UIItemType::WorkspaceSidebarThreadSearch
             | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::WorkspaceSidebarSshHosts
@@ -1805,6 +1817,8 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarBackground
             | UIItemType::WorkspaceSidebarResize
             | UIItemType::WorkspaceSidebarSettings
+            | UIItemType::UpdateCapsule
+            | UIItemType::UpdateCapsuleDismiss
             | UIItemType::WorkspaceSidebarThreadSearch
             | UIItemType::WorkspaceSidebarViewOptions
             | UIItemType::WorkspaceSidebarSshHosts
@@ -2452,7 +2466,10 @@ impl super::TermWindow {
         let ui_item = if matches!(self.current_mouse_capture, None | Some(MouseCapture::UI)) {
             let ui_item = self
                 .resolve_ui_item(&event)
-                .filter(|item| !self.vertical_wheel_tab_surface_passthrough(&event, item));
+                .filter(|item| {
+                    !self.vertical_wheel_tab_surface_passthrough(&event, item)
+                        && !update_capsule_wheel_passthrough(&event, item)
+                });
 
             match (self.last_ui_item.take(), &ui_item) {
                 (Some(prior), Some(item)) => {
@@ -4054,6 +4071,10 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteTransfer(_) => {
                 self.mouse_event_right_sidebar_remote_file(item.clone(), event, context);
             }
+            UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
+            UIItemType::UpdateCapsuleDismiss => {
+                self.mouse_event_update_capsule(true, event, context)
+            }
             UIItemType::WorkspaceSidebarSettings => {
                 self.mouse_event_workspace_sidebar_settings(event, context);
             }
@@ -4509,6 +4530,10 @@ impl super::TermWindow {
             }
             UIItemType::WorkspaceSidebarResize => {
                 self.mouse_event_workspace_sidebar_resize(item, event, context);
+            }
+            UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
+            UIItemType::UpdateCapsuleDismiss => {
+                self.mouse_event_update_capsule(true, event, context)
             }
             UIItemType::WorkspaceSidebarSettings => {
                 self.mouse_event_workspace_sidebar_settings(event, context);
@@ -5555,6 +5580,27 @@ impl super::TermWindow {
         self.invalidate_or_reflow_right_sidebar(previous_width, context);
     }
 
+    fn mouse_event_update_capsule(
+        &mut self,
+        dismiss: bool,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let clickable = dismiss || self.update_capsule_clickable();
+        context.set_cursor(Some(if clickable {
+            MouseCursor::Hand
+        } else {
+            MouseCursor::Arrow
+        }));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            if dismiss {
+                self.dismiss_update_capsule();
+            } else {
+                self.activate_update_capsule();
+            }
+        }
+    }
+
     pub fn mouse_event_workspace_sidebar_settings(
         &mut self,
         event: MouseEvent,
@@ -5562,7 +5608,16 @@ impl super::TermWindow {
     ) {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
-            crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
+            // The gear carries the dismissed update capsule's dot: the click
+            // goes where the capsule would have led.
+            if crate::termwindow::render::update_capsule::gear_dot().is_some() {
+                crate::settings_window::show_update_page_from(
+                    self.mux_window_id,
+                    &self.active_space_id,
+                );
+            } else {
+                crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
+            }
         }
     }
 

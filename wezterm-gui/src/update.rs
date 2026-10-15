@@ -17,28 +17,64 @@ lazy_static::lazy_static! {
     static ref UPDATER_WINDOW: Mutex<Option<ConnectionUI>> = Mutex::new(None);
 }
 
-/// Whether a release newer than this build is known. What the sidebar's
-/// settings button reads on every paint, so it is a flag and not a file:
-/// set from the cache at startup and by the checker after every check.
+/// Whether a release newer than this build is known. What the update
+/// capsule reads on every paint, so it is a flag and not a file: set from
+/// the cache at startup and by the checker after every check.
 ///
 /// Nothing is written into terminal output any more. The upstream banner
 /// printed two rows and an icon into every new local shell and left them in
-/// its scrollback; a dot on the settings button says the same thing without
-/// taking any space, on remote panes too, and leads to the page that can
-/// act on it.
+/// its scrollback; the capsule floating in the window's corner says the same
+/// thing without taking any of the terminal's lines, on remote panes too,
+/// and installs the update itself.
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 pub fn update_available() -> bool {
     UPDATE_AVAILABLE.load(Ordering::Relaxed)
 }
 
-/// Record the flag; when it changes, ask every window to repaint so the dot
-/// appears or goes away. Only the checker thread and a check asked for from
-/// Settings call this: both run once the GUI is up, and spawning onto the
-/// main thread needs its scheduler.
-fn set_update_available(available: bool) {
+lazy_static::lazy_static! {
+    /// The release `UPDATE_AVAILABLE` is about, kept in memory with the
+    /// flag: the update capsule names it on every paint and installs it when
+    /// clicked, whether or not the check could be saved to disk.
+    static ref AVAILABLE_RELEASE: Mutex<Option<Release>> = Mutex::new(None);
+}
+
+/// The newer release, while one is known.
+pub fn available_release() -> Option<Release> {
+    if !update_available() {
+        return None;
+    }
+    AVAILABLE_RELEASE.lock().ok()?.clone()
+}
+
+/// The newer release's version, without its `v`, while one is known.
+pub fn available_version() -> Option<String> {
+    if !update_available() {
+        return None;
+    }
+    let release = AVAILABLE_RELEASE.lock().ok()?;
+    release
+        .as_ref()
+        .map(|release| release.tag_name.trim_start_matches('v').to_string())
+}
+
+/// Record the flag and the release it is about; when either changes, ask
+/// every window to repaint so the update capsule appears, goes away or
+/// names the new release. Only the checker thread and a check asked for
+/// from Settings call this: both run once the GUI is up, and spawning onto
+/// the main thread needs its scheduler.
+fn set_update_available(available: bool, latest: &Release) {
+    let renamed = AVAILABLE_RELEASE
+        .lock()
+        .map(|mut release| {
+            let renamed = release.as_ref().map(|release| release.tag_name.as_str())
+                != Some(latest.tag_name.as_str());
+            *release = Some(latest.clone());
+            renamed
+        })
+        .unwrap_or(false);
     let was = UPDATE_AVAILABLE.swap(available, Ordering::Relaxed);
-    if was != available {
+    if was != available || (available && renamed) {
         promise::spawn::spawn_into_main_thread(async move {
             crate::frontend::front_end().invalidate_all_windows();
         })
@@ -54,6 +90,9 @@ pub fn load_last_release_info() {
         return;
     }
     let status = cached_update_status();
+    if let Ok(mut release) = AVAILABLE_RELEASE.lock() {
+        release.clone_from(&status.latest);
+    }
     UPDATE_AVAILABLE.store(
         status.update_available || always_show_update_ui(),
         Ordering::Relaxed,
@@ -148,7 +187,7 @@ mod update_version_tests {
 pub fn check_now() -> anyhow::Result<()> {
     let latest = get_latest_release_info()?;
     let newer = is_newer_release(&latest.tag_name, &running_release_version());
-    set_update_available(newer || always_show_update_ui());
+    set_update_available(newer || always_show_update_ui(), &latest);
     // Settings shows what it reads back from the cache: an answer that could
     // not be kept there is, as far as the page can tell, no answer.
     record_latest_release(&latest)
@@ -196,7 +235,7 @@ fn update_checker() {
             if let Ok(latest) = get_latest_release_info() {
                 let current = running_release_version();
                 let newer = is_newer_release(&latest.tag_name, &current);
-                set_update_available(newer || force_ui);
+                set_update_available(newer || force_ui, &latest);
                 if newer || force_ui {
                     log::info!(
                         "latest release {} is newer than current build {}",

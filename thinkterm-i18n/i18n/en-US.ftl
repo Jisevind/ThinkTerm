@@ -937,6 +937,13 @@ settings-sidebar-snippets-description = Saved commands and text you can paste in
 # Update notice (toast) and the Software Update page's install flow.
 update-toast-title = ThinkTerm update available
 update-toast-body = Click to see what's new
+update-capsule-available = Update available
+update-capsule-downloading = Downloading
+update-capsule-installing = Installing
+update-capsule-restart = Restart to update
+update-capsule-installed = Update installed
+update-capsule-failed = Update failed
+update-capsule-retry = Retry
 settings-update-install = Install Update
 settings-update-preparing = Preparing to install ThinkTerm { $version }…
 settings-update-installing = This window keeps working meanwhile.

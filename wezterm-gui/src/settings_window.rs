@@ -447,6 +447,219 @@ fn repaint_open_settings(refresh: bool) {
     }
 }
 
+/// Start installing `release`, unless an install already runs. Its progress
+/// and outcome land in `UPDATE_INSTALL`, for the Update page and the update
+/// capsule of every window alike.
+fn start_update_install_with(
+    release: crate::update::Release,
+    method: thinkterm_update::InstallMethod,
+) {
+    if matches!(update_install(), Some(UpdateInstall::Running { .. })) {
+        return;
+    }
+    let version = release.tag_name.trim_start_matches('v').to_string();
+    set_update_install(Some(UpdateInstall::Running {
+        version: version.clone(),
+        progress: None,
+        download_started: None,
+    }));
+    if matches!(update_check(), Some(UpdateCheck::Failed { .. })) {
+        set_update_check(None);
+    }
+    repaint_open_settings(false);
+    crate::frontend::front_end().invalidate_all_windows();
+
+    // The installer downloads and replaces files: off the UI thread, with
+    // its progress and outcome posted back to whichever Settings window is
+    // open by then and to the windows' update capsules.
+    let spawned = std::thread::Builder::new()
+        .name("thinkterm-update-install".into())
+        .spawn(move || {
+            // A cache written by a build that did not keep
+            // GitHub's checksums lacks them: ask for the release
+            // again then, and settle for the cache if that fails.
+            let release = if release.assets.iter().any(|a| a.sha256().is_none()) {
+                thinkterm_update::get_release_by_tag(&release.tag_name)
+                    .unwrap_or(release)
+            } else {
+                release
+            };
+            let mut progress = |progress| {
+                promise::spawn::spawn_into_main_thread(async move {
+                    // Never over the outcome, should a report
+                    // land after it.
+                    let reported = UPDATE_INSTALL.with(|install| {
+                        let mut install = install.borrow_mut();
+                        let Some(UpdateInstall::Running {
+                            progress: current,
+                            download_started,
+                            ..
+                        }) = &mut *install
+                        else {
+                            return None;
+                        };
+                        let shown = capsule_percent(current);
+                        use thinkterm_update::InstallProgress;
+                        if let InstallProgress::Downloading { done, .. } = progress {
+                            // A retry, or a redirect's body thrown
+                            // away, starts the count over, and the
+                            // rate is timed from there.
+                            let restarted = matches!(
+                                current,
+                                Some(InstallProgress::Downloading { done: before, .. })
+                                    if done < *before
+                            );
+                            if download_started.is_none() || restarted {
+                                *download_started = Some(Instant::now());
+                            }
+                        }
+                        *current = Some(progress);
+                        Some(capsule_percent(current) != shown)
+                    });
+                    if let Some(moved) = reported {
+                        repaint_open_settings(false);
+                        // The windows show only the whole percentage, and
+                        // nothing of it once the capsule has gone into the
+                        // gear.
+                        if moved && !crate::termwindow::render::update_capsule::dismissed() {
+                            crate::frontend::front_end().invalidate_all_windows();
+                        }
+                    }
+                })
+                .detach();
+            };
+            let result = if cfg!(windows) {
+                thinkterm_update::run_windows_installer(&release, &mut progress)
+            } else {
+                match method.manifest_for_install() {
+                    Some(manifest) => thinkterm_update::run_local_installer_captured(
+                        &manifest,
+                        &release,
+                        &mut progress,
+                    )
+                    .map(|_| ()),
+                    None => Err(anyhow::anyhow!("{}", method.how_to_update())),
+                }
+            };
+            let outcome = match result {
+                Ok(()) => UpdateInstall::Installed { version },
+                Err(err) => UpdateInstall::Failed {
+                    error: format!("{err:#}"),
+                },
+            };
+            promise::spawn::spawn_into_main_thread(async move {
+                set_update_install(Some(outcome));
+                repaint_open_settings(true);
+                crate::frontend::front_end().invalidate_all_windows();
+            })
+            .detach();
+        });
+    if let Err(err) = spawned {
+        set_update_install(Some(UpdateInstall::Failed {
+            error: err.to_string(),
+        }));
+    }
+}
+
+/// What the update capsule shows of an install's progress: the whole
+/// percentage while it downloads, none once the installer runs.
+fn capsule_percent(progress: &Option<thinkterm_update::InstallProgress>) -> Option<u64> {
+    match progress {
+        Some(thinkterm_update::InstallProgress::Downloading { done, total }) if *total > 0 => {
+            Some(done.saturating_mul(100) / total)
+        }
+        _ => None,
+    }
+}
+
+/// Install the newest release found, from outside Settings: the update
+/// capsule's click. False when there is none to install.
+pub(crate) fn start_update_install() -> bool {
+    let Some(release) =
+        crate::update::available_release().or_else(|| crate::update::cached_update_status().latest)
+    else {
+        return false;
+    };
+    start_update_install_with(release, thinkterm_update::InstallMethod::detect());
+    true
+}
+
+/// Whether this copy can replace itself, as opposed to one a package
+/// manager owns, whose update the Update page explains instead.
+pub(crate) fn installs_updates_itself() -> bool {
+    cfg!(windows) || thinkterm_update::InstallMethod::detect().self_updatable()
+}
+
+/// Where an update stands, as the update capsule shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum UpdateCapsuleStatus {
+    Available { version: String },
+    /// `fraction` is None before the first report and once the download is
+    /// in and the installer runs.
+    Installing { fraction: Option<f32> },
+    /// `restart`: whether restarting now keeps every terminal; where it
+    /// would not, the Update page says what to do instead.
+    Installed { restart: bool },
+    Failed,
+}
+
+pub(crate) fn update_capsule_status() -> Option<UpdateCapsuleStatus> {
+    use thinkterm_update::InstallProgress;
+    Some(match update_install() {
+        Some(UpdateInstall::Running { progress, .. }) => UpdateCapsuleStatus::Installing {
+            fraction: match progress {
+                Some(InstallProgress::Downloading { done, total }) if total > 0 => {
+                    Some((done as f32 / total as f32).clamp(0.0, 1.0))
+                }
+                _ => None,
+            },
+        },
+        Some(UpdateInstall::Installed { .. }) => UpdateCapsuleStatus::Installed {
+            restart: !cfg!(windows) && !restart_ends_terminals_lately(),
+        },
+        Some(UpdateInstall::Failed { .. }) => UpdateCapsuleStatus::Failed,
+        None => UpdateCapsuleStatus::Available {
+            version: crate::update::available_version()?,
+        },
+    })
+}
+
+/// `restart_ends_terminals`, asked again at most once a second: the update
+/// capsule asks on every paint of every window, and the answer only moves
+/// as panes come and go.
+fn restart_ends_terminals_lately() -> bool {
+    thread_local! {
+        static LAST: Cell<Option<(Instant, bool)>> = const { Cell::new(None) };
+    }
+    LAST.with(|last| match last.get() {
+        Some((at, ends)) if at.elapsed() < Duration::from_secs(1) => ends,
+        _ => {
+            let ends = restart_ends_terminals();
+            last.set(Some((Instant::now(), ends)));
+            ends
+        }
+    })
+}
+
+/// Restart into the installed update, from the update capsule. False when
+/// it did not: an install still runs, or restarting now would end
+/// terminals after all.
+pub(crate) fn restart_into_update() -> bool {
+    if !matches!(update_install(), Some(UpdateInstall::Installed { .. }))
+        || cfg!(windows)
+        || restart_ends_terminals()
+    {
+        return false;
+    }
+    match SettingsWindow::restart_application() {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!("restarting into the update: {err:#}");
+            false
+        }
+    }
+}
+
 fn settings_window_for_instance(instance_id: u64) -> Option<Rc<RefCell<SettingsWindow>>> {
     open_settings_window_with_id()
         .filter(|(current_id, _)| *current_id == instance_id)
@@ -6525,9 +6738,6 @@ impl SettingsWindow {
             }
             SettingsAction::InstallUpdate => {
                 self.ui.open_dropdown = None;
-                if matches!(update_install(), Some(UpdateInstall::Running { .. })) {
-                    return;
-                }
                 let Some(release) = self
                     .ui
                     .update_status
@@ -6541,99 +6751,8 @@ impl SettingsWindow {
                     .update_method
                     .clone()
                     .unwrap_or_else(thinkterm_update::InstallMethod::detect);
-                let version = release.tag_name.trim_start_matches('v').to_string();
-                set_update_install(Some(UpdateInstall::Running {
-                    version: version.clone(),
-                    progress: None,
-                    download_started: None,
-                }));
-                if matches!(update_check(), Some(UpdateCheck::Failed { .. })) {
-                    set_update_check(None);
-                }
+                start_update_install_with(release, method);
                 window.invalidate();
-
-                // The installer downloads and replaces files: off the UI
-                // thread, with its progress and outcome posted back to
-                // whichever Settings window is open by then.
-                let spawned = std::thread::Builder::new()
-                    .name("thinkterm-update-install".into())
-                    .spawn(move || {
-                        // A cache written by a build that did not keep
-                        // GitHub's checksums lacks them: ask for the release
-                        // again then, and settle for the cache if that fails.
-                        let release = if release.assets.iter().any(|a| a.sha256().is_none()) {
-                            thinkterm_update::get_release_by_tag(&release.tag_name)
-                                .unwrap_or(release)
-                        } else {
-                            release
-                        };
-                        let mut progress = |progress| {
-                            promise::spawn::spawn_into_main_thread(async move {
-                                // Never over the outcome, should a report
-                                // land after it.
-                                let reported = UPDATE_INSTALL.with(|install| {
-                                    let mut install = install.borrow_mut();
-                                    let Some(UpdateInstall::Running {
-                                        progress: current,
-                                        download_started,
-                                        ..
-                                    }) = &mut *install
-                                    else {
-                                        return false;
-                                    };
-                                    use thinkterm_update::InstallProgress;
-                                    if let InstallProgress::Downloading { done, .. } = progress {
-                                        // A retry, or a redirect's body thrown
-                                        // away, starts the count over, and the
-                                        // rate is timed from there.
-                                        let restarted = matches!(
-                                            current,
-                                            Some(InstallProgress::Downloading { done: before, .. })
-                                                if done < *before
-                                        );
-                                        if download_started.is_none() || restarted {
-                                            *download_started = Some(Instant::now());
-                                        }
-                                    }
-                                    *current = Some(progress);
-                                    true
-                                });
-                                if reported {
-                                    repaint_open_settings(false);
-                                }
-                            })
-                            .detach();
-                        };
-                        let result = if cfg!(windows) {
-                            thinkterm_update::run_windows_installer(&release, &mut progress)
-                        } else {
-                            match method.manifest_for_install() {
-                                Some(manifest) => thinkterm_update::run_local_installer_captured(
-                                    &manifest,
-                                    &release,
-                                    &mut progress,
-                                )
-                                .map(|_| ()),
-                                None => Err(anyhow::anyhow!("{}", method.how_to_update())),
-                            }
-                        };
-                        let outcome = match result {
-                            Ok(()) => UpdateInstall::Installed { version },
-                            Err(err) => UpdateInstall::Failed {
-                                error: format!("{err:#}"),
-                            },
-                        };
-                        promise::spawn::spawn_into_main_thread(async move {
-                            set_update_install(Some(outcome));
-                            repaint_open_settings(true);
-                        })
-                        .detach();
-                    });
-                if let Err(err) = spawned {
-                    set_update_install(Some(UpdateInstall::Failed {
-                        error: err.to_string(),
-                    }));
-                }
             }
             SettingsAction::OpenLatestRelease => {
                 self.ui.open_dropdown = None;

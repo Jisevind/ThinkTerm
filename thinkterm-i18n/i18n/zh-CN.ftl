@@ -907,6 +907,13 @@ settings-sidebar-snippets-description = 保存的命令和文本，可以粘贴�
 # 更新提醒(系统通知)与"软件更新"页的安装流程。
 update-toast-title = ThinkTerm 有新版本
 update-toast-body = 点击查看更新内容
+update-capsule-available = 有新版本
+update-capsule-downloading = 正在下载
+update-capsule-installing = 正在安装
+update-capsule-restart = 重启以完成更新
+update-capsule-installed = 更新已安装
+update-capsule-failed = 更新失败
+update-capsule-retry = 重试
 settings-update-install = 安装更新
 settings-update-preparing = 正在准备安装 ThinkTerm { $version }…
 settings-update-installing = 期间本窗口可以继续使用。

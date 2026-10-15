@@ -808,6 +808,8 @@ pub enum UIItemType {
     WorkspaceSidebarSshHosts,
     WorkspaceSidebarLiveOverview,
     WorkspaceSidebarNotifications,
+    UpdateCapsule,
+    UpdateCapsuleDismiss,
     RightSidebarToggle,
     RightSidebarMode(RightSidebarMode),
     RightSidebarBackground,
@@ -3047,6 +3049,7 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     context_menu: Option<ui::context_menu::ContextMenuState>,
+    pub(crate) update_capsule: render::update_capsule::UpdateCapsule,
     /// Lights running round copied or pasted text, and a paste waiting to
     /// show up for one (see `render::edge_light`).
     edge_lights: Vec<render::edge_light::EdgeLight>,
@@ -4091,6 +4094,7 @@ impl TermWindow {
             // usual way, and a light left frozen on screen would stay.
             || !self.edge_lights.is_empty()
             || self.pending_paste.is_some()
+            || self.update_capsule.owes_frames()
     }
 
     /// An overlay scrollbar that is still up has a fade to finish; the
@@ -4803,6 +4807,7 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             context_menu: None,
+            update_capsule: Default::default(),
             edge_lights: vec![],
             pending_paste: None,
             right_press_claimed: false,

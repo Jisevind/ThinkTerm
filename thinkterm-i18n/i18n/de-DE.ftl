@@ -937,6 +937,13 @@ settings-sidebar-snippets-description = Gespeicherte Befehle und Texte, die Sie 
 # Update-Hinweis (Mitteilung) und der Installationsablauf der Seite „Software-Update“.
 update-toast-title = ThinkTerm-Update verfügbar
 update-toast-body = Klicken, um die Neuerungen zu sehen
+update-capsule-available = Update verfügbar
+update-capsule-downloading = Wird geladen
+update-capsule-installing = Wird installiert
+update-capsule-restart = Neu starten zum Aktualisieren
+update-capsule-installed = Update installiert
+update-capsule-failed = Update fehlgeschlagen
+update-capsule-retry = Erneut versuchen
 settings-update-install = Update installieren
 settings-update-preparing = Installation von ThinkTerm { $version } wird vorbereitet…
 settings-update-installing = Dieses Fenster funktioniert währenddessen weiter.
