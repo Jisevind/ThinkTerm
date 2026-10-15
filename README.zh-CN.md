@@ -60,6 +60,7 @@ ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**
 - **断开后继续工作。** 客户端断开连接时，服务端持有的会话仍然运行。稍后重新连接，就能继续同一个 Shell、构建或 Agent 任务；主动关闭窗格是另一项操作。
 - **从不同客户端访问同一批会话。** 桌面端、`thinkterm tui` 和浏览器端都可以连接服务端，也可以同时接入多个客户端，以各自的界面操作共享会话。
 - **跨机器组织工作。** 每台主机运行自己的 mux 服务端。ThinkTerm Connect 将远程工作空间与本地工作放在同一个桌面界面中，通过侧边栏就能切换机器。进程始终在原来的主机上运行。
+- **更新时会话不中断。** 桌面端为服务器更新 ThinkTerm 时，正在运行的 mux 服务端会把会话交接给新版本，Shell、构建和 Agent 都会继续运行。
 
 会话持续运行的前提是 mux 服务端及其主机保持可用；这不意味着服务端或主机重启后能恢复原先运行的进程。
 
@@ -83,7 +84,8 @@ Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TU
 
 - **Rust、性能与内存效率。** ThinkTerm 面向高负载终端工作流，持续优化终端吞吐、渲染效率和内存占用，以多个会话与 Agent 并行工作时的流畅响应为目标。
 - **Agent 状态。** Agents 面板集中展示识别到的编程 Agent、工作状态和所属项目。可以在设置中关闭 Agent 检测和该面板。
-- **远程会话。** 可选择 SSH、Mosh，或通过 ThinkTerm Connect 使用持久 mux 会话。远程 mux 会话支持标签页、分屏、调整大小和重连；预测式本地回显可减轻高延迟连接下的输入迟滞感。
+- **远程会话。** 可选择 SSH、Mosh，或通过 ThinkTerm Connect 使用持久 mux 会话。远程 mux 会话支持标签页、分屏、调整大小和重连；预测式本地回显可减轻高延迟连接下的输入迟滞感。服务器上还没有 ThinkTerm 时，连接时会询问是否以当前用户安装（无需 root）；版本不一致时会提供对应的版本。
+- **内置 Tailscale。** 无需安装 Tailscale 客户端，就能在 ThinkTerm 中加入 tailnet 并连接其中的机器；它们会和已保存的服务器一起列在远程主机页中。支持 macOS 和 Linux。
 - **终端旁的文件。** 浏览项目文件，预览带语法高亮的源码，并用外部编辑器打开。远程文件通过 SFTP 访问，支持上传、下载和拖放传输。
 - **笔记。** 在兼容 Obsidian 的 Vault 中编辑 Markdown，支持表格、代码块和自动保存。文件仍是普通 Markdown，存放在你选择的目录中。
 - **片段与插件。** 内置 Snippets。插件可向桌面端和浏览器端添加侧边栏面板；仓库中包含 [Diff 插件](plugins/diff)，用于查看旁边终端所在 Git 仓库的改动。你也可以使用 [ThinkTerm SDK](docs/thinkterm/plugins.md#rust-sdk)，用 Rust 开发自己的插件。别人分享的插件可以在 GitHub 话题 [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin) 下找到。安装和开发方式见[插件指南](docs/thinkterm/plugins.md)。
@@ -91,7 +93,7 @@ Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TU
 - **原生桌面设置。** 调整主题、界面字号、终端选项和渲染后端。主窗口与设置窗口均支持 WebGPU 和 OpenGL；WebGPU 初始化失败时会回退到 OpenGL。
 - **五种界面语言。** English、简体中文、日本語、Français 和 Deutsch。
 
-CLI 也支持自动化操作窗格：`thinkterm cli send-text` 发送输入，`thinkterm cli get-text` 读取终端输出。Agent 可以借助这些命令通过终端交互。[协作说明](docs/thinkterm/agent-collaboration.md) 记录了已演示的工作流程，以及将终端输入用作消息机制的局限。
+CLI 也支持自动化操作窗格：`thinkterm cli send-text` 发送输入，`send-key` 发送按键，`get-text` 读取终端输出，`wait` 和 `events` 会在命令结束或窗格发生变化时告知。用 `set-pane-label` 给窗格命名后，就可以按名字指定窗格。Agent 可以借助这些命令通过终端交互。[协作说明](docs/thinkterm/agent-collaboration.md) 记录了已演示的工作流程，以及将终端输入用作消息机制的局限。
 
 ## 选择连接方式
 

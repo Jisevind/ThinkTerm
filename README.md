@@ -62,6 +62,7 @@ A terminal multiplexer manages multiple terminal sessions and lets clients attac
 - **Detach and return.** Disconnecting a client leaves its server-held sessions running. Reconnect later to continue the same shell, build, or agent task. Explicitly closing a pane is a separate action.
 - **Access the same sessions from different clients.** Use the desktop, `thinkterm tui`, or the browser to connect to the server. Multiple clients can be attached at once; each offers its own interface to the shared sessions.
 - **Work across machines.** Each host runs its own mux server. ThinkTerm Connect brings those remote workspaces into the desktop alongside local work, so you can switch machines from the sidebar. Processes continue to run on their original host.
+- **Update without dropping sessions.** When the desktop updates ThinkTerm on a server, the running mux server hands its sessions to the new version, so shells, builds, and agents keep running.
 
 Session persistence depends on the mux server and its host remaining available; it does not restore running processes after a server restart or host reboot.
 
@@ -85,7 +86,8 @@ Local and remote workspaces share the sidebar. Thread status helps distinguish r
 
 - **Rust, performance, and memory efficiency.** ThinkTerm is built for demanding terminal workflows. Terminal throughput, rendering efficiency, and memory use are ongoing optimization priorities, with the goal of keeping many sessions and agents responsive as they work in parallel.
 - **Agent status.** The Agents panel brings recognized coding agents into one list with their work status and project context. Agent detection and the panel can be disabled in settings.
-- **Remote sessions.** Choose SSH, Mosh, or persistent mux sessions through ThinkTerm Connect. Remote mux sessions support tabs, splits, resizing, and reconnecting. Predictive local echo can reduce perceived typing latency on slower connections.
+- **Remote sessions.** Choose SSH, Mosh, or persistent mux sessions through ThinkTerm Connect. Remote mux sessions support tabs, splits, resizing, and reconnecting. Predictive local echo can reduce perceived typing latency on slower connections. If a server does not have ThinkTerm yet, connecting offers to install it under your user account, no root needed; a server on a different version is offered the matching one.
+- **Built-in Tailscale.** Join your tailnet from ThinkTerm and reach its machines without the Tailscale app; they appear in Remote Hosts beside your saved servers. Available on macOS and Linux.
 - **Files beside the terminal.** Browse project files, preview source with syntax highlighting, and open files in an external editor. Remote file access uses SFTP, with uploads, downloads, and drag-and-drop transfers.
 - **Notes.** Work with Markdown in an Obsidian-compatible Vault, including tables, code blocks, and autosave. The files remain ordinary Markdown in a directory you choose.
 - **Snippets and plugins.** Snippets is built in. Plugins can add sidebar panels to the desktop and browser; the repository includes a [Diff plugin](plugins/diff) for inspecting the adjacent terminal's Git changes. Build your own plugins in Rust with the [ThinkTerm SDK](docs/thinkterm/plugins.md#rust-sdk). Find plugins others share under the GitHub topic [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin). See the [plugin guide](docs/thinkterm/plugins.md) for setup and development.
@@ -93,7 +95,7 @@ Local and remote workspaces share the sidebar. Thread status helps distinguish r
 - **Native desktop settings.** Adjust themes, UI font sizes, terminal options, and the renderer. Both the main window and settings support WebGPU and OpenGL, with an OpenGL fallback if WebGPU initialization fails.
 - **Five interface languages.** English, 简体中文, 日本語, Français, and Deutsch.
 
-The CLI also exposes panes to automation: `thinkterm cli send-text` sends input and `thinkterm cli get-text` reads terminal output. Agents can use these commands to interact through their terminals. The [collaboration notes](docs/thinkterm/agent-collaboration.md) describe the demonstrated workflow and the limits of terminal input as a messaging mechanism.
+The CLI also exposes panes to automation: `thinkterm cli send-text` sends input, `send-key` presses keys, `get-text` reads terminal output, and `wait` and `events` report when a command finishes or something happens in a pane. Label a pane with `set-pane-label` to address it by name. Agents can use these commands to interact through their terminals. The [collaboration notes](docs/thinkterm/agent-collaboration.md) describe the demonstrated workflow and the limits of terminal input as a messaging mechanism.
 
 ## Choose how you connect
 
