@@ -6754,6 +6754,7 @@ impl super::TermWindow {
             // this just reads what it said.
             let detect = spec.detect_os && spec.detected_distro.is_none();
             let detect_host_id = host_id.clone();
+            let fallback_host_id = host_id.clone();
             let detect_window = self.window.as_ref().cloned();
             promise::spawn::spawn(async move {
                 let domain = match Mux::get().get_domain_by_name(&name) {
@@ -6768,7 +6769,33 @@ impl super::TermWindow {
                 };
                 let attached = Arc::clone(&domain);
                 if let Err(err) = crate::connect_domain_into_space(None, domain).await {
-                    log::error!("connect {name}: {err:#}");
+                    // The host has no ThinkTerm and the person chose not to
+                    // install it: reach it with plain ssh this time. The host
+                    // stays a Connect host for the next connect.
+                    let declined = err.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<wezterm_client::client::RemoteInstallDeclined>()
+                            .is_some()
+                    });
+                    match (declined, detect_window.as_ref()) {
+                        (true, Some(window)) => {
+                            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                                let Some(spec) = crate::ssh_hosts::host_spec(&fallback_host_id)
+                                else {
+                                    return;
+                                };
+                                if let Some(window) = term_window.window.clone() {
+                                    term_window.open_direct_ssh_host_thread(
+                                        fallback_host_id,
+                                        &spec,
+                                        &window,
+                                        true,
+                                    );
+                                }
+                            })));
+                        }
+                        _ => log::error!("connect {name}: {err:#}"),
+                    }
                     return;
                 }
                 if detect {
@@ -6789,6 +6816,21 @@ impl super::TermWindow {
             return true;
         }
 
+        self.open_direct_ssh_host_thread(host_id, &spec, context, false)
+    }
+
+    /// A thread on `host_id` over a direct ssh (or Mosh) connection, in the
+    /// active Space: how a plain host opens, and how a Connect host opens
+    /// when its server could not run ThinkTerm. A Mosh thread, and one asked
+    /// to `connect_now` (the person already chose to connect), starts
+    /// connecting at once.
+    pub(crate) fn open_direct_ssh_host_thread(
+        &mut self,
+        host_id: String,
+        spec: &crate::ssh_hosts::SshHostSpec,
+        context: &dyn WindowOps,
+        connect_now: bool,
+    ) -> bool {
         self.snapshot_active_workspace_thread_layout();
         let use_mosh = spec.use_mosh;
         // Any Space can own projects now (a migrated collection simply
@@ -6804,7 +6846,7 @@ impl super::TermWindow {
             context.invalidate();
             return false;
         }
-        if use_mosh {
+        if use_mosh || connect_now {
             let _ = self.begin_open_remote_thread_connection(thread_id, context, None);
         }
         true

@@ -774,6 +774,19 @@ pub(crate) async fn connect_domain_into_space(
             }
             Err(err) => {
                 log::error!("attaching {domain_name} failed: {err:#}");
+                // The host has no ThinkTerm and the person chose not to
+                // install it: nothing is left to show in this window, and
+                // the caller that can reach the host with plain ssh needs
+                // to know why this stopped.
+                let declined = err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<wezterm_client::client::RemoteInstallDeclined>()
+                        .is_some()
+                });
+                if declined {
+                    ui.close();
+                    return Err(err);
+                }
                 return Ok(());
             }
         }

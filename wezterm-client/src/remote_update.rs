@@ -271,6 +271,114 @@ pub fn offer_remote_update(
     Ok(RemoteUpdateOutcome::Updated { restarted: true })
 }
 
+/// What became of the offer to install ThinkTerm on a host that had none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteInstallOutcome {
+    /// The person said no.
+    Declined,
+    /// Nothing could be installed: there is no way to ask here, the client
+    /// is not a release build, its release is not on GitHub, or the host
+    /// cannot run it. The UI already says which.
+    Unavailable,
+    Installed,
+}
+
+/// Offer to install this client's ThinkTerm on `ssh_dom`'s host, which has
+/// none, so that ThinkTerm Connect can run there. Asked once, before
+/// anything is looked up or installed.
+pub fn offer_remote_install(
+    ssh_dom: &SshDomain,
+    ui: &ConnectionUI,
+) -> anyhow::Result<RemoteInstallOutcome> {
+    let local = thinkterm_update::running_release_version();
+    let host = ssh_dom.remote_address.clone();
+    let command = thinkterm_update::install_command("server", &local);
+
+    ui.output_str(&format!(
+        "\nThinkTerm is not installed on {host}. ThinkTerm Connect runs there, so \
+         that its terminals keep running when you disconnect.\n"
+    ));
+    if !thinkterm_update::is_release_version(&local) {
+        ui.output_str(&format!(
+            "This client is a development build ({local}), so there is no release to \
+             install on {host} that matches it. Build and install a matching \
+             thinkterm-mux-server there by hand, or switch the host to SSH.\n"
+        ));
+        return Ok(RemoteInstallOutcome::Unavailable);
+    }
+    // Uncommitted changes can include a newer protocol than the release
+    // that carries this version label.
+    let caveat = if config::wezterm_version().ends_with("-dirty") {
+        format!(
+            "This client was built with unreleased source changes (codec {}), so the \
+             released {local} may still not match it.\n",
+            codec::CODEC_VERSION
+        )
+    } else {
+        String::new()
+    };
+    let answer = ui.input(&format!(
+        "ThinkTerm can install {local} there now (downloaded from GitHub, as the ssh \
+         user, under ~/.local, with no root):\n  \
+         {command}\n\
+         {caveat}Install it? [y/N] "
+    ));
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(err) => {
+            log::info!("remote install not offered: {err:#}");
+            ui.output_str(&format!(
+                "To install it yourself, run this on {host}:\n  {command}\n"
+            ));
+            return Ok(RemoteInstallOutcome::Unavailable);
+        }
+    };
+    if !is_yes(&answer) {
+        ui.output_str(&format!(
+            "Not installing. To do it yourself, run this on {host}:\n  {command}\n"
+        ));
+        return Ok(RemoteInstallOutcome::Declined);
+    }
+    if let Err(lookup) = thinkterm_update::get_release_by_tag(&local) {
+        if is_not_published(&lookup) {
+            ui.output_str(&format!(
+                "GitHub has no release {local} yet. Install a matching \
+                 thinkterm-mux-server on {host} by hand, or switch the host to SSH.\n"
+            ));
+        } else {
+            ui.output_str(&format!("Could not look up {local} on GitHub: {lookup:#}\n"));
+        }
+        return Ok(RemoteInstallOutcome::Unavailable);
+    }
+
+    let ssh_config = mux::ssh::ssh_domain_to_ssh_config(ssh_dom)?;
+    let mut ui_for_auth = ui.clone();
+    let session = mux::ssh::ssh_connect_with_ui_and_password(
+        ssh_config,
+        &mut ui_for_auth,
+        ssh_dom.stored_password.clone(),
+    )
+    .with_context(|| format!("opening an ssh session to {host} for the install"))?;
+    if let Some(reason) = host_cannot_take_a_release(&session) {
+        ui.output_str(&format!(
+            "{reason}, so the release build of {local} cannot be installed on {host}.\n{}\n",
+            thinkterm_update::build_from_source_instructions(&local)
+        ));
+        return Ok(RemoteInstallOutcome::Unavailable);
+    }
+
+    ui.output_str(&format!("\nInstalling ThinkTerm {local} on {host}...\n"));
+    if !run_and_relay(&session, ui, &command)? {
+        ui.output_str(&format!(
+            "\nThe installer on {host} failed; its output is above.\n{}\n",
+            thinkterm_update::build_from_source_instructions(&local)
+        ));
+        anyhow::bail!("the installer on {host} failed");
+    }
+    ui.output_str("Installed; connecting.\n");
+    Ok(RemoteInstallOutcome::Installed)
+}
+
 /// What a person types to stop the server themselves.
 const STOP_HINT: &str = "pkill -f thinkterm-mux-server";
 

@@ -314,6 +314,72 @@ pub struct IncompatibleVersionError {
     pub codec_vers: usize,
 }
 
+/// The host a ThinkTerm Connect domain reaches over ssh has neither
+/// ThinkTerm nor WezTerm to run the mux proxy with. The attach offers to
+/// install ThinkTerm there (`remote_update::offer_remote_install`).
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("ThinkTerm is not installed on {host}")]
+pub struct RemoteMuxMissing {
+    pub host: String,
+}
+
+/// The person chose not to install ThinkTerm on a host that has none. A
+/// click on the host's card then reaches it with plain ssh, this once; the
+/// other ways in stop here.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("ThinkTerm was not installed on {host}")]
+pub struct RemoteInstallDeclined {
+    pub host: String,
+}
+
+/// Asks a host whether the default proxy command has a binary to run: the
+/// same three places `Reconnectable::remote_mux_command` tries, in a shell
+/// that prints which way it went.
+const REMOTE_MUX_PROBE: &str = "if [ -x \"$HOME/.local/bin/thinkterm\" ] \
+     || command -v thinkterm >/dev/null 2>&1 \
+     || command -v wezterm >/dev/null 2>&1; \
+     then echo present; else echo missing; fi";
+
+/// Whether the probe's output says there is nothing to run. Anything but a
+/// plain "missing" -- a login banner, an error, no answer -- is not taken
+/// for one: the proxy then runs and fails the way it always has.
+fn probe_says_missing(output: &str) -> bool {
+    output.trim() == "missing"
+}
+
+/// How long a host gets to answer the probe. One that does not is taken to
+/// have a binary: the proxy then runs, and its handshake has its own limit.
+const REMOTE_MUX_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `fd` read until the other end closes it, or `None` once `limit` has
+/// passed first, or the output grows past anything the probe prints.
+fn read_until_closed_within(fd: &mut FileDescriptor, limit: Duration) -> Option<String> {
+    use filedescriptor::{poll, pollfd, AsRawSocketDescriptor, POLLIN};
+    const MAX_OUTPUT: usize = 16 * 1024;
+    let deadline = std::time::Instant::now() + limit;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        let mut pfd = [pollfd {
+            fd: fd.as_socket_descriptor(),
+            events: POLLIN,
+            revents: 0,
+        }];
+        match poll(&mut pfd, Some(left)) {
+            Ok(0) => return None,
+            Ok(_) => match fd.read(&mut buf) {
+                Ok(0) => return Some(String::from_utf8_lossy(&output).into_owned()),
+                Ok(len) if output.len() + len > MAX_OUTPUT => return None,
+                Ok(len) => output.extend_from_slice(&buf[..len]),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            },
+            Err(_) => return None,
+        }
+    }
+}
+
 /// The server answered an RPC with a refusal. The transport carried the
 /// request and the reply; only this request was rejected. Callers that
 /// keep going after a refusal downcast to this so that a transport
@@ -1613,6 +1679,36 @@ impl Reconnectable {
         }
     }
 
+    /// Whether `sess`'s host has no binary for the default proxy command.
+    /// A probe that cannot be run answers no.
+    fn remote_mux_missing(sess: &wezterm_ssh::Session) -> bool {
+        // Its input from /dev/null: closing our end of stdin early closes
+        // the whole channel, losing the answer.
+        let probe = format!("{{ {REMOTE_MUX_PROBE}; }} </dev/null");
+        let exec = match smol::block_on(sess.exec(&probe, None)) {
+            Ok(exec) => exec,
+            Err(err) => {
+                log::warn!("could not ask the host for its mux binary: {err:#}");
+                return false;
+            }
+        };
+        let stdin = exec.stdin;
+        let mut stdout = exec.stdout;
+        let mut stderr = exec.stderr;
+        let mut child = exec.child;
+        let drain = thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+        let Some(output) = read_until_closed_within(&mut stdout, REMOTE_MUX_PROBE_TIMEOUT) else {
+            // Closing our end of the channel ends it, and with it the
+            // drain; waiting on either here could last forever.
+            log::warn!("the host did not say in time whether it has a mux binary");
+            return false;
+        };
+        let _ = drain.join();
+        let _ = child.wait();
+        drop(stdin);
+        probe_says_missing(&output)
+    }
+
     fn ssh_connect(
         &mut self,
         ssh_dom: SshDomain,
@@ -1624,6 +1720,21 @@ impl Reconnectable {
 
         let sess =
             ssh_connect_with_ui_and_password(ssh_config, ui, ssh_dom.stored_password.clone())?;
+        // A host with no mux binary would answer the proxy only with
+        // "command not found" and a closed stream. Asked first, that case is
+        // told apart, and the attach can offer to install ThinkTerm. Only the
+        // default command is probed: a configured path or proxy command is
+        // the person's own, and a reconnect has already been through this.
+        if initial
+            && ssh_dom.override_proxy_command.is_none()
+            && ssh_dom.remote_wezterm_path.is_none()
+            && Self::remote_mux_missing(&sess)
+        {
+            return Err(RemoteMuxMissing {
+                host: ssh_dom.remote_address.clone(),
+            }
+            .into());
+        }
         let cmd = if let Some(cmd) = ssh_dom.override_proxy_command.clone() {
             cmd
         } else if initial || !no_auto_start {
@@ -3024,6 +3135,80 @@ mod tests {
             ),
             "/opt/bin/wezterm cli tlscreds"
         );
+    }
+
+    #[test]
+    fn only_a_plain_missing_counts_as_no_mux_binary() {
+        assert!(super::probe_says_missing("missing\n"));
+        assert!(!super::probe_says_missing("present\n"));
+        assert!(!super::probe_says_missing(""));
+        assert!(!super::probe_says_missing("Welcome to devbox\nmissing\n"));
+    }
+
+    /// The probe, run in a shell, says "missing" exactly when the default
+    /// proxy command finds nothing to run.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_finds_a_binary_exactly_where_the_proxy_command_would() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+
+        fn place(dir: &Path, name: &str) {
+            std::fs::create_dir_all(dir).unwrap();
+            let file = dir.join(name);
+            std::fs::write(&file, "#!/bin/sh\necho ran\n").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fn run(home: &Path, bin: &Path, script: &str) -> String {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .env_clear()
+                .env("HOME", home)
+                .env("PATH", bin)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        for (case, missing) in [
+            ("~/.local/bin/thinkterm", false),
+            ("thinkterm on PATH", false),
+            ("wezterm on PATH", false),
+            ("nothing", true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            let bin = dir.path().join("bin");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&bin).unwrap();
+            match case {
+                "~/.local/bin/thinkterm" => place(&home.join(".local/bin"), "thinkterm"),
+                "thinkterm on PATH" => place(&bin, "thinkterm"),
+                "wezterm on PATH" => place(&bin, "wezterm"),
+                _ => {}
+            }
+            let probe = run(&home, &bin, super::REMOTE_MUX_PROBE);
+            let proxy = run(&home, &bin, &Reconnectable::remote_mux_command(&None, "proxy"));
+            assert_eq!(super::probe_says_missing(&probe), missing, "{case}: {probe:?}");
+            assert_eq!(proxy.trim() == "ran", !missing, "{case}: {proxy:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_never_answers_is_given_up_on() {
+        let (mut ours, _theirs) = filedescriptor::socketpair().unwrap();
+        let started = Instant::now();
+        let read = super::read_until_closed_within(&mut ours, Duration::from_millis(100));
+        assert_eq!(read, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let (mut ours, mut theirs) = filedescriptor::socketpair().unwrap();
+        std::io::Write::write_all(&mut theirs, b"missing\n").unwrap();
+        drop(theirs);
+        let read = super::read_until_closed_within(&mut ours, Duration::from_secs(5));
+        assert_eq!(read.as_deref(), Some("missing\n"));
     }
 
     #[test]

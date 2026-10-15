@@ -338,6 +338,14 @@ pub fn is_fatal_attach_error(err: &anyhow::Error) -> bool {
             || cause
                 .downcast_ref::<wezterm_ssh::HostVerificationFailed>()
                 .is_some()
+            // A host with no ThinkTerm stays without one until somebody
+            // installs it; trying again would only ask again.
+            || cause
+                .downcast_ref::<crate::client::RemoteMuxMissing>()
+                .is_some()
+            || cause
+                .downcast_ref::<crate::client::RemoteInstallDeclined>()
+                .is_some()
     })
 }
 
@@ -5018,6 +5026,13 @@ mod tests {
                 file: None,
             })
             .context("host verification"),
+            anyhow::Error::new(crate::client::RemoteMuxMissing {
+                host: "server-a:22".to_string(),
+            })
+            .context("Installing ThinkTerm failed: cancelled"),
+            anyhow::Error::new(crate::client::RemoteInstallDeclined {
+                host: "server-a:22".to_string(),
+            }),
         ];
         for err in fatal_errors {
             assert!(is_fatal_attach_error(&err), "{}", format!("{err:#}"));
@@ -6192,7 +6207,49 @@ impl ClientDomain {
                         }
                     })
                 };
-                let mut client = connect(config.clone(), ui.clone()).await?;
+                let mut client = match connect(config.clone(), ui.clone()).await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        // A host with no ThinkTerm at all is the other
+                        // connect failure this side can repair: asked, it
+                        // gets this client's version over the same hop.
+                        let (ClientDomainConfig::Ssh(ssh), Some(missing)) =
+                            (&config, err.downcast_ref::<crate::client::RemoteMuxMissing>())
+                        else {
+                            return Err(err);
+                        };
+                        let host = missing.host.clone();
+                        let outcome = {
+                            let ssh = ssh.clone();
+                            let ui = ui.clone();
+                            spawn_into_new_thread(move || {
+                                crate::remote_update::offer_remote_install(&ssh, &ui)
+                            })
+                            .await
+                        };
+                        match outcome {
+                            Ok(crate::remote_update::RemoteInstallOutcome::Installed) => {
+                                connect(config.clone(), ui.clone()).await?
+                            }
+                            Ok(crate::remote_update::RemoteInstallOutcome::Declined) => {
+                                return Err(crate::client::RemoteInstallDeclined { host }.into());
+                            }
+                            // Why it could not be installed is on screen;
+                            // the host is still without ThinkTerm.
+                            Ok(crate::remote_update::RemoteInstallOutcome::Unavailable) => {
+                                return Err(err);
+                            }
+                            // The host is still without ThinkTerm, which
+                            // ends this attach; the reason it failed (a
+                            // cancelled password among them) goes with it.
+                            Err(install_err) => {
+                                return Err(err.context(format!(
+                                    "Installing ThinkTerm failed: {install_err:#}"
+                                )));
+                            }
+                        }
+                    }
+                };
 
                 ui.output_str("Checking server version\n");
                 let verified = client.verify_version_compat(&ui).await;
