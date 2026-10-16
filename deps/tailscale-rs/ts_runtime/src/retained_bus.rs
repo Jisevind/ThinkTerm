@@ -190,6 +190,14 @@ where
 #[derive(Debug, Copy, Clone, Default)]
 pub struct GetRetained<M>(PhantomData<M>);
 
+// ThinkTerm (derp runner): added, as the derived `Default` asks for an `M: Default`.
+impl<M> GetRetained<M> {
+    /// Ask for the retained value of type `M`.
+    pub fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
 impl<M> Message<GetRetained<M>> for RetainedBus
 where
     M: Clone + Send + 'static,

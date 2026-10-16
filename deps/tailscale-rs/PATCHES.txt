@@ -3,8 +3,8 @@ Patches to the vendored tailscale-rs crates
 
 What is here
 ------------
-The folders here -- tailscale, ts_runtime, ts_control and ts_netstack_smoltcp_core -- are
-copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
+The folders here -- tailscale, ts_runtime, ts_control, ts_netstack_smoltcp_core and ts_derp --
+are copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
 ThinkTerm's changes on top. The root Cargo.toml points crates.io's versions at them
 ([patch.crates-io]) and keeps them out of the workspace (exclude). Every other tailscale-rs
 crate (ts_keys, ts_tunnel, ...) still comes from crates.io, held at the same version by
@@ -22,15 +22,15 @@ below:
 
 The whole difference from upstream, at any time, against a fresh copy of 0.6.1:
 
-    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core; do
+    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core ts_derp; do
         curl -sL "https://static.crates.io/crates/$c/$c-0.6.1.crate" | tar xz -C /tmp
         diff -ru "/tmp/$c-0.6.1" "deps/tailscale-rs/$c"
     done
 
 Upstream files this copy does not carry (README.md, examples, tests, Cargo.lock,
 Cargo.toml.orig, .cargo_vcs_info.json) show up as "Only in", and so do the LICENSE and
-PATENTS that ts_runtime, ts_control and ts_netstack_smoltcp_core got from the tailscale
-crate, as they ship without them. All of that is expected.
+PATENTS that ts_runtime, ts_control, ts_netstack_smoltcp_core and ts_derp got from the
+tailscale crate, as they ship without them. All of that is expected.
 
 The changes
 -----------
@@ -75,35 +75,110 @@ lost peers (ts_netstack_smoltcp_core)
     retrying forever.
     Drop when: upstream sets a timeout and a keep-alive on its sockets.
 
-build (all four)
+derp dial (ts_derp, ts_runtime)
+    A DERP region whose servers cannot be reached, or whose TLS handshake fails, is an error
+    for its client; 0.6.1 unwraps the outcome of the dial and panics. A connection gets 15 s
+    to come up, as none of its steps has a limit of its own. After a failure the region's
+    runner waits and tries again, from 1 s doubling to 30 s, starting from 1 s again once a
+    connection held for 10 s. While it waits, what is queued for the region is dropped as it
+    comes, and the region becoming home ends the wait. 0.6.1's runner returned on any error,
+    leaving the region without a client. A try after a failed one starts with the region's
+    next server: the dial goes down a region's servers only up to the first that takes the
+    TCP connection, so one that then failed the TLS handshake, or said nothing till the 15 s
+    ran out, kept the others from ever being tried.
+    Drop when: upstream's DERP client reports a failed dial and its runner retries.
+
+derp frames (ts_derp)
+    A frame from a DERP server too short for its type -- a PeerGone without its reason byte,
+    as servers from before the reason send, or a packet without its source key -- is passed
+    over, and an unknown PeerGone reason only logged; 0.6.1 unwraps the first two, panicking,
+    and ends the connection over the third.
+    Drop when: upstream's client takes such frames in its stride.
+
+derp reads (ts_derp)
+    A DERP connection that has gone 120 s without a frame from the server counts as gone: the
+    server sends a keep-alive whenever it has had nothing else to send for a minute, and Go's
+    client allows as long. 0.6.1 waited for good, so a connection that died while nothing was
+    sent on it -- the machine slept, the network changed -- held its runner, often the home
+    region's, and the node got nothing more through it.
+    Drop when: upstream's client times its reads out.
+
+derp runner (ts_runtime)
+    A region's runner ends with its Uniderp: Uniderp::on_stop stops it, and the runner leaves
+    by itself once the Uniderp's end of the home-derp watch is gone. kameo leaves a linked task
+    running when a supervised actor is restarted, stops normally or goes down with its
+    supervisor, and 0.6.1's runner then spun at full speed on the closed watch for as long as
+    the process lived. The runner also ends when the dataplane closes its queue, which 0.6.1
+    took for activity and connected over, again and again with no wait. A runner ending while
+    its Uniderp lives fails the Uniderp, which is restarted with a new transport; by kameo's
+    default the Uniderp stayed up with no runner, and the region had no client.
+    A Uniderp that stops leaves its queue to a task that empties it until the dataplane goes:
+    routes lead to the transport until they are redone, and the dataplane unwraps each send,
+    so a packet coming meanwhile panicked it and it restarted empty. A Uniderp kameo restarts
+    asks the bus for the latest DERP latency measurement (RetainedBus's GetRetained::new):
+    keeping its actor id, it is not sent what the bus retains, and a restarted home region
+    took itself for any other until the DERP map changed.
+    Drop when: upstream ties the runner's lifetime to its Uniderp's.
+
+derp regions (ts_runtime)
+    A region whose Uniderp failed too often to be restarted is given up on its own, and
+    started once more a minute later if the DERP map still has it; by kameo's default
+    Multiderp stopped with it, and every other region's client went down too. Given up again
+    within 30 minutes of that, it waits twice as long each time, up to 30 minutes, as every
+    start takes a transport the dataplane keeps for good; DERP maps that come meanwhile do not
+    start it early. A Uniderp whose region left the DERP map stops normally and is not
+    restarted (0.6.1 restarted it five times, each taking a transport); should the map have
+    the region again by the time it is gone, it is started again at once.
+    Multiderp keeps its own record of each region's Uniderp, from its spawn until it is gone
+    for good, instead of looking it up in the registry: a Uniderp is there only once started,
+    so a map coming meanwhile started a second one for the region, and one gone for good
+    keeps its name there, so its region never came back. Multiderp also takes the region's
+    transport out of its map itself once the Uniderp is gone for good. Uniderp::on_stop did,
+    but kameo tells the supervisor before it runs on_stop: the Uniderp restarted in its place
+    could put its transport in first, and out it went.
+    Drop when: upstream's Multiderp outlives a region it gave up and starts it again.
+
+build (all five)
     #![doc = include_str!("../README.md")] became a one-line //! doc: the READMEs are not
     vendored (the root .gitignore drops *.md). In Cargo.toml, tailscale loses its
     [[example]], [[test]] and [profile.bench] sections, ts_netstack_smoltcp_core its
     [dev-dependencies], and ts_runtime gains tokio's "time" feature. Upstream's proptest
     module in ts_runtime/src/peer_tracker/peer_db.rs is switched off, as proptest is not a
-    dependency here.
+    dependency here. ts_derp loses its [[example]] sections, as the examples are not vendored,
+    and gains tokio's "time" and "io-util" features.
 
 Tests
 -----
 The additions above are called from thinkterm-tailnet, so losing one in a merge fails the
 build. The changes in behaviour have tests:
 
-    cargo test -p ts_runtime -p ts_control -p ts_netstack_smoltcp_core --lib
+    cargo test -p ts_runtime -p ts_control -p ts_netstack_smoltcp_core -p ts_derp --lib
 
     lost peers     socket_impl::tcp::tests (connect and listen)
     device info    node::tests
     sign-in state  control_runner::tests (the reason given)
     no panic       env::tests
+    derp dial      multiderp::uniderp::tests (an unreachable region, becoming home, a
+                   connection that does not come up, the next server)
+    derp reads     client::tests in ts_derp (a connection gone quiet, keep-alives)
+    derp runner    multiderp::uniderp::tests (a runner whose Uniderp is gone, whose queue
+                   is closed, that ended; a region given up; the transport of a Uniderp
+                   gone; a Uniderp restarted in the home region)
+    derp regions   multiderp::tests (the waits); multiderp::uniderp::tests (a region given
+                   up, waiting out its wait, getting one Uniderp, dropped from the map and
+                   put back)
 
 Not covered by a test: the peer tracker's answer for an empty tailnet, and the Failed state
 taking the place of the stop. Signing in to a real tailnet after an upgrade checks the
-first; signing in with a wrong auth key checks the second.
+first; signing in with a wrong auth key checks the second. Nor are the parts of derp dial
+and derp frames that need a working DERP server (the waits starting over after a connection
+that held, frames the server sends).
 
 Upgrading
 ---------
 1. Read upstream's CHANGELOG.md for the new version: its security fixes, and anything that
    touches the groups above. A group upstream now covers can be dropped instead of merged.
-2. For each of the four crates, merge three ways, file by file: the base is upstream's old
+2. For each of the five crates, merge three ways, file by file: the base is upstream's old
    version, ours is deps/tailscale-rs/<crate>, theirs is upstream's new version. With both
    versions unpacked in /tmp as above:
 
@@ -113,7 +188,7 @@ Upgrading
    Changes that do not overlap merge by themselves; overlapping ones are left between
    conflict markers. Copy files upstream added; move by hand our changes in a file upstream
    removed or renamed. For Cargo.toml, take upstream's new one and redo the build changes.
-3. Bump the version: the four entries under [patch.crates-io] in the root Cargo.toml and
+3. Bump the version: the five entries under [patch.crates-io] in the root Cargo.toml and
    the two in thinkterm-tailnet/Cargo.toml, then `cargo update` the other tailscale-rs
    crates to the same version. All tailscale-rs crates move together.
 4. Build, run the tests above and thinkterm-tailnet's, then sign in to a real tailnet and
