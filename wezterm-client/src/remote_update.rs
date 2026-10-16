@@ -137,9 +137,10 @@ pub fn offer_remote_update(
         ssh_dom.stored_password.clone(),
     )
     .with_context(|| format!("opening an ssh session to {host} for the update"))?;
+    let variant = remote_variant(&session);
     // A host the release binaries cannot run on gets the answer straight
     // away, rather than an installer run that fails at its first check.
-    if let Some(reason) = host_cannot_take_a_release(&session) {
+    if let Some(reason) = host_cannot_take_a_release(&session, variant) {
         ui.output_str(&format!(
             "{reason}, so the release build of {local} cannot be installed on {host}.\n{}\n",
             thinkterm_update::build_from_source_instructions(&local)
@@ -147,7 +148,6 @@ pub fn offer_remote_update(
         return Ok(RemoteUpdateOutcome::Declined);
     }
 
-    let variant = remote_variant(&session);
     let command = thinkterm_update::install_command(variant, &local);
     // Uncommitted changes can include a newer protocol than the release
     // that carries this version label.
@@ -292,7 +292,8 @@ pub fn offer_remote_install(
 ) -> anyhow::Result<RemoteInstallOutcome> {
     let local = thinkterm_update::running_release_version();
     let host = ssh_dom.remote_address.clone();
-    let command = thinkterm_update::install_command("server", &local);
+    let variant = "server";
+    let command = thinkterm_update::install_command(variant, &local);
 
     ui.output_str(&format!(
         "\nThinkTerm is not installed on {host}. ThinkTerm Connect runs there, so \
@@ -359,7 +360,7 @@ pub fn offer_remote_install(
         ssh_dom.stored_password.clone(),
     )
     .with_context(|| format!("opening an ssh session to {host} for the install"))?;
-    if let Some(reason) = host_cannot_take_a_release(&session) {
+    if let Some(reason) = host_cannot_take_a_release(&session, variant) {
         ui.output_str(&format!(
             "{reason}, so the release build of {local} cannot be installed on {host}.\n{}\n",
             thinkterm_update::build_from_source_instructions(&local)
@@ -398,13 +399,18 @@ const HOST_PROBE: &str =
 const VARIANT_READ: &str =
     "sed -n 's/^variant=//p' \"$HOME/.local/share/thinkterm/install-manifest\" 2>/dev/null";
 
-/// Why the host cannot run a release binary, if it cannot: the same two
-/// checks `install.sh` makes first, made here so the answer comes before
-/// the question. An unreadable answer is not a refusal; the script will
-/// check again.
-fn host_cannot_take_a_release(session: &Session) -> Option<String> {
+/// Why the host cannot run a release binary of `variant`, if it cannot: the
+/// same two checks `install.sh` makes first, made here so the answer comes
+/// before the question. An unreadable answer is not a refusal; the script
+/// will check again.
+fn host_cannot_take_a_release(session: &Session, variant: &str) -> Option<String> {
     let out = run_capture(session, HOST_PROBE).ok()?;
-    let mut lines = out.lines().map(str::trim);
+    release_refusal(&out, variant)
+}
+
+/// `host_cannot_take_a_release`, given what `HOST_PROBE` printed there.
+fn release_refusal(probe: &str, variant: &str) -> Option<String> {
+    let mut lines = probe.lines().map(str::trim);
     let os = lines.next()?;
     let arch = lines.next()?;
     let libc = lines.next().unwrap_or("");
@@ -416,13 +422,11 @@ fn host_cannot_take_a_release(session: &Session) -> Option<String> {
     }
     if os == "Linux" {
         if let Some(version) = thinkterm_update::parse_glibc_version(libc) {
-            if version < thinkterm_update::MIN_GLIBC {
+            let need = thinkterm_update::min_glibc(variant);
+            if version < need {
                 return Some(format!(
-                    "The host has glibc {}.{} and the release binaries need {}.{}",
-                    version.0,
-                    version.1,
-                    thinkterm_update::MIN_GLIBC.0,
-                    thinkterm_update::MIN_GLIBC.1
+                    "The host has glibc {}.{} and the {variant} release binaries need {}.{}",
+                    version.0, version.1, need.0, need.1
                 ));
             }
         }
@@ -522,7 +526,7 @@ fn run_and_relay_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_not_published, is_yes, without_input};
+    use super::{is_not_published, is_yes, release_refusal, without_input};
 
     #[test]
     fn only_an_explicit_yes_counts() {
@@ -531,6 +535,22 @@ mod tests {
         assert!(!is_yes(""));
         assert!(!is_yes("n"));
         assert!(!is_yes("maybe"));
+    }
+
+    #[test]
+    fn a_host_is_refused_by_the_glibc_of_the_variant_it_would_get() {
+        // RHEL 9 and its kin: the server runs there, the GUI does not.
+        let rhel9 = "Linux\naarch64\nglibc 2.34\n";
+        assert_eq!(release_refusal(rhel9, "server"), None);
+        let refused = release_refusal(rhel9, "desktop").expect("the GUI needs 2.35");
+        assert!(refused.contains("glibc 2.34"), "{refused}");
+        assert!(release_refusal("Linux\nx86_64\nglibc 2.31\n", "server").is_some());
+        assert_eq!(
+            release_refusal("Linux\nx86_64\nglibc 2.39\n", "desktop"),
+            None
+        );
+        assert!(release_refusal("Linux\nx86_64\nmusl libc (x86_64)\n", "server").is_some());
+        assert_eq!(release_refusal("Darwin\narm64\n\n", "desktop"), None);
     }
 
     #[cfg(unix)]

@@ -41,7 +41,11 @@
 set -eu
 
 repo="RoversX/thinkterm"
-min_glibc="2.35"   # the Ubuntu 22.04 build base; see .github/workflows/release.yml
+# The oldest glibc each variant's Linux binaries load on: the newest glibc
+# symbol version any of them needs. ci/check-glibc.sh holds every release to
+# these, and thinkterm-update carries the same two numbers.
+min_glibc_server="2.34"
+min_glibc_desktop="2.35"   # the GUI's alone; the rest need no more than the server
 
 variant=""
 tag=""
@@ -208,15 +212,27 @@ if [ "$os" = linux ]; then
   # The binaries link against glibc; musl (Alpine) cannot run them at all,
   # and an older glibc fails at load time with a message that blames a
   # symbol version rather than the real cause. Check here, in words.
+  if [ "$variant" = server ]; then
+    min_glibc=$min_glibc_server
+    newer="Ubuntu 22.04, Debian 12, RHEL 9"
+  else
+    min_glibc=$min_glibc_desktop
+    newer="Ubuntu 22.04, Debian 12, RHEL 10"
+  fi
   glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}') || glibc=""
   if [ -z "$glibc" ]; then
     if ldd --version 2>&1 | grep -qi musl; then
       die "this host uses musl libc; the release tarballs are built against glibc. Build from source instead."
     fi
-    warn "could not determine the glibc version; continuing, but the binaries need glibc >= $min_glibc"
+    warn "could not determine the glibc version; continuing, but the $variant binaries need glibc >= $min_glibc"
   elif lowest=$(printf '%s\n%s\n' "$min_glibc" "$glibc" | sort -V 2>/dev/null | head -n1) \
       && [ -n "$lowest" ] && [ "$lowest" != "$min_glibc" ]; then
-    die "glibc $glibc is too old: the release binaries need >= $min_glibc (Ubuntu 22.04, Debian 12, RHEL 10 or newer). Build from source instead."
+    also=""
+    if [ "$variant" = desktop ] && [ "$(printf '%s\n%s\n' "$min_glibc_server" "$glibc" \
+        | sort -V 2>/dev/null | head -n1)" = "$min_glibc_server" ]; then
+      also=" The server variant (--server) runs on it."
+    fi
+    die "glibc $glibc is too old: the $variant binaries need >= $min_glibc ($newer or newer). Build from source instead.$also"
   fi
   have tar || die "tar is required"
 else

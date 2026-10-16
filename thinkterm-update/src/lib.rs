@@ -35,10 +35,17 @@ pub const INSTALL_SCRIPT_URL: &str =
 const API_RELEASES: &str = "https://api.github.com/repos/RoversX/thinkterm/releases";
 const API_COMMITS: &str = "https://api.github.com/repos/RoversX/thinkterm/commits";
 
-/// The oldest glibc the Linux release binaries run on: the Ubuntu 22.04 base
-/// they are built in. `install.sh` carries the same number and refuses
-/// older hosts; this copy lets a client refuse before it even offers.
-pub const MIN_GLIBC: (u32, u32) = (2, 35);
+/// The oldest glibc the Linux release binaries of `variant` ("server" or
+/// "desktop", as `install.sh` takes it) load on: the newest glibc symbol
+/// version any of them needs, which `ci/check-glibc.sh` holds every release
+/// to. Only the GUI needs 2.35. `install.sh` carries the same numbers and
+/// refuses older hosts; this copy lets a client refuse before it even offers.
+pub fn min_glibc(variant: &str) -> (u32, u32) {
+    match variant {
+        "server" => (2, 34),
+        _ => (2, 35),
+    }
+}
 
 /// Parse `getconf GNU_LIBC_VERSION` output ("glibc 2.31") or a bare
 /// "2.31" into (major, minor).
@@ -1161,8 +1168,30 @@ mod tests {
         assert_eq!(parse_glibc_version("glibc 2.31\n"), Some((2, 31)));
         assert_eq!(parse_glibc_version("2.35"), Some((2, 35)));
         assert_eq!(parse_glibc_version(""), None);
-        assert!(parse_glibc_version("glibc 2.31").unwrap() < MIN_GLIBC);
-        assert!(parse_glibc_version("glibc 2.39").unwrap() >= MIN_GLIBC);
+        assert!(parse_glibc_version("glibc 2.31").unwrap() < min_glibc("server"));
+        assert!(parse_glibc_version("glibc 2.39").unwrap() >= min_glibc("desktop"));
+    }
+
+    #[test]
+    fn a_server_takes_a_glibc_the_desktop_does_not() {
+        // RHEL 9 and its kin, Amazon Linux 2023.
+        let glibc = parse_glibc_version("glibc 2.34").unwrap();
+        assert!(glibc >= min_glibc("server"));
+        assert!(glibc < min_glibc("desktop"));
+    }
+
+    #[test]
+    fn the_glibc_floors_are_install_sh_s() {
+        let script = include_str!("../../install.sh");
+        let floor = |name: &str| {
+            let line = script
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}=\"")))
+                .unwrap_or_else(|| panic!("install.sh sets no {name}"));
+            parse_glibc_version(line.split('"').nth(1).unwrap()).unwrap()
+        };
+        assert_eq!(floor("min_glibc_server"), min_glibc("server"));
+        assert_eq!(floor("min_glibc_desktop"), min_glibc("desktop"));
     }
 
     #[test]

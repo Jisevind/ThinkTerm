@@ -616,6 +616,13 @@ jobs:
             -p thinkterm-tailnet-node \
             -p strip-ansi-escapes
 
+      # install.sh, and the clients that install over ssh, let a host in by
+      # the glibc each variant needs; the tarballs they install come from
+      # the Ubuntu leg, so its binaries are held to those numbers.
+      - name: Check glibc floors
+        if: startsWith(matrix.name, 'ubuntu')
+        run: bash ci/check-glibc.sh "target/$CARGO_PROFILE"
+
       - name: Fetch the browser bundle
         uses: actions/download-artifact@v8
         with:

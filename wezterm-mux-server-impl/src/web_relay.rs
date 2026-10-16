@@ -1323,13 +1323,12 @@ impl Probe {
                     return Some("the host uses musl libc".to_string());
                 }
                 let glibc = thinkterm_update::parse_glibc_version(&self.libc)?;
-                (glibc < thinkterm_update::MIN_GLIBC).then(|| {
+                // The variant `install` puts there.
+                let need = thinkterm_update::min_glibc("server");
+                (glibc < need).then(|| {
                     format!(
                         "the host has glibc {}.{} and the release binaries need {}.{}",
-                        glibc.0,
-                        glibc.1,
-                        thinkterm_update::MIN_GLIBC.0,
-                        thinkterm_update::MIN_GLIBC.1
+                        glibc.0, glibc.1, need.0, need.1
                     )
                 })
             }
@@ -3355,6 +3354,8 @@ mod tests {
         assert!(linux("armv7l", "glibc 2.39").cannot_take_a_release().is_some());
         assert!(linux("x86_64", "musl libc (x86_64)").cannot_take_a_release().is_some());
         assert!(linux("aarch64", "glibc 2.31").cannot_take_a_release().is_some());
+        // RHEL 9 and its kin: what is installed there is the server.
+        assert_eq!(linux("aarch64", "glibc 2.34").cannot_take_a_release(), None);
         let mac = Probe {
             os: "Darwin".into(),
             arch: "arm64".into(),
