@@ -133,7 +133,7 @@ case $OSTYPE in
       esac
     fi
 
-    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui thinkterm-plugin-server strip-ansi-escapes ; do
+    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui thinkterm-plugin-server thinkterm-tailnet strip-ansi-escapes ; do
       if [[ -n "$macos_bin_dir" ]] ; then
         cp $macos_bin_dir/$bin $zipdir/ThinkTerm.app/Contents/MacOS/$bin
       # If the user ran a simple `cargo build --release`, then we want to allow
@@ -155,7 +155,7 @@ case $OSTYPE in
     # report's addresses can be resolved against the matching build.
     symdir="$zipdir-dSYM"
     rm -rf "$symdir" "$symdir.zip"
-    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui thinkterm-plugin-server strip-ansi-escapes ; do
+    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui thinkterm-plugin-server thinkterm-tailnet strip-ansi-escapes ; do
       dsym="${macos_bin_dir:-$TARGET_DIR/$PROFILE}/$bin.dSYM"
       if [[ -d "$dsym" ]] ; then
         mkdir -p "$symdir"
@@ -395,7 +395,7 @@ source ~/.cargo/env
 
 cargo build --profile ${PROFILE} \
       -p wezterm-gui -p wezterm -p wezterm-mux-server \
-      -p thinkterm-plugin-server -p strip-ansi-escapes
+      -p thinkterm-plugin-server -p thinkterm-tailnet-node -p strip-ansi-escapes
 BUILDEOFEOF
 )
           BUILD_REQUIRES=$(cat <<BREQEOF
@@ -490,6 +490,7 @@ install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/wezterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-gui -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-plugin-server -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-tailnet -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-mux-server -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/strip-ansi-escapes -t %{buildroot}/usr/bin
 install -Dm644 assets/shell-integration/* -t %{buildroot}/etc/profile.d
@@ -517,6 +518,7 @@ ${RPM_WEB_INSTALL}
 /usr/bin/wezterm
 /usr/bin/thinkterm-gui
 /usr/bin/thinkterm-plugin-server
+/usr/bin/thinkterm-tailnet
 /usr/bin/thinkterm-mux-server
 /usr/bin/strip-ansi-escapes
 /usr/bin/open-thinkterm-here
@@ -538,6 +540,7 @@ ${RPM_WEB_FILES}
 /usr/bin/thinkterm
 /usr/bin/wezterm
 /usr/bin/thinkterm-plugin-server
+/usr/bin/thinkterm-tailnet
 /usr/bin/thinkterm-mux-server
 /usr/bin/strip-ansi-escapes
 /usr/share/licenses/thinkterm-server/*
@@ -656,6 +659,7 @@ EOF
 
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-mux-server
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-plugin-server
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-tailnet
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/wezterm
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/strip-ansi-escapes
@@ -758,12 +762,14 @@ EOF
           $TARGET_DIR/$PROFILE/thinkterm-mux-server \
           $TARGET_DIR/$PROFILE/thinkterm-gui \
           $TARGET_DIR/$PROFILE/thinkterm-plugin-server \
+          $TARGET_DIR/$PROFILE/thinkterm-tailnet \
           $TARGET_DIR/$PROFILE/strip-ansi-escapes
         linux_tarball thinkterm-server \
           $TARGET_DIR/$PROFILE/thinkterm \
           $TARGET_DIR/$PROFILE/wezterm \
           $TARGET_DIR/$PROFILE/thinkterm-mux-server \
           $TARGET_DIR/$PROFILE/thinkterm-plugin-server \
+          $TARGET_DIR/$PROFILE/thinkterm-tailnet \
           $TARGET_DIR/$PROFILE/strip-ansi-escapes
       ;;
     esac
@@ -792,6 +798,7 @@ source="
   $TARGET_DIR/$PROFILE/thinkterm-gui
   $TARGET_DIR/$PROFILE/thinkterm-mux-server
   $TARGET_DIR/$PROFILE/thinkterm-plugin-server
+  $TARGET_DIR/$PROFILE/thinkterm-tailnet
   assets/open-thinkterm-here
   assets/open-wezterm-here
   assets/wezterm.desktop
@@ -817,6 +824,7 @@ package() {
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-gui
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-mux-server
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-plugin-server
+  install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-tailnet
 
   install -Dm644 "\$srcdir"/wezterm.desktop "\$pkgdir"/usr/share/applications/com.roversx.thinkterm.desktop
   install -Dm644 "\$srcdir"/wezterm.appdata.xml "\$pkgdir"/usr/share/metainfo/com.roversx.thinkterm.appdata.xml

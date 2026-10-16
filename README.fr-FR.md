@@ -133,7 +133,7 @@ Pour compiler l'application de bureau sur macOS ou Linux, installez Rust et les 
 git clone --recursive https://github.com/RoversX/ThinkTerm.git
 cd ThinkTerm
 ./get-deps
-cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server
+cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server -p thinkterm-tailnet-node
 ```
 
 Les exécutables sont créés dans `target/release`. Consultez le [guide de contribution](CONTRIBUTING.md) pour l'organisation du code et le processus de développement. Le [script de compilation web](ci/build-web.sh) produit les ressources Web séparément ; les points d'entrée mobiles sont [ios/build.sh](ios/build.sh) et [android/build.sh](android/build.sh).

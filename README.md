@@ -135,7 +135,7 @@ For a desktop build on macOS or Linux, install Rust and your platform's build to
 git clone --recursive https://github.com/RoversX/ThinkTerm.git
 cd ThinkTerm
 ./get-deps
-cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server
+cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server -p thinkterm-tailnet-node
 ```
 
 The binaries are written to `target/release`. See [Contributing](CONTRIBUTING.md) for the source layout and development workflow. The [browser build script](ci/build-web.sh) builds the separate Web assets; mobile build entry points are [ios/build.sh](ios/build.sh) and [android/build.sh](android/build.sh).

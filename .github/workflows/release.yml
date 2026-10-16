@@ -353,6 +353,7 @@ jobs:
             -p wezterm-gui \
             -p wezterm-mux-server \
             -p thinkterm-plugin-server \
+            -p thinkterm-tailnet-node \
             -p strip-ansi-escapes
 
       - name: Fetch the browser bundle
@@ -612,6 +613,7 @@ jobs:
             -p wezterm-gui \
             -p wezterm-mux-server \
             -p thinkterm-plugin-server \
+            -p thinkterm-tailnet-node \
             -p strip-ansi-escapes
 
       - name: Fetch the browser bundle

@@ -133,7 +133,7 @@ TUI 支持工作空间导航、标签页、分屏、调整大小、复制模式�
 git clone --recursive https://github.com/RoversX/ThinkTerm.git
 cd ThinkTerm
 ./get-deps
-cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server
+cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server -p thinkterm-tailnet-node
 ```
 
 生成的可执行文件位于 `target/release`。源码结构和开发流程见[贡献指南](CONTRIBUTING.md)。[浏览器构建脚本](ci/build-web.sh) 用于构建独立的 Web 资源；移动端构建入口为 [ios/build.sh](ios/build.sh) 和 [android/build.sh](android/build.sh)。

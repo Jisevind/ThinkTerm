@@ -347,7 +347,7 @@ EOT
   echo "    notarization credentials: profile '$NOTARY_PROFILE' works"
 fi
 
-BINARIES="wezterm thinkterm thinkterm-mux-server thinkterm-gui thinkterm-plugin-server strip-ansi-escapes"
+BINARIES="wezterm thinkterm thinkterm-mux-server thinkterm-gui thinkterm-plugin-server thinkterm-tailnet strip-ansi-escapes"
 
 if [[ "$BUILD" == yes ]]; then
   if ! rustup target list --installed 2>/dev/null | grep -qx "$RUST_TARGET"; then
@@ -359,14 +359,15 @@ if [[ "$BUILD" == yes ]]; then
 
   echo
   echo "==> Building for $ARCH ($PROFILE profile)"
-  # The same five packages the release workflow builds, which between them
-  # produce all six binaries the bundle carries.  Building the whole
+  # The same six packages the release workflow builds, which between them
+  # produce all seven binaries the bundle carries.  Building the whole
   # workspace instead would compile crates no package ships.
   cargo build --profile "$PROFILE" --target "$RUST_TARGET" \
     -p wezterm \
     -p wezterm-gui \
     -p wezterm-mux-server \
     -p thinkterm-plugin-server \
+    -p thinkterm-tailnet-node \
     -p strip-ansi-escapes
   echo
   echo "==> Building the browser client"

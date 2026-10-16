@@ -133,7 +133,7 @@ macOS または Linux でデスクトップ版をビルドするには、Rust �
 git clone --recursive https://github.com/RoversX/ThinkTerm.git
 cd ThinkTerm
 ./get-deps
-cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server
+cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server -p thinkterm-tailnet-node
 ```
 
 実行ファイルは `target/release` に生成されます。ソース構成と開発手順は[貢献ガイド](CONTRIBUTING.md)をご覧ください。[ブラウザー用ビルドスクリプト](ci/build-web.sh)で Web リソースを別途ビルドします。モバイル版のビルドには [ios/build.sh](ios/build.sh) と [android/build.sh](android/build.sh)を使用します。
