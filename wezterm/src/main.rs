@@ -20,6 +20,7 @@ mod asciicast;
 mod cli;
 mod config_check;
 mod plugin;
+mod skill;
 #[cfg(feature = "tailnet")]
 mod tailnet;
 
@@ -272,6 +273,12 @@ enum SubCommand {
         about = "List, turn on and off, reload and run plugins"
     )]
     Plugin(plugin::PluginCommand),
+
+    #[command(
+        name = "skill",
+        about = "Install ThinkTerm's skill and session-start hook into coding agents"
+    )]
+    Skill(skill::SkillCommand),
 
     #[cfg(feature = "tailnet")]
     #[command(
@@ -1243,6 +1250,7 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Replay(cmd) => cmd.run(),
         SubCommand::Update(cmd) => cmd.run(),
         SubCommand::Plugin(cmd) => cmd.run(),
+        SubCommand::Skill(cmd) => cmd.run(),
         #[cfg(feature = "tailnet")]
         SubCommand::Tailnet(cmd) => cmd.run(),
         SubCommand::ListFiles(cmd) => cmd.run(),

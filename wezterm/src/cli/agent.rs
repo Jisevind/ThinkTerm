@@ -2,6 +2,7 @@
 
 use crate::cli::CliOutputFormatKind;
 use clap::Parser;
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tabout::{tabulate_output, Alignment, Column};
 use thinkterm_proto::{AgentEvidence, AgentState};
@@ -18,7 +19,16 @@ enum AgentSubCommand {
     /// List panes running detected coding agents
     #[command(name = "list")]
     List(AgentListCommand),
+
+    /// Tell a coding agent starting in this pane where it is: its pane and
+    /// the others in its tab. The session-start hook `thinkterm skill
+    /// setup` installs runs this; outside a pane it prints nothing.
+    #[command(name = "context")]
+    Context(AgentContextCommand),
 }
+
+#[derive(Debug, Parser, Clone)]
+struct AgentContextCommand {}
 
 #[derive(Debug, Parser, Clone)]
 struct AgentListCommand {
@@ -36,7 +46,105 @@ impl AgentCommand {
     pub async fn run(&self, client: Client) -> anyhow::Result<()> {
         match &self.sub {
             AgentSubCommand::List(cmd) => cmd.run(client).await,
+            AgentSubCommand::Context(cmd) => cmd.run(client).await,
         }
+    }
+}
+
+/// A pane as the context describes it.
+struct ContextPane {
+    pane_id: mux::pane::PaneId,
+    tab_id: mux::tab::TabId,
+    tab_title: String,
+    title: String,
+    label: Option<String>,
+}
+
+/// At most this many neighbours are named; an agent can list the rest.
+const CONTEXT_NEIGHBOURS: usize = 12;
+/// Titles past this many characters are cut short.
+const CONTEXT_TITLE_CHARS: usize = 80;
+
+impl AgentContextCommand {
+    async fn run(&self, client: Client) -> anyhow::Result<()> {
+        let Some(pane_id) = std::env::var("WEZTERM_PANE")
+            .ok()
+            .and_then(|id| id.parse::<mux::pane::PaneId>().ok())
+        else {
+            return Ok(());
+        };
+        let listed = client.list_panes().await?;
+        let mut panes = vec![];
+        for (tabroot, tab_title) in listed.tabs.into_iter().zip(listed.tab_titles.iter()) {
+            let mut cursor = tabroot.into_tree().cursor();
+            loop {
+                if let Some(stack) = cursor.leaf_mut() {
+                    for entry in &stack.panes {
+                        panes.push(ContextPane {
+                            pane_id: entry.pane_id,
+                            tab_id: entry.tab_id,
+                            tab_title: tab_title.clone(),
+                            title: entry.title.clone(),
+                            label: listed.pane_labels.get(&entry.pane_id).cloned(),
+                        });
+                    }
+                }
+                match cursor.preorder_next() {
+                    Ok(c) => cursor = c,
+                    Err(_) => break,
+                }
+            }
+        }
+        if let Some(text) = session_context(pane_id, &panes) {
+            let out = std::io::stdout();
+            write!(out.lock(), "{text}").map_err(crate::stdout_error)?;
+        }
+        Ok(())
+    }
+}
+
+/// What an agent starting in `pane_id` is told, or None when that pane is
+/// not among `panes` (a pane of another server).
+fn session_context(pane_id: mux::pane::PaneId, panes: &[ContextPane]) -> Option<String> {
+    let me = panes.iter().find(|pane| pane.pane_id == pane_id)?;
+    let mut text = format!("You are running inside ThinkTerm, in pane {}", describe(me));
+    if !me.tab_title.is_empty() {
+        text.push_str(&format!(" in tab \"{}\"", me.tab_title));
+    }
+    text.push_str(".\n");
+    let beside: Vec<_> = panes
+        .iter()
+        .filter(|pane| pane.tab_id == me.tab_id && pane.pane_id != pane_id)
+        .collect();
+    if beside.is_empty() {
+        text.push_str("No other pane shares this tab.\n");
+    } else {
+        text.push_str("Other panes in this tab:\n");
+        for pane in beside.iter().take(CONTEXT_NEIGHBOURS) {
+            text.push_str(&format!("- pane {}\n", describe(pane)));
+        }
+        if beside.len() > CONTEXT_NEIGHBOURS {
+            text.push_str(&format!("- and {} more\n", beside.len() - CONTEXT_NEIGHBOURS));
+        }
+    }
+    let elsewhere = panes.iter().filter(|pane| pane.tab_id != me.tab_id).count();
+    if elsewhere > 0 {
+        text.push_str(&format!("Other tabs hold {elsewhere} more.\n"));
+    }
+    text.push_str(
+        "Read a pane's screen with `thinkterm cli get-text --pane <id or label> --trim`; \
+         `thinkterm cli list` shows every pane and `thinkterm cli --help` every command. \
+         If `thinkterm` is not on PATH, it is in $WEZTERM_EXECUTABLE_DIR.\n",
+    );
+    Some(text)
+}
+
+/// `12 "dev" (pnpm dev)`: the id, the label if any, and the title.
+fn describe(pane: &ContextPane) -> String {
+    let title: String = pane.title.chars().take(CONTEXT_TITLE_CHARS).collect();
+    match &pane.label {
+        Some(label) => format!("{} \"{}\" ({})", pane.pane_id, label, title),
+        None => format!("{} ({})", pane.pane_id, title),
     }
 }
 
@@ -176,5 +284,51 @@ impl AgentListCommand {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(pane_id: mux::pane::PaneId, tab_id: mux::tab::TabId, title: &str, label: Option<&str>) -> ContextPane {
+        ContextPane {
+            pane_id,
+            tab_id,
+            tab_title: if tab_id == 3 { "project".into() } else { String::new() },
+            title: title.into(),
+            label: label.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_agent_is_told_its_pane_and_the_panes_beside_it() {
+        let panes = [
+            pane(12, 3, "claude", Some("agent")),
+            pane(14, 3, "pnpm dev", Some("dev")),
+            pane(15, 3, "tail -f app.log", None),
+            pane(20, 4, "zsh", None),
+        ];
+        let text = session_context(12, &panes).unwrap();
+        assert!(text.starts_with(
+            "You are running inside ThinkTerm, in pane 12 \"agent\" (claude) in tab \"project\".\n"
+        ));
+        assert!(text.contains("- pane 14 \"dev\" (pnpm dev)\n"));
+        assert!(text.contains("- pane 15 (tail -f app.log)\n"));
+        assert!(text.contains("Other tabs hold 1 more.\n"));
+        assert!(!text.contains("pane 20"));
+    }
+
+    #[test]
+    fn an_agent_alone_in_its_tab_is_told_so() {
+        let text = session_context(20, &[pane(20, 4, "zsh", None)]).unwrap();
+        assert!(text.starts_with("You are running inside ThinkTerm, in pane 20 (zsh).\n"));
+        assert!(text.contains("No other pane shares this tab.\n"));
+        assert!(!text.contains("Other tabs"));
+    }
+
+    #[test]
+    fn a_pane_of_another_server_gets_nothing() {
+        assert!(session_context(99, &[pane(12, 3, "zsh", None)]).is_none());
     }
 }
