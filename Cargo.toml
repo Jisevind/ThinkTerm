@@ -466,3 +466,8 @@ ts_netstack_smoltcp_core = {path="deps/tailscale-rs/ts_netstack_smoltcp_core", v
 # distribution and model -- which 0.6.1 drops: Remote Hosts draws a machine
 # of the tailnet by it.
 ts_control = {path="deps/tailscale-rs/ts_control", version="0.6.1"}
+# Vendored so that neither a DERP region nobody can reach nor a frame too
+# short for what it carries panics its client (0.6.1 unwraps the outcome of
+# the dial and the frame's parse), and so that a connection gone quiet is
+# noticed rather than waited on for good.
+ts_derp = {path="deps/tailscale-rs/ts_derp", version="0.6.1"}
