@@ -590,7 +590,8 @@ pub(crate) struct NativeTerminalSettings {
     /// a separate, older thing and wins when it is on.
     #[serde(default = "default_true")]
     pub(crate) overlay_scrollbar: bool,
-    /// A pane opened by a split slides in from the side it opened on.
+    /// A pane opened by a split slides in from the side it opened on, and
+    /// a closed one goes back out that way.
     #[serde(default = "default_true")]
     pub(crate) split_animation: bool,
     pub(crate) font_size: Option<f64>,

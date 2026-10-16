@@ -31,7 +31,7 @@ use anyhow::Context;
 use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::{CollapsedPaneLayout, PositionedPane, SplitDirection};
+use mux::tab::{CollapsedPaneLayout, PaneStackTab, PositionedPane, SplitDirection};
 use mux::Mux;
 use ordered_float::NotNan;
 use std::rc::Rc;
@@ -447,6 +447,46 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Fill `rect` as `pos` fills its own room: in its nav bar's colour
+    /// across the rows that takes, and with its ground above and below.
+    pub(crate) fn paint_room_of(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        pos: &PositionedPane,
+        rect: RectF,
+    ) -> anyhow::Result<()> {
+        let nav_height = self.pane_nav_bar_height_for_pane(pos) as f32;
+        let band = if nav_height > 0.0
+            && !self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id)
+        {
+            let (_, pane_y) = self.pane_content_origin(pos)?;
+            let top = pane_y - self.pane_nav_lift(pos);
+            euclid::rect(rect.min_x(), top, rect.width(), nav_height).intersection(&rect)
+        } else {
+            None
+        };
+        let Some(band) = band else {
+            return self.paint_ground_of(layers, pos, rect);
+        };
+        let above = euclid::rect(
+            rect.min_x(),
+            rect.min_y(),
+            rect.width(),
+            band.min_y() - rect.min_y(),
+        );
+        let below = euclid::rect(
+            rect.min_x(),
+            band.max_y(),
+            rect.width(),
+            rect.max_y() - band.max_y(),
+        );
+        self.paint_ground_of(layers, pos, above)?;
+        self.paint_ground_of(layers, pos, below)?;
+        self.filled_rectangle(layers, 0, band, self.chrome_surface(self.chrome().header_bg))
+            .context("pane nav band")?;
+        Ok(())
+    }
+
     /// The pane's rectangle without that lift. Recording masks are kept as
     /// fractions of it, so it has to move with the pane's rows when a
     /// terminal bar comes or goes, as the whole frame did before the lift.
@@ -489,7 +529,7 @@ impl crate::TermWindow {
 
         const COLLAPSED_BUTTON_GAP: usize = 6;
 
-        let tabs = Mux::get().pane_stack_tabs(pos.pane.pane_id());
+        let tabs = self.pane_nav_tabs(pos);
         let active_tab = tabs.iter().find(|tab| tab.is_active);
 
         let is_vertical_strip = layout.split_direction == SplitDirection::Horizontal;
@@ -872,7 +912,38 @@ impl crate::TermWindow {
         Ok(strip_height)
     }
 
+    /// The tabs `pos`'s nav bar shows: those of its stack, or, for a closed
+    /// pane on its way out, what it showed. One that shows none is noted for
+    /// a frame, in case it closes (see `render::split_slide`).
+    fn pane_nav_tabs(&mut self, pos: &PositionedPane) -> Vec<PaneStackTab> {
+        let closed = self
+            .closed_pane_nav
+            .as_ref()
+            .filter(|nav| nav.pane(pos.pane.pane_id()).is_some());
+        let tabs = match closed {
+            // Out of its stack by now: it showed itself alone, if anything.
+            Some(nav) if nav.tab => vec![PaneStackTab {
+                pane_id: nav.pane.pane_id(),
+                title: nav.pane.title_without_waiting(),
+                is_active: true,
+            }],
+            Some(_) => vec![],
+            None => Mux::get().pane_stack_tabs(pos.pane.pane_id()),
+        };
+        if tabs.is_empty() {
+            self.split_slides.bare_nav(pos.pane.pane_id());
+        }
+        tabs
+    }
+
     fn can_collapse_pane_stack(&self, pos: &PositionedPane) -> bool {
+        if let Some(nav) = self
+            .closed_pane_nav
+            .as_ref()
+            .filter(|nav| nav.pane(pos.pane.pane_id()).is_some())
+        {
+            return nav.collapsible;
+        }
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
             return false;
         };
@@ -990,7 +1061,7 @@ impl crate::TermWindow {
             )?;
         }
 
-        let tabs = Mux::get().pane_stack_tabs(pos.pane.pane_id());
+        let tabs = self.pane_nav_tabs(pos);
         let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos.left);
         let tab_gap = self.ui_px(PANE_NAV_TAB_GAP);
         let viewport_width = self.pane_nav_tab_viewport_width(pos) as usize;
@@ -1373,7 +1444,11 @@ impl crate::TermWindow {
         surface: LinearRgba,
         watched: bool,
     ) -> anyhow::Result<usize> {
-        let pane = Mux::get().get_pane(pane_id);
+        let pane = Mux::get().get_pane(pane_id).or_else(|| {
+            self.closed_pane_nav
+                .as_ref()
+                .and_then(|nav| nav.pane(pane_id).cloned())
+        });
         // What an agent in the pane is up to: a working one spins the icon,
         // and one waiting on you, stopped on an error, or done with a result
         // nobody has seen yet gets a dot on the icon's shoulder.

@@ -3054,8 +3054,11 @@ pub struct TermWindow {
     /// show up for one (see `render::edge_light`).
     edge_lights: Vec<render::edge_light::EdgeLight>,
     pending_paste: Option<render::edge_light::PendingPaste>,
-    /// A pane just opened by a split, sliding in (see `render::split_slide`).
+    /// A pane sliding in on a split, or out on closing (see
+    /// `render::split_slide`).
     split_slides: render::split_slide::SplitSlides,
+    /// Set while a closed pane is painted on its way out.
+    closed_pane_nav: Option<render::split_slide::ClosedNav>,
     /// A mouse binding took the right button's press: its release does not
     /// run the built-in right click as well.
     right_press_claimed: bool,
@@ -4176,6 +4179,9 @@ impl TermWindow {
         } else if self.occluded.is_none() {
             self.occluded = Some(Instant::now());
             self.occlusion_released = false;
+            // What is split or closed while it is out of sight is not to
+            // slide when it is seen again, nor a closed pane held till then.
+            self.split_slides.release();
         }
     }
 
@@ -4267,6 +4273,9 @@ impl TermWindow {
         self.line_quad_cache.borrow_mut().clear();
         // Likewise the scratch recorder: a hidden window records no lines.
         *self.line_quad_scratch.borrow_mut() = HeapQuadAllocator::default();
+        // And the panes last painted, which would keep one closed since
+        // alive until the next frame.
+        self.split_slides.release();
         // The buffers just dropped stay resident until a device maintain
         // runs, and an occluded window submits no frames — poll once so
         // the memory actually returns now rather than at the reveal.
@@ -4813,6 +4822,7 @@ impl TermWindow {
             edge_lights: vec![],
             pending_paste: None,
             split_slides: Default::default(),
+            closed_pane_nav: None,
             right_press_claimed: false,
             recording_overlay: Default::default(),
             command_palette: None,

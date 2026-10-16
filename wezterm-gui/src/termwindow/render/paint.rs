@@ -11,7 +11,9 @@ use ::window::RectF;
 use ::window::WindowOps;
 use anyhow::Context;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use crate::termwindow::render::split_slide::{self, SplitSlide, TabLayout};
+use crate::termwindow::render::split_slide::{
+    self, ClosedNav, Drawn, Leaving, SlideFrame, TabLayout,
+};
 use mux::tab::{PositionedPane, SplitDirection, TabId};
 use smol::Timer;
 use std::collections::hash_map::DefaultHasher;
@@ -1315,6 +1317,9 @@ impl crate::TermWindow {
         if let Some(render_state) = self.render_state.as_ref() {
             render_state.dedicated_images.borrow_mut().end_frame();
         }
+        if present_frame {
+            self.split_slides.shown();
+        }
         let draw_result = if present_frame {
             self.call_draw(frame).map(|_| true)
         } else {
@@ -1628,8 +1633,6 @@ impl crate::TermWindow {
         gaps.apply_to(&mut layers)
     }
 
-    /// The terminal's ground across the window, as see-through as the window
-    /// is: the dark interface's, a lone pane's own, or the palette's.
     /// See `render::split_slide`. Taken every frame, painted or not, so a
     /// pane that arrives behind a content view does not slide in later,
     /// when the view goes.
@@ -1637,28 +1640,167 @@ impl crate::TermWindow {
         &mut self,
         panes: &[PositionedPane],
         now: Instant,
-    ) -> Option<(SplitSlide, f32)> {
+    ) -> split_slide::Slides {
+        // A hidden window painted all the same -- a resize finishing, a
+        // reload -- is no more seen than one that is not: nothing changed
+        // meanwhile is to slide when it shows (see `occlusion_changed`).
+        if self.occluded.is_some() {
+            self.split_slides.release();
+            return split_slide::Slides {
+                coming: None,
+                going: None,
+            };
+        }
         let layout = mux::Mux::get()
             .get_active_tab_for_window(self.mux_window_id)
             .map(|tab| TabLayout::of(tab.tab_id(), panes));
-        let slide =
-            self.split_slides
-                .advance(layout, crate::native_settings::split_animation(), now);
-        if slide.is_some() {
+        let slides = self.split_slides.advance(
+            layout,
+            panes,
+            crate::native_settings::split_animation(),
+            now,
+        );
+        if slides.coming.is_some() || slides.going.is_some() {
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }
         }
-        slide
+        slides
     }
 
-    /// Where a pane sliding in ends up: its ground and its nav bar, which
-    /// is lifted above the ground along the top. The divider it comes with
-    /// runs down the leading edge of its ground.
+    /// Where a pane a slide moves stands: its ground and its nav bar, which
+    /// is lifted above the ground along the top. A divider that comes or
+    /// goes with it runs down an edge of its ground.
     fn split_slide_place(&self, pos: &PositionedPane) -> anyhow::Result<RectF> {
         Ok(self.pane_background_rect(pos).union(&self.pane_frame_rect(pos)?))
     }
 
+    /// Where a slide may draw: the terminal's own part of the window. The
+    /// ground of a pane along the window's left edge runs on under the
+    /// sidebar, which covers it; the text and the dividers a slide took in
+    /// there would show, drawn in quad layers above the sidebar's ground.
+    fn split_slide_area(&self) -> RectF {
+        let left = self.tab_bar_left_edge() as f32;
+        euclid::rect(
+            left,
+            0.,
+            (self.terminal_viewport_right() - left).max(0.),
+            self.dimensions.pixel_height as f32,
+        )
+    }
+
+    /// Where each of `panes` that `moves` stands.
+    fn split_slide_places(
+        &self,
+        panes: &[PositionedPane],
+        moves: impl Fn(&PositionedPane) -> bool,
+    ) -> anyhow::Result<Vec<(mux::pane::PaneId, RectF)>> {
+        panes
+            .iter()
+            .filter(|pos| moves(pos))
+            .map(|pos| Ok((pos.pane.pane_id(), self.split_slide_place(pos)?)))
+            .collect()
+    }
+
+    /// How this frame draws what the slide under way moves.
+    fn split_slide_frame(
+        &self,
+        slides: &split_slide::Slides,
+        panes: &[PositionedPane],
+    ) -> anyhow::Result<SlideFrame> {
+        // That paints straight to the window, past any recording.
+        if self.config.use_box_model_render {
+            return Ok(SlideFrame::default());
+        }
+        let area = self.split_slide_area();
+        let cell = (
+            self.render_metrics.cell_size.width as f32,
+            self.render_metrics.cell_size.height as f32,
+        );
+        if let Some((slide, remaining)) = slides.coming.as_ref() {
+            if let Some(pos) = panes.iter().find(|pos| pos.pane.pane_id() == slide.pane_id) {
+                let moving = self.split_slide_places(panes, |pos| slide.moves(pos))?;
+                let place = self.split_slide_place(pos)?;
+                return Ok(SlideFrame::coming(slide, *remaining, place, &moving, cell, area));
+            }
+        }
+        if let Some((leaving, out)) = slides.going.as_ref() {
+            let moving = self.split_slide_places(panes, |pos| leaving.moves(pos))?;
+            let place = self.split_slide_place(&leaving.pane)?;
+            return Ok(SlideFrame::going(leaving, *out, place, &moving, cell, area));
+        }
+        Ok(SlideFrame::default())
+    }
+
+    /// Replay `recorded`, drawn as a slide's frame has it.
+    fn replay_drawn(
+        &self,
+        recorded: &HeapQuadAllocator,
+        layers: &mut TripleLayerQuadAllocator,
+        drawn: Drawn,
+    ) -> anyhow::Result<()> {
+        recorded.apply_to_clipped_at(
+            layers,
+            drawn.shift.0,
+            drawn.shift.1,
+            self.clip_of(drawn.clip),
+            1.0,
+        )
+    }
+
+    /// A closed pane on its way out, painted where it stood, and the
+    /// divider it goes with. What it registers for the pointer is dropped
+    /// again: it takes no clicks, its divider no drags.
+    fn record_leaving_pane(
+        &mut self,
+        leaving: &Leaving,
+    ) -> anyhow::Result<(HeapQuadAllocator, HeapQuadAllocator)> {
+        let pos = &leaving.pane;
+        let ui_items = self.ui_items.len();
+        // As `can_collapse_pane_stack` had it last frame, when it stood
+        // over or under the pane that has its room now.
+        let collapsed = |pane_stack_id: &mux::tab::PaneStackId| {
+            self.collapsed_pane_layouts.contains_key(pane_stack_id)
+        };
+        let collapsible = leaving.stood_in_a_column()
+            && !collapsed(&pos.pane_stack_id)
+            && mux::Mux::get()
+                .get_active_tab_for_window(self.mux_window_id)
+                .is_some_and(|tab| {
+                    !tab.iter_panes_ignoring_zoom()
+                        .iter()
+                        .any(|pane| collapsed(&pane.pane_stack_id))
+                });
+        let mut pane = HeapQuadAllocator::default();
+        {
+            let mut layers = TripleLayerQuadAllocator::Heap(&mut pane);
+            self.closed_pane_nav = Some(ClosedNav {
+                pane: Arc::clone(&pos.pane),
+                tab: leaving.showed_tab(),
+                collapsible,
+            });
+            let painted = self.paint_pane(pos, &mut layers);
+            self.closed_pane_nav = None;
+            painted.context("paint_pane")?;
+            if let Ok(frame) = self.pane_mask_frame(pos) {
+                self.paint_pane_recording_masks(pos, frame, &mut layers)?;
+            }
+        }
+        let mut divider = HeapQuadAllocator::default();
+        if let Some(active) = self.get_active_pane_or_overlay() {
+            self.paint_split(
+                &mut TripleLayerQuadAllocator::Heap(&mut divider),
+                &leaving.divider(),
+                &active,
+            )
+            .context("paint_split")?;
+        }
+        self.ui_items.truncate(ui_items);
+        Ok((pane, divider))
+    }
+
+    /// The terminal's ground across the window, as see-through as the window
+    /// is: the dark interface's, a lone pane's own, or the palette's.
     fn window_terminal_ground(&mut self, panes: &[PositionedPane]) -> LinearRgba {
         let ground = if let Some(ground) = self.dark_terminal_ground() {
             ground
@@ -4083,7 +4225,7 @@ impl crate::TermWindow {
         self.reconcile_active_mux_tab_size_before_paint();
         self.sync_pane_font_sizes();
         let panes = self.get_panes_to_render();
-        let split_slide = self.advance_split_slide(&panes, frame_now);
+        let slides = self.advance_split_slide(&panes, frame_now);
         let focused = self.focused.is_some();
         let window_is_transparent =
             !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
@@ -4233,14 +4375,33 @@ impl crate::TermWindow {
 
         let mut takeover_badge = false;
         if paint_terminal_world && !frontend_blocked {
-            // Where the pane sliding in has to go, if one is.
-            let mut sliding = None;
-            let made_room = split_slide.and_then(|(slide, _)| {
-                panes
-                    .iter()
-                    .find(|pos| pos.pane.pane_id() == slide.from_pane)
-                    .cloned()
-            });
+            // Not into a recording a content view's transition replays for a
+            // while: that is drawn as everything stands.
+            let slide_frame = if recording_flight {
+                SlideFrame::default()
+            } else {
+                self.split_slide_frame(&slides, &panes)
+                    .context("split slide frame")?
+            };
+            // A closed pane on its way out: painted ahead of the panes, so
+            // that the IME goes by the active one among them.
+            let going = match (slides.going.as_ref(), slide_frame.leaving) {
+                (Some((leaving, _)), Some(drawn)) => Some((
+                    self.record_leaving_pane(leaving)
+                        .context("record leaving pane")?,
+                    drawn,
+                )),
+                _ => None,
+            };
+            // Room no pane is in yet looks like the pane it belongs to: the
+            // window's own ground is lighter than a pane dimmed for not
+            // being active.
+            for (pane_id, rect) in &slide_frame.fills {
+                if let Some(pos) = panes.iter().find(|pos| pos.pane.pane_id() == *pane_id) {
+                    self.paint_room_of(&mut layers, pos, *rect)
+                        .context("split slide room")?;
+                }
+            }
             for pos in panes {
                 if pos.is_active {
                     if focused {
@@ -4248,21 +4409,8 @@ impl crate::TermWindow {
                         mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
                     }
                 }
-                match split_slide.filter(|(slide, _)| slide.pane_id == pos.pane.pane_id()) {
-                    Some((slide, remaining)) => {
-                        let place = self.split_slide_place(&pos)?;
-                        let shift = slide.offset(remaining, place.width(), place.height());
-                        // Until it gets there, its room still looks like
-                        // the pane that gave it up: the window's own ground
-                        // is lighter than a pane dimmed for not being active.
-                        if let Some(made_room) = made_room.as_ref() {
-                            self.paint_ground_of(
-                                &mut layers,
-                                made_room,
-                                split_slide::wake(place, shift),
-                            )
-                            .context("split slide ground")?;
-                        }
+                match slide_frame.pane(&pos) {
+                    Some(drawn) => {
                         let mut recorded = HeapQuadAllocator::default();
                         {
                             let mut pane_layers = TripleLayerQuadAllocator::Heap(&mut recorded);
@@ -4272,14 +4420,7 @@ impl crate::TermWindow {
                                 self.paint_pane_recording_masks(&pos, frame, &mut pane_layers)?;
                             }
                         }
-                        recorded.apply_to_clipped_at(
-                            &mut layers,
-                            shift.0,
-                            shift.1,
-                            self.clip_of(place),
-                            1.0,
-                        )?;
-                        sliding = Some((slide, pos, place, shift));
+                        self.replay_drawn(&recorded, &mut layers, drawn)?;
                     }
                     None => {
                         self.paint_pane(&pos, &mut layers).context("paint_pane")?;
@@ -4288,6 +4429,9 @@ impl crate::TermWindow {
                         }
                     }
                 }
+            }
+            if let Some(((pane, _), (drawn, _))) = going.as_ref() {
+                self.replay_drawn(pane, &mut layers, *drawn)?;
             }
 
             // Part of the terminal, gone with the panes wherever they are:
@@ -4298,9 +4442,9 @@ impl crate::TermWindow {
             if let Some(pane) = self.get_active_pane_or_overlay() {
                 let splits = self.get_splits();
                 for split in &splits {
-                    match sliding.as_ref().filter(|(slide, pos, ..)| slide.leads(pos, split)) {
-                        // The divider the split put in comes in with the pane.
-                        Some((_, _, place, shift)) => {
+                    match slide_frame.split(split) {
+                        // Along with the panes either side of it.
+                        Some(drawn) => {
                             let mut recorded = HeapQuadAllocator::default();
                             self.paint_split(
                                 &mut TripleLayerQuadAllocator::Heap(&mut recorded),
@@ -4308,19 +4452,16 @@ impl crate::TermWindow {
                                 &pane,
                             )
                             .context("paint_split")?;
-                            recorded.apply_to_clipped_at(
-                                &mut layers,
-                                shift.0,
-                                shift.1,
-                                self.clip_of(*place),
-                                1.0,
-                            )?;
+                            self.replay_drawn(&recorded, &mut layers, drawn)?;
                         }
                         None => self
                             .paint_split(&mut layers, split, &pane)
                             .context("paint_split")?,
                     }
                 }
+            }
+            if let Some(((_, divider), (_, drawn))) = going.as_ref() {
+                self.replay_drawn(divider, &mut layers, *drawn)?;
             }
             self.paint_frontend_shared_unused_grid(&mut layers)
                 .context("paint shared unused grid")?;
