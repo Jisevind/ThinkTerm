@@ -2217,10 +2217,12 @@ impl super::TermWindow {
         self.last_mouse_coords = (x, y);
 
         let mut capture_mouse = false;
+        // Who took the press this release lets go of.
+        let mut released_capture = None;
 
         match event.kind {
             WMEK::Release(ref press) => {
-                self.current_mouse_capture = None;
+                released_capture = self.current_mouse_capture.take();
                 self.current_mouse_buttons.retain(|p| p != press);
                 if press == &MousePress::Left && self.window_drag_position.take().is_some() {
                     // Completed a window drag
@@ -2585,18 +2587,34 @@ impl super::TermWindow {
                 self.clear_right_sidebar_text_focus();
                 context.invalidate();
             }
-            self.mouse_event_terminal(
-                pane,
-                ClickPosition {
-                    column: x,
-                    row: y,
-                    x_pixel_offset,
-                    y_pixel_offset,
-                },
-                event,
-                context,
-                capture_mouse,
+            // The rest of a press goes to the pane that took it, or nowhere.
+            // One that has gone since -- a close the confirmation took on the
+            // press -- leaves the button down over the pane that has its room
+            // by then, which would take the drag for a selection from wherever
+            // it was last clicked, and copy that on the release.
+            let pressed = match event.kind {
+                WMEK::Move => self.current_mouse_capture.as_ref(),
+                WMEK::Release(_) => released_capture.as_ref(),
+                _ => None,
+            };
+            let taken_elsewhere = matches!(
+                pressed,
+                Some(MouseCapture::TerminalPane(pane_id)) if *pane_id != pane.pane_id()
             );
+            if !taken_elsewhere {
+                self.mouse_event_terminal(
+                    pane,
+                    ClickPosition {
+                        column: x,
+                        row: y,
+                        x_pixel_offset,
+                        y_pixel_offset,
+                    },
+                    event,
+                    context,
+                    capture_mouse,
+                );
+            }
         }
 
         if prior_ui_item != ui_item {
