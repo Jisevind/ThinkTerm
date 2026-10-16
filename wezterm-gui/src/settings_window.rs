@@ -1140,6 +1140,8 @@ impl SettingsSection {
                 "Copy",
                 "Copy Effect",
                 "Selection",
+                "Split Animation",
+                "Animation",
                 "Terminal",
             ],
             Self::Workspaces => &[
@@ -1312,6 +1314,7 @@ impl SettingsSection {
                     "settings-right-click",
                     "settings-right-click-paste",
                     "settings-copy-effect",
+                    "settings-split-animation",
                 ]
                 .iter()
                 .any(|id| crate::i18n::tr(id).to_lowercase().contains(query)))
@@ -1831,6 +1834,7 @@ enum SettingsAction {
     OpenColorSchemePicker,
     SetTextContrast(crate::native_settings::NativeTextContrast),
     ToggleOverlayScrollbar,
+    ToggleSplitAnimation,
     SetBottomQuoteMode(NativeBottomQuoteMode),
     DecreaseBottomQuoteFontSize,
     IncreaseBottomQuoteFontSize,
@@ -6176,6 +6180,19 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::SetScrollMode(mode) => self.apply_scroll_mode(mode),
+            SettingsAction::ToggleSplitAnimation => {
+                let on = !self.native_settings.terminal.split_animation;
+                let done = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", crate::i18n::tr("settings-split-animation")),
+                        ("value", crate::i18n::tr(if on { "common-on" } else { "common-off" })),
+                    ],
+                );
+                self.apply_terminal_change("settings-split-animation", done, |terminal| {
+                    terminal.split_animation = on
+                })
+            }
             SettingsAction::ToggleCopyOnSelect => {
                 let on = !self.native_settings.terminal.copy_on_select;
                 let done = crate::i18n::tr(if on {
@@ -12695,6 +12712,26 @@ impl SettingsWindow {
                 &crate::i18n::tr("settings-overlay-scrollbar-description"),
                 this.native_settings.terminal.overlay_scrollbar,
                 SettingsAction::ToggleOverlayScrollbar,
+                rows.rule(),
+            )?);
+
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::SplitHorizontal,
+                TileColor::Indigo,
+            )?;
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-split-animation"),
+                &crate::i18n::tr("settings-split-animation-description"),
+                this.native_settings.terminal.split_animation,
+                SettingsAction::ToggleSplitAnimation,
                 rows.rule(),
             )?);
 

@@ -590,6 +590,9 @@ pub(crate) struct NativeTerminalSettings {
     /// a separate, older thing and wins when it is on.
     #[serde(default = "default_true")]
     pub(crate) overlay_scrollbar: bool,
+    /// A pane opened by a split slides in from the side it opened on.
+    #[serde(default = "default_true")]
+    pub(crate) split_animation: bool,
     pub(crate) font_size: Option<f64>,
     pub(crate) font_family: Option<String>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
@@ -621,6 +624,7 @@ impl Default for NativeTerminalSettings {
     fn default() -> Self {
         Self {
             overlay_scrollbar: true,
+            split_animation: true,
             font_size: None,
             font_family: None,
             remote_pane_resize_mode: NativeRemotePaneResizeMode::default(),
@@ -647,6 +651,11 @@ pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
 /// `load`, which deep-clones the whole settings tree.
 pub(crate) fn scroll_mode() -> NativeScrollMode {
     load_shared().terminal.scroll_mode
+}
+
+/// Read every frame, through the shared handle.
+pub(crate) fn split_animation() -> bool {
+    load_shared().terminal.split_animation
 }
 
 /// Read whenever a selection is let go of, through the shared handle.

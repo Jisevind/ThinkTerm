@@ -3054,6 +3054,8 @@ pub struct TermWindow {
     /// show up for one (see `render::edge_light`).
     edge_lights: Vec<render::edge_light::EdgeLight>,
     pending_paste: Option<render::edge_light::PendingPaste>,
+    /// A pane just opened by a split, sliding in (see `render::split_slide`).
+    split_slides: render::split_slide::SplitSlides,
     /// A mouse binding took the right button's press: its release does not
     /// run the built-in right click as well.
     right_press_claimed: bool,
@@ -4810,6 +4812,7 @@ impl TermWindow {
             update_capsule: Default::default(),
             edge_lights: vec![],
             pending_paste: None,
+            split_slides: Default::default(),
             right_press_claimed: false,
             recording_overlay: Default::default(),
             command_palette: None,

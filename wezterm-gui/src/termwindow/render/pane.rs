@@ -417,6 +417,36 @@ impl crate::TermWindow {
         Ok(rects)
     }
 
+    /// Fill `rect` the way `pos` fills its own ground, dimmed with it when
+    /// it is not the active pane, so the area reads as part of that pane.
+    /// With a background image the panes leave their ground unfilled, and
+    /// so does this.
+    pub(crate) fn paint_ground_of(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        pos: &PositionedPane,
+        rect: RectF,
+    ) -> anyhow::Result<()> {
+        if !self.window_background.is_empty() || rect.is_empty() {
+            return Ok(());
+        }
+        let palette = pos.pane.palette();
+        let mut quad = self.filled_rectangle(
+            layers,
+            0,
+            rect,
+            self.dark_terminal_ground()
+                .unwrap_or_else(|| palette.background.to_linear())
+                .mul_alpha(self.config.window_background_opacity),
+        )?;
+        quad.set_hsv(if pos.is_active {
+            None
+        } else {
+            Some(self.config.inactive_pane_hsb_for_background(palette.background))
+        });
+        Ok(())
+    }
+
     /// The pane's rectangle without that lift. Recording masks are kept as
     /// fractions of it, so it has to move with the pane's rows when a
     /// terminal bar comes or goes, as the whole frame did before the lift.
