@@ -105,6 +105,26 @@ fn ssh_error(id: &'static str, error: impl Into<String>) -> String {
     crate::i18n::tr_args(id, &args)
 }
 
+/// Saves `spec` as the saved host `id` (see `ssh_hosts::try_update_host`),
+/// and what goes with it.
+fn update_saved_host(id: &str, spec: SshHostSpec) -> anyhow::Result<Option<String>> {
+    let before = ssh_hosts::host_spec(id);
+    let Some(saved_id) = ssh_hosts::try_update_host(id, spec)? else {
+        return Ok(None);
+    };
+    if let (Some(before), Some(after)) = (before, ssh_hosts::host_spec(&saved_id)) {
+        // Renamed or moved to the other network, the host is reached under
+        // another name from now on, and its Spaces go with it: left under
+        // the old name, they would reconnect the way it was reached before,
+        // or not at all.
+        if let Some((from, to)) = ssh_hosts::connect_name_change(&before, &after) {
+            ssh_hosts::move_spaces_after_rename(from, to);
+        }
+        crate::refresh_connect_domain_for_ssh_host(&after);
+    }
+    Ok(Some(saved_id))
+}
+
 const PAD: f32 = 24.0;
 const TOOLBAR_H: f32 = 54.0;
 const TOOLBAR_GAP: f32 = 20.0;
@@ -249,6 +269,53 @@ impl HostMode {
             Self::Connect
         } else {
             Self::Ssh
+        }
+    }
+}
+
+/// A choice in a saved host's form, saved as it is clicked (see
+/// `SshHostsView::save_choice`). What is typed waits for Save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostChoice {
+    Network(SshNetwork),
+    Mode(HostMode),
+    DetectOs(bool),
+    ShellIntegration(bool),
+    FilesAutoConnect(bool),
+}
+
+impl HostChoice {
+    /// Makes the choice on `spec`, as Save makes it from the form.
+    fn apply_to(self, spec: &mut SshHostSpec) {
+        match self {
+            Self::Network(network) => spec.network = network,
+            Self::Mode(mode) => {
+                // Mosh and ThinkTerm Connect are alternative transports;
+                // only one can drive the connection.
+                spec.use_mosh = mode == HostMode::Mosh;
+                spec.multiplexing = mode == HostMode::Connect;
+                if spec.mosh_server_command.trim().is_empty() {
+                    spec.mosh_server_command = ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string();
+                }
+            }
+            Self::DetectOs(on) => spec.detect_os = on,
+            Self::ShellIntegration(on) => spec.shell_integration = on,
+            Self::FilesAutoConnect(on) => spec.files_auto_connect = on,
+        }
+    }
+
+    /// Puts back in `form` what `saved` has for the choice: what one that
+    /// could not be saved shows instead.
+    fn show_saved(self, saved: &SshHostSpec, form: &mut HostForm) {
+        match self {
+            Self::Network(_) => form.network = saved.network,
+            Self::Mode(_) => {
+                form.use_mosh = saved.use_mosh;
+                form.multiplexing = saved.multiplexing;
+            }
+            Self::DetectOs(_) => form.detect_os = saved.detect_os,
+            Self::ShellIntegration(_) => form.shell_integration = saved.shell_integration,
+            Self::FilesAutoConnect(_) => form.files_auto_connect = saved.files_auto_connect,
         }
     }
 }
@@ -831,38 +898,19 @@ impl SshHostsView {
         }
 
         let project_id = match &form.editing {
-            Some(id) => {
-                let before = ssh_hosts::host_spec(id);
-                match ssh_hosts::try_update_host(id, spec) {
-                    // Not `id`: moving the host to another endpoint re-keys the
-                    // record, and the caller selects what comes back.
-                    Ok(Some(saved_id)) => {
-                        if let (Some(before), Some(after)) =
-                            (before, ssh_hosts::host_spec(&saved_id))
-                        {
-                            // Renamed or moved to the other network, the host
-                            // is reached under another name from now on, and
-                            // its Spaces go with it: left under the old name,
-                            // they would reconnect the way it was reached
-                            // before, or not at all.
-                            if let Some((from, to)) = ssh_hosts::connect_name_change(&before, &after)
-                            {
-                                ssh_hosts::move_spaces_after_rename(from, to);
-                            }
-                            crate::refresh_connect_domain_for_ssh_host(&after);
-                        }
-                        saved_id
-                    }
-                    Ok(None) => {
-                        form.error = Some(crate::i18n::tr("ssh-error-host-missing"));
-                        return None;
-                    }
-                    Err(err) => {
-                        form.error = Some(ssh_error("ssh-error-save", format!("{err:#}")));
-                        return None;
-                    }
+            // Not `id`: moving the host to another endpoint re-keys the
+            // record, and the caller selects what comes back.
+            Some(id) => match update_saved_host(id, spec) {
+                Ok(Some(saved_id)) => saved_id,
+                Ok(None) => {
+                    form.error = Some(crate::i18n::tr("ssh-error-host-missing"));
+                    return None;
                 }
-            }
+                Err(err) => {
+                    form.error = Some(ssh_error("ssh-error-save", format!("{err:#}")));
+                    return None;
+                }
+            },
             None => match ssh_hosts::try_create_host(spec) {
                 Ok(id) => id,
                 Err(err) => {
@@ -874,6 +922,80 @@ impl SshHostsView {
         self.close_form();
         self.refresh();
         Some(project_id)
+    }
+
+    /// Saves `choice`, just made in the form, on the saved host the form
+    /// edits: that one choice, onto the host as saved, so that what was
+    /// typed into the form still waits for Save. A new host has nothing to
+    /// make it on yet; Save saves it with the rest.
+    fn save_choice(&mut self, choice: HostChoice) {
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let Some(id) = form.editing.clone() else {
+            return;
+        };
+        let Some(saved) = ssh_hosts::host_spec(&id) else {
+            form.error = Some(crate::i18n::tr("ssh-error-host-missing"));
+            return;
+        };
+        let mut spec = saved.clone();
+        choice.apply_to(&mut spec);
+        // Made already: there is nothing to write.
+        if spec == saved {
+            return;
+        }
+        // One record per endpoint, as Save checks: on the other network,
+        // the host may be saved already.
+        let endpoint_id = ssh_hosts::host_id_for_host(&spec);
+        if endpoint_id != id && ssh_hosts::host_exists(&endpoint_id) {
+            let mut args = FluentArgs::new();
+            args.set("endpoint", ssh_hosts::endpoint(&spec));
+            form.error = Some(crate::i18n::tr_args("ssh-error-duplicate", &args));
+            choice.show_saved(&saved, form);
+            return;
+        }
+        match update_saved_host(&id, spec) {
+            Ok(Some(saved_id)) => {
+                let now = ssh_hosts::host_spec(&saved_id);
+                let on_tailnet = now
+                    .as_ref()
+                    .is_some_and(|spec| spec.network == SshNetwork::Tailnet);
+                if let Some(spec) = now {
+                    form.original = Some(spec);
+                }
+                form.editing = Some(saved_id.clone());
+                self.keep_ring_on(&id, &saved_id, on_tailnet);
+            }
+            Ok(None) => {
+                form.error = Some(crate::i18n::tr("ssh-error-host-missing"));
+                choice.show_saved(&saved, form);
+            }
+            Err(err) => {
+                form.error = Some(ssh_error("ssh-error-save", format!("{err:#}")));
+                choice.show_saved(&saved, form);
+            }
+        }
+    }
+
+    /// The tailnet's machine of the host `id` keeps the ring once the host
+    /// is saved as `saved_id`: moved to the other network, the record is
+    /// keyed anew. Moved off the tailnet, no machine there stands for it any
+    /// more, so its card takes the ring -- where the list has it now, as the
+    /// record is keyed anew in place.
+    fn keep_ring_on(&mut self, id: &str, saved_id: &str, on_tailnet: bool) {
+        if self.tailnet.selected.as_deref() != Some(id) {
+            return;
+        }
+        if on_tailnet {
+            self.tailnet.selected = Some(saved_id.to_string());
+            return;
+        }
+        self.tailnet.selected = None;
+        if let Some(index) = self.filtered.iter().position(|entry| entry.id == id) {
+            self.selected = index;
+            self.selection_active = true;
+        }
     }
 
     // ---- input ------------------------------------------------------------
@@ -1097,16 +1219,19 @@ impl SshHostsView {
                     }
                     if network == SshNetwork::Tailnet && form.use_mosh {
                         form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
-                    } else {
-                        form.network = network;
-                        form.error = None;
+                        return ContentViewResponse::Redraw;
                     }
+                    form.network = network;
+                    form.error = None;
                 }
+                self.save_choice(HostChoice::Network(network));
                 ContentViewResponse::Redraw
             }
             SshViewAction::ToggleDetect => {
                 if let Some(form) = self.form.as_mut() {
                     form.detect_os = !form.detect_os;
+                    let choice = HostChoice::DetectOs(form.detect_os);
+                    self.save_choice(choice);
                 }
                 ContentViewResponse::Redraw
             }
@@ -1129,6 +1254,7 @@ impl SshHostsView {
                         self.focus = Focus::Field(FIELD_WORKSPACE);
                     }
                 }
+                self.save_choice(HostChoice::Mode(mode));
                 ContentViewResponse::Redraw
             }
             SshViewAction::SwitchToConnect(index) => {
@@ -1173,12 +1299,16 @@ impl SshHostsView {
             SshViewAction::ToggleShellIntegration => {
                 if let Some(form) = self.form.as_mut() {
                     form.shell_integration = !form.shell_integration;
+                    let choice = HostChoice::ShellIntegration(form.shell_integration);
+                    self.save_choice(choice);
                 }
                 ContentViewResponse::Redraw
             }
             SshViewAction::ToggleFilesAutoConnect => {
                 if let Some(form) = self.form.as_mut() {
                     form.files_auto_connect = !form.files_auto_connect;
+                    let choice = HostChoice::FilesAutoConnect(form.files_auto_connect);
+                    self.save_choice(choice);
                 }
                 ContentViewResponse::Redraw
             }
@@ -6336,6 +6466,95 @@ mod tests {
         assert_eq!(HostMode::of(form.use_mosh, form.multiplexing), HostMode::Connect);
         view.apply(super::SshViewAction::SetMode(HostMode::Ssh));
         assert!(view.form.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn a_choice_is_made_on_the_saved_host_as_save_makes_it() {
+        use super::{HostChoice, HostMode};
+        let saved = spec("server-a", "192.0.2.10");
+
+        let mut moved = saved.clone();
+        HostChoice::Network(SshNetwork::Tailnet).apply_to(&mut moved);
+        assert_eq!(moved.network, SshNetwork::Tailnet);
+        // Nothing else of the host goes with it.
+        moved.network = saved.network;
+        assert_eq!(moved, saved);
+
+        let mut mosh = saved.clone();
+        mosh.multiplexing = true;
+        mosh.mosh_server_command = String::new();
+        HostChoice::Mode(HostMode::Mosh).apply_to(&mut mosh);
+        assert_eq!(
+            HostMode::of(mosh.use_mosh, mosh.multiplexing),
+            HostMode::Mosh
+        );
+        // Never on Mosh without a server command to start.
+        assert_eq!(
+            mosh.mosh_server_command,
+            super::ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND
+        );
+        HostChoice::Mode(HostMode::Connect).apply_to(&mut mosh);
+        assert_eq!(
+            HostMode::of(mosh.use_mosh, mosh.multiplexing),
+            HostMode::Connect
+        );
+
+        let mut toggled = saved.clone();
+        HostChoice::DetectOs(false).apply_to(&mut toggled);
+        HostChoice::ShellIntegration(true).apply_to(&mut toggled);
+        HostChoice::FilesAutoConnect(true).apply_to(&mut toggled);
+        assert!(!toggled.detect_os && toggled.shell_integration && toggled.files_auto_connect);
+    }
+
+    #[test]
+    fn a_choice_that_could_not_be_saved_shows_what_is_saved() {
+        use super::{HostChoice, HostMode};
+        let saved = spec("server-a", "192.0.2.10");
+        let mut form = HostForm::default();
+        form.network = SshNetwork::Tailnet;
+        form.use_mosh = true;
+        form.detect_os = false;
+        HostChoice::Network(SshNetwork::Tailnet).show_saved(&saved, &mut form);
+        HostChoice::Mode(HostMode::Mosh).show_saved(&saved, &mut form);
+        HostChoice::DetectOs(false).show_saved(&saved, &mut form);
+        assert_eq!(form.network, SshNetwork::System);
+        assert_eq!(
+            HostMode::of(form.use_mosh, form.multiplexing),
+            HostMode::Ssh
+        );
+        assert!(form.detect_os);
+    }
+
+    #[test]
+    fn a_host_moved_off_the_tailnet_takes_the_ring_to_its_card() {
+        let mut view = SshHostsView::new();
+        let entry = |id: &str, label: &str| SshHostEntry {
+            id: id.to_string(),
+            source: SshHostSource::ThinkTerm,
+            spec: spec(label, "100.64.0.7"),
+        };
+        view.filtered = vec![
+            entry("ssh-other", "server-a"),
+            entry("ssh-saved", "server-b"),
+        ];
+        view.selection_active = false;
+        view.tailnet.selected = Some("ssh-saved".to_string());
+
+        // Still on the tailnet: its machine keeps the ring.
+        view.keep_ring_on("ssh-saved", "ssh-saved", true);
+        assert_eq!(view.tailnet.selected.as_deref(), Some("ssh-saved"));
+        assert!(!view.selection_active);
+
+        // Off it, keyed anew: its card takes the ring.
+        view.keep_ring_on("ssh-saved", "ssh-moved", false);
+        assert!(view.tailnet.selected.is_none());
+        assert!(view.selection_active);
+        assert_eq!(view.selected, 1);
+
+        // A host no machine had the ring for leaves the rings as they are.
+        view.selection_active = false;
+        view.keep_ring_on("ssh-other", "ssh-moved", false);
+        assert!(!view.selection_active);
     }
 
     #[test]

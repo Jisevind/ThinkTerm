@@ -512,25 +512,36 @@ pub(crate) fn connect_domain_for_ssh_host_id(host_id: &str) -> anyhow::Result<Ar
 /// client keeps the address, user and password it was built with, so one
 /// registered earlier would go on with the old ones until a restart. Only a
 /// domain doing nothing is replaced; one that is attached, attaching or
-/// retrying keeps going as it is.
+/// retrying keeps going as it is. So is one built the way the record has it
+/// already: the mux keeps every domain it is given, so another would only
+/// show up beside it, in the command palette for one.
 pub(crate) fn refresh_connect_domain_for_ssh_host(spec: &crate::ssh_hosts::SshHostSpec) {
     let name = crate::ssh_hosts::connect_domain_name(spec);
     let Some(domain) = Mux::get().get_domain_by_name(&name) else {
         return;
     };
-    let idle = domain.state() == mux::domain::DomainState::Detached
-        && domain
-            .downcast_ref::<ClientDomain>()
-            .is_some_and(|client| !client.is_attaching() && !client.is_attach_retrying());
-    if idle {
+    let Some(client) = domain.downcast_ref::<ClientDomain>() else {
+        return;
+    };
+    if domain.state() != mux::domain::DomainState::Detached
+        || client.is_attaching()
+        || client.is_attach_retrying()
+    {
+        return;
+    }
+    let current = client.ssh_domain_config().is_some_and(|built| {
+        crate::ssh_hosts::same_dialing(&built, &ssh_host_client_domain_config(spec, name.clone()))
+    });
+    if !current {
         add_ssh_host_client_domain(spec, name);
     }
 }
 
-fn add_ssh_host_client_domain(
+/// What a saved host's Connect domain is built with.
+fn ssh_host_client_domain_config(
     spec: &crate::ssh_hosts::SshHostSpec,
     domain_name: String,
-) -> Arc<dyn Domain> {
+) -> SshDomain {
     let mut dom = crate::ssh_hosts::build_ssh_domain(spec);
     dom.name = domain_name;
     dom.multiplexing = SshMultiplexing::WezTerm;
@@ -539,6 +550,14 @@ fn add_ssh_host_client_domain(
         .as_deref()
         .map(crate::secret::reveal)
         .filter(|p| !p.is_empty());
+    dom
+}
+
+fn add_ssh_host_client_domain(
+    spec: &crate::ssh_hosts::SshHostSpec,
+    domain_name: String,
+) -> Arc<dyn Domain> {
+    let dom = ssh_host_client_domain_config(spec, domain_name);
     let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(ClientDomainConfig::Ssh(dom)));
     Mux::get().add_domain(&domain);
     domain

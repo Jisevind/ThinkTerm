@@ -259,18 +259,8 @@ pub fn try_update_host(host_id: &str, mut spec: SshHostSpec) -> Result<Option<Ss
     let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) else {
         return Ok(None);
     };
-    // What connections found on the host is the record's to keep, not the
-    // copy the form took when it opened -- unless the host moved to another
-    // endpoint, which ThinkTerm has set nothing up on yet.
-    if new_id == host_id {
-        spec.shell_integration_applied = record.spec.shell_integration_applied;
-        spec.shell_integration_unsupported = record.spec.shell_integration_unsupported.clone();
-        spec.shell_integration_failure = record.spec.shell_integration_failure.clone();
-    } else {
-        spec.shell_integration_applied = false;
-        spec.shell_integration_unsupported = None;
-        spec.shell_integration_failure = None;
-    }
+    keep_what_connections_found(&record.spec, &mut spec);
+    let reached_as_before = same_ssh_domain(&record.spec, &spec);
     record.id = new_id.clone();
     record.spec = spec;
     save_ssh_host_store(&store)?;
@@ -281,9 +271,32 @@ pub fn try_update_host(host_id: &str, mut spec: SshHostSpec) -> Result<Option<Ss
         .map(|record| record.spec.clone());
     drop(store);
     if let Some(spec) = spec {
-        register_ssh_domain(&spec)?;
+        // Reached the way it was, the host has its domain already: the mux
+        // keeps every domain it is given, so another would only show up
+        // beside it, in the command palette for one.
+        if reached_as_before {
+            ensure_ssh_domain_registered(&spec)?;
+        } else {
+            register_ssh_domain(&spec)?;
+        }
     }
     Ok(Some(new_id))
+}
+
+/// What connections found on the host is the record's to keep, not the copy
+/// the form took when it opened -- unless the host moved to another
+/// endpoint, which ThinkTerm has set nothing up on yet. Over the other
+/// network, it is the same host.
+fn keep_what_connections_found(record: &SshHostSpec, spec: &mut SshHostSpec) {
+    if endpoint(spec) == endpoint(record) {
+        spec.shell_integration_applied = record.shell_integration_applied;
+        spec.shell_integration_unsupported = record.shell_integration_unsupported.clone();
+        spec.shell_integration_failure = record.shell_integration_failure.clone();
+    } else {
+        spec.shell_integration_applied = false;
+        spec.shell_integration_unsupported = None;
+        spec.shell_integration_failure = None;
+    }
 }
 
 pub fn try_remove_host(host_id: &str) -> Result<bool> {
@@ -675,6 +688,24 @@ fn register_ssh_domain(spec: &SshHostSpec) -> Result<()> {
     Ok(())
 }
 
+/// Whether two domains made from a host dial it the same way: everything
+/// `build_ssh_domain` takes from the host's record, and its password.
+pub fn same_dialing(a: &SshDomain, b: &SshDomain) -> bool {
+    a.name == b.name
+        && a.remote_address == b.remote_address
+        && a.username == b.username
+        && a.multiplexing == b.multiplexing
+        && a.ssh_option == b.ssh_option
+        && a.stored_password == b.stored_password
+}
+
+/// Whether `a` and `b` make the same ssh domain. Most of a host's record --
+/// how its shell is set up, whether its OS is detected, Mosh -- goes into
+/// none of its domains.
+fn same_ssh_domain(a: &SshHostSpec, b: &SshHostSpec) -> bool {
+    same_dialing(&build_ssh_domain(a), &build_ssh_domain(b)) && a.password == b.password
+}
+
 /// Ensure the host's SSH domain is registered with the mux, building and adding
 /// it on first use. Returns the domain name to spawn into. The actual SSH
 /// connection is established lazily by the domain's `spawn_pane`, so this is
@@ -789,6 +820,10 @@ fn domain_name_is_reachable(domain_name: &str) -> bool {
 /// now: when it was renamed or moved to the other network, and no other
 /// saved host goes by the old name as well.
 pub fn connect_name_change(old: &SshHostSpec, new: &SshHostSpec) -> Option<(String, String)> {
+    // The same name: no need to read every host, `~/.ssh/config`'s too.
+    if connect_domain_name(old) == connect_domain_name(new) {
+        return None;
+    }
     connect_name_change_among(old, new, &list_all_hosts())
 }
 
@@ -1431,6 +1466,52 @@ Host prod *.internal
         spec.multiplexing = false;
         spec.use_mosh = true;
         assert_eq!(pending_shell_integration(&spec), None);
+    }
+
+    #[test]
+    fn the_other_network_keeps_what_connections_found_on_the_host() {
+        let mut record = spec_with_options(HashMap::new());
+        record.shell_integration_applied = true;
+        record.shell_integration_unsupported = Some("nu".to_string());
+        // The form's copy, taken before the last connection.
+        let mut moved = spec_with_options(HashMap::new());
+        moved.network = SshNetwork::Tailnet;
+        keep_what_connections_found(&record, &mut moved);
+        assert!(moved.shell_integration_applied);
+        assert_eq!(moved.shell_integration_unsupported.as_deref(), Some("nu"));
+
+        // Another endpoint has nothing set up on it yet.
+        let mut elsewhere = record.clone();
+        elsewhere.port = Some(2222);
+        keep_what_connections_found(&record, &mut elsewhere);
+        assert!(!elsewhere.shell_integration_applied);
+        assert_eq!(elsewhere.shell_integration_unsupported, None);
+    }
+
+    #[test]
+    fn only_how_a_host_is_reached_makes_it_another_domain() {
+        let saved = spec_with_options(HashMap::new());
+        let mut settled = saved.clone();
+        settled.detect_os = true;
+        settled.shell_integration = true;
+        settled.shell_integration_applied = true;
+        settled.files_auto_connect = true;
+        settled.use_mosh = true;
+        assert!(same_ssh_domain(&saved, &settled));
+
+        let mut tailnet = saved.clone();
+        tailnet.network = SshNetwork::Tailnet;
+        let mut connect = saved.clone();
+        connect.multiplexing = true;
+        let mut port = saved.clone();
+        port.port = Some(2222);
+        let mut key = saved.clone();
+        key.identity_file = Some("/home/user/.ssh/id_example".to_string());
+        let mut password = saved.clone();
+        password.password = Some("sealed".to_string());
+        for changed in [tailnet, connect, port, key, password] {
+            assert!(!same_ssh_domain(&saved, &changed), "{changed:?}");
+        }
     }
 
     fn spec_with_options(ssh_options: HashMap<String, String>) -> SshHostSpec {
