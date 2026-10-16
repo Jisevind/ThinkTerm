@@ -6403,6 +6403,9 @@ impl TermWindow {
         else {
             return;
         };
+        // Renamed since it connected: the old way while that connection
+        // lasts, then the new one, with the Space moved over to it first.
+        let domain_name = crate::ssh_hosts::connect_name_after_rename(&domain_name);
         if !self.space_reconnects_in_flight.insert(domain_name.clone()) {
             return;
         }

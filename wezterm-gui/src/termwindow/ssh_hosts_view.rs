@@ -723,10 +723,9 @@ impl SshHostsView {
         self.form_content_h = 0.0;
     }
 
-    /// Validate + create/update. On success returns the project id, with the
-    /// Spaces the save left no way to reach (see `release_spaces_then`), and
-    /// closes the form; on error records the message and keeps the form open.
-    fn persist_form(&mut self) -> Option<(String, Vec<workspace_threads::SpaceId>)> {
+    /// Validate + create/update. On success returns the project id and closes
+    /// the form; on error records the message and keeps the form open.
+    fn persist_form(&mut self) -> Option<String> {
         let form = self.form.as_mut()?;
         if form.network == SshNetwork::Tailnet && form.use_mosh {
             form.error = Some(crate::i18n::tr("ssh-error-tailnet-mosh"));
@@ -831,7 +830,6 @@ impl SshHostsView {
             return None;
         }
 
-        let mut released = Vec::new();
         let project_id = match &form.editing {
             Some(id) => {
                 let before = ssh_hosts::host_spec(id);
@@ -843,15 +841,14 @@ impl SshHostsView {
                             (before, ssh_hosts::host_spec(&saved_id))
                         {
                             // Renamed or moved to the other network, the host
-                            // no longer answers to the name its Spaces know it
-                            // by. Let them go now, as the next launch would:
-                            // the host's next connection brings them back,
-                            // while kept, a click on one would connect it under
-                            // a name that Space does not know. References to
-                            // their threads stay, to resolve again then.
-                            released = workspace_threads::space_ids_for_domains(
-                                &ssh_hosts::domain_names_left_unreachable(&before, &after),
-                            );
+                            // is reached under another name from now on, and
+                            // its Spaces go with it: left under the old name,
+                            // they would reconnect the way it was reached
+                            // before, or not at all.
+                            if let Some((from, to)) = ssh_hosts::connect_name_change(&before, &after)
+                            {
+                                ssh_hosts::move_spaces_after_rename(from, to);
+                            }
                             crate::refresh_connect_domain_for_ssh_host(&after);
                         }
                         saved_id
@@ -876,7 +873,7 @@ impl SshHostsView {
         };
         self.close_form();
         self.refresh();
-        Some((project_id, released))
+        Some(project_id)
     }
 
     // ---- input ------------------------------------------------------------
@@ -1185,12 +1182,12 @@ impl SshHostsView {
                 }
                 ContentViewResponse::Redraw
             }
-            SshViewAction::Save => match self.persist_form() {
-                Some((_, released)) => release_spaces_then(released, ContentViewResponse::Redraw),
-                None => ContentViewResponse::Redraw,
-            },
+            SshViewAction::Save => {
+                self.persist_form();
+                ContentViewResponse::Redraw
+            }
             SshViewAction::SaveAndConnect => match self.persist_form() {
-                Some((id, released)) => release_spaces_then(released, open_thread_response(id)),
+                Some(id) => open_thread_response(id),
                 None => ContentViewResponse::Redraw,
             },
             SshViewAction::Cancel => {
@@ -1498,9 +1495,7 @@ impl SshHostsView {
             (KeyCode::Enter, _) => {
                 if in_form {
                     match self.persist_form() {
-                        Some((id, released)) => {
-                            release_spaces_then(released, open_thread_response(id))
-                        }
+                        Some(id) => open_thread_response(id),
                         None => ContentViewResponse::Redraw,
                     }
                 } else if let Some(entry) = self.filtered.get(self.selected) {
@@ -5840,28 +5835,6 @@ fn open_thread_response(project_id: String) -> ContentViewResponse {
             if tw.open_ssh_host_thread_without_connecting(project_id, &window) {
                 tw.close_content_view();
             }
-        }
-    }))
-}
-
-/// `then` (a redraw, or a callback such as `open_thread_response`) after
-/// dropping this device's copy of `released`: Spaces a saved host no longer
-/// reaches. Through the window, as `delete_host` drops a deleted host's,
-/// because it may be showing one; the server keeps them, and the host's next
-/// connection brings them back.
-fn release_spaces_then(
-    released: Vec<workspace_threads::SpaceId>,
-    then: ContentViewResponse,
-) -> ContentViewResponse {
-    if released.is_empty() {
-        return then;
-    }
-    ContentViewResponse::Run(Box::new(move |term_window| {
-        for space_id in released {
-            term_window.start_delete_space(&space_id, workspace_threads::SpaceRemoval::Local, false);
-        }
-        if let ContentViewResponse::Run(then) = then {
-            then(term_window);
         }
     }))
 }

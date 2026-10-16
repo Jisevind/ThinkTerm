@@ -56,6 +56,11 @@ fn store_version() -> u32 {
 
 lazy_static::lazy_static! {
     static ref SSH_HOST_STORE: Mutex<Option<SshHostStore>> = Mutex::new(None);
+    /// Renames saved while connected under the old name, as (old name, new
+    /// name): the host's Spaces stay with that connection while it lasts
+    /// (`connect_name_after_rename`). One entry per host at most, gone once
+    /// its Spaces have moved.
+    static ref RENAMED_WHILE_CONNECTED: Mutex<Vec<(String, String)>> = Mutex::new(vec![]);
 }
 
 fn ensure_store_loaded(
@@ -768,51 +773,137 @@ pub fn domain_names_for_host(spec: &SshHostSpec) -> Vec<String> {
 
 /// Whether a mux domain of this name can still be reached: a lua-configured
 /// or already-attached domain, or a saved host that is connected under this
-/// name. Not a host's record id, though `connect_domain_from_ssh_host` takes
-/// one: Remote Hosts once connected hosts under their ids, and a Space left
-/// under one is forgotten here so that the host's next connection brings it
-/// back under the host's own name.
+/// name or its record id. Remote Hosts once connected hosts under their ids;
+/// a Space left under one stays, for the host's connection under its own
+/// name to take over (see `ingest_remote_tree`).
 fn domain_name_is_reachable(domain_name: &str) -> bool {
     if Mux::get().get_domain_by_name(domain_name).is_some() {
         return true;
     }
     list_all_hosts()
         .into_iter()
-        .any(|entry| connect_domain_name(&entry.spec) == domain_name)
+        .any(|entry| connect_domain_name(&entry.spec) == domain_name || entry.id == domain_name)
 }
 
-/// The names a host could be connected under that an edit takes from it: its
-/// connection name, when it is renamed or moved to the other network.
-fn domain_names_dropped(old: &SshHostSpec, new: &SshHostSpec) -> Vec<String> {
-    let kept = domain_names_for_host(new);
-    domain_names_for_host(old)
-        .into_iter()
-        .filter(|name| !kept.contains(name))
-        .collect()
+/// The connection name an edit moved a host from, and the one it goes by
+/// now: when it was renamed or moved to the other network, and no other
+/// saved host goes by the old name as well.
+pub fn connect_name_change(old: &SshHostSpec, new: &SshHostSpec) -> Option<(String, String)> {
+    connect_name_change_among(old, new, &list_all_hosts())
 }
 
-/// The names an edit of a host leaves with nothing to connect: those it no
-/// longer answers to that no other saved host answers to either. A domain
-/// registered under one earlier this session does not count, as it would for
-/// `domain_name_is_reachable`: the Mux keeps every domain it was given, and
-/// that one is the host as it was before the edit.
-pub fn domain_names_left_unreachable(old: &SshHostSpec, new: &SshHostSpec) -> Vec<String> {
-    names_left_unreachable(old, new, &list_all_hosts())
-}
-
-fn names_left_unreachable(
+fn connect_name_change_among(
     old: &SshHostSpec,
     new: &SshHostSpec,
     hosts: &[SshHostEntry],
-) -> Vec<String> {
-    domain_names_dropped(old, new)
-        .into_iter()
-        .filter(|name| {
-            !hosts
-                .iter()
-                .any(|entry| domain_names_for_host(&entry.spec).contains(name))
-        })
+) -> Option<(String, String)> {
+    let before = connect_domain_name(old);
+    let after = connect_domain_name(new);
+    let still_used = hosts
+        .iter()
+        .any(|entry| connect_domain_name(&entry.spec) == before);
+    (before != after && !still_used).then_some((before, after))
+}
+
+/// Take a host's Spaces from the connection name an edit moved it off to
+/// the one it goes by now (see `connect_name_change`). Not while connected
+/// under the old name, even if that connection has dropped and is coming
+/// back: their windows show its terminals, and moved out from under it they
+/// would read as disconnected and be connected a second time beside it.
+/// They stay with it, as its address and password do, until it is gone.
+/// One that is only trying to connect has nothing on screen to keep, and
+/// gives them up at once.
+pub fn move_spaces_after_rename(from: String, to: String) {
+    let moved = rename_moves_now(&mut RENAMED_WHILE_CONNECTED.lock(), from, to, connected_under);
+    if let Some((from, to)) = moved {
+        crate::workspace_threads::move_spaces_to_domain(&from, &to);
+    }
+}
+
+/// The name to connect by for a host that goes by, or went by, `name`.
+/// Renamed while connected the old way, that is the old name as long as the
+/// connection lasts -- connecting lands in the windows already on it -- and
+/// the new one after, the Spaces moved over to it first.
+pub fn connect_name_after_rename(name: &str) -> String {
+    let (name, moved) = rename_settles(&mut RENAMED_WHILE_CONNECTED.lock(), name, connected_under);
+    if let Some((from, to)) = moved {
+        crate::workspace_threads::move_spaces_to_domain(&from, &to);
+    }
+    name
+}
+
+/// Whether a connection under `name` was made and has not been let go:
+/// connected, or reconnecting after a drop.
+fn connected_under(name: &str) -> bool {
+    Mux::get()
+        .get_domain_by_name(name)
+        .is_some_and(|domain| domain.state() == mux::domain::DomainState::Attached)
+}
+
+/// The Spaces a rename from `from` to `to` moves now, as (from, to): none
+/// while `connected` under the old name, the rename waiting in `renamed`
+/// instead.
+fn rename_moves_now(
+    renamed: &mut Vec<(String, String)>,
+    from: String,
+    to: String,
+    connected: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    // Renamed again before the first rename moved anything: one move, from
+    // the name the Spaces are under to the newest.
+    let from = match renamed.iter().position(|(_, new)| *new == from) {
+        Some(index) => renamed.remove(index).0,
+        None => from,
+    };
+    if from == to {
+        return None;
+    }
+    if connected(&from) {
+        renamed.push((from, to));
+        return None;
+    }
+    Some((from, to))
+}
+
+/// The name to connect by for `name` given the renames waiting in
+/// `renamed`, and the Spaces to move before connecting by it.
+fn rename_settles(
+    renamed: &mut Vec<(String, String)>,
+    name: &str,
+    connected: impl Fn(&str) -> bool,
+) -> (String, Option<(String, String)>) {
+    let Some(index) = renamed
+        .iter()
+        .position(|(old, new)| old == name || new == name)
+    else {
+        return (name.to_string(), None);
+    };
+    if connected(&renamed[index].0) {
+        return (renamed[index].0.clone(), None);
+    }
+    let (old, new) = renamed.remove(index);
+    (new.clone(), Some((old, new)))
+}
+
+/// The names saved hosts are connected under as things stand.
+pub fn connect_domain_names() -> std::collections::HashSet<String> {
+    list_all_hosts()
+        .iter()
+        .map(|entry| connect_domain_name(&entry.spec))
         .collect()
+}
+
+/// Move the Spaces left under a saved host's record id to the name the host
+/// is connected under. Remote Hosts once connected hosts under their ids, so
+/// a Space made then reconnected under the id and never under the host's
+/// own name. At startup, before anything is connected.
+pub fn move_spaces_off_record_ids() {
+    for entry in list_all_hosts() {
+        crate::workspace_threads::move_spaces_to_domain(
+            &entry.id,
+            &connect_domain_name(&entry.spec),
+        );
+    }
 }
 
 /// Drop this device's copy of every Space whose mux server it can no longer
@@ -1111,44 +1202,101 @@ mod tests {
     }
 
     #[test]
-    fn a_rename_or_a_move_to_the_other_network_drops_the_name_its_spaces_know() {
-        let mut old = spec_with_options(HashMap::new());
-        old.label = "server-a".into();
-        old.host = "100.64.0.2".into();
-        let dropped = |new: &SshHostSpec| domain_names_dropped(&old, new);
-
-        let mut new = old.clone();
-        new.multiplexing = true;
-        new.detect_os = false;
-        assert!(dropped(&new).is_empty());
-
-        new.label = "server-b".into();
-        assert_eq!(dropped(&new), vec!["server-a".to_string()]);
-
-        let mut new = old.clone();
-        new.network = SshNetwork::Tailnet;
-        assert!(dropped(&new).contains(&"server-a".to_string()));
-
-        // Back again: the tailnet name goes, the label is the name once more.
-        let mut back = new.clone();
-        back.network = SshNetwork::System;
-        let names = domain_names_dropped(&new, &back);
-        assert!(names.contains(&connect_domain_name(&new)));
-        assert!(!names.contains(&"server-a".to_string()));
-
-        // A name another saved host still goes by is that host's to keep.
+    fn a_rename_or_a_move_to_the_other_network_changes_the_connection_name() {
         let entry = |spec: &SshHostSpec| SshHostEntry {
             id: host_id_for_host(spec),
             source: SshHostSource::ThinkTerm,
             spec: spec.clone(),
         };
-        let mut renamed = old.clone();
-        renamed.label = "server-b".into();
+        let mut old = spec_with_options(HashMap::new());
+        old.label = "server-a".into();
+        old.host = "100.64.0.2".into();
+        let change = |new: &SshHostSpec| connect_name_change_among(&old, new, &[entry(new)]);
+
+        let mut new = old.clone();
+        new.multiplexing = true;
+        new.detect_os = false;
+        assert_eq!(change(&new), None);
+
+        new.label = "server-b".into();
+        assert_eq!(
+            change(&new),
+            Some(("server-a".to_string(), "server-b".to_string()))
+        );
+
+        let mut moved = old.clone();
+        moved.network = SshNetwork::Tailnet;
+        assert_eq!(
+            change(&moved),
+            Some(("server-a".to_string(), connect_domain_name(&moved)))
+        );
+
+        // A name another saved host still goes by stays that host's.
         let mut other = old.clone();
         other.host = "192.0.2.10".into();
-        let left = |hosts: &[SshHostEntry]| names_left_unreachable(&old, &renamed, hosts);
-        assert!(left(&[entry(&renamed)]).contains(&"server-a".to_string()));
-        assert!(!left(&[entry(&renamed), entry(&other)]).contains(&"server-a".to_string()));
+        assert_eq!(
+            connect_name_change_among(&old, &new, &[entry(&new), entry(&other)]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rename_with_nothing_connected_moves_the_spaces_at_once() {
+        let mut renamed = vec![];
+        assert_eq!(
+            rename_moves_now(&mut renamed, "server-a".into(), "server-b".into(), |_| false),
+            Some(("server-a".to_string(), "server-b".to_string()))
+        );
+        assert!(renamed.is_empty());
+        assert_eq!(
+            rename_settles(&mut renamed, "server-b", |_| false),
+            ("server-b".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn a_rename_while_connected_leaves_the_spaces_on_that_connection_until_it_ends() {
+        let mut renamed = vec![];
+        let connected = |name: &str| name == "server-a";
+        assert_eq!(
+            rename_moves_now(&mut renamed, "server-a".into(), "server-b".into(), connected),
+            None
+        );
+        // Connecting by either name lands on the connection still up.
+        assert_eq!(
+            rename_settles(&mut renamed, "server-b", connected),
+            ("server-a".to_string(), None)
+        );
+        assert_eq!(
+            rename_settles(&mut renamed, "server-a", connected),
+            ("server-a".to_string(), None)
+        );
+        // Renamed again meanwhile: still one move, from where the Spaces are.
+        assert_eq!(
+            rename_moves_now(&mut renamed, "server-b".into(), "server-c".into(), connected),
+            None
+        );
+        // Once it is down, connecting moves them over and goes by the new name.
+        assert_eq!(
+            rename_settles(&mut renamed, "server-c", |_| false),
+            (
+                "server-c".to_string(),
+                Some(("server-a".to_string(), "server-c".to_string()))
+            )
+        );
+        assert!(renamed.is_empty());
+    }
+
+    #[test]
+    fn renaming_back_while_connected_leaves_nothing_to_move() {
+        let mut renamed = vec![];
+        let connected = |name: &str| name == "server-a";
+        rename_moves_now(&mut renamed, "server-a".into(), "server-b".into(), connected);
+        assert_eq!(
+            rename_moves_now(&mut renamed, "server-b".into(), "server-a".into(), connected),
+            None
+        );
+        assert!(renamed.is_empty());
     }
 
     #[test]

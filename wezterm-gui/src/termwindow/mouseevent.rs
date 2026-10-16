@@ -6755,6 +6755,25 @@ impl super::TermWindow {
         }
     }
 
+    /// Connecting found the Space it opens on screen already, in the window
+    /// whose Space owner id is `holder`: if that is this one, open the
+    /// Space's thread here, connecting it as switching to the Space does,
+    /// and bring the window forward.
+    pub(crate) fn open_space_if_held_by(&mut self, holder: u64) {
+        if self.space_owner_id != holder {
+            return;
+        }
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if let Some(thread_id) =
+            crate::workspace_threads::ensure_active_thread_for_space(&self.active_space_id)
+        {
+            self.activate_workspace_thread(thread_id, &window);
+        }
+        window.focus();
+    }
+
     pub(crate) fn open_ssh_host_thread_without_connecting(
         &mut self,
         host_id: String,
@@ -6769,7 +6788,11 @@ impl super::TermWindow {
         // in its dedicated Space — the same flow as `thinkterm connect
         // <name>` — rather than opening a direct-ssh remote thread.
         if spec.multiplexing && !spec.use_mosh {
-            let name = crate::ssh_hosts::connect_domain_name(&spec);
+            // Renamed while connected the old way, the host is still on that
+            // connection; connecting again goes to it.
+            let name = crate::ssh_hosts::connect_name_after_rename(
+                &crate::ssh_hosts::connect_domain_name(&spec),
+            );
             // These hosts used to skip OS detection entirely: the branch
             // returned before anything read `detect_os`, and both detection
             // call sites downcast to `RemoteSshDomain`, which a mux client

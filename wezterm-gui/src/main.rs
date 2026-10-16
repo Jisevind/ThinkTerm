@@ -674,6 +674,9 @@ pub(crate) async fn connect_domain_into_space(
 
     // Already attached in this process: focus one of this domain's windows.
     if domain.state() == DomainState::Attached {
+        // The plan above may have added a row here that the server has not
+        // seen; nothing after this point would tell it.
+        workspace_threads::reconcile_remote_subtree(&domain_name);
         for window_id in mux.iter_windows() {
             let owned = mux
                 .get_window(window_id)
@@ -715,6 +718,17 @@ pub(crate) async fn connect_domain_into_space(
                 gui_window.window.focus();
                 return Ok(());
             }
+        }
+        // On screen in a window showing none of this connection: it was not
+        // connected, or the host was renamed or moved to the other network
+        // and this is the name it goes by now. Connect it there.
+        if let Some(holder) = workspace_threads::window_owner_for_space(&plan.space_id) {
+            for gui_window in crate::frontend::front_end().gui_windows() {
+                gui_window.window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |tw| tw.open_space_if_held_by(holder),
+                )));
+            }
+            return Ok(());
         }
         anyhow::bail!(
             "Space for domain {domain_name} is occupied by another window; \
@@ -860,6 +874,7 @@ pub(crate) async fn connect_domain_into_space(
         let client = domain
             .downcast_ref::<ClientDomain>()
             .ok_or_else(|| anyhow!("{domain_name} is not a multiplexing client domain"))?;
+        workspace_threads::put_thread_on_server(&domain_name, &settled.thread_id).await;
         crate::frontend::front_end().set_switching_workspaces(true);
         let ensured = client
             .ensure_thinkterm_thread(Some(settled.thread_id.clone()), size)
@@ -1383,6 +1398,7 @@ fn setup_mux(
     // Register ThinkTerm's saved SSH hosts as runtime mux domains so that
     // reconnecting / restoring remote sessions can resolve them by name.
     crate::ssh_hosts::register_saved_hosts();
+    crate::ssh_hosts::move_spaces_off_record_ids();
     // Both sources of domain names are registered by now, so a Space naming
     // one that still does not exist belongs to a host that has been deleted.
     // Local removal only; the server keeps its copy.

@@ -683,7 +683,7 @@ impl GuiFrontEnd {
                 }
 
                 let mux = Mux::get();
-                let (is_domain_owned, is_host, window_workspace) = {
+                let (is_domain_owned, is_host, window_workspace, origin_name) = {
                     let Some(mux_window) = mux.get_window(mux_window_id) else {
                         continue;
                     };
@@ -697,6 +697,10 @@ impl GuiFrontEnd {
                             .origin_domain()
                             .is_some_and(crate::local_sessions::is_host_domain_id),
                         mux_window.get_workspace().to_string(),
+                        mux_window
+                            .origin_domain()
+                            .and_then(|id| mux.get_domain(id))
+                            .map(|domain| domain.domain_name().to_string()),
                     )
                 };
                 // `get_window` holds a read guard for the mux's complete
@@ -727,6 +731,27 @@ impl GuiFrontEnd {
                     );
                     continue;
                 }
+                // A server's thread window has a Space of its own to show.
+                // Arriving through a second connection to the same server, it
+                // is a copy of one the Space's own connection shows already.
+                let home = match origin_name.as_deref() {
+                    Some(name) if is_domain_owned => {
+                        crate::workspace_threads::server_thread_window_home(
+                            &window_workspace,
+                            name,
+                        )
+                    }
+                    _ => crate::workspace_threads::ServerThreadWindowHome::Unknown,
+                };
+                if home == crate::workspace_threads::ServerThreadWindowHome::OtherConnection {
+                    log::debug!(
+                        "reconcile: leaving window {} in workspace {:?} hidden: its Space \
+                         is shown through another connection",
+                        mux_window_id,
+                        window_workspace,
+                    );
+                    continue;
+                }
 
                 front_end()
                     .spawned_mux_window
@@ -739,7 +764,29 @@ impl GuiFrontEnd {
                 // the one the domain just created (killing e.g. the in-window
                 // ConnectionUI mid-authentication).
                 let created = if is_domain_owned {
-                    TermWindow::new_window_without_restore(mux_window_id).await
+                    // On the thread's own Space when no window shows it, not
+                    // whichever local Space happens to be free.
+                    let owner = crate::workspace_threads::next_space_owner_id();
+                    match home {
+                        crate::workspace_threads::ServerThreadWindowHome::Space(space_id)
+                            if crate::workspace_threads::claim_free_space_for_window(
+                                owner, &space_id,
+                            ) =>
+                        {
+                            let created = TermWindow::new_window_with_claimed_space(
+                                mux_window_id,
+                                owner,
+                                space_id,
+                                None,
+                            )
+                            .await;
+                            if created.is_err() {
+                                crate::workspace_threads::release_window_space(owner);
+                            }
+                            created
+                        }
+                        _ => TermWindow::new_window_without_restore(mux_window_id).await,
+                    }
                 } else {
                     TermWindow::new_window(mux_window_id).await
                 };

@@ -1218,6 +1218,70 @@ pub fn release_window_space(owner_id: u64) {
     WINDOW_SPACES.lock().remove(&owner_id);
 }
 
+/// Where a window a server opened in one of its thread workspaces goes when
+/// nothing here asked for it (the reconcile shows the active workspace's).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServerThreadWindowHome {
+    /// The Space the thread is in, held through the connection the window
+    /// came by.
+    Space(SpaceId),
+    /// That Space is held through another connection to the same server,
+    /// whose own copy of the window it shows: a second GUI window would only
+    /// land on some unrelated local Space.
+    OtherConnection,
+    /// Not a thread this device knows to be that server's.
+    Unknown,
+}
+
+pub fn server_thread_window_home(workspace: &str, domain_name: &str) -> ServerThreadWindowHome {
+    THREAD_STORE
+        .lock()
+        .server_thread_window_home(workspace, domain_name)
+}
+
+impl WorkspaceThreadStore {
+    fn server_thread_window_home(&self, workspace: &str, domain_name: &str) -> ServerThreadWindowHome {
+        let Some((project_id, thread_id)) = parse_thread_workspace_name(workspace) else {
+            return ServerThreadWindowHome::Unknown;
+        };
+        let space_id = self
+            .projects
+            .iter()
+            .find(|project| project.threads.iter().any(|thread| thread.id == thread_id))
+            .or_else(|| self.projects.iter().find(|project| project.id == project_id))
+            .map(|project| project.space_id.as_str())
+            .or_else(|| space_id_from_remote_project_id(&project_id));
+        match space_id
+            .and_then(|space_id| self.spaces.iter().find(|space| space.id == space_id))
+            .and_then(|space| Some((space.id.clone(), space.client_domain.as_deref()?)))
+        {
+            Some((space_id, held_by)) if held_by == domain_name => {
+                ServerThreadWindowHome::Space(space_id)
+            }
+            Some(_) => ServerThreadWindowHome::OtherConnection,
+            None => ServerThreadWindowHome::Unknown,
+        }
+    }
+}
+
+/// Claim `space_id` for a window nobody explicitly opened, if no other
+/// window shows it. Unlike [`switch_window_space`] this is not the user
+/// going there, so the last active Space stays as it was.
+pub fn claim_free_space_for_window(owner_id: u64, space_id: &str) -> bool {
+    if !THREAD_STORE.lock().has_space(space_id) {
+        return false;
+    }
+    let mut assignments = WINDOW_SPACES.lock();
+    if assignments
+        .iter()
+        .any(|(owner, active_space)| *owner != owner_id && active_space == space_id)
+    {
+        return false;
+    }
+    assignments.insert(owner_id, space_id.to_string());
+    true
+}
+
 fn window_owner_for_space_in(assignments: &HashMap<u64, SpaceId>, space_id: &str) -> Option<u64> {
     assignments
         .iter()
@@ -3426,6 +3490,7 @@ pub(crate) async fn materialize_thread(
                 .downcast_ref::<wezterm_client::domain::ClientDomain>()
                 .filter(|client| !client.is_local_session_host())
             {
+                put_thread_on_server(domain.domain_name(), &thread_id).await;
                 let response = client_domain
                     .ensure_thinkterm_thread(Some(thread_id), size)
                     .await
@@ -4693,6 +4758,60 @@ fn tree_domain_for_thread(store: &WorkspaceThreadStore, thread_id: &str) -> Opti
     tree_domain_for_project(store, &project_id)
 }
 
+/// Move the Spaces this device holds under the connection name `from` to
+/// `to`: the name their server goes by now that its host was renamed, moved
+/// to the other network, or found under its record id. Done where the
+/// change is known for certain, so the Spaces reconnect the way the host is
+/// reached now rather than the way it was.
+pub fn move_spaces_to_domain(from: &str, to: &str) {
+    if from == to {
+        return;
+    }
+    {
+        let mut hidden = LOCALLY_HIDDEN_SPACES.lock();
+        if let Some(spaces) = hidden.remove(from) {
+            hidden.entry(to.to_string()).or_default().extend(spaces);
+        }
+    }
+    let mut store = THREAD_STORE.lock();
+    if store.move_spaces_to_domain(from, to) {
+        persist_locked(&store);
+    }
+}
+
+impl WorkspaceThreadStore {
+    fn move_spaces_to_domain(&mut self, from: &str, to: &str) -> bool {
+        let mut moved = false;
+        for space in &mut self.spaces {
+            if space.client_domain.as_deref() == Some(from) {
+                space.client_domain = Some(to.to_string());
+                moved = true;
+            }
+        }
+        if let Some(last) = self.last_space_per_domain.remove(from) {
+            self.last_space_per_domain
+                .entry(to.to_string())
+                .or_insert(last);
+            moved = true;
+        }
+        moved
+    }
+}
+
+/// Whether the connection named `domain_name` is up or on its way up. While
+/// it is, the Spaces it mirrors stay its own, even when the same server is
+/// also reached under another name.
+fn remote_domain_is_live(domain_name: &str) -> bool {
+    Mux::try_get()
+        .and_then(|mux| mux.get_domain_by_name(domain_name))
+        .is_some_and(|domain| {
+            domain.state() == mux::domain::DomainState::Attached
+                || domain
+                    .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                    .is_some_and(|client| client.is_attaching() || client.is_attach_retrying())
+        })
+}
+
 fn remote_tree_domain_is_attached(domain_name: &str) -> bool {
     // try_get: unit tests and early startup have no Mux; "no mux" must read
     // as "not attached" (the conservative answer that keeps refs alive).
@@ -4885,7 +5004,16 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         };
         store.ingest_host_tree(&tree_for_store, known.as_ref())
     } else {
-        store.ingest_remote_tree(domain_name, &tree_for_store)
+        // Another name keeps its Spaces while it is connected, or while a
+        // saved host still goes by it: two records for one machine each keep
+        // theirs. Only a name nothing goes by any more gives them up.
+        let current = std::cell::OnceCell::new();
+        store.ingest_remote_tree_with(domain_name, &tree_for_store, &|other| {
+            remote_domain_is_live(other)
+                || current
+                    .get_or_init(crate::ssh_hosts::connect_domain_names)
+                    .contains(other)
+        })
     };
     // A server can legitimately have no Spaces left — its last one was deleted
     // from here or from another device. A device that is connecting to it
@@ -5157,6 +5285,39 @@ pub fn reconcile_remote_subtree(domain_name: &str) {
         store.reconcile_ops_for_domain(domain_name, &last_known)
     };
     submit_tree_ops(domain_name.to_string(), ops);
+}
+
+/// Wait until the server behind `domain_name` knows `thread_id`, putting it
+/// there if it is not on its way yet. A thread made here is only sent up in
+/// the background, and asked to open a thread it has not heard of, the
+/// server opens another one instead: the window then waits on a workspace
+/// that never comes. Gives up after a few seconds, or at once when there is
+/// no tree from that server to tell by or no connection to send it over.
+pub async fn put_thread_on_server(domain_name: &str, thread_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut asked = 0;
+    while std::time::Instant::now() < deadline {
+        match LAST_KNOWN_REMOTE_TREES.lock().get(domain_name) {
+            Some(tree) if tree.thread(thread_id).is_some() => return,
+            Some(_) => {}
+            None => return,
+        }
+        // Nothing can be sent while the connection is not up: asking would
+        // only roll this device back to the last tree it heard.
+        if !remote_tree_domain_is_attached(domain_name) {
+            return;
+        }
+        let on_its_way = IN_FLIGHT_TREE_OPS.lock().contains_key(domain_name);
+        if !on_its_way {
+            if asked == 3 {
+                log::warn!("{domain_name} still does not know thread {thread_id}");
+                return;
+            }
+            asked += 1;
+            reconcile_remote_subtree(domain_name);
+        }
+        smol::Timer::after(std::time::Duration::from_millis(30)).await;
+    }
 }
 
 /// Push a thread's shared scalar state to its server.
@@ -6232,6 +6393,7 @@ impl WorkspaceThreadStore {
     }
 
     /// The Spaces currently attributed to `domain_name`.
+    #[cfg(test)]
     fn space_ids_for_domain(&self, domain_name: &str) -> std::collections::HashSet<SpaceId> {
         self.spaces
             .iter()
@@ -7356,9 +7518,23 @@ impl WorkspaceThreadStore {
         }
         ops.extend(order_ops);
 
+        // A remote server's tree also carries Spaces this device does not hold
+        // under this name: another device's, one held under the name the
+        // server was reached by before, one the ingest refused. Their rows
+        // are not this connection's to remove -- treating them as deleted
+        // here once wiped a Space off a server reached under a second name.
+        // So only rows inside the Spaces held under this name are removed.
+        let removable = |space_id: &str| match scope {
+            PublishScope::Domain(_) => space_ids.iter().any(|id| id == space_id),
+            PublishScope::Host => true,
+        };
+
         // Threads and projects first: deleting their Space would take them
         // with it, and we want the narrower removal when only a row went away.
         for project in &last_known.projects {
+            if !removable(&project.space_id) {
+                continue;
+            }
             for thread in &project.threads {
                 if !live_threads.contains(thread.id.as_str()) {
                     ops.push(codec::TreeOp::DeleteThread {
@@ -7372,15 +7548,26 @@ impl WorkspaceThreadStore {
                 });
             }
         }
-        for space in &last_known.spaces {
-            if !space_ids.contains(&space.id) {
-                ops.push(codec::TreeOp::DeleteSpace {
-                    space_id: space.id.clone(),
-                });
+        // A remote server's Spaces go only by an explicit delete
+        // (`delete_space_for_window`), never by this diff.
+        if scope == PublishScope::Host {
+            for space in &last_known.spaces {
+                if !space_ids.contains(&space.id) {
+                    ops.push(codec::TreeOp::DeleteSpace {
+                        space_id: space.id.clone(),
+                    });
+                }
             }
         }
 
         ops
+    }
+
+    /// `ingest_remote_tree_with` as connecting does it, short of the saved
+    /// hosts: only a live connection keeps its Spaces.
+    #[cfg(test)]
+    fn ingest_remote_tree(&mut self, domain_name: &str, tree: &codec::ThinkTermTree) -> bool {
+        self.ingest_remote_tree_with(domain_name, tree, &remote_domain_is_live)
     }
 
     /// Rebuild this domain's Spaces/Projects/Threads from the server's tree.
@@ -7394,18 +7581,52 @@ impl WorkspaceThreadStore {
     /// Remote records keep being written to the local JSON file, but purely as
     /// a cache: it lets the sidebar draw something before the attach finishes,
     /// and this function overwrites it wholesale when the truth arrives.
-    fn ingest_remote_tree(&mut self, domain_name: &str, tree: &codec::ThinkTermTree) -> bool {
-        // The tree is the server's word and nothing more. A Space whose id
-        // is already one of ours from elsewhere (the local default Space,
-        // another domain's) would have every local project under that id
-        // treated as this domain's and replaced, layouts included; and a
-        // project naming a Space the tree does not carry would be re-homed
-        // into the local default Space by normalize_after_load and read as
-        // local from then on. Neither row is taken.
+    ///
+    /// `keeps_its_spaces` says whether another connection name still holds
+    /// the Spaces it holds: see `taken_over` below.
+    fn ingest_remote_tree_with(
+        &mut self,
+        domain_name: &str,
+        tree: &codec::ThinkTermTree,
+        keeps_its_spaces: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        // A Space this device holds under another name for the same server
+        // -- one nothing goes by any more, such as the name of a host since
+        // deleted and saved again -- is this server's all the same. Its
+        // Spaces come over to this name; left behind, they could neither
+        // connect nor show up here.
+        let taken_over: Vec<(SpaceId, String)> = tree
+            .spaces
+            .iter()
+            .filter_map(|space| self.spaces.iter().find(|local| local.id == space.id))
+            .filter_map(|local| {
+                let other = local.client_domain.as_deref()?;
+                (other != domain_name && !keeps_its_spaces(other))
+                    .then(|| (local.id.clone(), other.to_string()))
+            })
+            .collect();
+        for (space_id, other) in &taken_over {
+            log::info!(
+                "{domain_name} takes Space {space_id} over from {other}: the same server, \
+                 reached under another name"
+            );
+        }
+        let held = |space: &Space| {
+            space.client_domain.as_deref() == Some(domain_name)
+                || taken_over.iter().any(|(id, _)| *id == space.id)
+        };
+
+        // Otherwise the tree is the server's word and nothing more. A Space
+        // whose id is already one of ours from elsewhere (the local default
+        // Space, a connected domain's) would have every local project under
+        // that id treated as this domain's and replaced, layouts included;
+        // and a project naming a Space the tree does not carry would be
+        // re-homed into the local default Space by normalize_after_load and
+        // read as local from then on. Neither row is taken.
         let foreign_space_ids: std::collections::HashSet<&str> = self
             .spaces
             .iter()
-            .filter(|space| space.client_domain.as_deref() != Some(domain_name))
+            .filter(|space| !held(space))
             .map(|space| space.id.as_str())
             .collect();
         let tree_spaces: Vec<&codec::TtSpace> = tree
@@ -7445,7 +7666,7 @@ impl WorkspaceThreadStore {
         let owned_space_ids: std::collections::HashSet<SpaceId> = self
             .spaces
             .iter()
-            .filter(|space| space.client_domain.as_deref() == Some(domain_name))
+            .filter(|space| held(space))
             .map(|space| space.id.clone())
             .chain(tree_spaces.iter().map(|space| space.id.clone()))
             .collect();
@@ -7453,7 +7674,7 @@ impl WorkspaceThreadStore {
         let mut space_state: HashMap<SpaceId, (Option<ProjectId>, Option<SpaceVaultBinding>)> =
             HashMap::new();
         for space in &self.spaces {
-            if space.client_domain.as_deref() == Some(domain_name) {
+            if held(space) {
                 space_state.insert(
                     space.id.clone(),
                     (space.active_project_id.clone(), space.note_vault.clone()),
@@ -7588,12 +7809,31 @@ impl WorkspaceThreadStore {
 
         // Splice the rebuilt block in where the old one started so that the
         // Space menu and sidebar do not reshuffle on every push.
-        let spaces = splice_in_place(&self.spaces, new_spaces, |space| {
-            space.client_domain.as_deref() == Some(domain_name)
-        });
+        let spaces = splice_in_place(&self.spaces, new_spaces, |space| held(space));
         let projects = splice_in_place(&self.projects, new_projects, |project| {
             owned_space_ids.contains(&project.space_id)
         });
+
+        // Land where this device last was on that server, as under its old
+        // name. What this name remembers so far may be only the stand-in the
+        // connect invented before the server spoke, which is gone now.
+        let remembered = self.last_space_per_domain.get(domain_name).is_some_and(|last| {
+            spaces
+                .iter()
+                .any(|space| space.id == *last && space.client_domain.as_deref() == Some(domain_name))
+        });
+        if !remembered {
+            let last = taken_over.iter().find_map(|(_, other)| {
+                self.last_space_per_domain
+                    .get(other)
+                    .filter(|space_id| taken_over.iter().any(|(id, _)| id == *space_id))
+                    .cloned()
+            });
+            if let Some(last) = last {
+                self.last_space_per_domain
+                    .insert(domain_name.to_string(), last);
+            }
+        }
 
         if spaces == self.spaces && projects == self.projects {
             return false;
@@ -9869,10 +10109,10 @@ pub fn adopt_orphan_remote_thread_windows(space_id: &str) -> bool {
         return false;
     }
 
-    let mux_project_id = remote_project_id_for_space(space_id, &mux_domain_host_id(&domain_name));
     let mux_project_name = crate::ssh_hosts::connect_domain_label(&domain_name);
 
     let mut store = THREAD_STORE.lock();
+    let mux_project_id = store.mux_domain_project_id(space_id, &domain_name);
     let mut changed = false;
     for (project_id, thread_id, workspace, cwd) in candidates {
         let workspace_known = store.projects.iter().any(|project| {
@@ -10043,7 +10283,40 @@ pub fn ensure_mux_domain_space(domain_name: &str) -> MuxDomainSpacePlan {
     plan
 }
 
+/// Whether `name` has the shape of a saved host's record id
+/// (`ssh-<hash>`, `system-ssh-<hash>`).
+fn is_host_record_id(name: &str) -> bool {
+    name.strip_prefix("system-ssh-")
+        .or_else(|| name.strip_prefix("ssh-"))
+        .is_some_and(|hash| !hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 impl WorkspaceThreadStore {
+    /// The project a mux-domain Space keeps for its server's own threads.
+    /// Its id, and the workspaces its threads run in on the server, are built
+    /// from the name the server was reached by when it was made; a Space
+    /// reached under another name since -- its host renamed, or moved to the
+    /// other network -- goes on with that project rather than growing a
+    /// second one beside it whose threads the server has never heard of.
+    fn mux_domain_project_id(&self, space_id: &str, domain_name: &str) -> ProjectId {
+        let own = remote_project_id_for_space(space_id, &mux_domain_host_id(domain_name));
+        if self.projects.iter().any(|project| project.id == own) {
+            return own;
+        }
+        self.projects
+            .iter()
+            .filter(|project| project.space_id == space_id && is_mux_domain_project_id(&project.id))
+            .max_by_key(|project| {
+                project
+                    .threads
+                    .iter()
+                    .map(|thread| thread.last_active_at)
+                    .max()
+            })
+            .map(|project| project.id.clone())
+            .unwrap_or(own)
+    }
+
     fn ensure_mux_domain_space(&mut self, domain_name: &str) -> MuxDomainSpacePlan {
         let store = self;
         let label = crate::ssh_hosts::connect_domain_label(domain_name);
@@ -10057,13 +10330,12 @@ impl WorkspaceThreadStore {
                 store.create_space_record_for_domain(label.clone(), Some(domain_name.to_string()))
             });
 
-        let host_id = mux_domain_host_id(domain_name);
-        let project_id = remote_project_id_for_space(&space_id, &host_id);
+        let project_id = store.mux_domain_project_id(&space_id, domain_name);
         if !store.projects.iter().any(|p| p.id == project_id) {
             store.projects.push(Project {
                 id: project_id.clone(),
                 space_id: space_id.clone(),
-                name: label,
+                name: label.clone(),
                 path: PathBuf::from(format!("wezterm-mux://{domain_name}")),
                 threads: vec![],
                 active_thread_id: None,
@@ -10078,6 +10350,20 @@ impl WorkspaceThreadStore {
             .iter_mut()
             .find(|p| p.id == project_id)
             .expect("mux domain project was just ensured");
+        // One made while Remote Hosts connected hosts under their record ids
+        // is still called by the id: show the host's name. A project named
+        // for any other connection may be another device's, and its name is
+        // shared through the server, so it stays as it is.
+        if let Some(named_for) =
+            remote_host_id_for_project_id(&project_id).strip_prefix(MUX_DOMAIN_HOST_PREFIX)
+        {
+            if named_for != domain_name
+                && project.name == named_for
+                && is_host_record_id(named_for)
+            {
+                project.name = label;
+            }
+        }
         // Connecting to the server is an explicit gesture: a hidden project
         // must not swallow the attach. The reconcile that follows a connect
         // propagates the un-archive to the server.
@@ -13757,6 +14043,235 @@ mod tests {
             op,
             codec::TreeOp::CreateProject { project_id, .. } if project_id == "local-1"
         )));
+    }
+
+    #[test]
+    fn a_reconcile_removes_only_rows_in_spaces_held_under_its_own_name() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        // The same server also carries a Space this device holds under the
+        // name it reached the server by before, and one it never took.
+        let mut server = sample_tree();
+        for (space, project, thread) in [
+            ("space-renamed", "renamed-p", "renamed-t"),
+            ("space-other", "other-p", "other-t"),
+        ] {
+            server.spaces.push(codec::TtSpace {
+                id: space.to_string(),
+                name: space.to_string(),
+            });
+            server.projects.push(codec::TtProject {
+                id: project.to_string(),
+                space_id: space.to_string(),
+                name: project.to_string(),
+                path: "/home/x".to_string(),
+                threads: vec![tree_thread(thread, project, "main")],
+                archived_at: None,
+            });
+        }
+        store.spaces.push(Space {
+            client_domain: Some("syd-before".to_string()),
+            ..store.spaces[1].clone()
+        });
+        store.spaces.last_mut().unwrap().id = "space-renamed".to_string();
+
+        assert!(store.delete_thread("rt2").is_some());
+        let ops = store.reconcile_ops_for_domain("syd", &server);
+        // A row that went away from this name's own Space still goes.
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::DeleteThread { thread_id } if thread_id == "rt2"
+        )));
+        // Nothing of the other two is touched.
+        assert!(!ops.iter().any(|op| match op {
+            codec::TreeOp::DeleteSpace { space_id } => space_id != "space-remote",
+            codec::TreeOp::RemoveProject { project_id } => project_id != "rp1",
+            codec::TreeOp::DeleteThread { thread_id } => thread_id != "rt2",
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn a_space_reached_under_another_name_goes_on_with_its_own_project() {
+        let mut store = remote_test_store("syd");
+        // Made when the server was reached as "syd-before": the project id,
+        // and the workspace its thread runs in on the server, carry that name.
+        let before = remote_project_id_for_space("space-remote", &mux_domain_host_id("syd-before"));
+        let mut thread = WorkspaceThread::new(before.clone(), "main".to_string(), None);
+        thread.materialized_workspace_name = Some(workspace_name_for_thread(&before, &thread.id));
+        let thread_id = thread.id.clone();
+        store.projects.push(test_project_in_space(
+            "space-remote",
+            &before,
+            "syd-before",
+            PathBuf::from("wezterm-mux://syd-before"),
+            vec![thread],
+        ));
+
+        let plan = store.ensure_mux_domain_space("syd");
+        assert_eq!(plan.space_id, "space-remote");
+        assert_eq!(plan.project_id, before);
+        assert_eq!(plan.thread_id, thread_id);
+        let projects: Vec<&Project> = store
+            .projects
+            .iter()
+            .filter(|project| project.space_id == "space-remote")
+            .collect();
+        assert_eq!(projects.len(), 1);
+        // Named for another connection, maybe another device's: its name is
+        // shared through the server and stays.
+        assert_eq!(projects[0].name, "syd-before");
+
+        // One still called by a host's record id shows the host's name.
+        let mut store = remote_test_store("syd");
+        let by_id = remote_project_id_for_space("space-remote", &mux_domain_host_id("ssh-0a1b2c"));
+        store.projects.push(test_project_in_space(
+            "space-remote",
+            &by_id,
+            "ssh-0a1b2c",
+            PathBuf::from("wezterm-mux://ssh-0a1b2c"),
+            vec![WorkspaceThread::new(by_id.clone(), "main".to_string(), None)],
+        ));
+        assert_eq!(store.ensure_mux_domain_space("syd").project_id, by_id);
+        let project = store.projects.iter().find(|project| project.id == by_id);
+        assert_eq!(project.unwrap().name, "syd");
+    }
+
+    #[test]
+    fn a_server_reached_under_a_new_name_takes_its_spaces_over() {
+        // Held under the name the server was reached by before.
+        let mut store = remote_test_store("syd-before");
+        assert!(store.ingest_remote_tree("syd-before", &sample_tree()));
+        store
+            .last_space_per_domain
+            .insert("syd-before".to_string(), "space-remote".to_string());
+        let held_by = |store: &WorkspaceThreadStore| {
+            store
+                .spaces
+                .iter()
+                .filter(|space| space.id == "space-remote")
+                .map(|space| space.client_domain.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // While that name is connected, its Spaces stay its own.
+        assert!(!store.ingest_remote_tree_with("syd", &sample_tree(), &|name| {
+            name == "syd-before"
+        }));
+        assert_eq!(held_by(&store), vec![Some("syd-before".to_string())]);
+
+        // Once it is not, they come over, rows and this device's place too --
+        // even when the connect already noted the stand-in Space it made.
+        store
+            .last_space_per_domain
+            .insert("syd".to_string(), "space-stand-in".to_string());
+        assert!(store.ingest_remote_tree_with("syd", &sample_tree(), &|_| false));
+        assert_eq!(held_by(&store), vec![Some("syd".to_string())]);
+        assert!(store
+            .projects
+            .iter()
+            .any(|project| project.id == "rp1" && project.space_id == "space-remote"));
+        assert_eq!(
+            store.last_space_per_domain.get("syd").map(String::as_str),
+            Some("space-remote")
+        );
+
+        // A Space of this device's own is never taken, whatever is said.
+        let local = store.spaces[0].id.clone();
+        let mut tree = sample_tree();
+        tree.spaces.push(codec::TtSpace {
+            id: local.clone(),
+            name: "impostor".to_string(),
+        });
+        store.ingest_remote_tree_with("syd", &tree, &|_| false);
+        let local = store.spaces.iter().find(|space| space.id == local).unwrap();
+        assert!(local.client_domain.is_none());
+    }
+
+    #[test]
+    fn a_host_reached_under_a_new_name_takes_its_spaces_along() {
+        let mut store = remote_test_store("syd-before");
+        store.spaces.push(Space {
+            id: "space-other".to_string(),
+            client_domain: Some("ams".to_string()),
+            ..store.spaces[1].clone()
+        });
+        store
+            .last_space_per_domain
+            .insert("syd-before".to_string(), "space-remote".to_string());
+
+        assert!(store.move_spaces_to_domain("syd-before", "syd"));
+        let held_by = |id: &str| {
+            store
+                .spaces
+                .iter()
+                .find(|space| space.id == id)
+                .and_then(|space| space.client_domain.clone())
+        };
+        assert_eq!(held_by("space-remote").as_deref(), Some("syd"));
+        assert_eq!(held_by("space-other").as_deref(), Some("ams"));
+        assert!(store.spaces[0].client_domain.is_none());
+        assert_eq!(
+            store.last_space_per_domain.get("syd").map(String::as_str),
+            Some("space-remote")
+        );
+        assert!(!store.last_space_per_domain.contains_key("syd-before"));
+        // Nothing left under the old name.
+        assert!(!store.move_spaces_to_domain("syd-before", "syd"));
+    }
+
+    #[test]
+    fn opening_a_thread_waits_only_while_its_server_has_not_heard_of_it() {
+        let domain = "put-thread-on-server";
+        let quickly = |thread_id: &str| {
+            let started = std::time::Instant::now();
+            smol::block_on(put_thread_on_server(domain, thread_id));
+            started.elapsed() < std::time::Duration::from_secs(1)
+        };
+        // No tree from that server yet: nothing to tell by, so no waiting.
+        assert!(quickly("rt1"));
+        // A thread the server already listed opens at once.
+        LAST_KNOWN_REMOTE_TREES
+            .lock()
+            .insert(domain.to_string(), sample_tree());
+        assert!(quickly("rt1"));
+        // One it has not, with no connection up to send it over: nothing to
+        // wait for either.
+        assert!(quickly("rt-new"));
+        LAST_KNOWN_REMOTE_TREES.lock().remove(domain);
+    }
+
+    #[test]
+    fn a_servers_thread_window_goes_to_its_own_space_and_no_other() {
+        let mut store = remote_test_store("syd");
+        let mut tree = sample_tree();
+        tree.projects[0]
+            .threads
+            .push(tree_thread("thread-1", "rp1", "work"));
+        assert!(store.ingest_remote_tree("syd", &tree));
+        let workspace = workspace_name_for_thread("rp1", "thread-1");
+
+        assert_eq!(
+            store.server_thread_window_home(&workspace, "syd"),
+            ServerThreadWindowHome::Space("space-remote".to_string())
+        );
+        // The same window copied in by a second connection to that server.
+        assert_eq!(
+            store.server_thread_window_home(&workspace, "syd-tailnet"),
+            ServerThreadWindowHome::OtherConnection
+        );
+        // Neither a thread nor a Space this device knows.
+        assert_eq!(
+            store.server_thread_window_home(
+                &workspace_name_for_thread("muxdomain-syd::space::space-gone", "thread-gone"),
+                "syd"
+            ),
+            ServerThreadWindowHome::Unknown
+        );
+        assert_eq!(
+            store.server_thread_window_home("default", "syd"),
+            ServerThreadWindowHome::Unknown
+        );
     }
 
     #[test]
