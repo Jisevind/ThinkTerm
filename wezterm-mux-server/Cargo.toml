@@ -18,8 +18,9 @@ path = "src/main.rs"
 [features]
 default = ["tailnet"]
 # Joining a tailnet with no Tailscale app installed (thinkterm-tailnet): the
-# server is the process that holds the machine's node.
-tailnet = ["dep:thinkterm-tailnet", "thinkterm-tailnet/node"]
+# server keeps `thinkterm-tailnet` running, which holds the machine's node in
+# a process of its own (see thinkterm-tailnet-node).
+tailnet = ["dep:thinkterm-tailnet"]
 
 [dependencies]
 thinkterm-tailnet = { workspace = true, optional = true }

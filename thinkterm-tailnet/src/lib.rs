@@ -1,14 +1,19 @@
 //! Joining a tailnet from inside ThinkTerm, without the Tailscale app: a node
-//! of Tailscale's own Rust implementation, held by the machine's mux server.
+//! of Tailscale's own Rust implementation, held by `thinkterm-tailnet`, a
+//! program the machine's mux server keeps running for it.
 //!
-//! The settings file says whether the machine joins; the mux server, built
-//! with the `node` feature, holds the node while it does ([`follow`]) and
-//! reports what the node is doing to a file the app and `thinkterm tailnet`
-//! read. SSH connections to the tailnet's machines go through the node
-//! ([`use_for_ssh`]) from any ThinkTerm process on the machine: the others
-//! ask the server for them on a socket, and need nothing of the library. The node
-//! also takes SSH connections from the tailnet to this machine's own sshd
-//! when `thinkterm tailnet up --serve-ssh` said to ([`Settings::serve_ssh`]), and
+//! The settings file says whether the machine joins; while it does, the mux
+//! server keeps `thinkterm-tailnet` running ([`keep_node`]), which holds the
+//! node ([`follow`], with the `node` feature) and reports what the node is
+//! doing to a file the app and `thinkterm tailnet` read. The node runs in a
+//! process of its own so that whatever goes wrong in the library -- a panic
+//! that aborts, a loop that spins, memory that grows -- stays out of the
+//! process the terminal sessions live in. SSH connections to the tailnet's
+//! machines go through the node ([`use_for_ssh`]) from any ThinkTerm process
+//! on the machine, the mux server's included: they ask `thinkterm-tailnet`
+//! for them on a socket, and need nothing of the library. The node also
+//! takes SSH connections from the tailnet to this machine's own sshd when
+//! `thinkterm tailnet up --serve-ssh` said to ([`Settings::serve_ssh`]), and
 //! nothing else.
 
 mod settings;
@@ -16,13 +21,17 @@ mod status;
 
 #[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
 mod holder;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod keeper;
 #[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
 mod node;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod proxy;
 
 #[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
-pub use holder::{follow, will_hold};
+pub use holder::{follow, is_following, is_off};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use keeper::{keep_node, will_hold};
 pub use settings::{load, load_summary, Settings, Summary};
 pub(crate) use status::Family;
 pub use status::{read_live_report, Peer, Report, Status};
@@ -33,8 +42,24 @@ pub fn follow(changed: impl Fn() + Send + Sync + 'static) {
     let _ = changed;
 }
 
-/// Nothing to hold where the library does not run.
+/// Nothing is held where the library does not run, so nothing is to let go.
 #[cfg(all(feature = "node", not(any(target_os = "macos", target_os = "linux"))))]
+pub fn is_off() -> bool {
+    true
+}
+
+/// Nothing follows the settings where the library does not run.
+#[cfg(all(feature = "node", not(any(target_os = "macos", target_os = "linux"))))]
+pub fn is_following() -> bool {
+    false
+}
+
+/// Nothing to keep running where the library does not run.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn keep_node() {}
+
+/// Nothing to take over where the library does not run.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn will_hold() {}
 
 use anyhow::{Context, Result};
@@ -48,9 +73,9 @@ pub const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 /// no limit of its own.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a connection selecting the tailnet waits for the mux server
-/// to take up the node: just after the switch was
-/// turned on, or while the server starts at login.
+/// How long a connection selecting the tailnet waits for `thinkterm-tailnet`
+/// to take up the node: just after the switch was turned on, or while it
+/// starts with the mux server at login.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const HOLDER_WAIT: Duration = Duration::from_secs(15);
 
@@ -177,7 +202,7 @@ fn fetch_control_key(_url: &url::Url) -> Result<()> {
 }
 
 /// Registers the tailnet for SSH connections that explicitly select it.
-/// For the processes that never hold the node: the app and `thinkterm`.
+/// For the app and `thinkterm`.
 pub fn use_for_ssh() {
     if !SUPPORTED {
         return;
@@ -189,9 +214,9 @@ pub fn use_for_ssh() {
     )));
 }
 
-/// [`use_for_ssh`] for the mux server: through its own node while it holds
-/// one (see `server_dial`).
-#[cfg(feature = "node")]
+/// [`use_for_ssh`] for the mux server: through whichever process holds the
+/// node, once the predecessor's node has gone after a takeover (see
+/// `server_dial`).
 pub fn use_for_ssh_in_server() {
     if !SUPPORTED {
         return;
@@ -208,9 +233,8 @@ pub fn use_for_ssh_in_server() {
 /// the SSH dialer reports that as an error, without trying system DNS.
 /// Blocks while connecting, and gives up soon after `cancelled` says so.
 ///
-/// For the processes that never hold the node, the app and `thinkterm`:
-/// it asks the server, and refers to nothing of the node itself, so that
-/// they link none of it even when built together with the server.
+/// For the app and `thinkterm`: it asks `thinkterm-tailnet`, and refers to
+/// nothing of the node itself, so that they link none of it.
 pub(crate) fn dial(
     host: &str,
     port: u16,
@@ -235,9 +259,9 @@ pub(crate) fn dial(
     }
 }
 
-/// `dial` for the mux server: through its own node while it holds one,
-/// else through the process that does.
-#[cfg(feature = "node")]
+/// `dial` for the mux server. During a takeover, it waits for the
+/// predecessor's node to go, rather than go through it and end with it (see
+/// `keeper::wait_out_takeover`).
 pub(crate) fn server_dial(
     host: &str,
     port: u16,
@@ -248,10 +272,12 @@ pub(crate) fn server_dial(
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let timeout = timeout.unwrap_or(DIAL_TIMEOUT);
-        if let Some(dialed) = holder::dial(host, port, family, timeout, cancelled) {
-            return dialed;
+        let started = std::time::Instant::now();
+        if !keeper::wait_out_takeover(timeout, cancelled) {
+            return None;
         }
-        through_holder(host, port, family, timeout, cancelled)
+        let left = timeout.saturating_sub(started.elapsed());
+        through_holder(host, port, family, left, cancelled)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -261,7 +287,8 @@ pub(crate) fn server_dial(
 }
 
 /// A connection through the process holding the selected node. While
-/// nobody holds it, the connection waits for a holder within its timeout.
+/// nobody holds it, or the node it holds is on its way out, the connection
+/// waits for a holder within its timeout.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn through_holder(
     host: &str,
@@ -369,6 +396,40 @@ mod tests {
         // The holder's own answer, once it was there to give one.
         assert!(dialed.is_none());
         assert!(started.elapsed() >= Duration::from_millis(300));
+        holder.join().unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_connection_is_asked_again_of_the_node_in_the_place_of_one_that_went() {
+        use std::io::{Read, Write};
+        let (_dir, path) = temp_socket();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let holder = std::thread::spawn(move || {
+            // The node on its way out takes the request and answers nothing.
+            let (mut going, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            while going.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {}
+            drop(going);
+            let (mut stream, _) = listener.accept().unwrap();
+            while stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {}
+            stream.write_all(b"ok\n").unwrap();
+            // The connection carries on until the asker is done with it.
+            let _ = stream.read(&mut byte);
+        });
+        let dialed = through_holder_at(
+            &path,
+            "server-a",
+            22,
+            Family::Any,
+            Duration::from_secs(5),
+            &|| false,
+        );
+        match dialed {
+            Some(Ok(connection)) => drop(connection),
+            Some(Err(err)) => panic!("no connection: {err:#}"),
+            None => panic!("no connection"),
+        }
         holder.join().unwrap();
     }
 

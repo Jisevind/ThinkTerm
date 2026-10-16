@@ -1,6 +1,6 @@
-//! Where the node is, as the process holding it -- the mux server -- last
-//! saw. It writes that to a file in the runtime folder, which is how the app
-//! and `thinkterm tailnet` learn what the node is doing without asking it.
+//! Where the node is, as the process holding it -- `thinkterm-tailnet` --
+//! last saw. It writes that to a file in the runtime folder, which is how the
+//! app and `thinkterm tailnet` learn what the node is doing without asking it.
 
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -125,7 +125,7 @@ impl Peer {
 /// The status file's contents.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
-    /// The process that wrote it, to tell a report from a server that has
+    /// The process that wrote it, to tell a report from a process that has
     /// since gone.
     pub pid: u32,
     pub status: Status,
@@ -149,10 +149,10 @@ pub(crate) fn read_report() -> Option<Report> {
 }
 
 /// The last report, if the process that wrote it is still running: one
-/// left behind by a server that has since gone describes nothing. One about
-/// a node in the tailnet also needs the node's socket to answer: the
-/// server's number may have gone to another process since, after a crash
-/// or a restart.
+/// left behind by a process that has since gone describes nothing. One
+/// about a node in the tailnet also needs the node's socket to answer: the
+/// process's number may have gone to another one since, after a crash or a
+/// restart.
 pub fn read_live_report() -> Option<Report> {
     read_report().filter(|report| {
         process_is_running(report.pid) && (!holds_node(&report.status) || node_answers())

@@ -5,10 +5,11 @@ edition = "2021"
 publish = false
 
 [features]
-# The node itself, for the one process that holds it: the mux server.
-# Without it this crate reads and changes the settings, reads the server's
-# reports, and asks the server for connections -- all the app and
-# `thinkterm` need, without the library in them.
+# The node itself, for the one process that holds it: `thinkterm-tailnet`
+# (thinkterm-tailnet-node). Without it this crate reads and changes the
+# settings, reads the node's reports, asks for connections through it, and
+# keeps it running -- all the app, `thinkterm` and the mux server need,
+# without the library in them.
 node = ["dep:tailscale", "dep:tokio", "dep:ts_control"]
 
 [dependencies]

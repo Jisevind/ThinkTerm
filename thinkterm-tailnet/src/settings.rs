@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// the secrets out.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Settings {
-    /// Whether the machine's mux server holds a node in the tailnet.
+    /// Whether the machine joins the tailnet: its mux server keeps a node
+    /// running while it does.
     pub enabled: bool,
     /// Whether the node takes SSH connections from the tailnet to this
     /// machine's own sshd: what `thinkterm tailnet up` turns on, for a
@@ -167,7 +168,7 @@ pub(crate) fn lock_for_update() -> Result<File> {
 
 /// Held for as long as a process holds the machine's node: two processes on
 /// one node's keys would take the node from each other -- a debug build's
-/// mux server beside the release one's. None while another process holds
+/// `thinkterm-tailnet` beside the release one's. None while another process holds
 /// it. Released when dropped, or when the process ends.
 #[cfg(all(feature = "node", any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn try_hold_node() -> Result<Option<File>> {
@@ -213,10 +214,7 @@ fn open_lock(name: &str) -> Result<File> {
 
 /// What tells one version of the file from the next: a save puts a new
 /// file in place, so its inode tells even where the clock is too coarse to.
-#[cfg(any(
-    all(feature = "node", any(target_os = "macos", target_os = "linux")),
-    test
-))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stamp {
     modified: Option<std::time::SystemTime>,
@@ -226,10 +224,7 @@ pub(crate) struct Stamp {
 }
 
 /// None while there is no file.
-#[cfg(any(
-    all(feature = "node", any(target_os = "macos", target_os = "linux")),
-    test
-))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn stamp(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
     Some(Stamp {

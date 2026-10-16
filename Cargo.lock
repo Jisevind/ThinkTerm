@@ -9596,6 +9596,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-tailnet-node"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "log",
+ "nix 0.29.0",
+ "tempfile",
+ "thinkterm-tailnet",
+]
+
+[[package]]
 name = "thinkterm-tui"
 version = "0.1.0"
 dependencies = [

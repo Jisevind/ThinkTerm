@@ -1,7 +1,6 @@
 //! A node in the tailnet, on a Tokio runtime of its own: the library needs
-//! one, and nothing else in these processes runs on Tokio.
+//! one, and nothing else in `thinkterm-tailnet` runs on Tokio.
 
-use crate::proxy::widen;
 use crate::status::{Family, Peer, Status};
 use anyhow::{anyhow, bail, Context, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -90,7 +89,6 @@ impl NodeConfig {
 
 pub(crate) struct Node {
     config: NodeConfig,
-    handle: tokio::runtime::Handle,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
     shared: Arc<Shared>,
     /// Where the machine's other ThinkTerm processes reach this node (see
@@ -166,6 +164,13 @@ impl Shared {
 
     fn status(&self) -> Status {
         self.state.lock().unwrap().0.clone()
+    }
+
+    /// Whether the node is on its way out: stopped, or given up to be
+    /// started anew. What is asked of it is better asked of the node in its
+    /// place.
+    pub fn is_going(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst) || self.broken.load(Ordering::SeqCst)
     }
 
     fn peers(&self) -> Vec<Peer> {
@@ -370,7 +375,6 @@ impl Node {
         };
         Ok(Self {
             config,
-            handle: runtime.handle().clone(),
             runtime: Mutex::new(Some(runtime)),
             shared,
             socket,
@@ -410,12 +414,6 @@ impl Node {
         }
     }
 
-    /// Whether the node was stopped: a dial that found nothing on it may
-    /// find it on the node started in its place.
-    pub fn is_stopped(&self) -> bool {
-        self.shared.stopped.load(Ordering::SeqCst)
-    }
-
     /// Whether the node was given up, to be started anew: it was stuck for
     /// its `broken_after` (see `watchdog`), or one of its loops panicked.
     /// The library tries the control server only a couple of times before it
@@ -428,87 +426,6 @@ impl Node {
     /// Whether the node has got in: one that has reconnects by itself.
     pub fn was_in(&self) -> bool {
         self.shared.was_in.load(Ordering::SeqCst)
-    }
-
-    /// A connection to `host:port` through the tailnet (see crate::dial),
-    /// else None. Blocks while it connects, so it is for the threads SSH
-    /// sessions connect on; gives up soon after `cancelled` says so.
-    pub fn dial(
-        &self,
-        host: &str,
-        port: u16,
-        family: Family,
-        timeout: Duration,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Option<Result<socket2::Socket>> {
-        let started = Instant::now();
-        let ip = self
-            .shared
-            .resolve(host, family, starting_wait(timeout), cancelled)?;
-        // What is left of the time, for the connection itself.
-        let left = timeout.saturating_sub(started.elapsed());
-        Some(
-            self.connect(SocketAddr::new(ip, port), left, cancelled)
-                .with_context(|| format!("connecting to {host}:{port} through the tailnet")),
-        )
-    }
-
-    fn connect(
-        &self,
-        to: SocketAddr,
-        timeout: Duration,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<socket2::Socket> {
-        // One end goes to the SSH library as its socket; the other is
-        // copied to and from the tailnet's stream.
-        let (ours, theirs) =
-            std::os::unix::net::UnixStream::pair().context("making a socket pair")?;
-        widen(&ours);
-        widen(&theirs);
-        ours.set_nonblocking(true)?;
-        let (done, connected) = std::sync::mpsc::sync_channel::<Result<()>>(1);
-        let shared = Arc::clone(&self.shared);
-        self.handle.spawn(async move {
-            let stream = match shared.tcp_connect(to, timeout).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    let _ = done.send(Err(err));
-                    return;
-                }
-            };
-            let ours = match tokio::net::UnixStream::from_std(ours) {
-                Ok(ours) => ours,
-                Err(err) => {
-                    let _ = done.send(Err(err.into()));
-                    return;
-                }
-            };
-            let _ = done.send(Ok(()));
-            // Ends at once if the caller gave up meanwhile: its end is gone.
-            bridge(stream, ours).await;
-        });
-        // A ConnectTimeout too large to add to now waits as long as it takes.
-        let deadline = Instant::now().checked_add(timeout.saturating_add(Duration::from_secs(1)));
-        loop {
-            match connected.recv_timeout(Duration::from_millis(100)) {
-                Ok(result) => {
-                    result?;
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if cancelled() {
-                        bail!("the session was closed while connecting");
-                    }
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        bail!("no answer within {timeout:?}");
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    bail!("the tailnet node stopped")
-                }
-            }
-        }
-        Ok(socket2::Socket::from(std::os::fd::OwnedFd::from(theirs)))
     }
 }
 

@@ -8,6 +8,7 @@ members = [
   "thinkterm-syntax",
   "thinkterm-core",
   "thinkterm-tailnet",
+  "thinkterm-tailnet-node",
   "thinkterm-file-index",
   "thinkterm-font-core",
   "thinkterm-font-web",

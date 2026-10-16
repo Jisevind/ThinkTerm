@@ -1,7 +1,8 @@
 //! `thinkterm tailnet`: a tailnet joined without the Tailscale app, for a
-//! machine nobody sits at. The mux server holds the node and lets SSH from
-//! the tailnet through to this machine's sshd; this command only changes the
-//! settings the server follows and reads back what it reports.
+//! machine nobody sits at. The mux server keeps the node running, in
+//! `thinkterm-tailnet`, which lets SSH from the tailnet through to this
+//! machine's sshd; this command only changes the settings they follow and
+//! reads back what the node reports.
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
@@ -252,8 +253,9 @@ fn wait_until_up(revision: u64) -> anyhow::Result<()> {
         let report = fresh_report(revision);
         if report.is_none() && start.elapsed() > Duration::from_secs(10) {
             println!(
-                "Saved. No mux server has picked it up yet: it joins when one starts \
-                 (`thinkterm-mux-server --daemonize`)."
+                "Saved. Nothing has picked it up yet: it joins once a mux server runs \
+                 (`thinkterm-mux-server --daemonize`) and has started thinkterm-tailnet, \
+                 whose log says why if it did not."
             );
             return Ok(());
         }
@@ -326,7 +328,7 @@ fn print_status(settings: &Settings) -> anyhow::Result<()> {
     );
     let Some(report) = report else {
         if settings.enabled {
-            println!("Node:      not running (no mux server is)");
+            println!("Node:      not running (no mux server is, or its thinkterm-tailnet is not)");
         }
         return Ok(());
     };

@@ -191,6 +191,6 @@ Upgrading
 3. Bump the version: the five entries under [patch.crates-io] in the root Cargo.toml and
    the two in thinkterm-tailnet/Cargo.toml, then `cargo update` the other tailscale-rs
    crates to the same version. All tailscale-rs crates move together.
-4. Build, run the tests above and thinkterm-tailnet's, then sign in to a real tailnet and
-   connect to a machine by name and by address.
+4. Build, run the tests above and thinkterm-tailnet's and thinkterm-tailnet-node's, then
+   sign in to a real tailnet and connect to a machine by name and by address.
 5. Update this file: the version above, and every group that changed or went away.

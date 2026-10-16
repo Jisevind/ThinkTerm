@@ -1,0 +1,27 @@
+[package]
+name = "thinkterm-tailnet-node"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# `thinkterm-tailnet`: the machine's node in the tailnet, in a process apart
+# from the mux server, which keeps it running while the tailnet is on (see
+# thinkterm-tailnet's keeper). Whatever goes wrong in the library stays out
+# of the process the terminal sessions live in.
+
+[[bin]]
+name = "thinkterm-tailnet"
+path = "src/main.rs"
+# Its docs would land where the thinkterm-tailnet library's do.
+doc = false
+
+[dependencies]
+config.workspace = true
+log = { workspace = true, features = ["std"] }
+thinkterm-tailnet = { workspace = true, features = ["node"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["signal"] }

@@ -1,6 +1,6 @@
 //! The machine's ThinkTerm processes reach the tailnet through the one
-//! holding the node, the mux server: the app, `thinkterm ssh`, and the
-//! server itself while another server holds it. A connection is asked for on
+//! holding the node, `thinkterm-tailnet`: the app, `thinkterm ssh` and the
+//! mux server. A connection is asked for on
 //! a socket beside the settings that only this user can open, with a line
 //! naming the host; the answer is a line too, and after "ok" the socket
 //! carries the connection itself. Asking needs nothing of the library: only
@@ -61,9 +61,21 @@ pub(crate) fn widen(socket: &impl std::os::fd::AsFd) {
 pub(crate) enum Asked {
     /// Nobody listens at `path`: no process here holds a node.
     Nobody,
+    /// The holder went without answering, as one does whose node is on its
+    /// way out (see `answer`): the node started in its place may answer.
+    Gone,
     /// A connection, why there is none, or None when `host` is none of its
-    /// machines or the holder went without answering.
+    /// machines or the holder kept its answer past any wait it could have.
     Answered(Option<Result<socket2::Socket>>),
+}
+
+/// What reading the holder's answer came to.
+enum Answer {
+    Line(String),
+    /// It went without one.
+    Gone,
+    /// It kept it past any wait it could have.
+    Late,
 }
 
 /// A connection to `host:port` through the node of the process listening
@@ -89,13 +101,15 @@ pub(crate) fn ask(
         return Asked::Answered(None);
     };
     line.push(b'\n');
+    // Closed before it read the request: it went without answering.
     if stream.write_all(&line).is_err() {
-        return Asked::Answered(None);
+        return Asked::Gone;
     }
     let answer = match read_answer(&mut stream, timeout, cancelled) {
-        Ok(Some(answer)) => answer,
-        // It went without answering; the selected network cannot connect.
-        Ok(None) => return Asked::Answered(None),
+        Ok(Answer::Line(answer)) => answer,
+        Ok(Answer::Gone) => return Asked::Gone,
+        // The selected network cannot connect.
+        Ok(Answer::Late) => return Asked::Answered(None),
         Err(err) => return Asked::Answered(Some(Err(err))),
     };
     Asked::Answered(match answer.as_str() {
@@ -127,14 +141,20 @@ fn connect_within(path: &Path, wait: Duration) -> Option<UnixStream> {
 }
 
 /// The holder's answer, read a byte at a time: what follows it is the
-/// connection's own. None when the holder went without one, or kept it
-/// past any wait it could have.
+/// connection's own.
 fn read_answer(
     stream: &mut UnixStream,
     timeout: Duration,
     cancelled: &dyn Fn() -> bool,
-) -> Result<Option<String>> {
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+) -> Result<Answer> {
+    // macOS sets no timeout on a connection whose other end has closed: it
+    // went without answering.
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .is_err()
+    {
+        return Ok(Answer::Gone);
+    }
     // The holder waits for its node to get in and for the other machine
     // within `timeout`.
     let deadline = Instant::now().checked_add(timeout.saturating_add(ANSWER_SLACK));
@@ -142,9 +162,9 @@ fn read_answer(
     loop {
         let mut byte = [0u8; 1];
         match stream.read(&mut byte) {
-            Ok(0) => return Ok(None),
+            Ok(0) => return Ok(Answer::Gone),
             Ok(_) if byte[0] == b'\n' => {
-                return Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+                return Ok(Answer::Line(String::from_utf8_lossy(&line).into_owned()))
             }
             Ok(_) if line.len() < LINE_MAX => line.push(byte[0]),
             Ok(_) => bail!("the tailnet's node gave no answer it could read"),
@@ -160,10 +180,10 @@ fn read_answer(
                 // The caller turns an unanswered request into a failure.
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     log::warn!("tailnet: the process holding the node did not answer");
-                    return Ok(None);
+                    return Ok(Answer::Late);
                 }
             }
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(Answer::Gone),
         }
     }
 }
@@ -237,8 +257,11 @@ async fn answer(shared: Arc<Shared>, mut stream: tokio::net::UnixStream) {
         })
         .await
     };
+    // A node on its way out answers nothing, rather than that it knows no
+    // such machine or cannot reach it: the asker asks the node in its place.
     let ip = match resolved {
         Ok(Some(ip)) => ip,
+        Ok(None) if shared.is_going() => return,
         Ok(None) => {
             let _ = stream.write_all(b"none\n").await;
             return;
@@ -257,6 +280,7 @@ async fn answer(shared: Arc<Shared>, mut stream: tokio::net::UnixStream) {
                 node::bridge(tailnet, stream).await;
             }
         }
+        Err(_) if shared.is_going() => {}
         Err(err) => {
             let err = err.context(format!(
                 "connecting to {}:{} through the tailnet",
@@ -322,6 +346,7 @@ mod tests {
         match ask(path, host, 22, family, Duration::from_secs(5), &|| false) {
             Asked::Answered(answered) => answered,
             Asked::Nobody => panic!("nobody listened at {}", path.display()),
+            Asked::Gone => panic!("the holder at {} went without answering", path.display()),
         }
     }
 
