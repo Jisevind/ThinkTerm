@@ -5718,6 +5718,87 @@ impl Domain for ClientDomain {
         Ok(source_pane)
     }
 
+    async fn swap_panes(
+        &self,
+        tab_id: TabId,
+        pane_id: PaneId,
+        other_pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let _mutation = inner.begin_structure_mutation();
+        let mux = Mux::get();
+
+        let tab = mux
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("tab_id {tab_id} is invalid"))?;
+        if tab.pane_index_for_pane(pane_id).is_none()
+            || tab.pane_index_for_pane(other_pane_id).is_none()
+        {
+            bail!("remote swap requires panes {pane_id} and {other_pane_id} to be in tab {tab_id}");
+        }
+
+        let pane = mux
+            .get_pane(pane_id)
+            .ok_or_else(|| anyhow!("pane_id {pane_id} is invalid"))?;
+        let other = mux
+            .get_pane(other_pane_id)
+            .ok_or_else(|| anyhow!("pane_id {other_pane_id} is invalid"))?;
+        let client_pane = pane
+            .downcast_ref::<ClientPane>()
+            .ok_or_else(|| anyhow!("pane_id {pane_id} is not a ClientPane"))?;
+        let other_client_pane = other
+            .downcast_ref::<ClientPane>()
+            .ok_or_else(|| anyhow!("pane_id {other_pane_id} is not a ClientPane"))?;
+        if !client_pane.belongs_to_client(&inner) || !other_client_pane.belongs_to_client(&inner) {
+            bail!("remote swap panes belong to different client connections");
+        }
+
+        let remote_pane_id = remote_move_pane_id(
+            other_pane_id,
+            other_client_pane.remote_pane_id(),
+            pane_id,
+            client_pane.remote_pane_id(),
+            inner.local_domain_id,
+            pane.domain_id(),
+        )?;
+        let remote_other_pane_id = other_client_pane.remote_pane_id();
+        let remote_tab_id = other_client_pane.remote_tab_id();
+        if client_pane.remote_tab_id() != remote_tab_id {
+            inner.defer_resync();
+            bail!(
+                "remote swap panes do not belong to the same remote tab: \
+                 {}, {remote_tab_id}",
+                client_pane.remote_tab_id()
+            );
+        }
+
+        if !inner.prepare_remote_tab_input(remote_tab_id).await? {
+            bail!("terminal is being operated on another device");
+        }
+
+        // As for a stack move: in place here before the round-trip, so
+        // dropping the drag preview does not show the old layout for one
+        // RTT. A failed RPC schedules a resync, which restores the tree.
+        tab.swap_panes(pane_id, other_pane_id)?;
+
+        if let Err(err) = inner
+            .client
+            .swap_panes(codec::SwapPanes {
+                pane_id: remote_pane_id,
+                other_pane_id: remote_other_pane_id,
+            })
+            .await
+        {
+            inner.defer_resync();
+            return Err(err).context("swapping remote panes");
+        }
+
+        inner.defer_resync();
+        Ok(())
+    }
+
     /// Forward the request to the remote; we need to translate the local ids
     /// to those that match the remote for the request, resync the changed
     /// structure, and then translate the results back to local

@@ -1028,6 +1028,7 @@ fn requires_existing_frontend_access(pdu: &Pdu) -> bool {
             | Pdu::SpawnPaneInStack(_)
             | Pdu::ActivatePaneInStack(_)
             | Pdu::MovePaneToStack(_)
+            | Pdu::SwapPanes(_)
             | Pdu::MovePaneToNewTab(_)
             | Pdu::MoveTab(_)
             | Pdu::AdjustPaneSize(_)
@@ -1157,6 +1158,7 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::SpawnPaneInStack(_)
             | Pdu::ActivatePaneInStack(_)
             | Pdu::MovePaneToStack(_)
+            | Pdu::SwapPanes(_)
             | Pdu::GetThinkTermTree(_)
             | Pdu::MutateThinkTermTree(_)
             | Pdu::GetThinkTermSessionState(_)
@@ -2101,6 +2103,13 @@ impl SessionHandler {
             Pdu::MovePaneToStack(request) => {
                 spawn_into_main_thread(async move {
                     schedule_move_pane_to_stack(request, send_response);
+                })
+                .detach();
+            }
+
+            Pdu::SwapPanes(request) => {
+                spawn_into_main_thread(async move {
+                    schedule_swap_panes(request, send_response);
                 })
                 .detach();
             }
@@ -3184,6 +3193,22 @@ where
             mux.move_pane_to_stack(request.source_pane_id, request.target_pane_id)
                 .await
                 .map(|_| Pdu::UnitResponse(UnitResponse {})),
+        );
+    })
+    .detach();
+}
+
+fn schedule_swap_panes<SND>(request: SwapPanes, send_response: SND)
+where
+    SND: Fn(anyhow::Result<Pdu>) + 'static,
+{
+    promise::spawn::spawn(async move {
+        // No identity, as for `schedule_move_pane_to_stack`.
+        send_response(
+            Mux::get()
+                .swap_panes(request.pane_id, request.other_pane_id)
+                .await
+                .map(|()| Pdu::UnitResponse(UnitResponse {})),
         );
     })
     .detach();

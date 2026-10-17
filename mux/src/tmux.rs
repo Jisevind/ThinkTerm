@@ -413,6 +413,15 @@ impl Domain for TmuxDomain {
         anyhow::bail!("moving an existing pane is not supported by TmuxDomain")
     }
 
+    async fn swap_panes(
+        &self,
+        _tab_id: TabId,
+        _pane_id: PaneId,
+        _other_pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("swapping panes is not supported by TmuxDomain")
+    }
+
     async fn spawn_pane(
         &self,
         _size: TerminalSize,

@@ -1449,6 +1449,10 @@ pub(crate) enum PendingRemoteConfirm {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneDropZone {
+    /// The target's own level-2 tab bar: join its stack, like a browser
+    /// tab dropped onto another window's tab strip.
+    Bar,
+    /// The middle of the target: trade places with it.
     Center,
     Left,
     Right,
@@ -1459,6 +1463,7 @@ pub(crate) enum PaneDropZone {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneDropKind {
     MoveIntoStack,
+    Swap,
     Split,
 }
 
@@ -1534,8 +1539,8 @@ pub(crate) struct PaneTabDragState {
     pub target: Option<PaneTabDropTarget>,
 }
 
-/// Split the target pane into a hit grid: an inner box maps to "move into
-/// this pane's stack", the border bands map to the nearest edge.
+/// Split the target pane into a hit grid: an inner box maps to "trade
+/// places with this pane", the border bands map to the nearest edge.
 pub(crate) fn pane_drop_zone(fx: f32, fy: f32) -> PaneDropZone {
     if fx > 0.28 && fx < 0.72 && fy > 0.28 && fy < 0.72 {
         return PaneDropZone::Center;
@@ -1558,7 +1563,9 @@ pub(crate) fn zone_split_request(zone: PaneDropZone) -> SplitRequest {
         direction: match zone {
             PaneDropZone::Left | PaneDropZone::Right => SplitDirection::Horizontal,
             PaneDropZone::Top | PaneDropZone::Bottom => SplitDirection::Vertical,
-            PaneDropZone::Center => unreachable!("center zone does not split"),
+            PaneDropZone::Bar | PaneDropZone::Center => {
+                unreachable!("joining or swapping does not split")
+            }
         },
         target_is_second: matches!(zone, PaneDropZone::Right | PaneDropZone::Bottom),
         top_level: false,
@@ -1567,19 +1574,26 @@ pub(crate) fn zone_split_request(zone: PaneDropZone) -> SplitRequest {
 }
 
 /// Decide what dropping onto `zone` would do, or None when the drop is a
-/// no-op (moving a pane onto the stack it is already in, or splitting a
-/// single-pane stack against itself).
+/// no-op (moving a pane onto the stack it is already in or swapping it with
+/// that stack, or splitting a single-pane stack against itself).
 pub(crate) fn pane_drop_action(
     zone: PaneDropZone,
     src_in_target_stack: bool,
     target_stack_len: usize,
 ) -> Option<PaneDropKind> {
     match zone {
-        PaneDropZone::Center => {
+        PaneDropZone::Bar => {
             if src_in_target_stack {
                 None
             } else {
                 Some(PaneDropKind::MoveIntoStack)
+            }
+        }
+        PaneDropZone::Center => {
+            if src_in_target_stack {
+                None
+            } else {
+                Some(PaneDropKind::Swap)
             }
         }
         _ => {
@@ -1830,10 +1844,16 @@ mod pane_drop_tests {
     #[test]
     fn drop_action_table() {
         // Moving into a stack the pane already lives in is a no-op
+        assert_eq!(pane_drop_action(PaneDropZone::Bar, true, 2), None);
+        assert_eq!(
+            pane_drop_action(PaneDropZone::Bar, false, 1),
+            Some(PaneDropKind::MoveIntoStack)
+        );
+        // So is trading places with it; any other pane trades places
         assert_eq!(pane_drop_action(PaneDropZone::Center, true, 2), None);
         assert_eq!(
             pane_drop_action(PaneDropZone::Center, false, 1),
-            Some(PaneDropKind::MoveIntoStack)
+            Some(PaneDropKind::Swap)
         );
         // Splitting a single-pane stack against itself is a no-op
         assert_eq!(pane_drop_action(PaneDropZone::Left, true, 1), None);

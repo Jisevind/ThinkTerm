@@ -3771,6 +3771,31 @@ impl Mux {
             .await
     }
 
+    /// Swap two panes of the same tab, each into the other's place; the
+    /// first is left active. The domain owns the mutation, as for
+    /// `move_pane_to_stack`.
+    pub async fn swap_panes(&self, pane_id: PaneId, other_pane_id: PaneId) -> anyhow::Result<()> {
+        if pane_id == other_pane_id {
+            anyhow::bail!("cannot swap pane {pane_id} with itself");
+        }
+        let (domain_id, _window_id, tab_id) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
+        let (other_domain_id, _other_window_id, other_tab_id) = self
+            .resolve_pane_id(other_pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {other_pane_id} not found"))?;
+        if domain_id != other_domain_id || tab_id != other_tab_id {
+            anyhow::bail!(
+                "cannot swap pane {pane_id} with pane {other_pane_id}: \
+                 they are not in the same tab of one domain"
+            );
+        }
+        let domain = self
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow::anyhow!("domain {domain_id} not found"))?;
+        domain.swap_panes(tab_id, pane_id, other_pane_id).await
+    }
+
     pub async fn move_pane_to_new_tab(
         &self,
         pane_id: PaneId,

@@ -827,7 +827,8 @@ macro_rules! pdu {
 /// 81: Pane labels (PaneLabelChanged, ListPanesResponse::pane_labels), the
 ///     threads behind workspaces (GetWorkspaceNames), and
 ///     ClientJoined/ClientLeft.
-pub const CODEC_VERSION: usize = 81;
+/// 82: SwapPanes swaps two panes of a tab, each into the other's place.
+pub const CODEC_VERSION: usize = 82;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -947,6 +948,7 @@ pdu! {
     GetWorkspaceNamesResponse: 119,
     ClientJoined: 120,
     ClientLeft: 121,
+    SwapPanes: 122,
 }
 
 impl Pdu {
@@ -987,6 +989,7 @@ impl Pdu {
             | Self::SpawnPaneInStack(_)
             | Self::ActivatePaneInStack(_)
             | Self::MovePaneToStack(_)
+            | Self::SwapPanes(_)
             | Self::MoveTab(_) => true,
             _ => false,
         }
@@ -1280,6 +1283,15 @@ pub struct ActivatePaneInStack {
 pub struct MovePaneToStack {
     pub source_pane_id: PaneId,
     pub target_pane_id: PaneId,
+}
+
+/// Swap two panes of a tab, each into the other's place in its stack; the
+/// first is left the active pane. Both ids are in the mux server's pane-id
+/// space. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SwapPanes {
+    pub pane_id: PaneId,
+    pub other_pane_id: PaneId,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -3077,6 +3089,27 @@ mod test {
     }
 
     #[test]
+    fn swap_panes_round_trip() {
+        let mut encoded = Vec::new();
+        Pdu::SwapPanes(SwapPanes {
+            pane_id: 17,
+            other_pane_id: 29,
+        })
+        .encode(&mut encoded, 0x42)
+        .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x42,
+                pdu: Pdu::SwapPanes(SwapPanes {
+                    pane_id: 17,
+                    other_pane_id: 29,
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn thinkterm_tree_round_trip() {
         let mut tree = ThinkTermTree::default();
         for op in [
@@ -3165,7 +3198,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 81);
+        assert_eq!(CODEC_VERSION, 82);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3235,7 +3268,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 81);
+        assert_eq!(CODEC_VERSION, 82);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3336,7 +3369,7 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 81);
+        assert_eq!(CODEC_VERSION, 82);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
@@ -3435,7 +3468,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 81);
+        assert_eq!(CODEC_VERSION, 82);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

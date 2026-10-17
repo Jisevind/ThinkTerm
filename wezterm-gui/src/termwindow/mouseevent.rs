@@ -3529,8 +3529,9 @@ impl super::TermWindow {
     }
 
     /// Hit-test the pointer against the rendered panes and record which
-    /// drop (move-into-stack or directional split) releasing here would
-    /// perform, along with the preview rectangle to paint.
+    /// drop (move into its stack, swap with it, or directional split)
+    /// releasing here would perform, along with the preview rectangle to
+    /// paint.
     fn update_pane_tab_drag_target(&mut self, event: &MouseEvent) {
         let Some(src_pane_id) = self.pane_tab_drag.as_ref().map(|state| state.pane_id) else {
             return;
@@ -3565,7 +3566,7 @@ impl super::TermWindow {
                 // another window's tab strip.
                 let nav_bar_h = self.pane_nav_bar_height_for_pane(&pos) as f32;
                 let zone = if y < rect.min_y() + nav_bar_h {
-                    PaneDropZone::Center
+                    PaneDropZone::Bar
                 } else {
                     pane_drop_zone(fx, fy)
                 };
@@ -3576,12 +3577,14 @@ impl super::TermWindow {
                 let preview = match zone {
                     // Joining the stack highlights the target's level-2 tab
                     // bar, like dropping a browser tab onto a tab strip.
-                    PaneDropZone::Center => euclid::rect(
+                    PaneDropZone::Bar => euclid::rect(
                         rect.origin.x,
                         rect.origin.y,
                         rect.size.width,
                         nav_bar_h.max(1.0),
                     ),
+                    // Trading places takes the whole of it.
+                    PaneDropZone::Center => rect,
                     PaneDropZone::Left => euclid::rect(
                         rect.origin.x,
                         rect.origin.y,
@@ -3680,6 +3683,36 @@ impl super::TermWindow {
                             )));
                         }
                         Err(err) => log::error!("pane tab drop move failed: {err:#}"),
+                    }
+                })
+                .detach();
+            }
+            PaneDropKind::Swap => {
+                let target_pane_id = target.target_pane_id;
+                let dest_tab_id = tab.tab_id();
+                let workspace = self.current_mux_workspace();
+                let window = GuiWin::new(self);
+                promise::spawn::spawn(async move {
+                    match Mux::get().swap_panes(src_pane_id, target_pane_id).await {
+                        Ok(()) => {
+                            window.window.notify(TermWindowNotif::Apply(Box::new(
+                                move |term_window| {
+                                    if term_window.active_tab_is(dest_tab_id) {
+                                        term_window.sync_active_tab_geometry_now();
+                                    }
+                                    if term_window.current_mux_workspace() == workspace {
+                                        term_window.persist_workspace_layout_after_mutation(
+                                            "pane tab drop swap",
+                                        );
+                                    }
+                                    term_window.update_title();
+                                    if let Some(window) = term_window.window.as_ref() {
+                                        window.invalidate();
+                                    }
+                                },
+                            )));
+                        }
+                        Err(err) => log::error!("pane tab drop swap failed: {err:#}"),
                     }
                 })
                 .detach();

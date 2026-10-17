@@ -155,6 +155,21 @@ pub trait Domain: Downcast + Send + Sync {
         Ok(pane)
     }
 
+    /// Swap two panes of a tab, each into the other's place. The default
+    /// implementation mutates the local mux tree. Proxy domains override
+    /// this so the authoritative remote tree is changed as well.
+    async fn swap_panes(
+        &self,
+        tab_id: TabId,
+        pane_id: PaneId,
+        other_pane_id: PaneId,
+    ) -> anyhow::Result<()> {
+        let tab = Mux::get()
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow::anyhow!("Invalid tab id {tab_id}"))?;
+        tab.swap_panes(pane_id, other_pane_id)
+    }
+
     /// The mux will call this method on the domain of the pane that
     /// is being moved to give the domain a chance to handle the movement.
     /// If this method returns Ok(None), then the mux will handle the
