@@ -20,6 +20,10 @@
 #                     (or ~/Applications when that is not writable).
 #   --from FILE       Use an already-downloaded tarball or zip; nothing is
 #                     fetched.
+#   --mirror M        Where the release archive comes from: auto (GitHub,
+#                     then each known mirror while it fails or crawls, then
+#                     GitHub again; the default), direct (GitHub only), or a
+#                     mirror's host such as ghfast.top (it, then GitHub).
 #   --dry-run         Say what would be done and stop before touching the disk.
 #
 # GITHUB_TOKEN in the environment is sent with every request. It is what lets
@@ -46,6 +50,9 @@ repo="RoversX/thinkterm"
 # these, and thinkterm-update carries the same two numbers.
 min_glibc_server="2.34"
 min_glibc_desktop="2.35"   # the GUI's alone; the rest need no more than the server
+# Hosts that proxy github.com downloads, for --mirror auto, in the order
+# tried. thinkterm-update carries the same list for Settings.
+mirrors="ghfast.top gh-proxy.org ghproxy.net gh.llkk.cc"
 
 variant=""
 tag=""
@@ -53,6 +60,7 @@ version=""
 prefix="${HOME}/.local"
 app_dir_opt=""
 from=""
+mirror="auto"
 dry_run=""
 
 usage() {
@@ -71,6 +79,12 @@ Install ThinkTerm on Linux or macOS.
                     (or ~/Applications when that is not writable).
   --from FILE       Use an already-downloaded tarball or zip; nothing is
                     fetched.
+  --mirror M        Where the release archive comes from: auto (GitHub, then
+                    ghfast.top gh-proxy.org ghproxy.net gh.llkk.cc while it
+                    fails or crawls, then GitHub again; the default), direct
+                    (GitHub only), or one mirror's host (it, then GitHub).
+                    Whatever serves it, the archive must match the SHA-256
+                    GitHub recorded.
   --dry-run         Say what would be done and stop before touching the disk.
 EOF
 }
@@ -124,6 +138,8 @@ while [ $# -gt 0 ]; do
     --app-dir=*) app_dir_opt="${1#--app-dir=}" ;;
     --from)     [ $# -ge 2 ] || die "--from needs a value"; from="$2"; shift ;;
     --from=*)   from="${1#--from=}" ;;
+    --mirror)   [ $# -ge 2 ] || die "--mirror needs a value"; mirror="$2"; shift ;;
+    --mirror=*) mirror="${1#--mirror=}" ;;
     --dry-run)  dry_run=1 ;;
     -h|--help)  banner; usage; exit 0 ;;
     *) die "unknown option '$1' (try --help)" ;;
@@ -132,6 +148,19 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$prefix" ] || die "--prefix needs a directory"
+# Where the archive is fetched from, in order: "github" or a mirror's host.
+case "$mirror" in
+  direct) sources="github" ;;
+  # GitHub again last, with no hurry: a link slow everywhere ends there.
+  auto)   sources="github $mirrors github" ;;
+  *)
+    mirror="${mirror#https://}"; mirror="${mirror%/}"
+    case "$mirror" in
+      "" | *[!A-Za-z0-9.-]*) die "--mirror takes direct, auto or a host name, not '$mirror'" ;;
+    esac
+    sources="$mirror github"
+    ;;
+esac
 bindir="$prefix/bin"
 sharedir="$prefix/share"
 
@@ -371,6 +400,7 @@ if [ -n "$from" ]; then
   say "  from:   $from"
 else
   say "  from:   $url"
+  [ "$sources" = github ] || say "  via:    $sources"
 fi
 say "  into:   $bindir"
 [ -z "$app_dir" ] || say "  app:    $app"
@@ -406,12 +436,52 @@ if [ -n "$from" ]; then
 else
   archive="$tmp/$asset"
   step "downloading${version:+ $version}..."
+  verified=""
   if [ -n "$asset_api_url" ]; then
     fetch -H "Accept: application/octet-stream" -o "$archive" "$asset_api_url" || die "download failed: $asset_api_url"
+  elif [ "$sources" != github ] && [ -n "$digest" ] && { have sha256sum || have shasum; }; then
+    # Each source in turn, until one sends the file GitHub recorded. A
+    # mirror is a third party serving the bytes, so mirrors are only used
+    # when the digest from the API can check what they send: anything that
+    # does not match is thrown away and the next source tried. The token
+    # never goes to a mirror. While another source is left, a transfer under
+    # 300 KB/s for 20 seconds counts as failed: a working connection to
+    # GitHub's CDN is far faster, and at that rate the server tarball still
+    # arrives in under three minutes.
+    left=$(printf '%s\n' $sources | wc -l)
+    for source in $sources; do
+      left=$((left - 1))
+      slow="--retry 3"
+      [ "$left" -eq 0 ] || slow="--retry 0 --connect-timeout 10 --speed-limit 307200 --speed-time 20"
+      rm -f "$archive"
+      if [ "$source" = github ]; then
+        say "  from GitHub..."
+        # shellcheck disable=SC2086
+        fetch $slow -o "$archive" "$url" || { warn "download from GitHub failed or was too slow"; continue; }
+      else
+        say "  from mirror $source..."
+        # shellcheck disable=SC2086
+        curl -fsSL $slow -o "$archive" "https://$source/$url" || { warn "mirror $source failed or was too slow"; continue; }
+      fi
+      if [ "$(sha256 "$archive")" = "$digest" ]; then
+        verified=1
+        break
+      fi
+      warn "checksum mismatch from $source; discarded"
+    done
+    [ -n "$verified" ] || die "could not download $asset from: $sources. Try another --mirror, or download $url yourself and pass it with --from"
+    step "verified SHA-256"
   else
+    if [ "$sources" != github ]; then
+      if [ -n "$digest" ]; then
+        warn "neither sha256sum nor shasum is available to check a mirror's download; downloading from GitHub"
+      else
+        warn "GitHub recorded no checksum to check a mirror's download against; downloading from GitHub"
+      fi
+    fi
     fetch -o "$archive" "$url" || die "download failed: $url"
   fi
-  if [ -n "$digest" ]; then
+  if [ -n "$digest" ] && [ -z "$verified" ]; then
     step "verifying SHA-256..."
     if got=$(sha256 "$archive"); then
       [ "$got" = "$digest" ] || die "checksum mismatch for $asset
