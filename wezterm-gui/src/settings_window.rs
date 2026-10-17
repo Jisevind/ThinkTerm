@@ -1314,6 +1314,7 @@ impl SettingsSection {
                     "settings-right-click",
                     "settings-right-click-paste",
                     "settings-copy-effect",
+                    "settings-focus-follows-mouse",
                     "settings-split-animation",
                 ]
                 .iter()
@@ -1838,6 +1839,7 @@ enum SettingsAction {
     SetScrollMode(crate::native_settings::NativeScrollMode),
     SetSelectionStyle(crate::native_settings::NativeSelectionStyle),
     ToggleCopyOnSelect,
+    ToggleFocusFollowsMouse,
     SetRightClick(crate::native_settings::NativeRightClick),
     SetCopyEffect(crate::native_settings::NativeCopyEffect),
     /// Hand the choosing to the command palette's scheme list, which already
@@ -6243,6 +6245,19 @@ impl SettingsWindow {
                 });
                 self.apply_terminal_change("settings-copy-on-select", done, |terminal| {
                     terminal.copy_on_select = on
+                })
+            }
+            SettingsAction::ToggleFocusFollowsMouse => {
+                let on = !self.native_settings.terminal.focus_follows_mouse;
+                let done = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", crate::i18n::tr("settings-focus-follows-mouse")),
+                        ("value", crate::i18n::tr(if on { "common-on" } else { "common-off" })),
+                    ],
+                );
+                self.apply_terminal_change("settings-focus-follows-mouse", done, |terminal| {
+                    terminal.focus_follows_mouse = on
                 })
             }
             SettingsAction::SetSelectionStyle(style) => self.apply_terminal_choice(
@@ -13005,6 +13020,26 @@ impl SettingsWindow {
                 &crate::i18n::tr("settings-copy-effect-description"),
                 &options,
                 selected,
+                rows.rule(),
+            )?);
+
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Mouse,
+                TileColor::Indigo,
+            )?;
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-focus-follows-mouse"),
+                &crate::i18n::tr("settings-focus-follows-mouse-description"),
+                this.native_settings.terminal.focus_follows_mouse,
+                SettingsAction::ToggleFocusFollowsMouse,
                 rows.rule(),
             )?);
 

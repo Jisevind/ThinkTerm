@@ -1983,6 +1983,13 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        // A move that does not reach the terminal -- the tab bar, a sidebar
+        // -- leaves no cell behind: coming back is coming into a pane.
+        let pointer_cell_before = if matches!(event.kind, WMEK::Move) {
+            self.last_pointer_cell.take()
+        } else {
+            self.last_pointer_cell
+        };
         self.plugin_panel_saw_button(&event.kind);
         if self.recording_overlay_mouse(&event, context) {
             return;
@@ -2613,6 +2620,7 @@ impl super::TermWindow {
                     event,
                     context,
                     capture_mouse,
+                    pointer_cell_before,
                 );
             }
         }
@@ -2630,6 +2638,8 @@ impl super::TermWindow {
                 && event.coords.y as usize <= self.dimensions.pixel_height
         });
         self.current_mouse_event = None;
+        // Coming back in is coming into a pane.
+        self.last_pointer_cell = None;
         // No hover surface outlives the pointer leaving the window.
         self.update_hover_tooltip(None);
         // The machine reads `Away` now: cancels an Arming, starts a grace.
@@ -9153,6 +9163,7 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
         capture_mouse: bool,
+        pointer_cell_before: Option<(i64, usize)>,
     ) {
         let mut is_click_to_focus_pane = false;
 
@@ -9167,14 +9178,35 @@ impl super::TermWindow {
             self.current_mouse_capture,
             Some(MouseCapture::TerminalPane(_))
         );
+        // A release belongs to the pane the press went to, and is measured
+        // there however far the drag went.
+        let measured_in_pane = is_already_captured || matches!(event.kind, WMEK::Release(_));
 
-        for pos in self.get_panes_to_render() {
-            if !is_already_captured
-                && row >= pos.top as i64
+        let panes = self.get_panes_to_render();
+        let covers = |pos: &PositionedPane, (row, column): (i64, usize)| {
+            row >= pos.top as i64
                 && row <= (pos.top + pos.height) as i64
                 && column >= pos.left
                 && column <= pos.left + pos.width
-            {
+        };
+        let cell = (row, column);
+        let is_over = move |pos: &PositionedPane| covers(pos, cell);
+        // A move that takes the mouse into another pane: the one under it
+        // now did not have it a move ago. Kept track of during a drag too,
+        // so the pane a drag ends over is not entered by the next nudge.
+        let crossed_into = if matches!(event.kind, WMEK::Move) {
+            self.last_pointer_cell = Some(cell);
+            panes
+                .iter()
+                .find(|pos| is_over(pos))
+                .filter(|pos| !pointer_cell_before.is_some_and(|before| covers(pos, before)))
+                .map(|pos| pos.pane.pane_id())
+        } else {
+            None
+        };
+
+        for pos in panes.iter() {
+            if !measured_in_pane && is_over(pos) {
                 if pane.pane_id() != pos.pane.pane_id() {
                     // We're over a pane that isn't active
                     match &event.kind {
@@ -9187,12 +9219,30 @@ impl super::TermWindow {
                             is_click_to_focus_pane = true;
                         }
                         WMEK::Move => {
-                            // ThinkTerm keeps pane focus explicit. The upstream
-                            // focus-follows-mouse behavior makes split panes
-                            // appear to switch while scrolling pane-local tabs.
+                            // ThinkTerm keeps pane focus explicit unless the
+                            // settings ask for it to follow the mouse: then
+                            // only as the mouse comes into the pane, in the
+                            // window in front, with no button held, and not
+                            // while another device has this terminal.
+                            if crossed_into == Some(pos.pane.pane_id())
+                                && self.focused.is_some()
+                                && event.mouse_buttons == WMB::NONE
+                                && !self.frontend_takeover_claimable()
+                                && crate::native_settings::focus_follows_mouse()
+                            {
+                                let mux = Mux::get();
+                                mux.get_active_tab_for_window(self.mux_window_id)
+                                    .map(|tab| tab.set_active_idx(pos.index));
+                                context.invalidate();
+                            }
+                            // The motion is the hovered pane's either way:
+                            // its position is measured in that pane, and
+                            // given to the focused one it lit up whatever
+                            // sat at the same spot there.
+                            pane = Arc::clone(&pos.pane);
                         }
-                        WMEK::Release(_) | WMEK::HorzWheel(_) => {}
-                        WMEK::VertWheel(_) => {
+                        WMEK::Release(_) => {}
+                        WMEK::VertWheel(_) | WMEK::HorzWheel(_) => {
                             // Let wheel events route to the hovered pane,
                             // even if it doesn't have focus
                             pane = Arc::clone(&pos.pane);
@@ -9206,7 +9256,7 @@ impl super::TermWindow {
                 x_pixel_offset = position.x_pixel_offset;
                 y_pixel_offset = position.y_pixel_offset;
                 break;
-            } else if is_already_captured && pane.pane_id() == pos.pane.pane_id() {
+            } else if measured_in_pane && pane.pane_id() == pos.pane.pane_id() {
                 let position = self.click_position_for_pane(&event, &pane, &pos);
                 column = position.column;
                 row = position.row;

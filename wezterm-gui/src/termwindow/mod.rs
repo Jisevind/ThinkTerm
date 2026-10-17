@@ -2982,6 +2982,13 @@ pub struct TermWindow {
     current_modifier_and_leds: (Modifiers, KeyboardLedStatus),
     current_mouse_buttons: Vec<MousePress>,
     current_mouse_capture: Option<MouseCapture>,
+    /// The cell (window row, column) the mouse last moved over in the
+    /// terminal area, forgotten when it moves anywhere else. Focus follows
+    /// the mouse when it crosses from one pane into another as the panes
+    /// lie now -- not whenever the focused pane differs, nor when another
+    /// pane comes under a resting mouse: a pane picked from the keyboard
+    /// keeps the focus until the mouse goes somewhere.
+    last_pointer_cell: Option<(i64, usize)>,
 
     opengl_info: Option<String>,
 
@@ -4760,6 +4767,7 @@ impl TermWindow {
             preview_scale_hold: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
+            last_pointer_cell: None,
             last_mouse_click: None,
             current_highlight: None,
             quad_generation: 0,

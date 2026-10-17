@@ -658,6 +658,9 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) right_click: NativeRightClick,
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) copy_effect: NativeCopyEffect,
+    /// The pane the mouse moves onto takes the focus, without a click.
+    #[serde(default)]
+    pub(crate) focus_follows_mouse: bool,
     /// See [`NativeTextContrast`]. `Off` defers to the Lua
     /// `text_min_contrast_ratio`, which is itself off unless set.
     #[serde(deserialize_with = "text_contrast_or_default")]
@@ -684,6 +687,7 @@ impl Default for NativeTerminalSettings {
             copy_on_select: true,
             right_click: NativeRightClick::default(),
             copy_effect: NativeCopyEffect::default(),
+            focus_follows_mouse: false,
             text_contrast: NativeTextContrast::default(),
             bottom_quote_enabled: false,
             bottom_quote_mode: NativeBottomQuoteMode::default(),
@@ -727,6 +731,11 @@ pub(crate) fn right_click() -> NativeRightClick {
 /// Read on every copy and paste, through the shared handle.
 pub(crate) fn copy_effect() -> NativeCopyEffect {
     load_shared().terminal.copy_effect
+}
+
+/// Read when the mouse moves onto another pane, through the shared handle.
+pub(crate) fn focus_follows_mouse() -> bool {
+    load_shared().terminal.focus_follows_mouse
 }
 
 /// The contrast floor in force, or `None` to leave colours alone. The
@@ -3090,19 +3099,22 @@ mod tests {
         assert_eq!(settings.terminal.scroll_mode, NativeScrollMode::Stepped);
         assert_eq!(settings.localization.language.as_deref(), Some("ja-JP"));
 
-        // Selecting copies unless turned off.
+        // Selecting copies unless turned off; the focus waits for a click
+        // unless turned on.
         assert!(settings.terminal.copy_on_select);
+        assert!(!settings.terminal.focus_follows_mouse);
 
         // The ones this build knows still read as written.
         let json = r#"{ "version": 1, "terminal": {
             "selection_style": "square", "copy_on_select": false, "right_click": "copy_or_paste",
-            "copy_effect": "color"
+            "copy_effect": "color", "focus_follows_mouse": true
         } }"#;
         let settings: ThinkTermNativeSettings = serde_json::from_str(json).unwrap();
         assert!(!settings.terminal.copy_on_select);
         assert_eq!(settings.terminal.selection_style, NativeSelectionStyle::Square);
         assert_eq!(settings.terminal.right_click, NativeRightClick::CopyOrPaste);
         assert_eq!(settings.terminal.copy_effect, NativeCopyEffect::Color);
+        assert!(settings.terminal.focus_follows_mouse);
     }
 
     /// The four this build does know still round-trip.
