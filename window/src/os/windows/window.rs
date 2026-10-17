@@ -144,9 +144,6 @@ pub(crate) struct WindowInner {
     /// reason as `occlusion_visible`: the owner wants the edges, not a message
     /// per pixel of a drag.
     last_frame_event: Option<(ScreenRect, bool)>,
-    /// The way of asking for the backdrop last applied: one switched off is
-    /// undone, and a window that never tried one is left as it always was.
-    backdrop_trial: Win32BackdropTrial,
     /// The EGL this window draws through onto DirectComposition, when it was
     /// made for `Win32BackdropTrial::Composition`: without a redirection
     /// bitmap, nothing it draws any other way would show.
@@ -966,7 +963,6 @@ impl Window {
             invalidated: true,
             occlusion_visible: None,
             last_frame_event: None,
-            backdrop_trial: Win32BackdropTrial::Off,
             composition: None,
         }));
 
@@ -1039,8 +1035,9 @@ impl Window {
         }
 
         apply_theme(hwnd.0);
-        let trial = window_backdrop_trial(inner.borrow().composition.is_some(), &config);
-        blur_behind(hwnd.0, blurs_behind(trial));
+        // DirectComposition carries the window's alpha itself; the rest
+        // need the old blur behind for it.
+        blur_behind(hwnd.0, inner.borrow().composition.is_none());
 
         // Make window capable of accepting drag and drop
         unsafe {
@@ -1909,23 +1906,6 @@ fn composition_connection(conn: &Connection) -> Option<Rc<crate::egl::GlConnecti
     }
 }
 
-/// The way of asking for the backdrop a window can take: whether it draws
-/// onto DirectComposition was settled when it was made, so a window made
-/// for it keeps it and one made without it waits for the next window.
-fn window_backdrop_trial(composition: bool, config: &ConfigHandle) -> Win32BackdropTrial {
-    match config.win32_backdrop_trial {
-        _ if composition => Win32BackdropTrial::Composition,
-        Win32BackdropTrial::Composition => Win32BackdropTrial::Off,
-        trial => trial,
-    }
-}
-
-/// Whether the old blur behind the window stays on: it is what lets the
-/// window's alpha through, except onto DirectComposition, which carries it.
-fn blurs_behind(trial: Win32BackdropTrial) -> bool {
-    trial != Win32BackdropTrial::Composition
-}
-
 /// "Blur behind" is the old vista term for a cool blurring
 /// effect that the DWM could enable.  Subsequent windows
 /// versions have removed the blurring.  We use this call
@@ -2046,15 +2026,13 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
         if let Some(inner) = rc_from_hwnd(hwnd) {
             let mut inner = inner.borrow_mut();
 
-            // Set Acrylic or Mica system Backdrop; a trial is of acrylic,
-            // asked for its own way.
-            let trial = window_backdrop_trial(inner.composition.is_some(), &inner.config);
-            let composition = trial == Win32BackdropTrial::Composition;
-            let accent = !*IS_WIN11_22H2 || trial == Win32BackdropTrial::Accent;
-            let acrylic = trial != Win32BackdropTrial::Off
-                || inner.config.win32_system_backdrop == SystemBackdrop::Acrylic;
+            // Set Acrylic or Mica system Backdrop; a window drawn onto
+            // DirectComposition was made for acrylic, and keeps it.
+            let composition = inner.composition.is_some();
+            let accent = !*IS_WIN11_22H2;
+            let acrylic =
+                composition || inner.config.win32_system_backdrop == SystemBackdrop::Acrylic;
             let pv_attribute = match inner.config.win32_system_backdrop {
-                _ if trial == Win32BackdropTrial::Accent => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_NONE,
                 _ if composition => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TRANSIENTWINDOW,
                 SystemBackdrop::Auto => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_AUTO,
                 SystemBackdrop::Disable => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_NONE,
@@ -2090,13 +2068,6 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
 
             DwmExtendFrameIntoClientArea(hwnd, &margins);
 
-            // A trial may be switched while the window is open: what lets
-            // the window's alpha through goes with it.
-            let tried = std::mem::replace(&mut inner.backdrop_trial, trial);
-            if trial != Win32BackdropTrial::Off || tried != Win32BackdropTrial::Off {
-                blur_behind(hwnd, blurs_behind(trial));
-            }
-
             // Apply Acrylic or Mica Backdrop
             if *IS_WIN11_22H2 {
                 DwmSetWindowAttribute(
@@ -2107,9 +2078,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
                 );
             }
 
-            // The accent policy: acrylic before 22H2, or by the trial of it;
-            // turned off again once that trial is.
-            let send = accent || tried == Win32BackdropTrial::Accent;
+            // The accent policy: acrylic before 22H2.
             let mut colour = inner.config.win32_acrylic_accent_color.to_srgb_u8();
             colour.3 = if colour.3 == 0 { 1 } else { colour.3 }; // acrylic doesn't like to have 0 alpha
             let on = accent && acrylic;
@@ -2128,7 +2097,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
                 AnimationId: 0,
             };
 
-            if send {
+            if accent {
                 if let Ok(user) = User32::open(std::path::Path::new("user32.dll")) {
                     (user.SetWindowCompositionAttribute)(
                         hwnd,

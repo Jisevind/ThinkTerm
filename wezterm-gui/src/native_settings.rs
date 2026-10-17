@@ -421,31 +421,25 @@ pub(crate) struct NativeAppearanceSettings {
     /// `window_background_opacity`. `None` follows the configuration.
     #[serde(deserialize_with = "window_opacity_or_default")]
     pub(crate) window_opacity: Option<u8>,
-    /// On Windows, another way of asking for the frosted backdrop behind a
-    /// see-through window, being tried (see `config::Win32BackdropTrial`).
+    /// On Windows, the system acrylic behind a see-through window (see
+    /// `config::Win32BackdropTrial`).
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) windows_backdrop: NativeWindowsBackdrop,
 }
 
-/// The ways Settings offers to try of asking Windows for the frosted
-/// backdrop, `Off` the usual one.
+/// Whether Settings asks Windows for its acrylic, `Composition` being on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeWindowsBackdrop {
     #[default]
     Off,
-    Accent,
     Composition,
 }
 
 impl NativeWindowsBackdrop {
-    /// Every way, in the order the settings window offers them.
-    pub(crate) const ALL: [Self; 3] = [Self::Off, Self::Accent, Self::Composition];
-
     fn trial(self) -> config::Win32BackdropTrial {
         match self {
             Self::Off => config::Win32BackdropTrial::Off,
-            Self::Accent => config::Win32BackdropTrial::Accent,
             Self::Composition => config::Win32BackdropTrial::Composition,
         }
     }
@@ -2942,14 +2936,14 @@ mod tests {
         settings.appearance.window_opacity = Some(100);
         let [_, blur, _] = window_opacity_overrides(&settings);
         assert_eq!(blur.1, None);
-        // The Windows backdrop is never Settings' to set; a way of asking
-        // for it being tried is, on Windows.
+        // The Windows backdrop is never Settings' to set; the acrylic drawn
+        // through DirectComposition is, on Windows.
         assert!(!WINDOW_OPACITY_KEYS.contains(&"win32_system_backdrop"));
-        settings.appearance.windows_backdrop = NativeWindowsBackdrop::Accent;
+        settings.appearance.windows_backdrop = NativeWindowsBackdrop::Composition;
         let [.., backdrop] = window_opacity_overrides(&settings);
         assert_eq!(
             backdrop.1,
-            cfg!(windows).then(|| config::Win32BackdropTrial::Accent.to_dynamic())
+            cfg!(windows).then(|| config::Win32BackdropTrial::Composition.to_dynamic())
         );
     }
 
@@ -2964,6 +2958,7 @@ mod tests {
         };
         assert_eq!(read(r#""composition""#), NativeWindowsBackdrop::Composition);
         // Ways tried and dropped read as off, as one not known yet does.
+        assert_eq!(read(r#""accent""#), NativeWindowsBackdrop::Off);
         assert_eq!(read(r#""system_blur""#), NativeWindowsBackdrop::Off);
         assert_eq!(read(r#""something_new""#), NativeWindowsBackdrop::Off);
     }

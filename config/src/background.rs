@@ -301,18 +301,14 @@ pub enum SystemBackdrop {
     Tabbed,
 }
 
-/// Another way of asking Windows for its acrylic backdrop, to find one that
-/// shows it behind a window drawn with OpenGL: asked for the usual way, it
-/// comes out opaque there (wezterm#6265). `Off` asks the usual way.
-/// `Accent` asks with the undocumented accent policy, as on Windows 10,
-/// even where the system backdrop exists. `Composition` draws through
-/// ANGLE onto a DirectComposition surface, whose alpha the system backdrop
-/// shows through; a window takes it, or leaves it, when opened.
+/// Acrylic behind a see-through window drawn with OpenGL, which the usual
+/// way of asking for it leaves opaque (wezterm#6265). `Composition` draws
+/// through ANGLE onto a DirectComposition surface, whose alpha the system
+/// acrylic shows through; a window takes it, or leaves it, when opened.
 #[derive(Debug, Copy, Clone, FromDynamic, ToDynamic, PartialEq, Eq, Default)]
 pub enum Win32BackdropTrial {
     #[default]
     Off,
-    Accent,
     Composition,
 }
 
