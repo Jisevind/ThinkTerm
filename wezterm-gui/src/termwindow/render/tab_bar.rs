@@ -158,7 +158,7 @@ impl crate::TermWindow {
             Some(colors) => colors.background().to_linear(),
             None => terminal_bg,
         }
-        .mul_alpha(self.config.window_background_opacity);
+        .mul_alpha(self.terminal_ground_opacity(self.config.window_background_opacity));
         let gl_state = self.render_state.as_ref().unwrap();
         let white_space = gl_state.util_sprites.white_space.texture_coords();
         let filled_box = gl_state.util_sprites.filled_box.texture_coords();

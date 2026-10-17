@@ -55,7 +55,7 @@ impl crate::TermWindow {
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let tab_width = self.window_tab_width_pixels().ceil() as usize;
 
-        let background = self.chrome_surface(chrome.header_bg);
+        let background = self.tab_bar_surface(chrome.header_bg);
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
 

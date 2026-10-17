@@ -1145,7 +1145,7 @@ impl crate::TermWindow {
 
         let chrome = self.chrome();
         let foreground = chrome.text;
-        let sidebar_bg = self.chrome_surface(chrome.workspace_sidebar_bg);
+        let sidebar_bg = self.sidebar_surface(chrome.workspace_sidebar_bg);
         let see_through = self.chrome_see_through();
         let sidebar_separator = chrome.separator;
         let selected_bg = chrome.sidebar_row_active_bg;
@@ -3304,7 +3304,7 @@ impl crate::TermWindow {
                         ring,
                         ring,
                     ),
-                    self.chrome_surface(chrome.workspace_sidebar_bg),
+                    self.sidebar_surface(chrome.workspace_sidebar_bg),
                     ring / 2.0,
                 )
                 .context("sidebar update dot ring")?;

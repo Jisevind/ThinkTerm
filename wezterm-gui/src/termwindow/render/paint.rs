@@ -2027,7 +2027,7 @@ impl crate::TermWindow {
         } else {
             self.palette().background.to_linear()
         };
-        ground.mul_alpha(self.config.window_background_opacity)
+        ground.mul_alpha(self.terminal_ground_opacity(self.config.window_background_opacity))
     }
 
     /// Record the window frame in three pieces, one per edge it can leave by.

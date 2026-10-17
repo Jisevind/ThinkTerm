@@ -467,7 +467,7 @@ impl crate::TermWindow {
             rect,
             self.dark_terminal_ground()
                 .unwrap_or_else(|| palette.background.to_linear())
-                .mul_alpha(self.config.window_background_opacity),
+                .mul_alpha(self.terminal_ground_opacity(self.config.window_background_opacity)),
         )?;
         quad.set_hsv(if pos.is_active {
             None
@@ -514,7 +514,7 @@ impl crate::TermWindow {
         );
         self.paint_ground_of(layers, pos, above)?;
         self.paint_ground_of(layers, pos, below)?;
-        self.filled_rectangle(layers, 0, band, self.chrome_surface(self.chrome().header_bg))
+        self.filled_rectangle(layers, 0, band, self.tab_bar_surface(self.chrome().header_bg))
             .context("pane nav band")?;
         Ok(())
     }
@@ -565,7 +565,7 @@ impl crate::TermWindow {
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
 
-        self.filled_rectangle(layers, 0, pane_rect, self.chrome_surface(chrome.sidebar_bg))
+        self.filled_rectangle(layers, 0, pane_rect, self.collapsed_bar_surface())
             .context("collapsed pane background")?;
 
         self.ui_items.push(UIItem {
@@ -953,7 +953,7 @@ impl crate::TermWindow {
         // sliced in half.
         self.paint_tab_row_fades(
             layers,
-            self.chrome_surface(chrome.sidebar_bg),
+            self.collapsed_bar_surface(),
             tab_y,
             tab_height,
             tab_start,
@@ -1046,7 +1046,7 @@ impl crate::TermWindow {
         // the tab strip itself. `header_bg` is the chrome's own colour in a
         // dark interface, so nothing moves there.
         // Over nothing see-through: the pane's ground stops below it.
-        let background = self.chrome_surface(chrome.header_bg);
+        let background = self.tab_bar_surface(chrome.header_bg);
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
@@ -2011,7 +2011,7 @@ impl crate::TermWindow {
                         *background_rect,
                         dark_chrome_background
                             .unwrap_or_else(|| palette.background.to_linear())
-                            .mul_alpha(config.window_background_opacity),
+                            .mul_alpha(self.terminal_ground_opacity(config.window_background_opacity)),
                     )
                     .context("filled_rectangle")?;
                 quad.set_hsv(if pos.is_active {

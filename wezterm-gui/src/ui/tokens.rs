@@ -268,7 +268,9 @@ impl UiPalette {
     /// tabs are the same control drawn twice, and they looked it until one of
     /// them was changed alone.
     pub(crate) fn active_tab_surface(&self) -> LinearRgba {
-        if self.header_bg == self.sidebar_bg {
+        // A dark interface keeps the raised control however its tab bars
+        // are shaded.
+        if self.header_bg == self.sidebar_bg || self.is_dark() {
             self.control_bg
         } else {
             self.sidebar_bg

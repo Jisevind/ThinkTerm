@@ -1527,6 +1527,15 @@ fn localized_mac_glass_label(glass: crate::native_settings::NativeMacGlass) -> S
     })
 }
 
+fn localized_shade_label(shade: crate::native_settings::NativeShade) -> String {
+    use crate::native_settings::NativeShade;
+    crate::i18n::tr(match shade {
+        NativeShade::Dark => "settings-area-shade-dark",
+        NativeShade::Mid => "settings-area-shade-mid",
+        NativeShade::Light => "settings-area-shade-light",
+    })
+}
+
 /// Whether this macOS has Liquid Glass to offer.
 fn liquid_glass_available() -> bool {
     #[cfg(target_os = "macos")]
@@ -1858,6 +1867,9 @@ enum SettingsAction {
     SetMainRenderer(NativeRendererBackend),
     ToggleMacGlassMenu,
     SetMacGlass(crate::native_settings::NativeMacGlass),
+    SetSidebarShade(crate::native_settings::NativeShade),
+    SetTabBarShade(crate::native_settings::NativeShade),
+    SetTerminalShade(crate::native_settings::NativeShade),
     ToggleDownloadSourceMenu,
     SetDownloadSource(thinkterm_update::DownloadSource),
     /// Swallows clicks that land in an open dropdown's padding or row
@@ -6081,6 +6093,23 @@ impl SettingsWindow {
                 };
             }
             SettingsAction::SetMacGlass(glass) => self.apply_mac_glass(glass),
+            SettingsAction::SetSidebarShade(shade) => self.apply_window_areas(
+                "settings-sidebar-shade",
+                localized_shade_label(shade),
+                |appearance| {
+                    appearance.sidebar_shade = crate::native_settings::NativeSidebarShade::of(shade)
+                },
+            ),
+            SettingsAction::SetTabBarShade(shade) => self.apply_window_areas(
+                "settings-tab-bar-shade",
+                localized_shade_label(shade),
+                |appearance| appearance.tab_bar_shade = shade,
+            ),
+            SettingsAction::SetTerminalShade(shade) => self.apply_window_areas(
+                "settings-terminal-shade",
+                localized_shade_label(shade),
+                |appearance| appearance.terminal_shade = shade,
+            ),
             SettingsAction::ToggleMainRendererMenu => {
                 self.ui.open_dropdown =
                     if self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer) {
@@ -8609,6 +8638,56 @@ impl SettingsWindow {
                     "settings-mac-glass",
                     current,
                 )?);
+            }
+            // Only where Settings can make the window see-through.
+            if crate::native_settings::window_opacity_supported() {
+                let appearance = &this.native_settings.appearance;
+                let shades = [
+                    (
+                        "settings-sidebar-shade",
+                        appearance.sidebar_shade.shade(),
+                        SettingsAction::SetSidebarShade as fn(_) -> SettingsAction,
+                    ),
+                    (
+                        "settings-tab-bar-shade",
+                        appearance.tab_bar_shade,
+                        SettingsAction::SetTabBarShade as fn(_) -> SettingsAction,
+                    ),
+                    (
+                        "settings-terminal-shade",
+                        appearance.terminal_shade,
+                        SettingsAction::SetTerminalShade as fn(_) -> SettingsAction,
+                    ),
+                ];
+                for (title, current, action) in shades {
+                    let options: Vec<(String, SettingsAction)> = crate::native_settings::NativeShade::ALL
+                        .iter()
+                        .map(|shade| (localized_shade_label(*shade), action(*shade)))
+                        .collect();
+                    let selected = crate::native_settings::NativeShade::ALL
+                        .iter()
+                        .position(|shade| *shade == current)
+                        .unwrap_or(0);
+                    let (tx, tw) = this.paint_row_tile(
+                        layers,
+                        row_x,
+                        rows.y,
+                        row_width,
+                        SvgIcon::Contrast,
+                        TileColor::Teal,
+                    )?;
+                    rows.add(this.paint_segmented_setting_row(
+                        layers,
+                        tx,
+                        rows.y,
+                        tw,
+                        &crate::i18n::tr(title),
+                        &crate::i18n::tr(&format!("{title}-description")),
+                        &options,
+                        selected,
+                        rows.rule(),
+                    )?);
+                }
             }
             Ok(rows.bottom)
         })?;
@@ -18098,6 +18177,38 @@ impl SettingsWindow {
                 )
             })
             .collect()
+    }
+
+    /// How the window's areas are coloured, in every window at once:
+    /// `change` makes it, `value` names it.
+    fn apply_window_areas(
+        &mut self,
+        setting_key: &str,
+        value: String,
+        change: impl FnOnce(&mut crate::native_settings::NativeAppearanceSettings),
+    ) {
+        self.ui.open_dropdown = None;
+        // Merged into the freshest settings, as `apply_window_opacity` is.
+        let mut merged = crate::native_settings::load();
+        change(&mut merged.appearance);
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr(setting_key);
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                crate::native_settings::apply_to_app(&self.native_settings);
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[("setting", setting), ("value", value)],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
     }
 
     /// What a see-through window shows behind it on macOS, in every window

@@ -2313,17 +2313,13 @@ fn settings_override_changes(
     applied
 }
 
-fn chrome_opacity(window_opacity: f32) -> f32 {
-    let window = window_opacity.clamp(0.0, 1.0);
-    window + (1.0 - window) / 4.0
-}
-
 #[cfg(test)]
 mod chrome_opacity_tests {
-    use super::chrome_opacity;
+    use crate::native_settings::frame_opacity;
 
     #[test]
     fn chrome_is_a_step_more_solid_than_the_terminal() {
+        let chrome_opacity = frame_opacity;
         assert_eq!(chrome_opacity(1.0), 1.0);
         assert!((chrome_opacity(0.8) - 0.85).abs() < 1e-6);
         assert_eq!(chrome_opacity(0.0), 0.25);
@@ -3021,6 +3017,12 @@ pub struct TermWindow {
     /// Refreshed in `config_was_reloaded`, which is also where a colour scheme
     /// override and an appearance change both land.
     chrome_palette: crate::ui::UiPalette,
+    /// The terminal's ground when Settings shades it other than its own,
+    /// read with `chrome_palette`.
+    terminal_shade: Option<LinearRgba>,
+    /// The shades Settings asks of the areas of a see-through window, read
+    /// with `chrome_palette`; `None` when opaque.
+    area_shades: Option<crate::native_settings::AreaShades>,
     /// The interface appearance `chrome_palette` was resolved for. A palette
     /// following the terminal takes its own from the scheme instead, so the
     /// two can differ.
@@ -4674,6 +4676,12 @@ impl TermWindow {
         let active_space_has_note_vault =
             crate::workspace_threads::space_note_vault(&active_space_id).is_some();
 
+        let (chrome_palette, terminal_shade, area_shades) =
+            crate::native_settings::window_chrome_palette(
+                crate::native_settings::effective_appearance(),
+                &config,
+                None,
+            );
         let myself = Self {
             frontend_geometry_phases: HashMap::new(),
             remote_open_intent: remote_open_domain
@@ -4783,12 +4791,9 @@ impl TermWindow {
             last_mouse_click: None,
             current_highlight: None,
             quad_generation: 0,
-            chrome_palette: crate::native_settings::chrome_palette(
-                crate::native_settings::load_shared().appearance.theme_mode,
-                crate::native_settings::effective_appearance(),
-                &config,
-                None,
-            ),
+            chrome_palette,
+            terminal_shade,
+            area_shades,
             chrome_appearance: crate::native_settings::effective_appearance(),
             shape_generation: 0,
             shape_cache: RefCell::new(LfuCache::new_weighted(
@@ -7564,8 +7569,8 @@ impl TermWindow {
     /// configuration reload behind it.
     pub(crate) fn refresh_chrome(&mut self) {
         self.chrome_appearance = crate::native_settings::effective_appearance();
-        self.chrome_palette = crate::native_settings::chrome_palette(
-            crate::native_settings::load_shared().appearance.theme_mode,
+        (self.chrome_palette, self.terminal_shade, self.area_shades) =
+            crate::native_settings::window_chrome_palette(
             self.chrome_appearance,
             &self.config,
             self.scheme_preview_ground,
@@ -7797,8 +7802,8 @@ impl TermWindow {
         // these two -- the settings-window routes reach them only through
         // their own notifies.
         self.chrome_appearance = crate::native_settings::effective_appearance();
-        self.chrome_palette = crate::native_settings::chrome_palette(
-            crate::native_settings::load_shared().appearance.theme_mode,
+        (self.chrome_palette, self.terminal_shade, self.area_shades) =
+            crate::native_settings::window_chrome_palette(
             self.chrome_appearance,
             &config,
             self.scheme_preview_ground,
@@ -8882,16 +8887,20 @@ impl TermWindow {
         theme_aligned_tab_bar_colors_from_palette(&self.palette().clone(), background)
     }
 
-    /// The terminal's ground in a dark interface: the chrome's colour rather
-    /// than the scheme's background. `None` in a light one, where the scheme's
+    /// The terminal's ground when it is not the scheme's background: the
+    /// shade Settings asks of it in a see-through window, else in a dark
+    /// interface the chrome's colour. `None` otherwise, where the scheme's
     /// background shows. Read off the appearance cached with the chrome
     /// palette; asking for it anew is costly (see `chrome_palette`).
     pub(crate) fn dark_terminal_ground(&self) -> Option<LinearRgba> {
-        matches!(
-            self.chrome_appearance,
-            ::window::Appearance::Dark | ::window::Appearance::DarkHighContrast
-        )
-        .then(|| self.chrome().sidebar_bg)
+        // A shade asked for in Settings, in either interface.
+        self.terminal_shade.or_else(|| {
+            matches!(
+                self.chrome_appearance,
+                ::window::Appearance::Dark | ::window::Appearance::DarkHighContrast
+            )
+            .then(|| self.chrome().sidebar_bg)
+        })
     }
 
     /// `color` as a surface of the chrome paints it. In a see-through window
@@ -8899,7 +8908,65 @@ impl TermWindow {
     /// through as well, but less than the terminal does, so that they still
     /// read as the frame around it.
     pub(crate) fn chrome_surface(&self, color: LinearRgba) -> LinearRgba {
-        color.mul_alpha(chrome_opacity(self.chrome_window_opacity()))
+        color.mul_alpha(crate::native_settings::frame_opacity(self.chrome_window_opacity()))
+    }
+
+    /// `color` as a sidebar paints it: as the chrome does, or as solid as
+    /// the shade Settings asks of it.
+    pub(crate) fn sidebar_surface(&self, color: LinearRgba) -> LinearRgba {
+        self.area_surface(color, self.area_shades.map(|shades| shades.sidebar))
+    }
+
+    /// `color` as a tab bar paints it: as the chrome does, or as solid as
+    /// the shade Settings asks of it.
+    pub(crate) fn tab_bar_surface(&self, color: LinearRgba) -> LinearRgba {
+        self.area_surface(color, self.area_shades.map(|shades| shades.tab_bar))
+    }
+
+    /// A collapsed pane stack's bar: the pane nav bars' fellow, so shaded as
+    /// the tab bars are in a see-through window, and as it always was in an
+    /// opaque one.
+    pub(crate) fn collapsed_bar_surface(&self) -> LinearRgba {
+        if self.area_shades.is_some() {
+            self.tab_bar_surface(self.chrome().header_bg)
+        } else {
+            self.chrome_surface(self.chrome().sidebar_bg)
+        }
+    }
+
+    fn area_surface(
+        &self,
+        color: LinearRgba,
+        shade: Option<crate::native_settings::NativeShade>,
+    ) -> LinearRgba {
+        match shade {
+            Some(shade) => color.mul_alpha(crate::native_settings::shade_opacity(
+                shade,
+                self.dark_interface(),
+                self.chrome_window_opacity(),
+            )),
+            None => self.chrome_surface(color),
+        }
+    }
+
+    /// How solid the terminal's ground is in a window `window` opaque: as
+    /// solid as the shade Settings asks of it, in a see-through window.
+    pub(crate) fn terminal_ground_opacity(&self, window: f32) -> f32 {
+        match self.area_shades {
+            Some(shades) => crate::native_settings::shade_opacity(
+                shades.terminal,
+                self.dark_interface(),
+                window,
+            ),
+            None => window,
+        }
+    }
+
+    fn dark_interface(&self) -> bool {
+        matches!(
+            self.chrome_appearance,
+            ::window::Appearance::Dark | ::window::Appearance::DarkHighContrast
+        )
     }
 
     /// Whether the window is see-through, and its chrome with it. Covering
@@ -8989,7 +9056,20 @@ impl TermWindow {
         if (config.window_background_opacity != 1.0) != (before.window_background_opacity != 1.0) {
             self.quad_generation += 1;
         }
+        let crossed_opaque = (config.window_background_opacity >= 1.0)
+            != (before.window_background_opacity >= 1.0);
         self.config = config;
+        // The area shades are for a see-through window: going opaque or
+        // see-through -- the slider dragged across 100%, full screen -- takes
+        // them away or brings them back without a reload.
+        if crossed_opaque {
+            (self.chrome_palette, self.terminal_shade, self.area_shades) =
+                crate::native_settings::window_chrome_palette(
+                    self.chrome_appearance,
+                    &self.config,
+                    self.scheme_preview_ground,
+                );
+        }
         self.invalidate_fancy_tab_bar();
         if let Some(window) = self.window.as_ref() {
             if platform_changed {

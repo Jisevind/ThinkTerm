@@ -9108,7 +9108,7 @@ impl crate::TermWindow {
         let chrome = self.chrome();
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
-        let sidebar_bg = self.chrome_surface(chrome.workspace_sidebar_bg);
+        let sidebar_bg = self.sidebar_surface(chrome.workspace_sidebar_bg);
         let see_through = self.chrome_see_through();
         let settings = crate::native_settings::load();
         let base_font_size = crate::native_settings::right_sidebar_font_size(&settings);
@@ -13336,7 +13336,7 @@ impl crate::TermWindow {
         muted_fg: LinearRgba,
         rect: RightSidebarRect,
     ) -> anyhow::Result<()> {
-        let sidebar_bg = self.chrome_surface(chrome.workspace_sidebar_bg);
+        let sidebar_bg = self.sidebar_surface(chrome.workspace_sidebar_bg);
         // See-through, the band above is the window border's alone.
         if rect.y > 0 && !self.chrome_see_through() {
             self.filled_rectangle(
@@ -18635,7 +18635,7 @@ impl crate::TermWindow {
             layers,
             2,
             euclid::rect(x as f32, y as f32, width as f32, height as f32),
-            self.chrome_surface(chrome.workspace_sidebar_bg),
+            self.sidebar_surface(chrome.workspace_sidebar_bg),
         )
         .context("right sidebar file scroll mask")?;
         Ok(())
@@ -18693,7 +18693,7 @@ impl crate::TermWindow {
                 layers,
                 2,
                 euclid::rect(x as f32, (y + step) as f32, width as f32, 1.0),
-                self.chrome_surface(chrome.workspace_sidebar_bg)
+                self.sidebar_surface(chrome.workspace_sidebar_bg)
                     .mul_alpha(alpha),
             )
             .context("right sidebar file top fade")?;
