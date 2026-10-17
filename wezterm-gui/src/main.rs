@@ -1478,6 +1478,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     wezterm_client::remote_update::set_keep_sessions_on_update(
         crate::native_settings::remote_update_keeps_sessions(),
     );
+    thinkterm_update::set_download_source(crate::native_settings::update_download_source(
+        &crate::native_settings::load_shared(),
+    ));
     thinkterm_update::set_transport(crate::update::reqwest_transport);
     wezterm_client::domain::set_local_session_host_replaced_sink(
         crate::local_sessions::on_host_replaced,

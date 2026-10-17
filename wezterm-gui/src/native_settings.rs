@@ -1127,6 +1127,11 @@ pub(crate) struct NativeWorkspaceSettings {
     /// Updating a remote mux server hands its sessions to the new version
     /// instead of stopping it; off, the update asks whether to stop it.
     pub(crate) remote_update_keeps_sessions: bool,
+    /// Where updates download the release from, as
+    /// `thinkterm_update::DownloadSource` names it: "auto" (the default),
+    /// "direct" (GitHub only) or a mirror's host. An unknown name is the
+    /// default. The CLI and the mux server read it from this file.
+    pub(crate) update_download_source: String,
     /// Local terminals run in a background mux server (the default unix
     /// domain) instead of inside the GUI process, so they survive the GUI
     /// quitting, crashing or updating. Read once at launch.
@@ -1142,6 +1147,7 @@ impl Default for NativeWorkspaceSettings {
             notification_sounds_enabled: true,
             system_notifications_enabled: true,
             remote_update_keeps_sessions: true,
+            update_download_source: thinkterm_update::DownloadSource::Auto.name().to_string(),
             // Preserve the behavior of older settings files without this field.
             // Fresh installs enable it in ThinkTermNativeSettings::for_new_install.
             local_sessions_via_mux: false,
@@ -2018,6 +2024,9 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
             after.workspaces.remote_update_keeps_sessions,
         );
     }
+    if before.workspaces.update_download_source != after.workspaces.update_download_source {
+        thinkterm_update::set_download_source(update_download_source(after));
+    }
 }
 
 /// Where the main window should reopen, or `None` if nothing has been
@@ -2715,6 +2724,12 @@ pub(crate) fn save_remote_hosts_inspector_width(width: usize) -> anyhow::Result<
 
 pub(crate) fn remote_update_keeps_sessions() -> bool {
     load().workspaces.remote_update_keeps_sessions
+}
+
+pub(crate) fn update_download_source(
+    settings: &ThinkTermNativeSettings,
+) -> thinkterm_update::DownloadSource {
+    thinkterm_update::DownloadSource::from_name(&settings.workspaces.update_download_source)
 }
 
 pub(crate) fn local_sessions_via_mux() -> bool {

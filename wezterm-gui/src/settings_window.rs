@@ -1508,6 +1508,15 @@ fn shell_catalog_including(
     catalog
 }
 
+fn download_source_label(source: thinkterm_update::DownloadSource) -> String {
+    use thinkterm_update::DownloadSource;
+    match source {
+        DownloadSource::Direct => crate::i18n::tr("settings-update-download-source-direct"),
+        DownloadSource::Auto => crate::i18n::tr("settings-update-download-source-auto"),
+        DownloadSource::Mirror(host) => host.to_string(),
+    }
+}
+
 fn localized_remote_pane_resize_mode_label(mode: NativeRemotePaneResizeMode) -> String {
     crate::i18n::tr(match mode {
         NativeRemotePaneResizeMode::Auto => "settings-remote-pane-resize-mode-auto",
@@ -1825,6 +1834,8 @@ enum SettingsAction {
     WindowOpacitySlider,
     ToggleMainRendererMenu,
     SetMainRenderer(NativeRendererBackend),
+    ToggleDownloadSourceMenu,
+    SetDownloadSource(thinkterm_update::DownloadSource),
     /// Swallows clicks that land in an open dropdown's padding or row
     /// gaps instead of letting them reach the controls underneath.
     DropdownMenuBackdrop,
@@ -1956,6 +1967,8 @@ enum SettingsDrag {
 enum SettingsDropdown {
     Language,
     MainRenderer,
+    /// Where updates download the release from, on the Updates page.
+    DownloadSource,
     DefaultShell,
     CommandPaletteHotkey,
     WebLinkTtl,
@@ -4035,6 +4048,8 @@ impl SettingsWindow {
                         | SettingsAction::SetAppIcon(_)
                         | SettingsAction::ToggleMainRendererMenu
                         | SettingsAction::SetMainRenderer(_)
+                        | SettingsAction::ToggleDownloadSourceMenu
+                        | SettingsAction::SetDownloadSource(_)
                         | SettingsAction::ToggleDefaultShellMenu
                         | SettingsAction::SetDefaultShell(_)
                         | SettingsAction::ToggleCommandPaletteHotkeyMenu
@@ -6054,6 +6069,30 @@ impl SettingsWindow {
                         );
                     }
                 }
+            }
+            SettingsAction::ToggleDownloadSourceMenu => {
+                self.ui.open_dropdown =
+                    if self.ui.open_dropdown == Some(SettingsDropdown::DownloadSource) {
+                        None
+                    } else {
+                        Some(SettingsDropdown::DownloadSource)
+                    };
+            }
+            SettingsAction::SetDownloadSource(source) => {
+                self.ui.open_dropdown = None;
+                self.native_settings.workspaces.update_download_source = source.name().to_string();
+                thinkterm_update::set_download_source(source);
+                let setting = crate::i18n::tr("settings-update-download-source");
+                self.status = match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => settings_tr(
+                        "settings-status-value-now",
+                        &[("setting", setting), ("value", download_source_label(source))],
+                    ),
+                    Err(err) => settings_tr(
+                        "settings-status-save-error",
+                        &[("setting", setting), ("error", format!("{err:#}"))],
+                    ),
+                };
             }
             SettingsAction::DropdownMenuBackdrop => {
                 // Deliberately inert: the click was inside the open menu
@@ -15731,11 +15770,24 @@ impl SettingsWindow {
             self.paint_compact_row(layers, tx, row_y, tw, label, value, index > 0)?;
         }
 
-        // One choice: what updating a remote server does to its sessions.
+        // Two choices: where updates download from, and what updating a
+        // remote server does to its sessions.
         let toggle_card_y = card_y + card_height + gap;
-        let toggle_card_height = self.compact_card_height(1);
+        let toggle_card_height = self.compact_card_height(2);
         self.paint_group_card(layers, x, toggle_card_y, max_width, toggle_card_height)?;
-        let toggle_row_y = toggle_card_y + self.ui_px(12.0);
+        let source_row_y = toggle_card_y + self.ui_px(12.0);
+        let (tx, tw) = self.paint_band_tile(
+            layers,
+            row_x,
+            source_row_y,
+            row_step,
+            row_width,
+            SvgIcon::Download,
+            TileColor::Teal,
+        )?;
+        self.paint_download_source_row(layers, tx, source_row_y, tw, row_step)?;
+        let toggle_row_y = source_row_y + row_step;
+        self.paint_separator(layers, tx, toggle_row_y, tw)?;
         let (tx, tw) = self.paint_band_tile(
             layers,
             row_x,
@@ -18049,6 +18101,12 @@ impl SettingsWindow {
                 control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
+            SettingsDropdown::DownloadSource => self.paint_download_source_menu(
+                layers,
+                control_x,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
+                control_width,
+            ),
             SettingsDropdown::DefaultShell => self.paint_default_shell_menu(
                 layers,
                 control_x,
@@ -18097,6 +18155,86 @@ impl SettingsWindow {
             })
             .collect();
         self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
+    fn paint_download_source_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<()> {
+        let current = crate::native_settings::update_download_source(&self.native_settings);
+        let options: Vec<(String, SettingsAction, bool)> = thinkterm_update::DownloadSource::all()
+            .map(|source| {
+                (
+                    download_source_label(source),
+                    SettingsAction::SetDownloadSource(source),
+                    source == current,
+                )
+            })
+            .collect();
+        self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
+    /// The Updates page's download source: a hinted label and a dropdown,
+    /// both centred in a single-line band like the toggle under it.
+    fn paint_download_source_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        band_height: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let control_width = self.settings_control_width(width);
+        let control_x = x + width - control_width;
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let control_y = y + ((band_height - control_height) / 2.0).max(0.0);
+        self.note_dropdown_anchor(
+            SettingsDropdown::DownloadSource,
+            (control_x, control_y, control_width),
+        );
+        let action = SettingsAction::ToggleDownloadSourceMenu;
+        let label = download_source_label(crate::native_settings::update_download_source(
+            &self.native_settings,
+        ));
+        let control_rect = self.dropdown_pill_rect(control_x, control_y, control_width, &label);
+        let open = self.ui.open_dropdown == Some(SettingsDropdown::DownloadSource);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+
+        let cell_height = self.metrics.cell_size.height as f32;
+        let icon_size = self.ui_px(HINT_ICON_SIDE);
+        let icon_gap = self.ui_px(HINT_ICON_GAP);
+        let text_width =
+            (control_rect.min_x() - x - icon_size - icon_gap - 24.0).max(width * 0.3);
+        let label_y = control_y + (control_height - cell_height) / 2.0;
+        self.paint_hinted_label(
+            layers,
+            x,
+            label_y,
+            text_width,
+            &crate::i18n::tr("settings-update-download-source"),
+            "settings-update-download-source-description",
+        )?;
+        self.paint_dropdown_pill(layers, control_rect, &label, bg, border)?;
+        Ok(())
     }
 
     fn paint_main_renderer_menu(
