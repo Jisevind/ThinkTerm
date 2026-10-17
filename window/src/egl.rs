@@ -55,6 +55,17 @@ impl std::fmt::Debug for EglWrapper {
 #[cfg(windows)]
 const DIRECT_COMPOSITION_ANGLE: i32 = 0x33A5;
 
+/// The size of `window`'s client area, in pixels.
+#[cfg(windows)]
+fn client_size(window: ffi::EGLNativeWindowType) -> (u32, u32) {
+    let mut rect: winapi::shared::windef::RECT = unsafe { std::mem::zeroed() };
+    unsafe { winapi::um::winuser::GetClientRect(window, &mut rect) };
+    (
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    )
+}
+
 #[derive(Debug)]
 pub struct GlConnection {
     egl: EglWrapper,
@@ -91,6 +102,10 @@ pub struct GlState {
     connection: Rc<GlConnection>,
     surface: ffi::types::EGLSurface,
     context: ffi::types::EGLContext,
+    /// The window a DirectComposition surface is drawn for, checked at
+    /// each swap: see `swap_buffers`.
+    #[cfg(windows)]
+    composition_window: Option<ffi::EGLNativeWindowType>,
 }
 
 impl Drop for GlState {
@@ -400,6 +415,26 @@ impl GlState {
         &self.connection
     }
 
+    fn surface_size(&self) -> (u32, u32) {
+        let mut width = 0;
+        let mut height = 0;
+        unsafe {
+            self.connection.QuerySurface(
+                self.connection.display,
+                self.surface,
+                ffi::WIDTH as i32,
+                &mut width,
+            );
+            self.connection.QuerySurface(
+                self.connection.display,
+                self.surface,
+                ffi::HEIGHT as i32,
+                &mut height,
+            );
+        }
+        (width as u32, height as u32)
+    }
+
     fn with_egl_lib<T, F: FnMut(EglWrapper) -> anyhow::Result<T>>(
         mut func: F,
     ) -> anyhow::Result<T> {
@@ -520,11 +555,13 @@ impl GlState {
         connection: &Rc<GlConnection>,
         window: ffi::EGLNativeWindowType,
     ) -> anyhow::Result<GlState> {
-        Self::create_with_surface_attributes(
+        let mut state = Self::create_with_surface_attributes(
             connection,
             window,
             &[DIRECT_COMPOSITION_ANGLE, ffi::TRUE as i32],
-        )
+        )?;
+        state.composition_window = Some(window);
+        Ok(state)
     }
 
     fn connect_with(
@@ -692,6 +729,8 @@ impl GlState {
                 connection: Rc::clone(connection),
                 context,
                 surface,
+                #[cfg(windows)]
+                composition_window: None,
             });
         }
 
@@ -705,10 +744,27 @@ unsafe impl glium::backend::Backend for GlState {
     }
 
     fn swap_buffers(&self) -> Result<(), glium::SwapBuffersError> {
+        // ANGLE resizes the swap chain behind a DirectComposition window only
+        // as it presents: a frame drawn just after a resize went into the
+        // old size's buffer, so the window is asked to draw once more. Done
+        // here, with no window state touched: this runs inside its paint.
+        // A minimized window's client area is empty, and the swap chain keeps
+        // its size then: that is not a frame to redraw.
+        #[cfg(windows)]
+        let stale = self.composition_window.filter(|&window| {
+            let client = client_size(window);
+            client.0 > 0 && client.1 > 0 && self.surface_size() != client
+        });
         let res = unsafe {
             self.connection
                 .SwapBuffers(self.connection.display, self.surface)
         };
+        #[cfg(windows)]
+        if let Some(window) = stale {
+            unsafe {
+                winapi::um::winuser::InvalidateRect(window, std::ptr::null(), 0);
+            }
+        }
         if res != 1 {
             Err(match unsafe { self.connection.GetError() } as u32 {
                 ffi::CONTEXT_LOST => glium::SwapBuffersError::ContextLost,
@@ -725,26 +781,7 @@ unsafe impl glium::backend::Backend for GlState {
     }
 
     fn get_framebuffer_dimensions(&self) -> (u32, u32) {
-        let mut width = 0;
-        let mut height = 0;
-
-        unsafe {
-            self.connection.QuerySurface(
-                self.connection.display,
-                self.surface,
-                ffi::WIDTH as i32,
-                &mut width,
-            );
-        }
-        unsafe {
-            self.connection.QuerySurface(
-                self.connection.display,
-                self.surface,
-                ffi::HEIGHT as i32,
-                &mut height,
-            );
-        }
-        (width as u32, height as u32)
+        self.surface_size()
     }
 
     fn is_current(&self) -> bool {

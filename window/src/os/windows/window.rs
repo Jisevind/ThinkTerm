@@ -1232,29 +1232,6 @@ impl HasWindowHandle for Window {
 
 #[async_trait(?Send)]
 impl WindowOps for Window {
-    fn finish_frame(&self, frame: glium::Frame) -> anyhow::Result<()> {
-        // ANGLE resizes the swap chain behind a DirectComposition window only
-        // as it presents: a frame drawn just after a resize went into the
-        // old size's buffer, so draw once more at the new one.
-        let stale = rc_from_hwnd(self.0 .0).and_then(|inner| {
-            let inner = inner.borrow();
-            inner.composition.as_ref()?;
-            let drawn = inner.gl_state.as_ref()?.get_framebuffer_dimensions();
-            let mut rect: RECT = unsafe { std::mem::zeroed() };
-            unsafe { GetClientRect(self.0 .0, &mut rect) };
-            let client = (
-                (rect.right - rect.left).max(0) as u32,
-                (rect.bottom - rect.top).max(0) as u32,
-            );
-            Some(drawn != client)
-        });
-        frame.finish()?;
-        if stale == Some(true) {
-            self.invalidate();
-        }
-        Ok(())
-    }
-
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
         promise::spawn::spawn(async move {
