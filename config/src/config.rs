@@ -24,7 +24,8 @@ use crate::wsl::WslDomain;
 use crate::{
     default_config_with_overrides_applied, default_one_point_oh, default_one_point_oh_f64,
     default_true, default_win32_acrylic_accent_color, CellWidth, GpuInfo,
-    IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor,
+    IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MacosWindowGlass,
+    MouseEventTriggerMods, RgbaColor,
     SerialDomain, SystemBackdrop, WebGpuPowerPreference, Win32BackdropTrial, CONFIG_DIRS,
     CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
 };
@@ -617,6 +618,11 @@ pub struct Config {
     /// Only works on MacOS
     #[dynamic(default)]
     pub macos_window_background_blur: i64,
+
+    /// Only works on MacOS: what a see-through window shows behind it (see
+    /// `MacosWindowGlass`).
+    #[dynamic(default)]
+    pub macos_window_glass: MacosWindowGlass,
 
     /// Only works on KDE Wayland
     #[dynamic(default)]

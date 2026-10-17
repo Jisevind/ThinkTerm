@@ -1517,6 +1517,28 @@ fn download_source_label(source: thinkterm_update::DownloadSource) -> String {
     }
 }
 
+fn localized_mac_glass_label(glass: crate::native_settings::NativeMacGlass) -> String {
+    use crate::native_settings::NativeMacGlass;
+    crate::i18n::tr(match glass {
+        NativeMacGlass::Blur => "settings-mac-glass-blur",
+        NativeMacGlass::Regular => "settings-mac-glass-regular",
+        NativeMacGlass::Clear => "settings-mac-glass-clear",
+        NativeMacGlass::ClearOverBlur => "settings-mac-glass-clear-over-blur",
+    })
+}
+
+/// Whether this macOS has Liquid Glass to offer.
+fn liquid_glass_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ::window::os::macos::liquid_glass_available()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 fn localized_remote_pane_resize_mode_label(mode: NativeRemotePaneResizeMode) -> String {
     crate::i18n::tr(match mode {
         NativeRemotePaneResizeMode::Auto => "settings-remote-pane-resize-mode-auto",
@@ -1834,6 +1856,8 @@ enum SettingsAction {
     WindowOpacitySlider,
     ToggleMainRendererMenu,
     SetMainRenderer(NativeRendererBackend),
+    ToggleMacGlassMenu,
+    SetMacGlass(crate::native_settings::NativeMacGlass),
     ToggleDownloadSourceMenu,
     SetDownloadSource(thinkterm_update::DownloadSource),
     /// Swallows clicks that land in an open dropdown's padding or row
@@ -1967,6 +1991,8 @@ enum SettingsDrag {
 enum SettingsDropdown {
     Language,
     MainRenderer,
+    /// What a see-through window shows behind it, on macOS.
+    MacGlass,
     /// Where updates download the release from, on the Updates page.
     DownloadSource,
     DefaultShell,
@@ -4048,6 +4074,8 @@ impl SettingsWindow {
                         | SettingsAction::SetAppIcon(_)
                         | SettingsAction::ToggleMainRendererMenu
                         | SettingsAction::SetMainRenderer(_)
+                        | SettingsAction::ToggleMacGlassMenu
+                        | SettingsAction::SetMacGlass(_)
                         | SettingsAction::ToggleDownloadSourceMenu
                         | SettingsAction::SetDownloadSource(_)
                         | SettingsAction::ToggleDefaultShellMenu
@@ -6044,6 +6072,15 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleMacGlassMenu => {
+                self.ui.open_dropdown = if self.ui.open_dropdown == Some(SettingsDropdown::MacGlass)
+                {
+                    None
+                } else {
+                    Some(SettingsDropdown::MacGlass)
+                };
+            }
+            SettingsAction::SetMacGlass(glass) => self.apply_mac_glass(glass),
             SettingsAction::ToggleMainRendererMenu => {
                 self.ui.open_dropdown =
                     if self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer) {
@@ -8551,6 +8588,28 @@ impl SettingsWindow {
                 TileColor::Blue,
             )?;
             rows.add(this.paint_window_opacity_row(layers, tx, rows.y, tw, rows.rule())?);
+            if cfg!(target_os = "macos") && liquid_glass_available() {
+                let (tx, tw) = this.paint_row_tile(
+                    layers,
+                    row_x,
+                    rows.y,
+                    row_width,
+                    SvgIcon::Contrast,
+                    TileColor::Indigo,
+                )?;
+                let current = localized_mac_glass_label(this.native_settings.appearance.mac_glass);
+                rows.add(this.paint_choice_dropdown_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    rows.rule(),
+                    SettingsDropdown::MacGlass,
+                    SettingsAction::ToggleMacGlassMenu,
+                    "settings-mac-glass",
+                    current,
+                )?);
+            }
             Ok(rows.bottom)
         })?;
 
@@ -17932,6 +17991,142 @@ impl SettingsWindow {
         self.paint_dropdown_menu(layers, x, y, width, &options)
     }
 
+    /// A row whose control opens `dropdown`, showing `current`: the title
+    /// and description from `title_key` and its `-description`.
+    fn paint_choice_dropdown_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+        dropdown: SettingsDropdown,
+        action: SettingsAction,
+        title_key: &str,
+        current: String,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+
+        let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
+        self.note_dropdown_anchor(dropdown, (control_x, control_y, control_width));
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
+        let control_rect = self.dropdown_pill_rect(control_x, control_y, control_width, &current);
+        let open = self.ui.open_dropdown == Some(dropdown);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            &crate::i18n::tr(title_key),
+            palette.text,
+            text_width,
+        )?;
+        let extra = self.draw_row_description(
+            layers,
+            x,
+            y,
+            &crate::i18n::tr(&format!("{title_key}-description")),
+            text_width,
+        )?;
+        self.paint_dropdown_pill(layers, control_rect, &current, bg, border)?;
+
+        Ok(extra)
+    }
+
+    /// `options` as the menu of the pill at `control`: as wide as its
+    /// longest name and right-aligned with the pill, under it or -- where
+    /// there is no room, as on the last row of a page -- over it.
+    fn paint_fitted_dropdown_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        (control_x, control_y, control_width): (f32, f32, f32),
+        options: &[(String, SettingsAction, bool)],
+    ) -> anyhow::Result<()> {
+        // The height `paint_dropdown_menu` gives it.
+        let rows = options.len() as f32;
+        let menu_height = self.ui_px(8.0) * 2.0
+            + self.ui_px(46.0) * rows
+            + self.ui_px(6.0) * (rows - 1.0).max(0.0);
+        let below = control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0);
+        let y = if below + menu_height <= self.content_bottom() - self.ui_px(8.0) {
+            below
+        } else {
+            (control_y - self.ui_px(8.0) - menu_height).max(self.content_scroll_area_top())
+        };
+        let ui_font = Rc::clone(&self.ui_font);
+        let widest = options
+            .iter()
+            .map(|(label, ..)| self.measure_text_width(&ui_font, label))
+            .fold(0.0, f32::max);
+        let right = control_x + control_width;
+        let width = (widest + self.ui_px(48.0))
+            .max(control_width)
+            .min(right - self.ui_px(8.0));
+        self.paint_dropdown_menu(layers, right - width, y, width, options)
+    }
+
+    fn mac_glass_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
+        let current = self.native_settings.appearance.mac_glass;
+        crate::native_settings::NativeMacGlass::ALL
+            .iter()
+            .map(|glass| {
+                (
+                    localized_mac_glass_label(*glass),
+                    SettingsAction::SetMacGlass(*glass),
+                    *glass == current,
+                )
+            })
+            .collect()
+    }
+
+    /// What a see-through window shows behind it on macOS, in every window
+    /// at once, as the window opacity is.
+    fn apply_mac_glass(&mut self, glass: crate::native_settings::NativeMacGlass) {
+        self.ui.open_dropdown = None;
+        // Merged into the freshest settings, as `apply_window_opacity` is.
+        let mut merged = crate::native_settings::load();
+        merged.appearance.mac_glass = glass;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-mac-glass");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                crate::native_settings::apply_window_opacity_to_app(&self.native_settings);
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[("setting", setting), ("value", localized_mac_glass_label(glass))],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     fn paint_main_renderer_row(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -18095,6 +18290,14 @@ impl SettingsWindow {
                 control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
+            SettingsDropdown::MacGlass => {
+                let options = self.mac_glass_menu_options();
+                self.paint_fitted_dropdown_menu(
+                    layers,
+                    (control_x, control_y, control_width),
+                    &options,
+                )
+            }
             SettingsDropdown::MainRenderer => self.paint_main_renderer_menu(
                 layers,
                 control_x,

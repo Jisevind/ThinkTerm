@@ -421,6 +421,35 @@ pub(crate) struct NativeAppearanceSettings {
     /// `window_background_opacity`. `None` follows the configuration.
     #[serde(deserialize_with = "window_opacity_or_default")]
     pub(crate) window_opacity: Option<u8>,
+    /// On macOS, what a see-through window shows behind it.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) mac_glass: NativeMacGlass,
+}
+
+/// What a see-through window shows behind it on macOS: the plain blur, or
+/// Liquid Glass (see `config::MacosWindowGlass`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeMacGlass {
+    #[default]
+    Blur,
+    Regular,
+    Clear,
+    ClearOverBlur,
+}
+
+impl NativeMacGlass {
+    /// Every look, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 4] = [Self::Blur, Self::Regular, Self::Clear, Self::ClearOverBlur];
+
+    fn glass(self) -> config::MacosWindowGlass {
+        match self {
+            Self::Blur => config::MacosWindowGlass::Blur,
+            Self::Regular => config::MacosWindowGlass::Regular,
+            Self::Clear => config::MacosWindowGlass::Clear,
+            Self::ClearOverBlur => config::MacosWindowGlass::ClearOverBlur,
+        }
+    }
 }
 
 /// The window opacity, whatever shape a hand edit gave it. One field that
@@ -480,22 +509,30 @@ const WINDOW_BLUR_RADIUS: i64 = 20;
 /// decides again.
 pub(crate) fn window_opacity_overrides(
     settings: &ThinkTermNativeSettings,
-) -> [(&'static str, Option<wezterm_dynamic::Value>); 3] {
+) -> [(&'static str, Option<wezterm_dynamic::Value>); 4] {
     use wezterm_dynamic::ToDynamic;
     let changes = window_opacity_changes(settings.appearance.window_opacity);
-    let [opacity, blur, backdrop] = WINDOW_OPACITY_KEYS;
+    let [opacity, blur, backdrop, glass] = WINDOW_OPACITY_KEYS;
+    let mac_glass = settings.appearance.mac_glass;
     [
         (opacity, changes.opacity.map(|opacity| opacity.to_dynamic())),
         (blur, changes.blur.map(|blur| blur.to_dynamic())),
         (backdrop, changes.acrylic.map(|acrylic| acrylic.to_dynamic())),
+        // Always, on macOS: choosing the blur in Settings undoes a glass the
+        // configuration file asks for.
+        (
+            glass,
+            cfg!(target_os = "macos").then(|| mac_glass.glass().to_dynamic()),
+        ),
     ]
 }
 
 /// The configuration keys Settings' window opacity overrides in a window.
-pub(crate) const WINDOW_OPACITY_KEYS: [&str; 3] = [
+pub(crate) const WINDOW_OPACITY_KEYS: [&str; 4] = [
     "window_background_opacity",
     "macos_window_background_blur",
     "win32_backdrop_trial",
+    "macos_window_glass",
 ];
 
 /// What a window opacity of `percent` changes in a window's configuration:
@@ -1945,6 +1982,7 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.app_icon != after.appearance.app_icon
         || before.appearance.color_scheme != after.appearance.color_scheme
         || before.appearance.window_opacity != after.appearance.window_opacity
+        || before.appearance.mac_glass != after.appearance.mac_glass
     {
         // Language, theme, colour scheme, opacity, chrome and app icon.
         apply_to_app(after);
@@ -2906,12 +2944,19 @@ mod tests {
     fn window_opacity_overrides_the_opacity_and_asks_for_a_blur() {
         use wezterm_dynamic::ToDynamic;
         let mut settings = ThinkTermNativeSettings::default();
-        let [opacity, blur, backdrop] = window_opacity_overrides(&settings);
+        let [opacity, blur, backdrop, glass] = window_opacity_overrides(&settings);
         assert_eq!(opacity, ("window_background_opacity", None));
         assert_eq!(blur, ("macos_window_background_blur", None));
         assert_eq!(backdrop, ("win32_backdrop_trial", None));
+        assert_eq!(
+            glass,
+            (
+                "macos_window_glass",
+                cfg!(target_os = "macos").then(|| config::MacosWindowGlass::Blur.to_dynamic())
+            )
+        );
         settings.appearance.window_opacity = Some(80);
-        let [opacity, blur, _] = window_opacity_overrides(&settings);
+        let [opacity, blur, ..] = window_opacity_overrides(&settings);
         if window_opacity_supported() {
             assert_eq!(opacity.1, Some(0.8f64.to_dynamic()));
         } else {
@@ -2925,21 +2970,45 @@ mod tests {
             assert_eq!(opacity.1, Some(0.3f64.to_dynamic()));
         }
         settings.appearance.window_opacity = Some(100);
-        let [_, blur, _] = window_opacity_overrides(&settings);
+        let [_, blur, ..] = window_opacity_overrides(&settings);
         assert_eq!(blur.1, None);
         // Opaque, Windows is asked for no acrylic either. The Windows
         // backdrop itself is never Settings' to set.
-        let [.., backdrop] = window_opacity_overrides(&settings);
+        let [_, _, backdrop, _] = window_opacity_overrides(&settings);
         assert_eq!(backdrop.1, None);
         assert!(!WINDOW_OPACITY_KEYS.contains(&"win32_system_backdrop"));
         // See-through, it is, on Windows.
         settings.appearance.window_opacity = Some(80);
-        let [.., backdrop] = window_opacity_overrides(&settings);
+        let [_, _, backdrop, _] = window_opacity_overrides(&settings);
         assert_eq!(
             backdrop.1,
             (cfg!(windows) && window_opacity_supported())
                 .then(|| config::Win32BackdropTrial::Composition.to_dynamic())
         );
+    }
+
+    #[test]
+    fn the_mac_glass_is_asked_for_on_macos_and_read_whatever_was_written() {
+        use wezterm_dynamic::ToDynamic;
+        let mut settings = ThinkTermNativeSettings::default();
+        settings.appearance.mac_glass = NativeMacGlass::ClearOverBlur;
+        let [.., glass] = window_opacity_overrides(&settings);
+        assert_eq!(
+            glass.1,
+            cfg!(target_os = "macos")
+                .then(|| config::MacosWindowGlass::ClearOverBlur.to_dynamic())
+        );
+        let read = |written: &str| {
+            let text = format!(r#"{{"appearance":{{"mac_glass":{written}}}}}"#);
+            serde_json::from_str::<ThinkTermNativeSettings>(&text)
+                .unwrap()
+                .appearance
+                .mac_glass
+        };
+        assert_eq!(read(r#""clear_over_blur""#), NativeMacGlass::ClearOverBlur);
+        // A look tried and dropped reads as the blur.
+        assert_eq!(read(r#""regular_over_blur""#), NativeMacGlass::Blur);
+        assert_eq!(read(r#""something_new""#), NativeMacGlass::Blur);
     }
 
     #[test]

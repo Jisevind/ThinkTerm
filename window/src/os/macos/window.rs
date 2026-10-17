@@ -33,7 +33,7 @@ use cocoa::foundation::{
     NSString, NSUInteger,
 };
 use config::window::WindowLevel;
-use config::{ConfigHandle, RgbaColor, SrgbaTuple};
+use config::{ConfigHandle, MacosWindowGlass, RgbaColor, SrgbaTuple};
 use core_foundation::base::{CFTypeID, TCFType};
 use core_foundation::bundle::{CFBundleGetBundleWithIdentifier, CFBundleGetFunctionPointerForName};
 use core_foundation::data::{CFData, CFDataGetBytePtr, CFDataRef};
@@ -771,6 +771,53 @@ pub(crate) struct WindowInner {
     window: StrongPtr,
     config: ConfigHandle,
     titlebar_sidebar_button_visible: bool,
+    /// The Liquid Glass the view sits in while the window is see-through,
+    /// in place of it as the window's content view, and the look it was
+    /// made for: see `update_glass`.
+    glass: Option<(StrongPtr, GlassLook)>,
+    /// What the glass sits on when the look has a blur under it: an
+    /// `NSVisualEffectView` blurring the desktop behind the window, as the
+    /// window's content view in the glass's place.
+    glass_backing: Option<StrongPtr>,
+}
+
+/// Liquid Glass as `NSGlassEffectView` draws it: its style, and whether it
+/// sits on a blur of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlassLook {
+    style: isize,
+    over_blur: bool,
+}
+
+impl GlassLook {
+    /// The look `glass` asks for, or `None` for the plain blur.
+    fn of(glass: MacosWindowGlass) -> Option<Self> {
+        let (style, over_blur) = match glass {
+            MacosWindowGlass::Blur => return None,
+            MacosWindowGlass::Regular => (0, false),
+            MacosWindowGlass::Clear => (1, false),
+            MacosWindowGlass::ClearOverBlur => (1, true),
+        };
+        Some(Self { style, over_blur })
+    }
+}
+
+/// Whether this macOS has Liquid Glass (26 and later).
+pub fn liquid_glass_available() -> bool {
+    Class::get("NSGlassEffectView").is_some()
+}
+
+/// The radius of `window`'s corners, which the glass has to share or its
+/// corners show unblurred: AppKit keeps it in the private `_cornerRadius`.
+fn window_corner_radius(window: id) -> CGFloat {
+    unsafe {
+        let responds: BOOL = msg_send![window, respondsToSelector: sel!(_cornerRadius)];
+        if responds == YES {
+            msg_send![window, _cornerRadius]
+        } else {
+            0.0
+        }
+    }
 }
 
 fn function_key_to_keycode(function_key: char) -> KeyCode {
@@ -1046,6 +1093,8 @@ impl Window {
                 view,
                 config: config.clone(),
                 titlebar_sidebar_button_visible: false,
+                glass: None,
+                glass_backing: None,
             }));
             inner.borrow_mut().window.replace(weak_window);
             conn.windows
@@ -1767,17 +1816,24 @@ impl WindowInner {
                 .window_decorations
                 .contains(WindowDecorations::MACOS_FORCE_ENABLE_SHADOW)
             {
-                YES
+                true
             } else if self
                 .config
                 .window_decorations
                 .contains(WindowDecorations::MACOS_FORCE_DISABLE_SHADOW)
             {
-                NO
+                false
             } else {
-                is_opaque
+                // Glass is a surface of its own, and its shadow takes its
+                // shape -- except clear glass alone, which lets the text's
+                // alpha through as the plain window does (wezterm#310).
+                is_opaque == YES
+                    || self
+                        .glass
+                        .as_ref()
+                        .is_some_and(|(_, look)| look.style == 0 || look.over_blur)
             };
-            self.window.setHasShadow_(shadow);
+            self.window.setHasShadow_(if shadow { YES } else { NO });
         }
     }
 
@@ -1797,12 +1853,74 @@ impl WindowInner {
     }
 
     fn update_window_background_blur(&mut self) {
+        // The glass blurs what is behind it itself, or sits on a blur of its
+        // own: this one, the window server's, under it puts a dark band
+        // along its rim.
+        let radius = if self.glass.is_some() {
+            0
+        } else {
+            self.config.macos_window_background_blur
+        };
         unsafe {
             CGSSetWindowBackgroundBlurRadius(
                 CGSMainConnectionID(),
                 self.window.windowNumber(),
-                self.config.macos_window_background_blur,
+                radius,
             );
+        }
+    }
+
+    /// Put the view in Liquid Glass while the window is see-through and
+    /// the configuration asks for it, and take it out again otherwise. The
+    /// glass is the window's content view then -- or sits in the blur that
+    /// is -- with ours as its content: what we draw see-through shows the
+    /// glass behind it. A different look is made afresh.
+    fn update_glass(&mut self) {
+        let look = GlassLook::of(self.config.macos_window_glass)
+            .filter(|_| self.config.window_background_opacity < 1.0)
+            .filter(|_| liquid_glass_available());
+        if self.glass.as_ref().map(|(_, made)| *made) == look {
+            return;
+        }
+        unsafe {
+            if let Some((glass, _)) = self.glass.take() {
+                let () = msg_send![*glass, setContentView: nil];
+                self.window.setContentView_(*self.view);
+                self.glass_backing = None;
+            }
+            if let Some(look) = look {
+                let frame = NSView::frame(*self.view);
+                let glass: id = msg_send![class!(NSGlassEffectView), alloc];
+                let glass = StrongPtr::new(msg_send![glass, initWithFrame: frame]);
+                let () = msg_send![*glass, setStyle: look.style];
+                let () = msg_send![*glass, setCornerRadius: window_corner_radius(*self.window)];
+                let () = msg_send![
+                    *glass,
+                    setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
+                ];
+                if look.over_blur {
+                    let backing: id = msg_send![class!(NSVisualEffectView), alloc];
+                    let backing = StrongPtr::new(msg_send![backing, initWithFrame: frame]);
+                    // Blending behind the window, always active, with the
+                    // under-window material.
+                    let () = msg_send![*backing, setBlendingMode: 0isize];
+                    let () = msg_send![*backing, setState: 1isize];
+                    let () = msg_send![*backing, setMaterial: 21isize];
+                    let () = msg_send![
+                        *backing,
+                        setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
+                    ];
+                    self.window.setContentView_(*backing);
+                    let () = msg_send![*backing, addSubview: *glass];
+                    self.glass_backing = Some(backing);
+                } else {
+                    self.window.setContentView_(*glass);
+                }
+                let () = msg_send![*glass, setContentView: *self.view];
+                self.glass = Some((glass, look));
+            }
+            log::info!("liquid glass: {look:?}");
+            let () = msg_send![*self.window, makeFirstResponder: *self.view];
         }
     }
 }
@@ -2292,6 +2410,7 @@ impl WindowInner {
                 inner.screen_changed = true;
             }
         }
+        self.update_glass();
         self.update_window_shadow();
         self.update_window_background_blur();
         self.update_titlebar_background();
