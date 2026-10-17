@@ -5334,6 +5334,10 @@ impl SettingsWindow {
         self.ui.open_dropdown = None;
         // Merged into the freshest settings, as `apply_window_opacity` is.
         let mut merged = crate::native_settings::load();
+        // Way 4 is settled as a window is made: choosing it, or leaving it,
+        // shows once ThinkTerm has restarted.
+        let after_restart = [merged.appearance.windows_backdrop, backdrop]
+            .contains(&NativeWindowsBackdrop::Composition);
         merged.appearance.windows_backdrop = backdrop;
         self.set_native_settings(merged);
         let setting = crate::i18n::tr("settings-windows-backdrop");
@@ -5341,7 +5345,11 @@ impl SettingsWindow {
             Ok(()) => {
                 crate::native_settings::apply_window_opacity_to_app(&self.native_settings);
                 self.status = settings_tr(
-                    "settings-status-value-now",
+                    if after_restart {
+                        "settings-status-value-after-restart"
+                    } else {
+                        "settings-status-value-now"
+                    },
                     &[
                         ("setting", setting),
                         ("value", localized_windows_backdrop_label(backdrop)),
