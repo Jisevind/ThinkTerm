@@ -226,6 +226,30 @@ pub fn check_now() -> anyhow::Result<()> {
     record_latest_release(&latest)
 }
 
+/// The release to install in place of `offered`, the one on offer: a newer
+/// one may have come out since it was found, and installing it would only
+/// be followed by another update. What GitHub says is recorded as a check
+/// records it; when it cannot say, the offer stands. Blocks on the network,
+/// so callers run it off the UI thread.
+pub fn newest_release(offered: Release) -> Release {
+    let Ok(mut latest) = get_latest_release_info() else {
+        return offered;
+    };
+    let verdict = judge_release(
+        &mut latest,
+        &running_release_version(),
+        cached_release().as_ref(),
+    );
+    if !verdict.newer {
+        return offered;
+    }
+    set_update_available(true, verdict.new_build, &latest);
+    if let Err(err) = record_latest_release(&latest) {
+        log::warn!("{err:#}");
+    }
+    latest
+}
+
 /// Persist the newest release seen; the file's mtime is the time of the
 /// check. Written beside it and renamed over it, so a reader -- Settings, or
 /// the other of the two threads that check -- never sees half a file.

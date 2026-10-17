@@ -475,6 +475,25 @@ fn start_update_install_with(
     let spawned = std::thread::Builder::new()
         .name("thinkterm-update-install".into())
         .spawn(move || {
+            // What is newest now, should a release have come out since this
+            // one was found; the page and the capsule name it from here on.
+            let release = crate::update::newest_release(release);
+            let newest = release.tag_name.trim_start_matches('v').to_string();
+            if newest != version {
+                let newest = newest.clone();
+                promise::spawn::spawn_into_main_thread(async move {
+                    UPDATE_INSTALL.with(|install| {
+                        if let Some(UpdateInstall::Running { version, .. }) =
+                            &mut *install.borrow_mut()
+                        {
+                            *version = newest;
+                        }
+                    });
+                    repaint_open_settings(true);
+                })
+                .detach();
+            }
+            let version = newest;
             // A cache written by a build that did not keep
             // GitHub's checksums lacks them: ask for the release
             // again then, and settle for the cache if that fails.
@@ -14754,7 +14773,7 @@ impl SettingsWindow {
         headline: &str,
         subline: &str,
         progress: Option<f32>,
-        button: Option<(String, SettingsAction)>,
+        buttons: Vec<(String, SettingsAction)>,
     ) -> anyhow::Result<f32> {
         let palette = self.palette();
         let body_font = Rc::clone(&self.body_font);
@@ -14766,18 +14785,23 @@ impl SettingsWindow {
 
         self.paint_group_card(layers, x, y, max_width, height)?;
 
+        // On the card's right, top to bottom and one width for all: side by
+        // side, two of them leave the text too little room in most languages.
         let mut text_right = x + max_width - padding;
-        if let Some((label, action)) = button {
-            let width = self.button_width_for_label(&label, self.ui_px(230.0));
+        if !buttons.is_empty() {
+            let width = buttons
+                .iter()
+                .map(|(label, _)| self.button_width_for_label(label, self.ui_px(230.0)))
+                .fold(0.0, f32::max);
+            let control = self.ui_px(CONTROL_HEIGHT);
+            let gap = self.ui_px(12.0);
+            let count = buttons.len() as f32;
             let button_x = x + max_width - padding - width;
-            self.draw_button(
-                layers,
-                button_x,
-                y + (height - self.ui_px(CONTROL_HEIGHT)) / 2.0,
-                width,
-                &label,
-                action,
-            )?;
+            let mut button_y = y + (height - (control * count + gap * (count - 1.0))) / 2.0;
+            for (label, action) in buttons {
+                self.draw_button(layers, button_x, button_y, width, &label, action)?;
+                button_y += control + gap;
+            }
             text_right = button_x - self.ui_px(24.0);
         }
 
@@ -15593,9 +15617,10 @@ impl SettingsWindow {
             crate::i18n::tr("settings-update-check-now")
         };
 
-        // The one button on the hero: install when there is something to
-        // install and this copy is ours to replace, restart once it has been
-        // replaced, check otherwise. While an install runs there is nothing
+        // The hero's buttons: install when there is something to install and
+        // this copy is ours to replace, with a check under it, as a newer
+        // release may have come out since; restart once it has been
+        // replaced; check otherwise. While an install runs there is nothing
         // to click, and the Windows installer restarts ThinkTerm itself.
         let self_updatable = self
             .ui
@@ -15603,25 +15628,28 @@ impl SettingsWindow {
             .as_ref()
             .is_some_and(|method| method.self_updatable() || cfg!(windows));
         let install = update_install();
-        let hero_button = match (&hero, &install) {
-            (_, Some(UpdateInstall::Running { .. })) => None,
+        let hero_buttons = match (&hero, &install) {
+            (_, Some(UpdateInstall::Running { .. })) => vec![],
             // Restart only where it ends no terminal: shells this process
             // runs itself would go with it, so there the person quits and
             // reopens when ready. The Windows installer restarts by itself.
             (_, Some(UpdateInstall::Installed { .. }))
                 if !cfg!(windows) && !restart_ends_terminals() =>
             {
-                Some((
+                vec![(
                     crate::i18n::tr("settings-restart"),
                     SettingsAction::RestartApplication,
-                ))
+                )]
             }
-            (_, Some(UpdateInstall::Installed { .. })) => None,
-            (UpdateHero::Available { .. }, _) if self_updatable => Some((
-                crate::i18n::tr("settings-update-install"),
-                SettingsAction::InstallUpdate,
-            )),
-            _ => Some((check_label, SettingsAction::CheckForUpdates)),
+            (_, Some(UpdateInstall::Installed { .. })) => vec![],
+            (UpdateHero::Available { .. }, _) if self_updatable => vec![
+                (
+                    crate::i18n::tr("settings-update-install"),
+                    SettingsAction::InstallUpdate,
+                ),
+                (check_label, SettingsAction::CheckForUpdates),
+            ],
+            _ => vec![(check_label, SettingsAction::CheckForUpdates)],
         };
 
         // The card says what is happening now: an install or a check in
@@ -15724,7 +15752,7 @@ impl SettingsWindow {
             &headline,
             &subline,
             progress,
-            hero_button,
+            hero_buttons,
         )?;
 
         // Three plain facts, one line each: the labels say what they are, and
@@ -15896,7 +15924,7 @@ impl SettingsWindow {
                 &[("version", version.clone())],
             ),
             None,
-            Some((copy_label, SettingsAction::CopyVersionInfo)),
+            vec![(copy_label, SettingsAction::CopyVersionInfo)],
         )?;
 
         // Build only earns a line when it says something Version does not: a
