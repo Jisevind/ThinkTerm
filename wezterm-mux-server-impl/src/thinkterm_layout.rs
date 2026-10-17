@@ -93,6 +93,29 @@ lazy_static::lazy_static! {
 static LISTENER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static CHANGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// The file's writes, in the order their snapshots were taken. A write
+/// waits for the disk -- on macOS `sync_all` is a full flush, 5 to 30 ms --
+/// so the debounced snapshot, taken on the main thread after every focus
+/// change, hands its write to a thread of its own; `flush_now` still writes
+/// in place. A write older than one already on disk is dropped.
+static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// A write handed off did not land: the next snapshot writes even when
+/// nothing changed since.
+static BACKGROUND_WRITE_FAILED: AtomicBool = AtomicBool::new(false);
+
+lazy_static::lazy_static! {
+    /// The newest write done, per file.
+    static ref WRITTEN: Mutex<HashMap<PathBuf, u64>> = Mutex::new(HashMap::new());
+    /// The newest write handed off and not yet started, per file.
+    static ref PENDING_WRITE: Mutex<PendingWrite> = Mutex::new(PendingWrite::default());
+}
+
+#[derive(Default)]
+struct PendingWrite {
+    next: HashMap<PathBuf, (u64, StoredLayouts)>,
+    writer_running: bool,
+}
+
 pub fn layout_path() -> PathBuf {
     config::DATA_DIR.join("thinkterm_layout.json")
 }
@@ -164,12 +187,115 @@ fn commit_candidate(
     current: &mut StoredLayouts,
     candidate: StoredLayouts,
 ) -> Result<bool> {
-    if candidate == *current {
+    // What was handed to the writer is on disk before this returns: a
+    // caller writing in place -- `flush_now`, just before the process
+    // exits -- must not leave it to a thread about to die.
+    finish_handed_off_writes();
+    if candidate == *current && !BACKGROUND_WRITE_FAILED.load(Ordering::Acquire) {
         return Ok(false);
     }
-    save_to_path(path, &candidate)?;
+    let sequence = WRITE_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
+    save_in_order(path, &candidate, sequence)?;
+    BACKGROUND_WRITE_FAILED.store(false, Ordering::Release);
     *current = candidate;
     Ok(true)
+}
+
+/// As `commit_candidate`, but the write happens on another thread: the
+/// snapshot in memory changes now, the file as soon as the disk allows.
+fn commit_candidate_in_background(
+    path: &Path,
+    current: &mut StoredLayouts,
+    candidate: StoredLayouts,
+) -> bool {
+    if candidate == *current && !BACKGROUND_WRITE_FAILED.load(Ordering::Acquire) {
+        return false;
+    }
+    let sequence = WRITE_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
+    BACKGROUND_WRITE_FAILED.store(false, Ordering::Release);
+    *current = candidate.clone();
+
+    let mut pending = PENDING_WRITE.lock().unwrap();
+    pending
+        .next
+        .insert(path.to_path_buf(), (sequence, candidate));
+    if pending.writer_running {
+        return true;
+    }
+    pending.writer_running = true;
+    drop(pending);
+    if let Err(err) = std::thread::Builder::new()
+        .name("layout-writer".to_string())
+        .spawn(write_pending)
+    {
+        log::warn!("starting the layout writer: {err:#}; writing in place");
+        write_pending();
+    }
+    true
+}
+
+/// Write what was handed off, newest first, until nothing is left.
+fn write_pending() {
+    loop {
+        let mut pending = PENDING_WRITE.lock().unwrap();
+        let Some(path) = pending.next.keys().next().cloned() else {
+            pending.writer_running = false;
+            return;
+        };
+        let Some((sequence, stored)) = pending.next.remove(&path) else {
+            continue;
+        };
+        // The file is held before the slot is let go: a commit finishing
+        // the handed-off writes finds either the write still in the slot
+        // or this one under way, and waits for it.
+        let mut written = WRITTEN.lock().unwrap();
+        drop(pending);
+        write_handed_off(&mut written, &path, &stored, sequence);
+    }
+}
+
+/// Write here what was handed off and not started yet, after the write
+/// under way, if any.
+fn finish_handed_off_writes() {
+    let mut pending = PENDING_WRITE.lock().unwrap();
+    let handed_off = std::mem::take(&mut pending.next);
+    let mut written = WRITTEN.lock().unwrap();
+    drop(pending);
+    for (path, (sequence, stored)) in handed_off {
+        write_handed_off(&mut written, &path, &stored, sequence);
+    }
+}
+
+fn write_handed_off(
+    written: &mut HashMap<PathBuf, u64>,
+    path: &Path,
+    stored: &StoredLayouts,
+    sequence: u64,
+) {
+    if let Err(err) = save_in_order_locked(written, path, stored, sequence) {
+        // Marked while the file is held, so a commit waiting on it sees it.
+        BACKGROUND_WRITE_FAILED.store(true, Ordering::Release);
+        log::error!("persisting ThinkTerm layouts: {err:#}");
+    }
+}
+
+/// Write `stored` unless a newer snapshot of the file is already on disk.
+fn save_in_order(path: &Path, stored: &StoredLayouts, sequence: u64) -> Result<()> {
+    save_in_order_locked(&mut WRITTEN.lock().unwrap(), path, stored, sequence)
+}
+
+fn save_in_order_locked(
+    written: &mut HashMap<PathBuf, u64>,
+    path: &Path,
+    stored: &StoredLayouts,
+    sequence: u64,
+) -> Result<()> {
+    if written.get(path).is_some_and(|done| *done >= sequence) {
+        return Ok(());
+    }
+    save_to_path(path, stored)?;
+    written.insert(path.to_path_buf(), sequence);
+    Ok(())
 }
 
 fn prune_orphaned_layouts(
@@ -226,7 +352,7 @@ fn schedule_snapshot() {
             if CHANGE_GENERATION.load(Ordering::Acquire) != generation {
                 return;
             }
-            if let Err(err) = snapshot_live_layouts(generation) {
+            if let Err(err) = snapshot_live_layouts(generation, true) {
                 log::error!("persisting ThinkTerm layouts: {err:#}");
             }
         })
@@ -240,7 +366,7 @@ fn schedule_snapshot() {
 /// discard the user's final split/tab/focus change.
 pub fn flush_now() -> Result<()> {
     let generation = CHANGE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    snapshot_live_layouts(generation)
+    snapshot_live_layouts(generation, false)
 }
 
 fn thread_records(tree: &codec::ThinkTermTree) -> Vec<(String, String)> {
@@ -258,7 +384,7 @@ fn thread_records(tree: &codec::ThinkTermTree) -> Vec<(String, String)> {
         .collect()
 }
 
-fn snapshot_live_layouts(_generation: u64) -> Result<()> {
+fn snapshot_live_layouts(_generation: u64, in_background: bool) -> Result<()> {
     let tree = crate::thinkterm_tree::snapshot();
     let records = thread_records(&tree);
     // An archived project's stored layouts are frozen: archiving kills its
@@ -328,7 +454,11 @@ fn snapshot_live_layouts(_generation: u64) -> Result<()> {
         }
     }
 
-    commit_candidate(&layout_path(), &mut store.stored, candidate)?;
+    if in_background {
+        commit_candidate_in_background(&layout_path(), &mut store.stored, candidate);
+    } else {
+        commit_candidate(&layout_path(), &mut store.stored, candidate)?;
+    }
     store.live_workspaces = next_live;
     Ok(())
 }
@@ -953,6 +1083,60 @@ mod tests {
         let before = current.clone();
         assert!(commit_candidate(&path, &mut current, StoredLayouts::default()).is_err());
         assert_eq!(current, before);
+    }
+
+    #[test]
+    fn an_older_write_never_lands_over_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thinkterm_layout.json");
+        let mut newer = StoredLayouts::default();
+        newer
+            .layouts
+            .insert("thread-1".to_string(), sample_layout("workspace-1"));
+        save_in_order(&path, &newer, 2).unwrap();
+        save_in_order(&path, &StoredLayouts::default(), 1).unwrap();
+        assert_eq!(load_from_path(&path).unwrap(), newer);
+    }
+
+    #[test]
+    fn a_write_handed_off_lands_while_memory_changes_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thinkterm_layout.json");
+        let mut current = StoredLayouts::default();
+        let mut candidate = StoredLayouts::default();
+        candidate
+            .layouts
+            .insert("thread-1".to_string(), sample_layout("workspace-1"));
+        assert!(commit_candidate_in_background(
+            &path,
+            &mut current,
+            candidate.clone()
+        ));
+        assert_eq!(current, candidate);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while load_from_path(&path).ok().as_ref() != Some(&candidate) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the write never landed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn writing_in_place_first_finishes_what_was_handed_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thinkterm_layout.json");
+        let mut current = StoredLayouts::default();
+        let mut candidate = StoredLayouts::default();
+        candidate
+            .layouts
+            .insert("thread-1".to_string(), sample_layout("workspace-1"));
+        commit_candidate_in_background(&path, &mut current, candidate.clone());
+        // As `flush_now` before an exit, with nothing new to write: what
+        // the writer had is on disk by the time it returns.
+        assert!(!commit_candidate(&path, &mut current, candidate.clone()).unwrap());
+        assert_eq!(load_from_path(&path).unwrap(), candidate);
     }
 
     #[test]
