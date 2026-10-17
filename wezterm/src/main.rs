@@ -1224,6 +1224,9 @@ fn init_config(opts: &Opt) -> anyhow::Result<ConfigHandle> {
 
 fn run() -> anyhow::Result<()> {
     env_bootstrap::bootstrap();
+    // Updates from here through the system's curl, which goes through the
+    // proxy the environment names; see `thinkterm_update::curl_transport`.
+    thinkterm_update::set_transport(thinkterm_update::curl_transport);
 
     let saver = UmaskSaver::new();
 

@@ -32,6 +32,113 @@ pub const REPO_URL: &str = "https://github.com/RoversX/thinkterm";
 pub const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh";
 
+/// Hosts that proxy github.com downloads, for where GitHub itself is slow
+/// or unreachable, in the order `Auto` tries them. `install.sh` carries the
+/// same list for `--mirror auto`.
+pub const MIRRORS: [&str; 4] = ["ghfast.top", "gh-proxy.org", "ghproxy.net", "gh.llkk.cc"];
+
+/// Where release archives and the Windows installer are downloaded from.
+/// Only those: the releases API and the installer script always come from
+/// GitHub, and an archive from a mirror is used only when it matches the
+/// digest GitHub recorded for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DownloadSource {
+    /// GitHub, then each of `MIRRORS` in turn, then GitHub again: a link
+    /// that is slow everywhere ends on GitHub, not on whichever mirror
+    /// happens to be last.
+    #[default]
+    Auto,
+    /// GitHub only.
+    Direct,
+    /// This mirror, then GitHub.
+    Mirror(&'static str),
+}
+
+impl DownloadSource {
+    /// Every choice, in the order Settings offers them. The first is what a
+    /// process nobody told otherwise uses, as install.sh does.
+    pub fn all() -> impl Iterator<Item = Self> {
+        [Self::Auto, Self::Direct]
+            .into_iter()
+            .chain(MIRRORS.iter().map(|host| Self::Mirror(host)))
+    }
+
+    /// The name a settings file keeps: "direct", "auto" or a mirror's host.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Auto => "auto",
+            Self::Mirror(host) => host,
+        }
+    }
+
+    /// The source a settings file names; anything this build does not know
+    /// -- a mirror since dropped from `MIRRORS`, say -- is the default.
+    pub fn from_name(name: &str) -> Self {
+        Self::all()
+            .find(|source| source.name() == name)
+            .unwrap_or_default()
+    }
+
+    /// Where to fetch `github_url` from, in order.
+    fn urls(self, github_url: &str) -> Vec<String> {
+        let via = |host: &str| format!("https://{host}/{github_url}");
+        match self {
+            Self::Direct => vec![github_url.to_string()],
+            Self::Auto => std::iter::once(github_url.to_string())
+                .chain(MIRRORS.iter().map(|host| via(host)))
+                .chain(std::iter::once(github_url.to_string()))
+                .collect(),
+            Self::Mirror(host) => vec![via(host), github_url.to_string()],
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::all().position(|source| source == self).unwrap_or(0)
+    }
+}
+
+/// `DOWNLOAD_SOURCE` before anything set it.
+const SOURCE_UNSET: usize = usize::MAX;
+
+static DOWNLOAD_SOURCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(SOURCE_UNSET);
+
+/// The GUI sets this from its settings as they change.
+pub fn set_download_source(source: DownloadSource) {
+    DOWNLOAD_SOURCE.store(source.index(), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// What the GUI set; in a process it did not set it in -- the CLI, the mux
+/// server -- what its settings file says right now, so the choice made in
+/// Settings holds there too.
+pub fn download_source() -> DownloadSource {
+    match DOWNLOAD_SOURCE.load(std::sync::atomic::Ordering::SeqCst) {
+        SOURCE_UNSET => download_source_at(&config::native_settings_path()),
+        index => DownloadSource::all().nth(index).unwrap_or_default(),
+    }
+}
+
+/// The download source the GUI's settings file at `path` names, or the
+/// default when it names none or cannot be read.
+fn download_source_at(path: &Path) -> DownloadSource {
+    #[derive(Default, Deserialize)]
+    struct Settings {
+        #[serde(default)]
+        workspaces: Workspaces,
+    }
+    #[derive(Default, Deserialize)]
+    struct Workspaces {
+        #[serde(default)]
+        update_download_source: String,
+    }
+    let settings = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+        .unwrap_or_default();
+    DownloadSource::from_name(&settings.workspaces.update_download_source)
+}
+
 const API_RELEASES: &str = "https://api.github.com/repos/RoversX/thinkterm/releases";
 const API_COMMITS: &str = "https://api.github.com/repos/RoversX/thinkterm/commits";
 
@@ -166,6 +273,61 @@ struct DownloadSink<'a> {
     reported: Option<Instant>,
 }
 
+/// When a source that has another after it gives way to the next one: it
+/// takes longer than `connect` to connect, sends nothing for `stall`, or --
+/// where the transport can drop a body part-way -- sends under `min_rate`
+/// bytes a second over a `window`. From mainland China GitHub often hangs
+/// or crawls rather than fails. install.sh asks curl for the same.
+#[derive(Debug, Clone, Copy)]
+pub struct GiveWay {
+    pub connect: Duration,
+    pub stall: Duration,
+    pub min_rate: u64,
+    pub window: Duration,
+}
+
+const GIVE_WAY: GiveWay = GiveWay {
+    connect: Duration::from_secs(10),
+    stall: Duration::from_secs(20),
+    min_rate: 300 * 1024,
+    window: Duration::from_secs(20),
+};
+
+/// What one GET came back with. A 2xx body has gone to the writer by then.
+#[derive(Debug)]
+pub struct Answer {
+    pub status: u16,
+    pub reason: String,
+    pub location: Option<String>,
+}
+
+/// One GET of `url` sending `headers`, redirects not followed, the body of a
+/// 2xx written out as it arrives; `give_way` as above, for a source that has
+/// another after it.
+pub type Transport = fn(
+    url: &str,
+    headers: &[(&str, String)],
+    give_way: Option<GiveWay>,
+    body: &mut dyn Write,
+) -> anyhow::Result<Answer>;
+
+static TRANSPORT: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
+
+/// Make every GET here -- the releases API, install.sh, release assets --
+/// through `transport` instead of http_req. The GUI hands over one built on
+/// reqwest, which it links anyway: that goes through the system's proxy,
+/// and can drop a body part-way, so a source that crawls gives way too,
+/// where http_req can only leave one that stalls (its reader thread panics
+/// when the body is dropped early). The CLI and the mux server, which do
+/// not link reqwest, stay on http_req.
+pub fn set_transport(transport: Transport) {
+    let _ = TRANSPORT.set(transport);
+}
+
+fn transport() -> Transport {
+    TRANSPORT.get().copied().unwrap_or(http_req_transport)
+}
+
 impl Write for DownloadSink<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         use sha2::Digest;
@@ -216,9 +378,11 @@ pub fn download_asset_to(
     use sha2::Digest;
     // With a token the repository may be private, and then only the API
     // serves the bytes; install.sh downloads from there in that case too.
-    let (url, accept) = match update_token() {
-        Some(_) => (asset.url.as_str(), Some("application/octet-stream")),
-        None => (asset.browser_download_url.as_str(), None),
+    // A mirror only when there is a digest to check what it sends.
+    let (urls, accept) = match update_token() {
+        Some(_) => (vec![asset.url.clone()], Some("application/octet-stream")),
+        None if asset.sha256().is_none() => (vec![asset.browser_download_url.clone()], None),
+        None => (download_source().urls(&asset.browser_download_url), None),
     };
     let file =
         std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -231,37 +395,65 @@ pub fn download_asset_to(
         interval: PROGRESS_INTERVAL,
         reported: None,
     };
-    let mut attempt = 1;
-    let fetched = loop {
-        let mut result = http_get_into(url, accept, &mut sink);
-        if result.is_ok() {
-            result = sink.flush().map_err(anyhow::Error::from);
-        }
-        // http_req ends a body at the first read error instead of failing,
-        // so a dropped connection arrives as a short file: count the bytes.
-        if result.is_ok() && sink.total > 0 && sink.done != sink.total {
-            result = Err(anyhow!(
-                "the download stopped at {} of {} bytes",
-                sink.done,
-                sink.total
-            ));
-        }
-        match result {
-            Err(err)
-                if attempt < DOWNLOAD_ATTEMPTS
-                    && !err.chain().any(|cause| cause.is::<Refused>()) =>
-            {
-                log::warn!("downloading {} (attempt {attempt}): {err:#}", asset.name);
-                std::thread::sleep(Duration::from_secs(attempt));
-                attempt += 1;
-                if let Err(err) = sink.restart() {
-                    break Err(err.into());
-                }
+    let transport = transport();
+    let mut fetched = Err(anyhow!("no source to download from"));
+    for (index, url) in urls.iter().enumerate() {
+        // Every source but the last gets one try and gives way as `GiveWay`
+        // says; the last is the one there is no point leaving.
+        let last = index + 1 == urls.len();
+        let attempts = if last { DOWNLOAD_ATTEMPTS } else { 1 };
+        let give_way = (!last).then_some(GIVE_WAY);
+        if index > 0 {
+            if let Err(err) = sink.restart() {
+                fetched = Err(err.into());
+                break;
             }
-            result => break result,
+            // Back to nothing at once, not when the next source first sends.
+            (sink.progress)(0, sink.total);
+        }
+        let mut attempt = 1;
+        fetched = loop {
+            let mut result = http_get_into(url, accept, transport, give_way, &mut sink);
+            if result.is_ok() {
+                result = sink.flush().map_err(anyhow::Error::from);
+            }
+            // http_req ends a body at the first read error instead of failing,
+            // so a dropped connection arrives as a short file: count the bytes.
+            if result.is_ok() && sink.total > 0 && sink.done != sink.total {
+                result = Err(anyhow!(
+                    "the download stopped at {} of {} bytes",
+                    sink.done,
+                    sink.total
+                ));
+            }
+            match result {
+                Err(err)
+                    if attempt < attempts
+                        && !err.chain().any(|cause| cause.is::<Refused>()) =>
+                {
+                    log::warn!("downloading {} (attempt {attempt}): {err:#}", asset.name);
+                    std::thread::sleep(Duration::from_secs(attempt));
+                    attempt += 1;
+                    if let Err(err) = sink.restart() {
+                        break Err(err.into());
+                    }
+                }
+                result => break result,
+            }
+        }
+        .with_context(|| format!("downloading {} from {url}", asset.name));
+        if !last {
+            match &fetched {
+                Err(err) => log::warn!("{err:#}; trying the next source"),
+                Ok(()) if !digest_matches(asset, &sink.hasher) => {
+                    log::warn!("{} from {url} does not match its digest; discarded", asset.name);
+                    fetched = Err(anyhow!("checksum mismatch from {url}"));
+                }
+                Ok(()) => break,
+            }
+            continue;
         }
     }
-    .with_context(|| format!("downloading {}", asset.name));
     let DownloadSink {
         hasher,
         done,
@@ -289,6 +481,13 @@ pub fn download_asset_to(
         }
         None => Ok(false),
     }
+}
+
+fn digest_matches(asset: &Asset, hasher: &sha2::Sha256) -> bool {
+    use sha2::Digest;
+    asset
+        .sha256()
+        .map_or(true, |expected| hex::encode(hasher.clone().finalize()) == expected)
 }
 
 /// The installer ci/deploy.sh builds for `arch`. x86_64 keeps the name it
@@ -353,7 +552,7 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
 /// assets go through `download_asset_to` instead.
 pub fn http_get(uri: &str) -> anyhow::Result<Vec<u8>> {
     let mut body = Vec::new();
-    http_get_into(uri, None, &mut body)?;
+    http_get_into(uri, None, transport(), None, &mut body)?;
     Ok(body)
 }
 
@@ -375,12 +574,10 @@ const MAX_REDIRECTS: usize = 5;
 fn http_get_into<S: BodySink>(
     uri: &str,
     accept: Option<&str>,
+    transport: Transport,
+    give_way: Option<GiveWay>,
     sink: &mut S,
 ) -> anyhow::Result<()> {
-    use http_req::request::{HttpVersion, Request};
-    use http_req::uri::Uri;
-    use std::convert::TryFrom;
-
     let auth = update_token().map(|token| format!("Bearer {token}"));
 
     let mut current = uri.to_string();
@@ -390,36 +587,34 @@ fn http_get_into<S: BodySink>(
             Some(host) => format!("{uri} (redirected to {host})"),
             None => uri.to_string(),
         };
-        let parsed = Uri::try_from(current.as_str())?;
-        let mut request = Request::new(&parsed);
-        request
-            .version(HttpVersion::Http10)
-            .header("User-Agent", &format!("thinkterm/{}", config::wezterm_version()));
+        let mut headers = vec![(
+            "User-Agent",
+            format!("thinkterm/{}", config::wezterm_version()),
+        )];
         if let Some(accept) = accept {
-            request.header("Accept", accept);
+            headers.push(("Accept", accept.to_string()));
         }
         // Only to the host the token was meant for: the storage a download
         // is redirected to is signed already and must not see it.
         if let Some(auth) = auth.as_ref().filter(|_| same_host(uri, &current)) {
-            request.header("Authorization", auth);
+            headers.push(("Authorization", auth.clone()));
         }
-        let res = request
-            .send(sink)
-            .map_err(|e| anyhow!("fetching {what}: {e}"))?;
-        let status = res.status_code();
-        if status.is_redirect() {
-            let Some(location) = res.headers().get("Location") else {
+        let answer = transport(&current, &headers, give_way, &mut *sink)
+            .map_err(|e| anyhow!("fetching {what}: {e:#}"))?;
+        let status = answer.status;
+        if (300..400).contains(&status) {
+            let Some(location) = answer.location else {
                 return Err(Refused(format!("fetching {what}: HTTP {status} without a Location")).into());
             };
-            current = redirect_target(&current, location)
+            current = redirect_target(&current, &location)
                 .map_err(|err| Refused(format!("fetching {what}: {err:#}")))?;
             sink.restart()?;
             continue;
         }
-        if !status.is_success() {
-            let message = format!("fetching {what}: HTTP {status} {}", res.reason());
+        if !(200..300).contains(&status) {
+            let message = format!("fetching {what}: HTTP {status} {}", answer.reason);
             // A timeout or a rate limit is worth another try; no other 4xx is.
-            let lasting = status.is_client_err() && !matches!(u16::from(status), 408 | 429);
+            let lasting = (400..500).contains(&status) && !matches!(status, 408 | 429);
             return Err(if lasting {
                 Refused(message).into()
             } else {
@@ -429,6 +624,177 @@ fn http_get_into<S: BodySink>(
         return Ok(());
     }
     Err(Refused(format!("fetching {uri}: more than {MAX_REDIRECTS} redirects")).into())
+}
+
+/// http_req's GET: HTTP/1.0, no proxy, and a minute to connect and for
+/// each read unless `give_way` asks for less. It cannot drop a body
+/// part-way, so `give_way`'s rate goes unchecked.
+fn http_req_transport(
+    url: &str,
+    headers: &[(&str, String)],
+    give_way: Option<GiveWay>,
+    mut body: &mut dyn Write,
+) -> anyhow::Result<Answer> {
+    use http_req::request::{HttpVersion, Request};
+    use http_req::uri::Uri;
+    use std::convert::TryFrom;
+
+    let parsed = Uri::try_from(url)?;
+    let mut request = Request::new(&parsed);
+    request.version(HttpVersion::Http10);
+    for (name, value) in headers {
+        request.header(*name, value);
+    }
+    if let Some(give_way) = give_way {
+        request
+            .connect_timeout(Some(give_way.connect))
+            .read_timeout(Some(give_way.stall));
+    }
+    let res = request.send(&mut body)?;
+    Ok(Answer {
+        status: res.status_code().into(),
+        reason: res.reason().to_string(),
+        location: res.headers().get("Location").cloned(),
+    })
+}
+
+/// The GET through the system's curl, for a process that does not link
+/// reqwest: curl goes through the proxy the environment names
+/// (`https_proxy`, `all_proxy`, socks5 too), and gives up on a source that
+/// crawls. The URL and the headers -- a token among them -- reach it on its
+/// stdin, not its command line, which other users can read. With no curl
+/// to run, http_req does it.
+pub fn curl_transport(
+    url: &str,
+    headers: &[(&str, String)],
+    give_way: Option<GiveWay>,
+    body: &mut dyn Write,
+) -> anyhow::Result<Answer> {
+    curl_get(&[], url, headers, give_way, body)
+}
+
+/// `curl_transport`, with `extra` on curl's command line.
+fn curl_get(
+    extra: &[&str],
+    url: &str,
+    headers: &[(&str, String)],
+    give_way: Option<GiveWay>,
+    body: &mut dyn Write,
+) -> anyhow::Result<Answer> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::{Command, Stdio};
+
+    // A line break would end curl's config line early and start another.
+    let lines = std::iter::once(url).chain(headers.iter().map(|(_, value)| value.as_str()));
+    for line in lines {
+        anyhow::ensure!(!line.chars().any(char::is_control), "refusing {line:?}");
+    }
+    let quote = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut config = format!("url = \"{}\"\n", quote(url));
+    for (name, value) in headers {
+        config.push_str(&format!("header = \"{name}: {}\"\n", quote(value)));
+    }
+
+    // Under the rate for the window gives way, nothing at all included; the
+    // last source gets http_req's minute to connect and to go without data.
+    let (connect, rate, window) = match give_way {
+        Some(give_way) => (give_way.connect, give_way.min_rate, give_way.window),
+        None => (Duration::from_secs(60), 1, Duration::from_secs(60)),
+    };
+    let secs = |d: Duration| d.as_secs().max(1).to_string();
+    let mut child = match Command::new("curl")
+        // First, or curl reads ~/.curlrc, where an --include or a
+        // --write-out would land in the body.
+        .arg("--disable")
+        .args(["--silent", "--show-error", "--suppress-connect-headers"])
+        // The answer's head, then its body, both to stdout.
+        .args(["--dump-header", "-", "--config", "-"])
+        .args(["--connect-timeout", &secs(connect)])
+        .args(["--speed-limit", &rate.to_string(), "--speed-time", &secs(window)])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return http_req_transport(url, headers, give_way, body);
+        }
+        Err(err) => return Err(err).context("running curl"),
+    };
+    child
+        .stdin
+        .take()
+        .context("no stdin on curl")?
+        .write_all(config.as_bytes())?;
+    // What curl says when it fails, read aside so it cannot fill its pipe.
+    let stderr = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        })
+    });
+    let mut out = BufReader::new(child.stdout.take().context("no stdout on curl")?);
+
+    let read = (|| -> anyhow::Result<Option<Answer>> {
+        // "HTTP/1.1 302 Found" or "HTTP/2 200", then headers, then a blank
+        // line; nothing at all if curl failed before an answer came.
+        let mut answer: Option<Answer> = None;
+        loop {
+            let mut line = Vec::new();
+            if out.read_until(b'\n', &mut line)? == 0 {
+                return Ok(None);
+            }
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end();
+            match &mut answer {
+                None if line.is_empty() => continue,
+                None => {
+                    let mut parts = line.splitn(3, ' ');
+                    let status = parts
+                        .nth(1)
+                        .and_then(|status| status.parse().ok())
+                        .with_context(|| format!("curl answered {line:?}"))?;
+                    answer = Some(Answer {
+                        status,
+                        reason: parts.next().unwrap_or_default().to_string(),
+                        location: None,
+                    });
+                }
+                Some(_) if line.is_empty() => break,
+                Some(answer) => {
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("location") {
+                            answer.location = Some(value.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let answer = answer.expect("the loop leaves only with an answer");
+        if (200..300).contains(&answer.status) {
+            std::io::copy(&mut out, body)?;
+        }
+        Ok(Some(answer))
+    })();
+
+    // Done with it either way: an answer that was not a 2xx leaves its body
+    // unread, and curl stops when its pipe closes.
+    drop(out);
+    let complete = matches!(&read, Ok(Some(answer)) if (200..300).contains(&answer.status));
+    if !complete {
+        let _ = child.kill();
+    }
+    let exit = child.wait().context("waiting for curl")?;
+    let said = stderr
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default();
+    match read? {
+        Some(answer) if !complete || exit.success() => Ok(answer),
+        _ => Err(anyhow!("curl: {} ({exit})", said.trim())),
+    }
 }
 
 /// An answer that asking again will not change: a 4xx other than a timeout
@@ -739,8 +1105,20 @@ pub fn install_command(variant: &str, version: &str) -> String {
          trap 'rm -f \"$installer\"' EXIT; \
          trap 'exit 130' INT; trap 'exit 143' TERM; \
          curl -fsSL -o \"$installer\" {INSTALL_SCRIPT_URL} && \
-         sh \"$installer\" --{variant} --version {version})"
+         sh \"$installer\" --{variant} --version {version}{mirror})",
+        mirror = mirror_arg(download_source()),
     )
+}
+
+/// What `install.sh` is told about where to download from: nothing for
+/// `Auto`, the script's own default -- which also keeps the default working
+/// with a copy of the script from before `--mirror`. The names are this
+/// file's own, so they need no quoting.
+fn mirror_arg(source: DownloadSource) -> String {
+    match source {
+        DownloadSource::Auto => String::new(),
+        source => format!(" --mirror {}", source.name()),
+    }
 }
 
 /// The command that upgrades a running mux server on the host in place:
@@ -1086,6 +1464,187 @@ mod tests {
         ));
     }
 
+    thread_local! {
+        /// The URLs and header names `fake_transport` was asked for.
+        static ASKED: std::cell::RefCell<Vec<(String, Vec<String>)>> = Default::default();
+    }
+
+    /// github.com redirects to the storage, which answers; anything else is
+    /// not there.
+    fn fake_transport(
+        url: &str,
+        headers: &[(&str, String)],
+        _give_way: Option<GiveWay>,
+        body: &mut dyn Write,
+    ) -> anyhow::Result<Answer> {
+        ASKED.with(|asked| {
+            asked.borrow_mut().push((
+                url.to_string(),
+                headers.iter().map(|(name, _)| name.to_string()).collect(),
+            ))
+        });
+        let answer = |status, location: Option<&str>| Answer {
+            status,
+            reason: String::new(),
+            location: location.map(str::to_string),
+        };
+        if url.starts_with("https://github.com/") {
+            body.write_all(b"<a redirect's own page>")?;
+            return Ok(answer(302, Some("https://objects.example.com/a?sig=1")));
+        }
+        if url == "https://objects.example.com/a?sig=1" {
+            body.write_all(b"the asset")?;
+            return Ok(answer(200, None));
+        }
+        Ok(answer(404, None))
+    }
+
+    #[test]
+    fn the_download_source_is_read_from_the_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // No file, no field, a name this build does not know: the default.
+        assert_eq!(download_source_at(&path), DownloadSource::Auto);
+        let write = |text: &str| std::fs::write(&path, text).unwrap();
+        write(r#"{"workspaces":{"remote_update_keeps_sessions":true}}"#);
+        assert_eq!(download_source_at(&path), DownloadSource::Auto);
+        write(r#"{"workspaces":{"update_download_source":"direct"},"other":1}"#);
+        assert_eq!(download_source_at(&path), DownloadSource::Direct);
+        write(r#"{"workspaces":{"update_download_source":"ghproxy.net"}}"#);
+        assert_eq!(download_source_at(&path), DownloadSource::Mirror("ghproxy.net"));
+        write(r#"{"workspaces":{"update_download_source":"gone.example"}}"#);
+        assert_eq!(download_source_at(&path), DownloadSource::Auto);
+    }
+
+    #[test]
+    fn a_transport_is_driven_through_redirects() {
+        let mut body = Vec::new();
+        http_get_into(
+            "https://github.com/o/r/releases/download/1.0/a.zip",
+            Some("application/octet-stream"),
+            fake_transport,
+            None,
+            &mut body,
+        )
+        .unwrap();
+        // The redirect's own body is dropped; both asks carry the agent and
+        // the Accept header.
+        assert_eq!(body, b"the asset");
+        let asked = ASKED.with(|asked| asked.take());
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[1].0, "https://objects.example.com/a?sig=1");
+        for (_, headers) in &asked {
+            assert!(headers.iter().any(|name| name == "User-Agent"), "{headers:?}");
+            assert!(headers.iter().any(|name| name == "Accept"), "{headers:?}");
+        }
+        // A 404 is not asked again.
+        let err = http_get_into("https://example.com/missing", None, fake_transport, None, &mut Vec::new())
+            .unwrap_err();
+        assert!(err.chain().any(|cause| cause.is::<Refused>()), "{err:#}");
+    }
+
+    /// A server on localhost answering one request with `head`, then `len`
+    /// bytes, `chunk` of them every `pause`; the URL to ask it at, and what
+    /// it was asked.
+    fn serve(
+        head: String,
+        len: usize,
+        chunk: usize,
+        pause: Duration,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (asked, request) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let _ = asked.send(String::from_utf8_lossy(&buf[..read]).to_string());
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let mut sent = 0;
+            while sent < len {
+                let n = chunk.min(len - sent);
+                // The client hanging up is how a test that gives way ends.
+                if stream.write_all(&vec![b'x'; n]).is_err() {
+                    return;
+                }
+                sent += n;
+                std::thread::sleep(pause);
+            }
+        });
+        (format!("http://{addr}/asset"), request)
+    }
+
+    fn ok_head(len: usize) -> String {
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
+    }
+
+    /// Straight to the test server, whatever proxy this machine names.
+    fn curl(
+        url: &str,
+        headers: &[(&str, String)],
+        give_way: Option<GiveWay>,
+        body: &mut Vec<u8>,
+    ) -> anyhow::Result<Answer> {
+        curl_get(&["--noproxy", "*"], url, headers, give_way, body)
+    }
+
+    const QUICK: GiveWay = GiveWay {
+        connect: Duration::from_secs(5),
+        stall: Duration::from_secs(5),
+        min_rate: 64 * 1024,
+        window: Duration::from_secs(1),
+    };
+
+    #[test]
+    fn curl_reads_a_whole_body_and_sends_the_headers() {
+        let (url, request) = serve(ok_head(200_000), 200_000, 50_000, Duration::from_millis(1));
+        let mut body = Vec::new();
+        let headers = [("Accept", "application/octet-stream".to_string())];
+        let answer = curl(&url, &headers, Some(QUICK), &mut body).unwrap();
+        assert_eq!(answer.status, 200);
+        assert_eq!(body.len(), 200_000);
+        let request = request.recv().unwrap();
+        assert!(request.contains("Accept: application/octet-stream"), "{request}");
+    }
+
+    #[test]
+    fn curl_hands_a_redirect_back_unfollowed() {
+        let head = "HTTP/1.1 302 Found\r\nLocation: https://objects.example.com/a?sig=1\r\n\
+                    Content-Length: 5\r\nConnection: close\r\n\r\n";
+        let (url, _) = serve(head.to_string(), 5, 5, Duration::ZERO);
+        let mut body = Vec::new();
+        let answer = curl(&url, &[], None, &mut body).unwrap();
+        assert_eq!(answer.status, 302);
+        assert_eq!(answer.location.as_deref(), Some("https://objects.example.com/a?sig=1"));
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn curl_gives_way_when_a_body_crawls() {
+        // 1 KB every 50 ms is about 20 KB/s, under the 64 asked for.
+        let (url, _) = serve(ok_head(1_000_000), 1_000_000, 1024, Duration::from_millis(50));
+        let err = curl(&url, &[], Some(QUICK), &mut Vec::new()).unwrap_err();
+        assert!(format!("{err:#}").contains("curl"), "{err:#}");
+    }
+
+    #[test]
+    fn curl_waits_out_a_slow_last_source() {
+        let (url, _) = serve(ok_head(20_000), 20_000, 1024, Duration::from_millis(20));
+        let mut body = Vec::new();
+        curl(&url, &[], None, &mut body).unwrap();
+        assert_eq!(body.len(), 20_000);
+    }
+
+    #[test]
+    fn curl_refuses_a_line_break_in_what_it_would_send() {
+        let headers = [("Authorization", "Bearer a\nurl = \"http://example.com\"".to_string())];
+        assert!(curl("https://example.com/a", &headers, None, &mut Vec::new()).is_err());
+    }
+
     #[test]
     fn a_download_counts_hashes_and_starts_over() {
         use sha2::Digest;
@@ -1231,6 +1790,34 @@ mod tests {
         let cmd = install_command("server", "0.2.0");
         assert!(cmd.contains("--server --version 0.2.0"), "{cmd}");
         assert!(cmd.contains(INSTALL_SCRIPT_URL), "{cmd}");
+    }
+
+    #[test]
+    fn download_sources_order_github_and_mirrors() {
+        let url = "https://github.com/o/r/releases/download/1.0/a.tar.gz";
+        assert_eq!(DownloadSource::Direct.urls(url), [url]);
+        let auto = DownloadSource::Auto.urls(url);
+        assert_eq!(auto.len(), MIRRORS.len() + 2);
+        assert_eq!(auto[0], url);
+        assert_eq!(auto[1], format!("https://{}/{url}", MIRRORS[0]));
+        assert_eq!(auto.last().map(String::as_str), Some(url));
+        assert_eq!(
+            DownloadSource::Mirror("ghproxy.net").urls(url),
+            [format!("https://ghproxy.net/{url}"), url.to_string()]
+        );
+        // What a settings file keeps reads back as the same source; what
+        // this build does not know is GitHub.
+        for source in DownloadSource::all() {
+            assert_eq!(DownloadSource::from_name(source.name()), source);
+            assert_eq!(DownloadSource::all().nth(source.index()), Some(source));
+        }
+        assert_eq!(DownloadSource::from_name("gone.example"), DownloadSource::Auto);
+        assert_eq!(mirror_arg(DownloadSource::Direct), " --mirror direct");
+        assert_eq!(mirror_arg(DownloadSource::Auto), "");
+        assert_eq!(
+            mirror_arg(DownloadSource::Mirror("ghfast.top")),
+            " --mirror ghfast.top"
+        );
     }
 
     #[cfg(unix)]
