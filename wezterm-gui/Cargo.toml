@@ -98,7 +98,7 @@ rangeset.workspace = true
 ratelim.workspace = true
 rayon.workspace = true
 regex.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "socks"] }
 # Text, for the labels in Mermaid diagrams.
 resvg = { workspace = true, features = ["text", "system-fonts", "memmap-fonts"] }
 merman.workspace = true

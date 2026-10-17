@@ -346,3 +346,179 @@ pub fn start_update_checker() {
             .expect("failed to spawn update checker thread");
     }
 }
+
+/// The updater's GETs through reqwest rather than http_req (see
+/// `thinkterm_update::set_transport`). It goes through the proxy the system
+/// or the environment names, as a browser would; and dropping a reqwest body
+/// part-way just closes the connection, so a source that crawls can give
+/// way to the next one, not only one that stalls.
+pub fn reqwest_transport(
+    url: &str,
+    headers: &[(&str, String)],
+    give_way: Option<thinkterm_update::GiveWay>,
+    body: &mut dyn std::io::Write,
+) -> anyhow::Result<thinkterm_update::Answer> {
+    fetch(
+        reqwest::blocking::Client::builder(),
+        url,
+        headers,
+        give_way,
+        body,
+    )
+}
+
+/// `reqwest_transport` with a client from `builder`.
+fn fetch(
+    builder: reqwest::blocking::ClientBuilder,
+    url: &str,
+    headers: &[(&str, String)],
+    give_way: Option<thinkterm_update::GiveWay>,
+    body: &mut dyn std::io::Write,
+) -> anyhow::Result<thinkterm_update::Answer> {
+    use std::io::Read;
+    use std::time::Instant;
+
+    // http_req's minute to connect and for each read, unless the source is
+    // to give way sooner. reqwest's blocking timeout covers the answer and
+    // each read, not the whole body.
+    let (connect, stall) = give_way.map_or(
+        (Duration::from_secs(60), Duration::from_secs(60)),
+        |give_way| (give_way.connect, give_way.stall),
+    );
+    let client = builder
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect)
+        .timeout(stall)
+        .build()?;
+    // The bytes as sent: they are hashed against GitHub's digest.
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity");
+    for (name, value) in headers {
+        request = request.header(*name, value.as_str());
+    }
+    let mut response = request.send()?;
+    let status = response.status();
+    let answer = thinkterm_update::Answer {
+        status: status.as_u16(),
+        reason: status.canonical_reason().unwrap_or_default().to_string(),
+        location: response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|location| location.to_str().ok())
+            .map(str::to_string),
+    };
+    if !status.is_success() {
+        return Ok(answer);
+    }
+
+    let mut buf = vec![0u8; 64 * 1024];
+    // When the current window began, and what it has brought so far.
+    let mut window = (Instant::now(), 0u64);
+    loop {
+        let read = response.read(&mut buf)?;
+        if read == 0 {
+            return Ok(answer);
+        }
+        body.write_all(&buf[..read])?;
+        let Some(give_way) = give_way else {
+            continue;
+        };
+        window.1 += read as u64;
+        let elapsed = window.0.elapsed();
+        if elapsed >= give_way.window {
+            if (window.1 as f64) < give_way.min_rate as f64 * elapsed.as_secs_f64() {
+                anyhow::bail!(
+                    "under {} KB/s for {} s",
+                    give_way.min_rate / 1024,
+                    give_way.window.as_secs()
+                );
+            }
+            window = (Instant::now(), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// The transport, but straight to the test server whatever proxy this
+    /// machine names.
+    fn reqwest_transport(
+        url: &str,
+        headers: &[(&str, String)],
+        give_way: Option<thinkterm_update::GiveWay>,
+        body: &mut dyn std::io::Write,
+    ) -> anyhow::Result<thinkterm_update::Answer> {
+        fetch(
+            reqwest::blocking::Client::builder().no_proxy(),
+            url,
+            headers,
+            give_way,
+            body,
+        )
+    }
+
+    /// A server on localhost answering one GET with `len` bytes, `chunk` of
+    /// them every `pause`; the URL to ask it at.
+    fn serve(len: usize, chunk: usize, pause: Duration) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n");
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let mut sent = 0;
+            while sent < len {
+                let n = chunk.min(len - sent);
+                // The client hanging up is how a test that gives way ends.
+                if stream.write_all(&vec![b'x'; n]).is_err() {
+                    return;
+                }
+                sent += n;
+                std::thread::sleep(pause);
+            }
+        });
+        format!("http://{addr}/asset")
+    }
+
+    const QUICK: thinkterm_update::GiveWay = thinkterm_update::GiveWay {
+        connect: Duration::from_secs(5),
+        stall: Duration::from_secs(5),
+        min_rate: 64 * 1024,
+        window: Duration::from_millis(300),
+    };
+
+    #[test]
+    fn reqwest_transport_reads_a_whole_body() {
+        let url = serve(200_000, 50_000, Duration::from_millis(1));
+        let mut body = Vec::new();
+        let answer = reqwest_transport(&url, &[], Some(QUICK), &mut body).unwrap();
+        assert_eq!(answer.status, 200);
+        assert_eq!(body.len(), 200_000);
+    }
+
+    #[test]
+    fn reqwest_transport_gives_way_when_a_body_crawls() {
+        // 1 KB every 50 ms is about 20 KB/s, under the 64 asked for.
+        let url = serve(1_000_000, 1024, Duration::from_millis(50));
+        let err = reqwest_transport(&url, &[], Some(QUICK), &mut Vec::new()).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("KB/s"), "{}", err);
+    }
+
+    #[test]
+    fn reqwest_transport_waits_out_a_slow_last_source() {
+        // With no source after it, the same crawl is read to the end.
+        let url = serve(20_000, 1024, Duration::from_millis(20));
+        let mut body = Vec::new();
+        reqwest_transport(&url, &[], None, &mut body).unwrap();
+        assert_eq!(body.len(), 20_000);
+    }
+}
