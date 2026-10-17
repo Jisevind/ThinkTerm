@@ -435,20 +435,18 @@ pub(crate) enum NativeWindowsBackdrop {
     #[default]
     Off,
     Accent,
-    System,
-    SystemBlur,
+    Composition,
 }
 
 impl NativeWindowsBackdrop {
     /// Every way, in the order the settings window offers them.
-    pub(crate) const ALL: [Self; 4] = [Self::Off, Self::Accent, Self::System, Self::SystemBlur];
+    pub(crate) const ALL: [Self; 3] = [Self::Off, Self::Accent, Self::Composition];
 
     fn trial(self) -> config::Win32BackdropTrial {
         match self {
             Self::Off => config::Win32BackdropTrial::Off,
             Self::Accent => config::Win32BackdropTrial::Accent,
-            Self::System => config::Win32BackdropTrial::System,
-            Self::SystemBlur => config::Win32BackdropTrial::SystemBlur,
+            Self::Composition => config::Win32BackdropTrial::Composition,
         }
     }
 }
@@ -2964,7 +2962,9 @@ mod tests {
                 .appearance
                 .windows_backdrop
         };
-        assert_eq!(read(r#""system_blur""#), NativeWindowsBackdrop::SystemBlur);
+        assert_eq!(read(r#""composition""#), NativeWindowsBackdrop::Composition);
+        // Ways tried and dropped read as off, as one not known yet does.
+        assert_eq!(read(r#""system_blur""#), NativeWindowsBackdrop::Off);
         assert_eq!(read(r#""something_new""#), NativeWindowsBackdrop::Off);
     }
 

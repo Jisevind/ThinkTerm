@@ -4541,6 +4541,18 @@ impl TermWindow {
         };
         let main_renderer =
             crate::native_settings::main_window_renderer(&native_settings, config.front_end);
+        // Only OpenGL draws onto DirectComposition: a window that will be
+        // drawn any other way is made the usual way, or it would show nothing.
+        let config = if config.win32_backdrop_trial == config::Win32BackdropTrial::Composition
+            && (main_renderer != crate::native_settings::NativeRendererBackend::OpenGL
+                || crate::renderer_choice::has_failed(
+                    crate::native_settings::NativeRendererBackend::OpenGL,
+                ))
+        {
+            config.adjusted(|config| config.win32_backdrop_trial = config::Win32BackdropTrial::Off)
+        } else {
+            config
+        };
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
 

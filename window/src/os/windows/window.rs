@@ -29,6 +29,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wezterm_color_types::LinearRgba;
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::KeyboardLedStatus;
@@ -146,6 +147,10 @@ pub(crate) struct WindowInner {
     /// The way of asking for the backdrop last applied: one switched off is
     /// undone, and a window that never tried one is left as it always was.
     backdrop_trial: Win32BackdropTrial,
+    /// The EGL this window draws through onto DirectComposition, when it was
+    /// made for `Win32BackdropTrial::Composition`: without a redirection
+    /// bitmap, nothing it draws any other way would show.
+    composition: Option<Rc<crate::egl::GlConnection>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -457,6 +462,24 @@ impl WindowInner {
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let conn = Connection::get().unwrap();
 
+        if let Some(glconn) = self.composition.as_ref() {
+            let gl_state = crate::egl::GlState::create_for_composition(glconn, self.hwnd.0)
+                .and_then(|state| unsafe {
+                    Ok(glium::backend::Context::new(
+                        Rc::new(state),
+                        true,
+                        callback_behavior(),
+                    )?)
+                })
+                .map_err(|err| {
+                    // Later windows are made the usual way.
+                    COMPOSITION_FAILED.store(true, Ordering::Relaxed);
+                    err
+                })?;
+            self.gl_state.replace(gl_state.clone());
+            return Ok(gl_state);
+        }
+
         let gl_state = if self.config.prefer_egl {
             match conn.gl_connection.borrow().as_ref() {
                 None => crate::egl::GlState::create(None, self.hwnd.0),
@@ -765,6 +788,7 @@ impl Window {
         name: &str,
         geometry: ResolvedGeometry,
         frame_rect: Option<ScreenRect>,
+        ex_style: u32,
         lparam: *const RefCell<WindowInner>,
     ) -> anyhow::Result<HWND> {
         let class_name = wide_string(class_name);
@@ -807,7 +831,7 @@ impl Window {
             let name = wide_string(name);
             let hwnd = unsafe {
                 CreateWindowExW(
-                    0,
+                    ex_style,
                     class_name.as_ptr(),
                     name.as_ptr(),
                     style,
@@ -876,7 +900,7 @@ impl Window {
         let name = wide_string(name);
         let hwnd = unsafe {
             CreateWindowExW(
-                0,
+                ex_style,
                 class_name.as_ptr(),
                 name.as_ptr(),
                 style,
@@ -943,6 +967,7 @@ impl Window {
             occlusion_visible: None,
             last_frame_event: None,
             backdrop_trial: Win32BackdropTrial::Off,
+            composition: None,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -959,12 +984,25 @@ impl Window {
         let frame_rect = geometry.windows_frame_rect;
         let geometry = conn.resolve_geometry(geometry);
 
+        // Chosen for good when the window is made: the extended style that
+        // lets DirectComposition through cannot be taken off again.
+        let composition = (config.win32_backdrop_trial == Win32BackdropTrial::Composition)
+            .then(|| composition_connection(&conn))
+            .flatten();
+        let ex_style = if composition.is_some() {
+            WS_EX_NOREDIRECTIONBITMAP
+        } else {
+            0
+        };
+        inner.borrow_mut().composition = composition;
+
         let hwnd = match Self::create_window(
             config.clone(),
             class_name,
             name,
             geometry.clone(),
             frame_rect,
+            ex_style,
             raw,
         ) {
             Ok(hwnd) => HWindow(hwnd),
@@ -1001,10 +1039,8 @@ impl Window {
         }
 
         apply_theme(hwnd.0);
-        blur_behind(
-            hwnd.0,
-            config.win32_backdrop_trial != Win32BackdropTrial::System,
-        );
+        let trial = window_backdrop_trial(inner.borrow().composition.is_some(), &config);
+        blur_behind(hwnd.0, blurs_behind(trial));
 
         // Make window capable of accepting drag and drop
         unsafe {
@@ -1196,6 +1232,29 @@ impl HasWindowHandle for Window {
 
 #[async_trait(?Send)]
 impl WindowOps for Window {
+    fn finish_frame(&self, frame: glium::Frame) -> anyhow::Result<()> {
+        // ANGLE resizes the swap chain behind a DirectComposition window only
+        // as it presents: a frame drawn just after a resize went into the
+        // old size's buffer, so draw once more at the new one.
+        let stale = rc_from_hwnd(self.0 .0).and_then(|inner| {
+            let inner = inner.borrow();
+            inner.composition.as_ref()?;
+            let drawn = inner.gl_state.as_ref()?.get_framebuffer_dimensions();
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            unsafe { GetClientRect(self.0 .0, &mut rect) };
+            let client = (
+                (rect.right - rect.left).max(0) as u32,
+                (rect.bottom - rect.top).max(0) as u32,
+            );
+            Some(drawn != client)
+        });
+        frame.finish()?;
+        if stale == Some(true) {
+            self.invalidate();
+        }
+        Ok(())
+    }
+
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let window = self.0;
         promise::spawn::spawn(async move {
@@ -1843,6 +1902,53 @@ fn get_window_state(hwnd: HWND) -> WindowState {
     }
 }
 
+/// A window made for DirectComposition could not be drawn that way: the
+/// rest are made the usual way, as nothing else shows in one.
+static COMPOSITION_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The EGL to draw a new window through onto DirectComposition: the one
+/// already open when it can, else one found for it. `None` when no EGL here
+/// can, and the window is made the usual way.
+fn composition_connection(conn: &Connection) -> Option<Rc<crate::egl::GlConnection>> {
+    if COMPOSITION_FAILED.load(Ordering::Relaxed) {
+        return None;
+    }
+    if let Some(glconn) = conn.gl_connection.borrow().as_ref() {
+        if glconn.has_extension("EGL_ANGLE_direct_composition") {
+            return Some(Rc::clone(glconn));
+        }
+    }
+    match crate::egl::GlState::connect_for_composition() {
+        Ok(glconn) => {
+            conn.gl_connection
+                .borrow_mut()
+                .get_or_insert_with(|| Rc::clone(&glconn));
+            Some(glconn)
+        }
+        Err(err) => {
+            log::warn!("DirectComposition backdrop unavailable: {err:#}");
+            None
+        }
+    }
+}
+
+/// The way of asking for the backdrop a window can take: whether it draws
+/// onto DirectComposition was settled when it was made, so a window made
+/// for it keeps it and one made without it waits for the next window.
+fn window_backdrop_trial(composition: bool, config: &ConfigHandle) -> Win32BackdropTrial {
+    match config.win32_backdrop_trial {
+        _ if composition => Win32BackdropTrial::Composition,
+        Win32BackdropTrial::Composition => Win32BackdropTrial::Off,
+        trial => trial,
+    }
+}
+
+/// Whether the old blur behind the window stays on: it is what lets the
+/// window's alpha through, except onto DirectComposition, which carries it.
+fn blurs_behind(trial: Win32BackdropTrial) -> bool {
+    trial != Win32BackdropTrial::Composition
+}
+
 /// "Blur behind" is the old vista term for a cool blurring
 /// effect that the DWM could enable.  Subsequent windows
 /// versions have removed the blurring.  We use this call
@@ -1965,15 +2071,14 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
 
             // Set Acrylic or Mica system Backdrop; a trial is of acrylic,
             // asked for its own way.
-            let trial = inner.config.win32_backdrop_trial;
-            let system_trial =
-                matches!(trial, Win32BackdropTrial::System | Win32BackdropTrial::SystemBlur);
+            let trial = window_backdrop_trial(inner.composition.is_some(), &inner.config);
+            let composition = trial == Win32BackdropTrial::Composition;
             let accent = !*IS_WIN11_22H2 || trial == Win32BackdropTrial::Accent;
             let acrylic = trial != Win32BackdropTrial::Off
                 || inner.config.win32_system_backdrop == SystemBackdrop::Acrylic;
             let pv_attribute = match inner.config.win32_system_backdrop {
                 _ if trial == Win32BackdropTrial::Accent => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_NONE,
-                _ if system_trial => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TRANSIENTWINDOW,
+                _ if composition => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TRANSIENTWINDOW,
                 SystemBackdrop::Auto => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_AUTO,
                 SystemBackdrop::Disable => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_NONE,
                 SystemBackdrop::Acrylic => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TRANSIENTWINDOW,
@@ -1982,7 +2087,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
             };
 
             let margins = match inner.config.window_decorations {
-                _ if system_trial => -1,
+                _ if composition => -1,
                 WindowDecorations::TITLE => -1,
                 _ => 0,
             };
@@ -2001,7 +2106,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
             // the window's alpha through goes with it.
             let tried = std::mem::replace(&mut inner.backdrop_trial, trial);
             if trial != Win32BackdropTrial::Off || tried != Win32BackdropTrial::Off {
-                blur_behind(hwnd, trial != Win32BackdropTrial::System);
+                blur_behind(hwnd, blurs_behind(trial));
             }
 
             // Apply Acrylic or Mica Backdrop

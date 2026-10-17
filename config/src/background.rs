@@ -304,17 +304,16 @@ pub enum SystemBackdrop {
 /// Another way of asking Windows for its acrylic backdrop, to find one that
 /// shows it behind a window drawn with OpenGL: asked for the usual way, it
 /// comes out opaque there (wezterm#6265). `Off` asks the usual way.
-/// `System` and `SystemBlur` ask for the system backdrop over the whole
-/// window, without and with the blur behind that lets the window's own
-/// alpha through; `Accent` asks with the undocumented accent policy, as on
-/// Windows 10, even where the system backdrop exists.
+/// `Accent` asks with the undocumented accent policy, as on Windows 10,
+/// even where the system backdrop exists. `Composition` draws through
+/// ANGLE onto a DirectComposition surface, whose alpha the system backdrop
+/// shows through; a window takes it, or leaves it, when opened.
 #[derive(Debug, Copy, Clone, FromDynamic, ToDynamic, PartialEq, Eq, Default)]
 pub enum Win32BackdropTrial {
     #[default]
     Off,
-    System,
-    SystemBlur,
     Accent,
+    Composition,
 }
 
 pub fn default_win32_acrylic_accent_color() -> RgbaColor {

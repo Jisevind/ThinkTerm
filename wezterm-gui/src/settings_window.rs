@@ -1512,8 +1512,7 @@ fn localized_windows_backdrop_label(backdrop: NativeWindowsBackdrop) -> String {
     crate::i18n::tr(match backdrop {
         NativeWindowsBackdrop::Off => "settings-windows-backdrop-off",
         NativeWindowsBackdrop::Accent => "settings-windows-backdrop-accent",
-        NativeWindowsBackdrop::System => "settings-windows-backdrop-system",
-        NativeWindowsBackdrop::SystemBlur => "settings-windows-backdrop-system-blur",
+        NativeWindowsBackdrop::Composition => "settings-windows-backdrop-composition",
     })
 }
 

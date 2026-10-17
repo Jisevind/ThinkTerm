@@ -28,6 +28,11 @@ fn failure_record(backend: NativeRendererBackend) -> &'static std::thread::Local
     }
 }
 
+/// Whether `backend` has failed to come up in a window on this thread.
+pub(crate) fn has_failed(backend: NativeRendererBackend) -> bool {
+    failure_record(backend).with(Cell::get)
+}
+
 fn label(backend: NativeRendererBackend) -> &'static str {
     match backend {
         NativeRendererBackend::WebGpu => "WebGPU",

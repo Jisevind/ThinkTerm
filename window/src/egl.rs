@@ -50,6 +50,11 @@ impl std::fmt::Debug for EglWrapper {
     }
 }
 
+/// `EGL_ANGLE_direct_composition`: a window surface drawn onto a
+/// DirectComposition visual, alpha and all, rather than into the window.
+#[cfg(windows)]
+const DIRECT_COMPOSITION_ANGLE: i32 = 0x33A5;
+
 #[derive(Debug)]
 pub struct GlConnection {
     egl: EglWrapper,
@@ -346,19 +351,14 @@ impl EglWrapper {
         display: ffi::types::EGLDisplay,
         config: ffi::types::EGLConfig,
         window: ffi::EGLNativeWindowType,
+        extra_attributes: &[i32],
     ) -> anyhow::Result<ffi::types::EGLSurface> {
+        let mut attributes = vec![ffi::GL_COLORSPACE as i32, ffi::GL_COLORSPACE_SRGB as i32];
+        attributes.extend_from_slice(extra_attributes);
+        attributes.push(ffi::NONE as i32);
         let surface = unsafe {
-            self.egl.CreateWindowSurface(
-                display,
-                config,
-                window,
-                [
-                    ffi::GL_COLORSPACE as i32,
-                    ffi::GL_COLORSPACE_SRGB as i32,
-                    ffi::NONE as i32,
-                ]
-                .as_ptr(),
-            )
+            self.egl
+                .CreateWindowSurface(display, config, window, attributes.as_ptr())
         };
         if surface.is_null() {
             Err(self.error("EGL CreateWindowSurface"))
@@ -400,9 +400,9 @@ impl GlState {
         &self.connection
     }
 
-    fn with_egl_lib<F: FnMut(EglWrapper) -> anyhow::Result<Self>>(
+    fn with_egl_lib<T, F: FnMut(EglWrapper) -> anyhow::Result<T>>(
         mut func: F,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<T> {
         let mut paths: Vec<std::path::PathBuf> = vec![
             #[cfg(target_os = "windows")]
             "libEGL.dll".into(),
@@ -494,41 +494,75 @@ impl GlState {
         window: ffi::EGLNativeWindowType,
     ) -> anyhow::Result<Self> {
         Self::with_egl_lib(|egl| {
-            let egl_display = egl.get_display(display)?;
-
-            let (major, minor) = egl.initialize_and_get_version(egl_display)?;
-            log::trace!("initialized EGL version {}.{}", major, minor);
-
-            let is_opengl = unsafe {
-                if egl.egl.BindAPI(ffi::OPENGL_API) != 0 {
-                    log::trace!("using OpenGL");
-                    true
-                } else if egl.egl.BindAPI(ffi::OPENGL_ES_API) != 0 {
-                    log::trace!("using GLES");
-                    false
-                } else {
-                    anyhow::bail!("Unable to bind to OpenGL or GL ES!?");
-                }
-            };
-
-            let extensions = unsafe { egl.egl.QueryString(egl_display, ffi::EXTENSIONS as _) };
-            let extensions = if extensions.is_null() {
-                String::new()
-            } else {
-                let cstr = unsafe { std::ffi::CStr::from_ptr(extensions) };
-                String::from_utf8_lossy(cstr.to_bytes()).to_string()
-            };
-            log::trace!("EGL extensions: {}", extensions);
-
-            let connection = Rc::new(GlConnection {
-                display: egl_display,
-                egl,
-                is_opengl,
-                extensions,
-            });
-
+            let connection = Self::connect_with(egl, display)?;
             Self::create_with_existing_connection(&connection, window)
         })
+    }
+
+    /// An EGL connection that can draw onto DirectComposition, from the
+    /// first EGL found that can -- the ANGLE shipped beside the executable.
+    #[cfg(windows)]
+    pub fn connect_for_composition() -> anyhow::Result<Rc<GlConnection>> {
+        Self::with_egl_lib(|egl| {
+            let connection = Self::connect_with(egl, None)?;
+            ensure!(
+                connection.has_extension("EGL_ANGLE_direct_composition"),
+                "no EGL_ANGLE_direct_composition"
+            );
+            Ok(connection)
+        })
+    }
+
+    /// A window surface on `connection` drawn onto DirectComposition: the
+    /// window was made without a redirection bitmap, so nothing else shows.
+    #[cfg(windows)]
+    pub fn create_for_composition(
+        connection: &Rc<GlConnection>,
+        window: ffi::EGLNativeWindowType,
+    ) -> anyhow::Result<GlState> {
+        Self::create_with_surface_attributes(
+            connection,
+            window,
+            &[DIRECT_COMPOSITION_ANGLE, ffi::TRUE as i32],
+        )
+    }
+
+    fn connect_with(
+        egl: EglWrapper,
+        display: Option<ffi::EGLNativeDisplayType>,
+    ) -> anyhow::Result<Rc<GlConnection>> {
+        let egl_display = egl.get_display(display)?;
+
+        let (major, minor) = egl.initialize_and_get_version(egl_display)?;
+        log::trace!("initialized EGL version {}.{}", major, minor);
+
+        let is_opengl = unsafe {
+            if egl.egl.BindAPI(ffi::OPENGL_API) != 0 {
+                log::trace!("using OpenGL");
+                true
+            } else if egl.egl.BindAPI(ffi::OPENGL_ES_API) != 0 {
+                log::trace!("using GLES");
+                false
+            } else {
+                anyhow::bail!("Unable to bind to OpenGL or GL ES!?");
+            }
+        };
+
+        let extensions = unsafe { egl.egl.QueryString(egl_display, ffi::EXTENSIONS as _) };
+        let extensions = if extensions.is_null() {
+            String::new()
+        } else {
+            let cstr = unsafe { std::ffi::CStr::from_ptr(extensions) };
+            String::from_utf8_lossy(cstr.to_bytes()).to_string()
+        };
+        log::trace!("EGL extensions: {}", extensions);
+
+        Ok(Rc::new(GlConnection {
+            display: egl_display,
+            egl,
+            is_opengl,
+            extensions,
+        }))
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -543,6 +577,14 @@ impl GlState {
     pub fn create_with_existing_connection(
         connection: &Rc<GlConnection>,
         window: ffi::EGLNativeWindowType,
+    ) -> anyhow::Result<GlState> {
+        Self::create_with_surface_attributes(connection, window, &[])
+    }
+
+    fn create_with_surface_attributes(
+        connection: &Rc<GlConnection>,
+        window: ffi::EGLNativeWindowType,
+        surface_attributes: &[i32],
     ) -> anyhow::Result<GlState> {
         let configs = connection.egl.choose_config(
             connection.display,
@@ -600,7 +642,7 @@ impl GlState {
             let surface =
                 match connection
                     .egl
-                    .create_window_surface(connection.display, config, window)
+                    .create_window_surface(connection.display, config, window, surface_attributes)
                 {
                     Ok(s) => s,
                     Err(e) => {
