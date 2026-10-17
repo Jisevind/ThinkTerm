@@ -375,6 +375,21 @@ impl QuadTrait for BoxedQuad {
     }
 }
 
+/// One quad's `verts` translated and cropped to `clip` as a recorded quad is
+/// on replay, for one drawn outside the quad layers -- a picture on a texture
+/// of its own -- that has to go along with them. `None` where none of it is
+/// left.
+pub fn translated_clipped_vertices(
+    verts: &[Vertex; VERTICES_PER_CELL],
+    offset_x: f32,
+    offset_y: f32,
+    clip: QuadClipRect,
+) -> Option<[Vertex; VERTICES_PER_CELL]> {
+    BoxedQuad::from_vertices(verts)
+        .translated_clipped(offset_x, offset_y, clip)
+        .map(|quad| quad.to_vertices())
+}
+
 impl BoxedQuad {
     fn from_vertices(verts: &[Vertex; VERTICES_PER_CELL]) -> Self {
         let [x1, y1] = verts[V_TOP_LEFT].tex;

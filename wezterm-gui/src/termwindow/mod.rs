@@ -3079,6 +3079,8 @@ pub struct TermWindow {
     split_slides: render::split_slide::SplitSlides,
     /// Set while a closed pane is painted on its way out.
     closed_pane_nav: Option<render::split_slide::ClosedNav>,
+    /// Set while a pane carried into another stack is painted on its way.
+    nav_morph: Option<render::split_slide::NavMorph>,
     /// A mouse binding took the right button's press: its release does not
     /// run the built-in right click as well.
     right_press_claimed: bool,
@@ -4843,6 +4845,7 @@ impl TermWindow {
             pending_paste: None,
             split_slides: Default::default(),
             closed_pane_nav: None,
+            nav_morph: None,
             right_press_claimed: false,
             recording_overlay: Default::default(),
             command_palette: None,

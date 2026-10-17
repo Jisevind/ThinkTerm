@@ -591,7 +591,8 @@ pub(crate) struct NativeTerminalSettings {
     #[serde(default = "default_true")]
     pub(crate) overlay_scrollbar: bool,
     /// A pane opened by a split slides in from the side it opened on, and
-    /// a closed one goes back out that way.
+    /// a closed one goes back out that way; a zoomed one pushes the others
+    /// out of the tab, and lets them back in.
     #[serde(default = "default_true")]
     pub(crate) split_animation: bool,
     pub(crate) font_size: Option<f64>,

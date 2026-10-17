@@ -31,6 +31,7 @@ use anyhow::Context;
 use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
+use crate::termwindow::render::split_slide::TabPlace;
 use mux::tab::{CollapsedPaneLayout, PaneStackTab, PositionedPane, SplitDirection};
 use mux::Mux;
 use ordered_float::NotNan;
@@ -196,6 +197,35 @@ impl crate::TermWindow {
             .saturating_add(self.ui_px(PANE_NAV_INSET))
     }
 
+    /// The band `pos`'s nav bar runs along, and where along it the buttons
+    /// at its end start; `None` without one, or for a stack collapsed to a
+    /// strip, which is all nav bar.
+    pub(crate) fn pane_nav_band(
+        &self,
+        pos: &PositionedPane,
+    ) -> anyhow::Result<Option<(RectF, f32)>> {
+        let nav_height = self.pane_nav_bar_height_for_pane(pos);
+        if nav_height == 0
+            || pos.width == 0
+            || self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id)
+        {
+            return Ok(None);
+        }
+        let (_, pane_y) = self.pane_content_origin(pos)?;
+        let (pane_x, pane_width) = self.pane_chrome_span(pos)?;
+        let buttons = pane_x + pane_width
+            - self.pane_nav_action_reserved_width(pos, nav_height) as f32;
+        Ok(Some((
+            euclid::rect(
+                pane_x,
+                pane_y - self.pane_nav_lift(pos),
+                pane_width,
+                nav_height as f32,
+            ),
+            buttons.max(pane_x),
+        )))
+    }
+
     /// Horizontal room the *collapsed* strip leaves for its tabs.
     ///
     /// The expanded bar's `pane_nav_tab_viewport_width` does not describe this
@@ -250,7 +280,7 @@ impl crate::TermWindow {
             .saturating_sub(self.right_sidebar_width()) as f32
     }
 
-    fn pane_content_origin(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {
+    pub(crate) fn pane_content_origin(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {
         let (top_bar_height, _) = self.pane_area_insets();
         let border = self.get_os_border();
         let (padding_left, _) = self.padding_left_top();
@@ -448,19 +478,21 @@ impl crate::TermWindow {
     }
 
     /// Fill `rect` as `pos` fills its own room: in its nav bar's colour
-    /// across the rows that takes, and with its ground above and below.
+    /// across the rows that takes, drawn `nav_shift` further down than it
+    /// stands, and with its ground above and below.
     pub(crate) fn paint_room_of(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         pos: &PositionedPane,
         rect: RectF,
+        nav_shift: f32,
     ) -> anyhow::Result<()> {
         let nav_height = self.pane_nav_bar_height_for_pane(pos) as f32;
         let band = if nav_height > 0.0
             && !self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id)
         {
             let (_, pane_y) = self.pane_content_origin(pos)?;
-            let top = pane_y - self.pane_nav_lift(pos);
+            let top = pane_y - self.pane_nav_lift(pos) + nav_shift;
             euclid::rect(rect.min_x(), top, rect.width(), nav_height).intersection(&rect)
         } else {
             None
@@ -484,6 +516,27 @@ impl crate::TermWindow {
         self.paint_ground_of(layers, pos, below)?;
         self.filled_rectangle(layers, 0, band, self.chrome_surface(self.chrome().header_bg))
             .context("pane nav band")?;
+        Ok(())
+    }
+
+    /// Fill `rect`, room no pane covers while panes are rearranged, in the
+    /// ground the sidebar has, darker than a pane's: the panes are seen to
+    /// cross it. With a background image the panes leave their ground
+    /// unfilled, and the picture shows here too.
+    pub(crate) fn paint_slide_backdrop(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+    ) -> anyhow::Result<()> {
+        if !self.window_background.is_empty() || rect.is_empty() {
+            return Ok(());
+        }
+        self.filled_rectangle(
+            layers,
+            0,
+            rect,
+            self.chrome_surface(self.chrome().workspace_sidebar_bg),
+        )?;
         Ok(())
     }
 
@@ -936,7 +989,7 @@ impl crate::TermWindow {
         tabs
     }
 
-    fn can_collapse_pane_stack(&self, pos: &PositionedPane) -> bool {
+    pub(crate) fn can_collapse_pane_stack(&self, pos: &PositionedPane) -> bool {
         if let Some(nav) = self
             .closed_pane_nav
             .as_ref()
@@ -1088,15 +1141,71 @@ impl crate::TermWindow {
             || self.tab_wheel_scroll_active();
         let tab_height = button_size;
         let tab_y = button_y;
-        for (idx, tab) in tabs.into_iter().enumerate() {
+        // Where along the bar the first tab stands, scrolled: a pane carried
+        // into another stack goes on from where its tabs stood here.
+        let lead = tab_start as f32 - scroll_offset - pane_x;
+        self.split_slides
+            .nav(pos.pane.pane_id(), lead, tabs.iter().map(|tab| tab.pane_id));
+        // One carried goes from the tabs it showed to its new stack's on its
+        // way there (see `render::split_slide`).
+        let morph = self
+            .nav_morph
+            .as_ref()
+            .filter(|morph| morph.pane_id == pos.pane.pane_id());
+        let places = match morph {
+            Some(morph) => {
+                let from_width = self
+                    .adaptive_tab_width(morph.from.len(), viewport_width as f32, tab_gap as f32)
+                    .ceil() as usize;
+                let to: Vec<PaneId> = tabs.iter().map(|tab| tab.pane_id).collect();
+                morph.places(&to, (from_width + tab_gap) as f32, tab_step as f32, lead)
+            }
+            None => tabs
+                .iter()
+                .enumerate()
+                .map(|(idx, tab)| TabPlace {
+                    pane_id: tab.pane_id,
+                    x: lead + idx.saturating_mul(tab_step) as f32,
+                    opacity: 1.0,
+                    kept: true,
+                })
+                .collect(),
+        };
+        // Where the tabs drawn whole stand while one is carried: one fading
+        // in or out is cut short of them, its title in the layer over their
+        // capsules.
+        let whole: Vec<f32> = match morph {
+            Some(_) => places
+                .iter()
+                .filter(|place| place.kept && place.opacity >= 1.0)
+                .map(|place| pane_x + place.x)
+                .collect(),
+            None => vec![],
+        };
+        for place in places {
             if tab_width <= icon_size + self.ui_px(PANE_NAV_ICON_GAP) + button_size
                 || viewport_width == 0
             {
                 break;
             }
+            // One left behind is no longer in the stack, and fades out.
+            let left_behind;
+            let tab = match tabs.iter().find(|tab| tab.pane_id == place.pane_id) {
+                Some(tab) => tab,
+                None => match Mux::get().get_pane(place.pane_id) {
+                    Some(pane) => {
+                        left_behind = PaneStackTab {
+                            pane_id: place.pane_id,
+                            title: pane.title_without_waiting(),
+                            is_active: false,
+                        };
+                        &left_behind
+                    }
+                    None => continue,
+                },
+            };
 
-            let virtual_x = idx.saturating_mul(tab_step) as f32;
-            let tab_left = tab_start as f32 + virtual_x - scroll_offset;
+            let tab_left = pane_x + place.x;
             let tab_right = tab_left + tab_width as f32;
             if tab_right <= tab_start as f32 || tab_left >= max_tab_right as f32 {
                 continue;
@@ -1108,13 +1217,34 @@ impl crate::TermWindow {
             if visible_width <= 1.0 {
                 continue;
             }
+            // Drawn within the strip, a shadow and all; one fading, only
+            // where the tabs drawn whole leave it.
+            let (mut shown_left, mut shown_right) = (tab_start as f32, max_tab_right as f32);
+            if place.opacity < 1.0 || !place.kept {
+                (shown_left, shown_right) = (visible_left, visible_right);
+                for other in &whole {
+                    let other_right = other + tab_width as f32;
+                    if other_right <= shown_left || *other >= shown_right {
+                        continue;
+                    }
+                    if other - shown_left >= shown_right - other_right {
+                        shown_right = shown_right.min(*other);
+                    } else {
+                        shown_left = shown_left.max(other_right);
+                    }
+                }
+                if shown_right - shown_left <= 1.0 {
+                    continue;
+                }
+            }
 
             let selected_tab = tab.is_active;
             let is_renaming_tab = self.is_renaming_pane_nav_tab(tab.pane_id);
             let this_tab_fg = if selected_tab { tab_fg } else { muted_fg };
             let hover_x = visible_left.max(0.0) as usize;
             let hover_width = visible_width.max(0.0) as usize;
-            let is_hovered = !suppress_hover
+            let is_hovered = place.kept
+                && !suppress_hover
                 && self.is_pointer_over_ui_rect(hover_x, tab_y, hover_width, tab_height);
             let tab_surface_color = if selected_tab {
                 chrome.active_tab_surface()
@@ -1128,17 +1258,19 @@ impl crate::TermWindow {
             } else {
                 LinearRgba::TRANSPARENT
             };
-            self.ui_items.push(UIItem {
-                x: visible_left.max(0.0) as usize,
-                y: tab_y,
-                width: visible_width.max(0.0) as usize,
-                height: tab_height,
-                item_type: UIItemType::PaneNav {
-                    pane_id: pos.pane.pane_id(),
-                    pane_index: pos.index,
-                    action: PaneNavAction::Activate(tab.pane_id),
-                },
-            });
+            if place.kept {
+                self.ui_items.push(UIItem {
+                    x: visible_left.max(0.0) as usize,
+                    y: tab_y,
+                    width: visible_width.max(0.0) as usize,
+                    height: tab_height,
+                    item_type: UIItemType::PaneNav {
+                        pane_id: pos.pane.pane_id(),
+                        pane_index: pos.index,
+                        action: PaneNavAction::Activate(tab.pane_id),
+                    },
+                });
+            }
 
             // Reborrow: the surrounding loop cannot move the caller's `&mut`.
             let out_layers = &mut *layers;
@@ -1305,13 +1437,13 @@ impl crate::TermWindow {
                     tab_left,
                     0.0,
                     QuadClipRect::from_top_left_pixels(
-                        tab_start as f32,
+                        shown_left,
                         tab_y as f32,
-                        max_tab_right as f32,
+                        shown_right,
                         (tab_y + tab_height) as f32,
                         &self.dimensions,
                     ),
-                    1.0,
+                    place.opacity,
                 )
                 .context("pane nav tab content")?;
         }
