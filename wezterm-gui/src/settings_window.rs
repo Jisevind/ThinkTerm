@@ -43,7 +43,7 @@ use window::{
 
 use crate::native_settings::{
     NativeAppIcon, NativeBottomQuoteMode, NativeRemotePaneResizeMode, NativeRendererBackend,
-    NativeThemeMode, NativeWindowsBackdrop, ThinkTermNativeSettings, DEFAULT_HOME_FONT_SIZE,
+    NativeThemeMode, ThinkTermNativeSettings, DEFAULT_HOME_FONT_SIZE,
     DEFAULT_PANE_HEADER_FONT_SIZE, DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE,
     DEFAULT_TAB_FONT_SIZE,
 };
@@ -1845,7 +1845,6 @@ enum SettingsAction {
     QuitApplication,
     ToggleBottomQuote,
     SetRemotePaneResizeMode(NativeRemotePaneResizeMode),
-    ToggleWindowsBackdrop,
     SetScrollMode(crate::native_settings::NativeScrollMode),
     SetSelectionStyle(crate::native_settings::NativeSelectionStyle),
     ToggleCopyOnSelect,
@@ -5186,6 +5185,11 @@ impl SettingsWindow {
         // Merged into the freshest settings, as `apply_text_contrast` does:
         // this window's copy can be older than what other windows saved.
         let mut merged = crate::native_settings::load();
+        // On Windows the acrylic behind a see-through window is drawn the way
+        // a window was made: windows made opaque show it after a restart.
+        let see_through = |opacity: Option<u8>| opacity.is_some_and(|percent| percent < 100);
+        let acrylic_after_restart =
+            cfg!(windows) && !see_through(merged.appearance.window_opacity) && see_through(opacity);
         merged.appearance.window_opacity = opacity;
         self.set_native_settings(merged);
         let setting = crate::i18n::tr("settings-window-opacity");
@@ -5193,7 +5197,11 @@ impl SettingsWindow {
             Ok(()) => {
                 crate::native_settings::apply_window_opacity_to_app(&self.native_settings);
                 self.status = settings_tr(
-                    "settings-status-value-now",
+                    if acrylic_after_restart {
+                        "settings-status-window-acrylic-after-restart"
+                    } else {
+                        "settings-status-value-now"
+                    },
                     &[
                         ("setting", setting),
                         ("value", window_opacity_label(opacity)),
@@ -5315,41 +5323,6 @@ impl SettingsWindow {
                 self.status = settings_tr(
                     "settings-status-terminal-error",
                     &[("error", format!("{err:#}"))],
-                );
-            }
-        }
-    }
-
-    /// Turn the Windows acrylic on or off. A window takes it, or leaves
-    /// it, as it is made: it shows once ThinkTerm has restarted.
-    fn toggle_windows_backdrop(&mut self) {
-        self.ui.open_dropdown = None;
-        // Merged into the freshest settings, as `apply_window_opacity` is.
-        let mut merged = crate::native_settings::load();
-        let on = merged.appearance.windows_backdrop == NativeWindowsBackdrop::Off;
-        merged.appearance.windows_backdrop = if on {
-            NativeWindowsBackdrop::Composition
-        } else {
-            NativeWindowsBackdrop::Off
-        };
-        self.set_native_settings(merged);
-        let setting = crate::i18n::tr("settings-windows-backdrop");
-        match crate::native_settings::save(&self.native_settings) {
-            Ok(()) => {
-                crate::native_settings::apply_window_opacity_to_app(&self.native_settings);
-                self.status = settings_tr(
-                    "settings-status-value-after-restart",
-                    &[
-                        ("setting", setting),
-                        ("value", crate::i18n::tr(if on { "common-on" } else { "common-off" })),
-                    ],
-                );
-            }
-            Err(err) => {
-                self.set_native_settings(crate::native_settings::load());
-                self.status = settings_tr(
-                    "settings-status-save-error",
-                    &[("setting", setting), ("error", format!("{err:#}"))],
                 );
             }
         }
@@ -6297,7 +6270,6 @@ impl SettingsWindow {
             SettingsAction::SetRemotePaneResizeMode(mode) => {
                 self.apply_remote_pane_resize_mode(mode)
             }
-            SettingsAction::ToggleWindowsBackdrop => self.toggle_windows_backdrop(),
             SettingsAction::SetBottomQuoteMode(mode) => self.apply_bottom_quote_mode(mode),
             SettingsAction::DecreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(-1.0),
             SettingsAction::IncreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(1.0),
@@ -8540,28 +8512,6 @@ impl SettingsWindow {
                 TileColor::Blue,
             )?;
             rows.add(this.paint_window_opacity_row(layers, tx, rows.y, tw, rows.rule())?);
-            if cfg!(windows) {
-                let (tx, tw) = this.paint_row_tile(
-                    layers,
-                    row_x,
-                    rows.y,
-                    row_width,
-                    SvgIcon::Contrast,
-                    TileColor::Indigo,
-                )?;
-                rows.add(this.paint_toggle_setting_row(
-                    layers,
-                    tx,
-                    rows.y,
-                    tw,
-                    &crate::i18n::tr("settings-windows-backdrop"),
-                    &crate::i18n::tr("settings-windows-backdrop-description"),
-                    this.native_settings.appearance.windows_backdrop
-                        != NativeWindowsBackdrop::Off,
-                    SettingsAction::ToggleWindowsBackdrop,
-                    rows.rule(),
-                )?);
-            }
             Ok(rows.bottom)
         })?;
 

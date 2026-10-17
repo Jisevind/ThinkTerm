@@ -421,28 +421,6 @@ pub(crate) struct NativeAppearanceSettings {
     /// `window_background_opacity`. `None` follows the configuration.
     #[serde(deserialize_with = "window_opacity_or_default")]
     pub(crate) window_opacity: Option<u8>,
-    /// On Windows, the system acrylic behind a see-through window (see
-    /// `config::Win32BackdropTrial`).
-    #[serde(deserialize_with = "choice_or_default")]
-    pub(crate) windows_backdrop: NativeWindowsBackdrop,
-}
-
-/// Whether Settings asks Windows for its acrylic, `Composition` being on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum NativeWindowsBackdrop {
-    #[default]
-    Off,
-    Composition,
-}
-
-impl NativeWindowsBackdrop {
-    fn trial(self) -> config::Win32BackdropTrial {
-        match self {
-            Self::Off => config::Win32BackdropTrial::Off,
-            Self::Composition => config::Win32BackdropTrial::Composition,
-        }
-    }
 }
 
 /// The window opacity, whatever shape a hand edit gave it. One field that
@@ -506,15 +484,10 @@ pub(crate) fn window_opacity_overrides(
     use wezterm_dynamic::ToDynamic;
     let changes = window_opacity_changes(settings.appearance.window_opacity);
     let [opacity, blur, backdrop] = WINDOW_OPACITY_KEYS;
-    let trial = settings.appearance.windows_backdrop;
     [
         (opacity, changes.opacity.map(|opacity| opacity.to_dynamic())),
         (blur, changes.blur.map(|blur| blur.to_dynamic())),
-        (
-            backdrop,
-            (cfg!(windows) && trial != NativeWindowsBackdrop::Off)
-                .then(|| trial.trial().to_dynamic()),
-        ),
+        (backdrop, changes.acrylic.map(|acrylic| acrylic.to_dynamic())),
     ]
 }
 
@@ -526,15 +499,17 @@ pub(crate) const WINDOW_OPACITY_KEYS: [&str; 3] = [
 ];
 
 /// What a window opacity of `percent` changes in a window's configuration:
-/// the opacity, and while it is see-through on macOS the blur the
-/// configuration file does not ask for itself. `None` changes nothing.
+/// the opacity, and while it is see-through the frosted glass that goes
+/// with it -- on macOS the blur the configuration file does not ask for
+/// itself, on Windows the acrylic drawn through DirectComposition, which a
+/// window takes as it is made. `None` changes nothing.
 ///
-/// Windows is given no backdrop: with this window frame any
-/// `win32_system_backdrop` turns a see-through window opaque (see
-/// wezterm#6265), so that stays the configuration's to choose.
+/// `win32_system_backdrop` stays the configuration's to choose: with this
+/// window frame it turns a see-through window opaque (wezterm#6265).
 struct WindowOpacityChanges {
     opacity: Option<f64>,
     blur: Option<i64>,
+    acrylic: Option<config::Win32BackdropTrial>,
 }
 
 fn window_opacity_changes(percent: Option<u8>) -> WindowOpacityChanges {
@@ -549,6 +524,8 @@ fn window_opacity_changes(percent: Option<u8>) -> WindowOpacityChanges {
             && cfg!(target_os = "macos")
             && config.macos_window_background_blur == 0)
             .then_some(WINDOW_BLUR_RADIUS),
+        acrylic: (see_through && cfg!(windows))
+            .then_some(config::Win32BackdropTrial::Composition),
     }
 }
 
@@ -1962,7 +1939,6 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.app_icon != after.appearance.app_icon
         || before.appearance.color_scheme != after.appearance.color_scheme
         || before.appearance.window_opacity != after.appearance.window_opacity
-        || before.appearance.windows_backdrop != after.appearance.windows_backdrop
     {
         // Language, theme, colour scheme, opacity, chrome and app icon.
         apply_to_app(after);
@@ -2936,31 +2912,26 @@ mod tests {
         settings.appearance.window_opacity = Some(100);
         let [_, blur, _] = window_opacity_overrides(&settings);
         assert_eq!(blur.1, None);
-        // The Windows backdrop is never Settings' to set; the acrylic drawn
-        // through DirectComposition is, on Windows.
+        // Opaque, Windows is asked for no acrylic either. The Windows
+        // backdrop itself is never Settings' to set.
+        let [.., backdrop] = window_opacity_overrides(&settings);
+        assert_eq!(backdrop.1, None);
         assert!(!WINDOW_OPACITY_KEYS.contains(&"win32_system_backdrop"));
-        settings.appearance.windows_backdrop = NativeWindowsBackdrop::Composition;
+        // See-through, it is, on Windows.
+        settings.appearance.window_opacity = Some(80);
         let [.., backdrop] = window_opacity_overrides(&settings);
         assert_eq!(
             backdrop.1,
-            cfg!(windows).then(|| config::Win32BackdropTrial::Composition.to_dynamic())
+            (cfg!(windows) && window_opacity_supported())
+                .then(|| config::Win32BackdropTrial::Composition.to_dynamic())
         );
     }
 
     #[test]
-    fn a_windows_backdrop_this_build_does_not_know_is_off() {
-        let read = |written: &str| {
-            let text = format!(r#"{{"appearance":{{"windows_backdrop":{written}}}}}"#);
-            serde_json::from_str::<ThinkTermNativeSettings>(&text)
-                .unwrap()
-                .appearance
-                .windows_backdrop
-        };
-        assert_eq!(read(r#""composition""#), NativeWindowsBackdrop::Composition);
-        // Ways tried and dropped read as off, as one not known yet does.
-        assert_eq!(read(r#""accent""#), NativeWindowsBackdrop::Off);
-        assert_eq!(read(r#""system_blur""#), NativeWindowsBackdrop::Off);
-        assert_eq!(read(r#""something_new""#), NativeWindowsBackdrop::Off);
+    fn a_frosted_glass_choice_left_by_a_trial_build_is_ignored() {
+        let text = r#"{"appearance":{"window_opacity":80,"windows_backdrop":"composition"}}"#;
+        let settings: ThinkTermNativeSettings = serde_json::from_str(text).unwrap();
+        assert_eq!(settings.appearance.window_opacity, Some(80));
     }
 
     use config::UiColors;
