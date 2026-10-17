@@ -1,16 +1,15 @@
 use crate::bitmaps::BitmapImage;
-use core_graphics::base::{
-    kCGBitmapByteOrder32Little, kCGImageAlphaPremultipliedFirst, kCGRenderingIntentDefault,
-};
+use core_graphics::base::{kCGBitmapByteOrder32Big, kCGImageAlphaLast, kCGRenderingIntentDefault};
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::data_provider::CGDataProvider;
 use core_graphics::image::CGImage;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Allows referencing a BitmapImage as a CGImage.
-/// The CGImage points to the data owned by the BitmapImage.
-/// This type is set up to borrow that data; the compiler
-/// will enforce the borrow and keep the code safe.
+/// The CGImage holds a copy of the BitmapImage's pixels: whoever it is
+/// handed to may keep it after the BitmapImage is gone, as AppKit keeps
+/// the application icon.
 pub struct BitmapRef<'a> {
     image: CGImage,
     _phantom: PhantomData<&'a ()>,
@@ -35,8 +34,7 @@ impl<'a> BitmapRef<'a> {
             let data = image.pixel_data();
             std::slice::from_raw_parts(data, byte_size)
         };
-        // This is also safe for the same reason as above
-        let provider = unsafe { CGDataProvider::from_slice(slice) };
+        let provider = CGDataProvider::from_buffer(Arc::new(slice.to_vec()));
 
         let should_interpolate = true;
         let bytes_per_row = width * 4;
@@ -47,7 +45,10 @@ impl<'a> BitmapRef<'a> {
             32,
             bytes_per_row,
             &CGColorSpace::create_device_rgb(),
-            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
+            // RGBA, unpremultiplied: what Image::with_rgba32 keeps of a
+            // decoded PNG, and what the X11 icon reads it as. Read as BGRA,
+            // the blue icon came out red.
+            kCGImageAlphaLast | kCGBitmapByteOrder32Big,
             &provider,
             should_interpolate,
             kCGRenderingIntentDefault,
