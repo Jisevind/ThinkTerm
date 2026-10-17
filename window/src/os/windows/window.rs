@@ -2064,20 +2064,31 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
             };
 
             let margins = match inner.config.window_decorations {
-                _ if composition => -1,
-                WindowDecorations::TITLE => -1,
-                _ => 0,
+                // The frame the backdrop shows on, over the whole window: the
+                // side bands as wide as any window, and none at the top. One
+                // there (or -1) has DWM draw its own caption into it, and the
+                // caption buttons over ours.
+                _ if composition => MARGINS {
+                    cxLeftWidth: 0xFF_FFFF,
+                    cxRightWidth: 0xFF_FFFF,
+                    cyTopHeight: 0,
+                    cyBottomHeight: 0,
+                },
+                WindowDecorations::TITLE => MARGINS {
+                    cxLeftWidth: -1,
+                    cxRightWidth: -1,
+                    cyTopHeight: -1,
+                    cyBottomHeight: -1,
+                },
+                _ => MARGINS {
+                    cxLeftWidth: 0,
+                    cxRightWidth: 0,
+                    cyTopHeight: 0,
+                    cyBottomHeight: 0,
+                },
             };
 
-            DwmExtendFrameIntoClientArea(
-                hwnd,
-                &MARGINS {
-                    cxLeftWidth: margins,
-                    cxRightWidth: margins,
-                    cyTopHeight: margins,
-                    cyBottomHeight: margins,
-                },
-            );
+            DwmExtendFrameIntoClientArea(hwnd, &margins);
 
             // A trial may be switched while the window is open: what lets
             // the window's alpha through goes with it.
