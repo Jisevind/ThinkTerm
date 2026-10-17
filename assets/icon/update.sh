@@ -8,6 +8,7 @@ src=ThinkTerm_simple.png
 windows_src=ThinkTerm_windows.png
 macos_icns=ThinkTerm_simple.icns
 classic_macos_icns=ThinkTerm.icns
+red_macos_icns=ThinkTerm_red.icns
 
 conv_opts="-colors 256 -background none -density 300"
 
@@ -34,6 +35,17 @@ if [ -f "$macos_icns" ]; then
     if [ -f "$classic_macos_icns" ]; then
       sips -z 128 128 -s format png "$classic_macos_icns" --out ThinkTerm_128.png
     fi
+  fi
+  # The red icon is the default one with red and blue swapped.
+  if command -v iconutil >/dev/null 2>&1 ; then
+    rm -rf red.iconset && iconutil -c iconset "$macos_icns" -o red.iconset
+    for png in red.iconset/*.png ; do
+      convert "$png" -channel-fx 'red<=>blue' "$png"
+    done
+    iconutil -c icns red.iconset -o "$red_macos_icns"
+    rm -rf red.iconset
+    cp "$red_macos_icns" ../macos/ThinkTerm.app/Contents/Resources/ThinkTerm_red.icns
+    sips -z 128 128 -s format png "$red_macos_icns" --out ThinkTerm_red_128.png
   fi
 else
   png2icns ../macos/ThinkTerm.app/Contents/Resources/ThinkTerm_simple.icns icon_*px.png

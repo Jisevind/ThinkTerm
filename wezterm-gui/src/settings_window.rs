@@ -1454,6 +1454,7 @@ fn localized_theme_mode_label(mode: NativeThemeMode) -> String {
 fn localized_app_icon_label(icon: NativeAppIcon) -> String {
     crate::i18n::tr(match icon {
         NativeAppIcon::Simple => "settings-app-icon-simple",
+        NativeAppIcon::Red => "settings-app-icon-red",
         NativeAppIcon::Classic => "settings-app-icon-classic",
     })
 }
@@ -9055,7 +9056,21 @@ impl SettingsWindow {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
         let side = self.ui_px(88.0).round();
-        let gap = self.ui_px(20.0);
+        let labels = NativeAppIcon::ALL.map(localized_app_icon_label);
+        let widest = labels
+            .iter()
+            .map(|label| self.measure_text_width(&body_font, label))
+            .fold(0.0, f32::max);
+        let count = NativeAppIcon::ALL.len() as f32;
+        let spacing = self.ui_px(12.0);
+        // Every name gets the room of the widest, so none is cut off --
+        // unless the names would then take over half the row: in a narrow
+        // window they end in an ellipsis rather than crowd out the title.
+        let label_room = widest.min(((width * 0.5 - spacing * (count - 1.0)) / count).max(side));
+        // Names a little apart; wide ones spread the icons.
+        let gap = self.ui_px(20.0).max(label_room + spacing - side).ceil();
+        // How far a name wider than its icon hangs past it, on each side.
+        let overhang = ((label_room - side) / 2.0).max(0.0).ceil();
         // The artwork keeps the macOS icon grid's margin: 13 of every 128
         // pixels on each side are clear, and the ring hugs what is drawn.
         let inset = (side * 13.0 / 128.0).round();
@@ -9064,12 +9079,10 @@ impl SettingsWindow {
         let cell_height = self.metrics.cell_size.height as f32;
         let chosen = self.native_settings.appearance.app_icon;
         let accent = self.chrome_palette.accent;
-        let count = NativeAppIcon::ALL.len() as f32;
-        let block_x = x + width - side * count - gap * (count - 1.0);
+        let block_x = x + width - overhang - side * count - gap * (count - 1.0);
         // The drawn face's top lines up with the label's.
         let icon_y = y - inset;
         let label_y = icon_y + side - inset + self.ui_px(10.0);
-        let label_room = side + gap * 0.8;
 
         for (index, icon) in NativeAppIcon::ALL.iter().copied().enumerate() {
             let icon_x = block_x + (side + gap) * index as f32;
@@ -9094,7 +9107,7 @@ impl SettingsWindow {
                 )?;
             }
             self.draw_app_icon_choice(layers, icon, icon_x, icon_y, side)?;
-            let label = localized_app_icon_label(icon);
+            let label = &labels[index];
             let label_width = self.measure_text_width(&body_font, &label).min(label_room);
             self.draw_text(
                 layers,
@@ -9117,7 +9130,7 @@ impl SettingsWindow {
             );
         }
 
-        let text_width = (block_x - x - self.ui_px(24.0)).max(0.0);
+        let text_width = (block_x - overhang - x - self.ui_px(24.0)).max(0.0);
         self.draw_text(
             layers,
             &ui_font,

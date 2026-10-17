@@ -128,6 +128,8 @@ where
 #[serde(rename_all = "lowercase")]
 pub(crate) enum NativeAppIcon {
     Simple,
+    /// The simple one, red.
+    Red,
     #[serde(alias = "default")]
     Classic,
 }
@@ -141,7 +143,8 @@ impl Default for NativeAppIcon {
 impl NativeAppIcon {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Simple => "Simple",
+            Self::Simple => "Blue Pill",
+            Self::Red => "Red Pill",
             Self::Classic => "Classic",
         }
     }
@@ -149,17 +152,19 @@ impl NativeAppIcon {
     fn file_name(self) -> &'static str {
         match self {
             Self::Simple => "ThinkTerm_simple.icns",
+            Self::Red => "ThinkTerm_red.icns",
             Self::Classic => "ThinkTerm.icns",
         }
     }
 
-    pub(crate) const ALL: [Self; 2] = [Self::Simple, Self::Classic];
+    pub(crate) const ALL: [Self; 3] = [Self::Simple, Self::Red, Self::Classic];
 
     /// A 128px copy of the icon, for Settings to show as a choice: the
     /// full-size art is megabytes of PNG to decode for a 44pt picture.
     pub(crate) fn thumbnail(self) -> &'static [u8] {
         match self {
             Self::Simple => include_bytes!("../../assets/icon/ThinkTerm_simple_128.png"),
+            Self::Red => include_bytes!("../../assets/icon/ThinkTerm_red_128.png"),
             Self::Classic => include_bytes!("../../assets/icon/ThinkTerm_128.png"),
         }
     }
@@ -405,6 +410,9 @@ impl NativeBottomQuoteMode {
 pub(crate) struct NativeAppearanceSettings {
     #[serde(deserialize_with = "theme_mode_or_default")]
     pub(crate) theme_mode: NativeThemeMode,
+    /// A build without the icon a newer one chose falls back to the
+    /// default rather than failing the file, as with the theme.
+    #[serde(deserialize_with = "choice_or_default")]
     pub(crate) app_icon: NativeAppIcon,
     /// Color scheme picked in the command palette; overrides the config's
     /// `color_scheme` for every window. `None` follows the configuration.
@@ -3043,6 +3051,24 @@ mod tests {
     /// The mouse and clipboard choices too: a typo, or a newer build's
     /// value, costs that one field and nothing else; a field this build no
     /// longer has is passed over.
+    #[test]
+    fn an_unknown_app_icon_does_not_take_the_rest_with_them() {
+        let json = r#"{
+            "version": 1,
+            "appearance": { "theme_mode": "light", "app_icon": "green" },
+            "localization": { "language": "ja-JP" }
+        }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.appearance.app_icon, NativeAppIcon::default());
+        assert_eq!(settings.appearance.theme_mode, NativeThemeMode::Light);
+        assert_eq!(settings.localization.language.as_deref(), Some("ja-JP"));
+
+        let json = r#"{ "version": 1, "appearance": { "app_icon": "red" } }"#;
+        let settings: ThinkTermNativeSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.appearance.app_icon, NativeAppIcon::Red);
+    }
+
     #[test]
     fn unknown_mouse_and_clipboard_choices_do_not_take_the_rest_with_them() {
         let json = r#"{
