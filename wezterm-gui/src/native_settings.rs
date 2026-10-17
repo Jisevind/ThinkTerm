@@ -413,6 +413,36 @@ pub(crate) struct NativeAppearanceSettings {
     /// `window_background_opacity`. `None` follows the configuration.
     #[serde(deserialize_with = "window_opacity_or_default")]
     pub(crate) window_opacity: Option<u8>,
+    /// On Windows, another way of asking for the frosted backdrop behind a
+    /// see-through window, being tried (see `config::Win32BackdropTrial`).
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) windows_backdrop: NativeWindowsBackdrop,
+}
+
+/// The ways Settings offers to try of asking Windows for the frosted
+/// backdrop, `Off` the usual one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeWindowsBackdrop {
+    #[default]
+    Off,
+    Accent,
+    System,
+    SystemBlur,
+}
+
+impl NativeWindowsBackdrop {
+    /// Every way, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 4] = [Self::Off, Self::Accent, Self::System, Self::SystemBlur];
+
+    fn trial(self) -> config::Win32BackdropTrial {
+        match self {
+            Self::Off => config::Win32BackdropTrial::Off,
+            Self::Accent => config::Win32BackdropTrial::Accent,
+            Self::System => config::Win32BackdropTrial::System,
+            Self::SystemBlur => config::Win32BackdropTrial::SystemBlur,
+        }
+    }
 }
 
 /// The window opacity, whatever shape a hand edit gave it. One field that
@@ -467,22 +497,33 @@ pub(crate) fn window_opacity_supported() -> bool {
 const WINDOW_BLUR_RADIUS: i64 = 20;
 
 /// The configuration keys the window-opacity setting overrides, and with
-/// what. `None` removes a key, so that the configuration decides again.
+/// what -- with them, on Windows, the way of asking for the frosted
+/// backdrop being tried. `None` removes a key, so that the configuration
+/// decides again.
 pub(crate) fn window_opacity_overrides(
     settings: &ThinkTermNativeSettings,
-) -> [(&'static str, Option<wezterm_dynamic::Value>); 2] {
+) -> [(&'static str, Option<wezterm_dynamic::Value>); 3] {
     use wezterm_dynamic::ToDynamic;
     let changes = window_opacity_changes(settings.appearance.window_opacity);
-    let [opacity, blur] = WINDOW_OPACITY_KEYS;
+    let [opacity, blur, backdrop] = WINDOW_OPACITY_KEYS;
+    let trial = settings.appearance.windows_backdrop;
     [
         (opacity, changes.opacity.map(|opacity| opacity.to_dynamic())),
         (blur, changes.blur.map(|blur| blur.to_dynamic())),
+        (
+            backdrop,
+            (cfg!(windows) && trial != NativeWindowsBackdrop::Off)
+                .then(|| trial.trial().to_dynamic()),
+        ),
     ]
 }
 
 /// The configuration keys Settings' window opacity overrides in a window.
-pub(crate) const WINDOW_OPACITY_KEYS: [&str; 2] =
-    ["window_background_opacity", "macos_window_background_blur"];
+pub(crate) const WINDOW_OPACITY_KEYS: [&str; 3] = [
+    "window_background_opacity",
+    "macos_window_background_blur",
+    "win32_backdrop_trial",
+];
 
 /// What a window opacity of `percent` changes in a window's configuration:
 /// the opacity, and while it is see-through on macOS the blur the
@@ -1912,6 +1953,7 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.app_icon != after.appearance.app_icon
         || before.appearance.color_scheme != after.appearance.color_scheme
         || before.appearance.window_opacity != after.appearance.window_opacity
+        || before.appearance.windows_backdrop != after.appearance.windows_backdrop
     {
         // Language, theme, colour scheme, opacity, chrome and app icon.
         apply_to_app(after);
@@ -2864,11 +2906,12 @@ mod tests {
     fn window_opacity_overrides_the_opacity_and_asks_for_a_blur() {
         use wezterm_dynamic::ToDynamic;
         let mut settings = ThinkTermNativeSettings::default();
-        let [opacity, blur] = window_opacity_overrides(&settings);
+        let [opacity, blur, backdrop] = window_opacity_overrides(&settings);
         assert_eq!(opacity, ("window_background_opacity", None));
         assert_eq!(blur, ("macos_window_background_blur", None));
+        assert_eq!(backdrop, ("win32_backdrop_trial", None));
         settings.appearance.window_opacity = Some(80);
-        let [opacity, blur] = window_opacity_overrides(&settings);
+        let [opacity, blur, _] = window_opacity_overrides(&settings);
         if window_opacity_supported() {
             assert_eq!(opacity.1, Some(0.8f64.to_dynamic()));
         } else {
@@ -2882,10 +2925,30 @@ mod tests {
             assert_eq!(opacity.1, Some(0.3f64.to_dynamic()));
         }
         settings.appearance.window_opacity = Some(100);
-        let [_, blur] = window_opacity_overrides(&settings);
+        let [_, blur, _] = window_opacity_overrides(&settings);
         assert_eq!(blur.1, None);
-        // The Windows backdrop is never Settings' to set.
+        // The Windows backdrop is never Settings' to set; a way of asking
+        // for it being tried is, on Windows.
         assert!(!WINDOW_OPACITY_KEYS.contains(&"win32_system_backdrop"));
+        settings.appearance.windows_backdrop = NativeWindowsBackdrop::Accent;
+        let [.., backdrop] = window_opacity_overrides(&settings);
+        assert_eq!(
+            backdrop.1,
+            cfg!(windows).then(|| config::Win32BackdropTrial::Accent.to_dynamic())
+        );
+    }
+
+    #[test]
+    fn a_windows_backdrop_this_build_does_not_know_is_off() {
+        let read = |written: &str| {
+            let text = format!(r#"{{"appearance":{{"windows_backdrop":{written}}}}}"#);
+            serde_json::from_str::<ThinkTermNativeSettings>(&text)
+                .unwrap()
+                .appearance
+                .windows_backdrop
+        };
+        assert_eq!(read(r#""system_blur""#), NativeWindowsBackdrop::SystemBlur);
+        assert_eq!(read(r#""something_new""#), NativeWindowsBackdrop::Off);
     }
 
     use config::UiColors;

@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
-use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
+use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop, Win32BackdropTrial};
 use lazy_static::lazy_static;
 use promise::Future;
 use raw_window_handle::{
@@ -143,6 +143,9 @@ pub(crate) struct WindowInner {
     /// reason as `occlusion_visible`: the owner wants the edges, not a message
     /// per pixel of a drag.
     last_frame_event: Option<(ScreenRect, bool)>,
+    /// The way of asking for the backdrop last applied: one switched off is
+    /// undone, and a window that never tried one is left as it always was.
+    backdrop_trial: Win32BackdropTrial,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -939,6 +942,7 @@ impl Window {
             invalidated: true,
             occlusion_visible: None,
             last_frame_event: None,
+            backdrop_trial: Win32BackdropTrial::Off,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -997,7 +1001,10 @@ impl Window {
         }
 
         apply_theme(hwnd.0);
-        enable_blur_behind(hwnd.0);
+        blur_behind(
+            hwnd.0,
+            config.win32_backdrop_trial != Win32BackdropTrial::System,
+        );
 
         // Make window capable of accepting drag and drop
         unsafe {
@@ -1840,8 +1847,9 @@ fn get_window_state(hwnd: HWND) -> WindowState {
 /// effect that the DWM could enable.  Subsequent windows
 /// versions have removed the blurring.  We use this call
 /// to tell DWM that we set proper alpha channel info as
-/// a result of rendering our window content.
-fn enable_blur_behind(hwnd: HWND) {
+/// a result of rendering our window content; `enable`
+/// false takes that back.
+fn blur_behind(hwnd: HWND, enable: bool) {
     use winapi::shared::minwindef::*;
     use winapi::um::dwmapi::*;
     use winapi::um::wingdi::*;
@@ -1851,7 +1859,7 @@ fn enable_blur_behind(hwnd: HWND) {
 
         let bb = DWM_BLURBEHIND {
             dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-            fEnable: TRUE,
+            fEnable: if enable { TRUE } else { FALSE },
             hRgnBlur: region,
             fTransitionOnMaximized: FALSE,
         };
@@ -1955,8 +1963,17 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
         if let Some(inner) = rc_from_hwnd(hwnd) {
             let mut inner = inner.borrow_mut();
 
-            // Set Acrylic or Mica system Backdrop
+            // Set Acrylic or Mica system Backdrop; a trial is of acrylic,
+            // asked for its own way.
+            let trial = inner.config.win32_backdrop_trial;
+            let system_trial =
+                matches!(trial, Win32BackdropTrial::System | Win32BackdropTrial::SystemBlur);
+            let accent = !*IS_WIN11_22H2 || trial == Win32BackdropTrial::Accent;
+            let acrylic = trial != Win32BackdropTrial::Off
+                || inner.config.win32_system_backdrop == SystemBackdrop::Acrylic;
             let pv_attribute = match inner.config.win32_system_backdrop {
+                _ if trial == Win32BackdropTrial::Accent => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_NONE,
+                _ if system_trial => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TRANSIENTWINDOW,
                 SystemBackdrop::Auto => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_AUTO,
                 SystemBackdrop::Disable => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_NONE,
                 SystemBackdrop::Acrylic => DWM_SYSTEMBACKDROP_TYPE::DWMSBT_TRANSIENTWINDOW,
@@ -1965,6 +1982,7 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
             };
 
             let margins = match inner.config.window_decorations {
+                _ if system_trial => -1,
                 WindowDecorations::TITLE => -1,
                 _ => 0,
             };
@@ -1979,6 +1997,13 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
                 },
             );
 
+            // A trial may be switched while the window is open: what lets
+            // the window's alpha through goes with it.
+            let tried = std::mem::replace(&mut inner.backdrop_trial, trial);
+            if trial != Win32BackdropTrial::Off || tried != Win32BackdropTrial::Off {
+                blur_behind(hwnd, trial != Win32BackdropTrial::System);
+            }
+
             // Apply Acrylic or Mica Backdrop
             if *IS_WIN11_22H2 {
                 DwmSetWindowAttribute(
@@ -1987,28 +2012,30 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
                     &pv_attribute as *const _ as _,
                     std::mem::size_of_val(&pv_attribute) as u32,
                 );
-            } else {
-                let mut colour = inner.config.win32_acrylic_accent_color.to_srgb_u8();
-                colour.3 = if colour.3 == 0 { 1 } else { colour.3 }; // acrylic doesn't like to have 0 alpha
+            }
 
-                let mut policy = ACCENT_POLICY {
-                    AccentState: if inner.config.win32_system_backdrop == SystemBackdrop::Acrylic {
-                        ACCENT_STATE::ACCENT_ENABLE_ACRYLICBLURBEHIND as _
-                    } else {
-                        ACCENT_STATE::ACCENT_DISABLED as _
-                    },
-                    AccentFlags: if inner.config.win32_system_backdrop == SystemBackdrop::Acrylic {
-                        2
-                    } else {
-                        0
-                    },
-                    GradientColour: (colour.0 as u32)
-                        | (colour.1 as u32) << 8
-                        | (colour.2 as u32) << 16
-                        | (colour.3 as u32) << 24,
-                    AnimationId: 0,
-                };
+            // The accent policy: acrylic before 22H2, or by the trial of it;
+            // turned off again once that trial is.
+            let send = accent || tried == Win32BackdropTrial::Accent;
+            let mut colour = inner.config.win32_acrylic_accent_color.to_srgb_u8();
+            colour.3 = if colour.3 == 0 { 1 } else { colour.3 }; // acrylic doesn't like to have 0 alpha
+            let on = accent && acrylic;
 
+            let mut policy = ACCENT_POLICY {
+                AccentState: if on {
+                    ACCENT_STATE::ACCENT_ENABLE_ACRYLICBLURBEHIND as _
+                } else {
+                    ACCENT_STATE::ACCENT_DISABLED as _
+                },
+                AccentFlags: if on { 2 } else { 0 },
+                GradientColour: (colour.0 as u32)
+                    | (colour.1 as u32) << 8
+                    | (colour.2 as u32) << 16
+                    | (colour.3 as u32) << 24,
+                AnimationId: 0,
+            };
+
+            if send {
                 if let Ok(user) = User32::open(std::path::Path::new("user32.dll")) {
                     (user.SetWindowCompositionAttribute)(
                         hwnd,
@@ -2019,22 +2046,22 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
                         },
                     );
                 }
+            }
 
-                if !*IS_WIN10 && !*IS_WIN11_22H2 {
-                    // For build versions less than 22h2 but are still win11
-                    let mica_enabled: u32 =
-                        if inner.config.win32_system_backdrop == SystemBackdrop::Mica {
-                            1
-                        } else {
-                            0
-                        };
-                    DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_MICA_EFFECT,
-                        &mica_enabled as *const _ as _,
-                        std::mem::size_of_val(&mica_enabled) as u32,
-                    );
-                }
+            if !*IS_WIN10 && !*IS_WIN11_22H2 {
+                // For build versions less than 22h2 but are still win11
+                let mica_enabled: u32 =
+                    if inner.config.win32_system_backdrop == SystemBackdrop::Mica {
+                        1
+                    } else {
+                        0
+                    };
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_MICA_EFFECT,
+                    &mica_enabled as *const _ as _,
+                    std::mem::size_of_val(&mica_enabled) as u32,
+                );
             }
 
             if appearance != inner.appearance {

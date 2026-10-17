@@ -25,8 +25,8 @@ use crate::{
     default_config_with_overrides_applied, default_one_point_oh, default_one_point_oh_f64,
     default_true, default_win32_acrylic_accent_color, CellWidth, GpuInfo,
     IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor,
-    SerialDomain, SystemBackdrop, WebGpuPowerPreference, CONFIG_DIRS, CONFIG_FILE_OVERRIDE,
-    CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    SerialDomain, SystemBackdrop, WebGpuPowerPreference, Win32BackdropTrial, CONFIG_DIRS,
+    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
 };
 use anyhow::Context;
 use luahelper::impl_lua_conversion_dynamic;
@@ -628,6 +628,11 @@ pub struct Config {
 
     #[dynamic(default = "default_win32_acrylic_accent_color")]
     pub win32_acrylic_accent_color: RgbaColor,
+
+    /// Only works on Windows: tries another way of asking for the acrylic
+    /// backdrop, which it then asks for (see `Win32BackdropTrial`).
+    #[dynamic(default)]
+    pub win32_backdrop_trial: Win32BackdropTrial,
 
     /// Specifies the alpha value to use when rendering the background
     /// of the window.  The background is taken either from the

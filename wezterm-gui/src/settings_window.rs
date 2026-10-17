@@ -43,7 +43,7 @@ use window::{
 
 use crate::native_settings::{
     NativeAppIcon, NativeBottomQuoteMode, NativeRemotePaneResizeMode, NativeRendererBackend,
-    NativeThemeMode, ThinkTermNativeSettings, DEFAULT_HOME_FONT_SIZE,
+    NativeThemeMode, NativeWindowsBackdrop, ThinkTermNativeSettings, DEFAULT_HOME_FONT_SIZE,
     DEFAULT_PANE_HEADER_FONT_SIZE, DEFAULT_SETTINGS_FONT_SIZE, DEFAULT_SIDEBAR_FONT_SIZE,
     DEFAULT_TAB_FONT_SIZE,
 };
@@ -1487,6 +1487,15 @@ fn shell_catalog_including(
     catalog
 }
 
+fn localized_windows_backdrop_label(backdrop: NativeWindowsBackdrop) -> String {
+    crate::i18n::tr(match backdrop {
+        NativeWindowsBackdrop::Off => "settings-windows-backdrop-off",
+        NativeWindowsBackdrop::Accent => "settings-windows-backdrop-accent",
+        NativeWindowsBackdrop::System => "settings-windows-backdrop-system",
+        NativeWindowsBackdrop::SystemBlur => "settings-windows-backdrop-system-blur",
+    })
+}
+
 fn localized_remote_pane_resize_mode_label(mode: NativeRemotePaneResizeMode) -> String {
     crate::i18n::tr(match mode {
         NativeRemotePaneResizeMode::Auto => "settings-remote-pane-resize-mode-auto",
@@ -1824,6 +1833,7 @@ enum SettingsAction {
     QuitApplication,
     ToggleBottomQuote,
     SetRemotePaneResizeMode(NativeRemotePaneResizeMode),
+    SetWindowsBackdrop(NativeWindowsBackdrop),
     SetScrollMode(crate::native_settings::NativeScrollMode),
     SetSelectionStyle(crate::native_settings::NativeSelectionStyle),
     ToggleCopyOnSelect,
@@ -5297,6 +5307,36 @@ impl SettingsWindow {
         }
     }
 
+    /// Try another way of asking Windows for the frosted backdrop, in every
+    /// window at once, as the window opacity is.
+    fn apply_windows_backdrop(&mut self, backdrop: NativeWindowsBackdrop) {
+        self.ui.open_dropdown = None;
+        // Merged into the freshest settings, as `apply_window_opacity` is.
+        let mut merged = crate::native_settings::load();
+        merged.appearance.windows_backdrop = backdrop;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-windows-backdrop");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                crate::native_settings::apply_window_opacity_to_app(&self.native_settings);
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", setting),
+                        ("value", localized_windows_backdrop_label(backdrop)),
+                    ],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     fn apply_remote_pane_resize_mode(&mut self, mode: NativeRemotePaneResizeMode) {
         self.ui.open_dropdown = None;
         self.native_settings.terminal.remote_pane_resize_mode = mode;
@@ -6226,6 +6266,7 @@ impl SettingsWindow {
             SettingsAction::SetRemotePaneResizeMode(mode) => {
                 self.apply_remote_pane_resize_mode(mode)
             }
+            SettingsAction::SetWindowsBackdrop(backdrop) => self.apply_windows_backdrop(backdrop),
             SettingsAction::SetBottomQuoteMode(mode) => self.apply_bottom_quote_mode(mode),
             SettingsAction::DecreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(-1.0),
             SettingsAction::IncreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(1.0),
@@ -8468,6 +8509,42 @@ impl SettingsWindow {
                 TileColor::Blue,
             )?;
             rows.add(this.paint_window_opacity_row(layers, tx, rows.y, tw, rows.rule())?);
+            if cfg!(windows) {
+                let options: Vec<(String, SettingsAction)> = NativeWindowsBackdrop::ALL
+                    .iter()
+                    .map(|backdrop| {
+                        (
+                            localized_windows_backdrop_label(*backdrop),
+                            SettingsAction::SetWindowsBackdrop(*backdrop),
+                        )
+                    })
+                    .collect();
+                let selected = NativeWindowsBackdrop::ALL
+                    .iter()
+                    .position(|backdrop| {
+                        *backdrop == this.native_settings.appearance.windows_backdrop
+                    })
+                    .unwrap_or(0);
+                let (tx, tw) = this.paint_row_tile(
+                    layers,
+                    row_x,
+                    rows.y,
+                    row_width,
+                    SvgIcon::Contrast,
+                    TileColor::Indigo,
+                )?;
+                rows.add(this.paint_segmented_setting_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr("settings-windows-backdrop"),
+                    &crate::i18n::tr("settings-windows-backdrop-description"),
+                    &options,
+                    selected,
+                    rows.rule(),
+                )?);
+            }
             Ok(rows.bottom)
         })?;
 

@@ -8957,7 +8957,8 @@ impl TermWindow {
         let platform_changed = (config.window_background_opacity >= 1.0)
             != (before.window_background_opacity >= 1.0)
             || config.macos_window_background_blur != before.macos_window_background_blur
-            || config.win32_system_backdrop != before.win32_system_backdrop;
+            || config.win32_system_backdrop != before.win32_system_backdrop
+            || config.win32_backdrop_trial != before.win32_backdrop_trial;
         if !platform_changed && config.window_background_opacity == before.window_background_opacity
         {
             return;
