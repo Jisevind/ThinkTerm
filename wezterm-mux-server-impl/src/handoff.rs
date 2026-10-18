@@ -27,6 +27,13 @@
 //! process. Also left behind, by design: bytes of a partial escape
 //! sequence at the pause boundary, and output held by an unfinished
 //! synchronized-output frame (the next frame redraws).
+//!
+//! Windows passes no descriptors over a socket. There the old server
+//! duplicates each handle into the successor itself -- a pane's pseudo
+//! console (its pipes, signal pipe, reference and console host) and its
+//! process, and the pid file -- and sends the numbers they have there
+//! (`Successor`). The listening socket does not travel: the successor binds
+//! it once the old server has exited. Everything else is the same.
 
 use anyhow::{anyhow, bail, Context};
 use std::convert::TryFrom;
@@ -37,17 +44,42 @@ use mux::pane::{Pane, PaneId};
 use mux::tab::{Tab, TabId};
 use mux::window::{Window, WindowId};
 use mux::{Mux, PausedReader};
+#[cfg(unix)]
 use passfd::FdPassingExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+#[cfg(windows)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use wezterm_uds::{UnixListener, UnixStream};
 use wezterm_term::{TerminalSize, TerminalSnapshot};
+
+/// What travels with a pane besides its messages: the pty descriptor, or on
+/// Windows the pseudo console's handles (`ConPtyHandoff::into_handles`)
+/// followed by the process's.
+#[cfg(unix)]
+type PaneObjects = OwnedFd;
+#[cfg(windows)]
+type PaneObjects = Vec<OwnedHandle>;
+
+/// The pid file as the successor receives it.
+#[cfg(unix)]
+pub type PidFile = OwnedFd;
+#[cfg(windows)]
+pub type PidFile = OwnedHandle;
 
 /// Bumped whenever the messages below change shape. Both sides say theirs
 /// first; a mismatch is refused before anything is paused.
@@ -210,6 +242,7 @@ fn placeholder(what: &str) -> HandoffMessage {
 /// room left than the descriptor takes, where a write would wait for the
 /// reader -- and a pane's message can end just short of filling it. Wait
 /// for the reader here too, as long as a step may take.
+#[cfg(unix)]
 fn send_fd(stream: &UnixStream, fd: RawFd) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut tries = 1;
@@ -246,12 +279,210 @@ fn send_fd(stream: &UnixStream, fd: RawFd) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn recv_owned_fd(stream: &UnixStream) -> anyhow::Result<OwnedFd> {
     let fd = stream
         .as_raw_fd()
         .recv_fd()
         .context("receiving a file descriptor")?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The successor's process, open to receive handles, on Windows.
+#[cfg(windows)]
+struct Successor(OwnedHandle);
+
+#[cfg(windows)]
+impl Successor {
+    /// The process at the other end of `stream`, if this server may give
+    /// it its consoles: a mux server running as the same user at the same
+    /// integrity level. Anything that can reach the handoff socket can
+    /// already talk to this server, but the handles of an elevated server's
+    /// panes are elevated shells, and must not reach a process below it.
+    fn of(stream: &UnixStream) -> anyhow::Result<Self> {
+        use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcess};
+        use winapi::um::winnt::{PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION};
+        let pid = peer_pid(stream)?;
+        let handle = unsafe {
+            OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("opening the successor, pid {pid}"));
+        }
+        let process = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+        if !mux::session_server::is_mux_server_process(pid) {
+            bail!("the successor (pid {pid}) is not a mux server");
+        }
+        let ours = token_identity(unsafe { GetCurrentProcess() } as _)?;
+        let theirs = token_identity(process.as_raw_handle())?;
+        if ours != theirs {
+            bail!(
+                "the successor (pid {pid}) runs as another user or at another integrity level \
+                 (an elevated server and one that is not)"
+            );
+        }
+        Ok(Self(process))
+    }
+
+    /// Duplicate `handles` into the successor, then send the numbers they
+    /// have there: a count, then each as a little-endian u64.
+    fn send(&self, stream: &mut UnixStream, handles: &[RawHandle]) -> anyhow::Result<()> {
+        use winapi::um::handleapi::DuplicateHandle;
+        use winapi::um::processthreadsapi::GetCurrentProcess;
+        use winapi::um::winnt::DUPLICATE_SAME_ACCESS;
+        let mut sent = Vec::with_capacity(handles.len());
+        for &handle in handles {
+            let mut there = std::ptr::null_mut();
+            let ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle as _,
+                    self.0.as_raw_handle() as _,
+                    &mut there,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
+                self.close(&sent);
+                return Err(err).context("duplicating a handle into the successor");
+            }
+            sent.push(there as usize as u64);
+        }
+        let mut frame = Vec::with_capacity(4 + 8 * sent.len());
+        frame.extend_from_slice(&(sent.len() as u32).to_le_bytes());
+        for value in &sent {
+            frame.extend_from_slice(&value.to_le_bytes());
+        }
+        if let Err(err) = stream.write_all(&frame).and_then(|()| stream.flush()) {
+            self.close(&sent);
+            return Err(err).context("sending handles to the successor");
+        }
+        Ok(())
+    }
+
+    /// Close handles put into the successor that it will never hear of.
+    fn close(&self, sent: &[u64]) {
+        use winapi::um::handleapi::DuplicateHandle;
+        use winapi::um::winnt::DUPLICATE_CLOSE_SOURCE;
+        for &value in sent {
+            unsafe {
+                DuplicateHandle(
+                    self.0.as_raw_handle() as _,
+                    value as usize as _,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    DUPLICATE_CLOSE_SOURCE,
+                )
+            };
+        }
+    }
+}
+
+/// The handles the predecessor put into this process for the message just
+/// read; refused unless there are exactly `expected`.
+#[cfg(windows)]
+fn recv_handles(stream: &mut UnixStream, expected: usize) -> anyhow::Result<Vec<OwnedHandle>> {
+    let mut count = [0u8; 4];
+    stream
+        .read_exact(&mut count)
+        .context("reading a handle count")?;
+    let count = u32::from_le_bytes(count) as usize;
+    if count > 64 {
+        bail!("the predecessor claims to have sent {count} handles");
+    }
+    // All of them owned before anything is judged, so none leaks.
+    let mut handles = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut value = [0u8; 8];
+        stream.read_exact(&mut value).context("reading a handle")?;
+        let value = u64::from_le_bytes(value) as usize;
+        handles.push(unsafe { OwnedHandle::from_raw_handle(value as RawHandle) });
+    }
+    if count != expected {
+        bail!("expected {expected} handles, the predecessor sent {count}");
+    }
+    Ok(handles)
+}
+
+/// The pid of the process at the other end of an AF_UNIX stream.
+#[cfg(windows)]
+fn peer_pid(stream: &UnixStream) -> anyhow::Result<u32> {
+    use std::os::windows::io::AsRawSocket;
+    use winapi::um::winsock2::{WSAGetLastError, WSAIoctl, SOCKET};
+    /// `_WSAIOR(IOC_VENDOR, 256)` from afunix.h.
+    const SIO_AF_UNIX_GETPEERPID: u32 = 0x5800_0100;
+    let mut pid: u32 = 0;
+    let mut returned: u32 = 0;
+    let rc = unsafe {
+        WSAIoctl(
+            stream.as_raw_socket() as SOCKET,
+            SIO_AF_UNIX_GETPEERPID,
+            std::ptr::null_mut(),
+            0,
+            &mut pid as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc != 0 || pid == 0 {
+        bail!("asking for the successor's pid failed: WSA error {}", unsafe {
+            WSAGetLastError()
+        });
+    }
+    Ok(pid)
+}
+
+/// Who a process runs as, for comparing two: its user's SID and its
+/// integrity level.
+#[cfg(windows)]
+fn token_identity(process: RawHandle) -> anyhow::Result<(Vec<u8>, u32)> {
+    use winapi::um::processthreadsapi::OpenProcessToken;
+    use winapi::um::securitybaseapi::{GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation};
+    use winapi::um::winnt::{
+        TokenIntegrityLevel, TokenUser, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TOKEN_USER,
+    };
+
+    fn information(token: &OwnedHandle, class: TOKEN_INFORMATION_CLASS) -> anyhow::Result<Vec<u64>> {
+        let mut len = 0u32;
+        unsafe { GetTokenInformation(token.as_raw_handle() as _, class, std::ptr::null_mut(), 0, &mut len) };
+        // u64s, for the alignment of the structures read from it.
+        let mut buf = vec![0u64; (len as usize + 7) / 8];
+        let ok = unsafe {
+            GetTokenInformation(token.as_raw_handle() as _, class, buf.as_mut_ptr() as *mut _, len, &mut len)
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error()).context("reading a process token");
+        }
+        Ok(buf)
+    }
+
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process as _, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("opening a process token");
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token as _) };
+
+    let user = information(&token, TokenUser)?;
+    let sid = unsafe { (*(user.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let sid_bytes =
+        unsafe { std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize) }.to_vec();
+
+    let label = information(&token, TokenIntegrityLevel)?;
+    let level_sid = unsafe { (*(label.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid };
+    let level = unsafe {
+        let count = *GetSidSubAuthorityCount(level_sid);
+        *GetSidSubAuthority(level_sid, u32::from(count.saturating_sub(1)))
+    };
+    Ok((sid_bytes, level))
 }
 
 const KITTY_PLAYBACK_TAG: &[u8] = b"KGPA\x01";
@@ -391,17 +622,39 @@ fn decode_snapshot(
 
 // ------------------------------------------------------- the old server
 
+#[cfg(unix)]
 static PID_FILE_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(unix)]
 static REPORT_FD: AtomicI32 = AtomicI32::new(-1);
+/// Raw handles; 0 is none.
+#[cfg(windows)]
+static PID_FILE_HANDLE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(windows)]
+static REPORT_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 /// The pid file this daemon holds locked, to pass on with everything else.
+#[cfg(unix)]
 pub fn remember_pid_file_fd(fd: RawFd) {
     PID_FILE_FD.store(fd, Ordering::SeqCst);
 }
 
 /// The pipe back to the shell that ran `--daemonize --takeover`.
+#[cfg(unix)]
 pub fn remember_report_fd(fd: RawFd) {
     REPORT_FD.store(fd, Ordering::SeqCst);
+}
+
+/// The pid file this daemon holds open, which is its lock on Windows, to
+/// pass on with everything else.
+#[cfg(windows)]
+pub fn remember_pid_file_handle(handle: RawHandle) {
+    PID_FILE_HANDLE.store(handle as usize, Ordering::SeqCst);
+}
+
+/// The pipe back to the `--daemonize --takeover` launcher.
+#[cfg(windows)]
+pub fn remember_report_handle(handle: RawHandle) {
+    REPORT_HANDLE.store(handle as usize, Ordering::SeqCst);
 }
 
 /// Tell the shell that ran `--daemonize --takeover` how it went, once;
@@ -429,12 +682,23 @@ pub fn report_takeover_failure(err: &anyhow::Error) -> i32 {
     }
 }
 
+#[cfg(unix)]
 fn write_report(line: String) {
     let fd = REPORT_FD.swap(-1, Ordering::SeqCst);
     if fd < 0 {
         return;
     }
     let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+    pipe.write_all(line.as_bytes()).ok();
+}
+
+#[cfg(windows)]
+fn write_report(line: String) {
+    let handle = REPORT_HANDLE.swap(0, Ordering::SeqCst);
+    if handle == 0 {
+        return;
+    }
+    let mut pipe = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
     pipe.write_all(line.as_bytes()).ok();
 }
 
@@ -507,7 +771,7 @@ fn serve(mut stream: UnixStream, socket_path: &Path) {
 /// Dropping it before the successor owns the panes resumes them.
 struct Capture {
     hello: Hello,
-    panes: Vec<(HandoffPane, OwnedFd)>,
+    panes: Vec<(HandoffPane, PaneObjects)>,
     topology: Vec<HandoffWindow>,
     paused: Vec<PausedReader>,
 }
@@ -519,6 +783,8 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
     if version != HANDOFF_VERSION {
         bail!("the successor speaks handoff version {version}, this server speaks {HANDOFF_VERSION}");
     }
+    #[cfg(windows)]
+    let successor = Successor::of(stream)?;
     let unix_domains = config::configuration().unix_domains.len();
     if unix_domains > 1 {
         bail!(
@@ -526,11 +792,21 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
              stop and restart it instead"
         );
     }
+    #[cfg(unix)]
     let listener_fd = crate::local::listener_fd_for(socket_path)
         .ok_or_else(|| anyhow!("no listening socket registered for {}", socket_path.display()))?;
+    #[cfg(windows)]
+    let _ = socket_path;
+    #[cfg(unix)]
     let pid_file_fd = PID_FILE_FD.load(Ordering::SeqCst);
+    #[cfg(unix)]
+    let has_pid_file = pid_file_fd >= 0;
+    #[cfg(windows)]
+    let pid_file_handle = PID_FILE_HANDLE.load(Ordering::SeqCst);
+    #[cfg(windows)]
+    let has_pid_file = pid_file_handle != 0;
 
-    let capture = block_on_main(move || capture(pid_file_fd >= 0))?;
+    let capture = block_on_main(move || capture(has_pid_file))?;
     log::info!(
         "handing {} panes, {} windows to the successor ({} left behind)",
         capture.panes.len(),
@@ -539,24 +815,40 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
     );
 
     write_message(stream, &HandoffMessage::Hello(capture.hello.clone()))?;
-    if pid_file_fd >= 0 {
+    if has_pid_file {
+        #[cfg(unix)]
         send_fd(stream, pid_file_fd)?;
+        #[cfg(windows)]
+        successor
+            .send(stream, &[pid_file_handle as RawHandle])
+            .context("sending the pid file")?;
     }
     expect(stream, "Ack")?;
 
-    for (pane, fd) in &capture.panes {
+    for (pane, objects) in &capture.panes {
         let pane_id = pane.pane_id;
         write_message(stream, &HandoffMessage::Pane(clone_pane(pane)))
             .with_context(|| format!("sending pane {pane_id}"))?;
-        send_fd(stream, fd.as_raw_fd())
+        #[cfg(unix)]
+        send_fd(stream, objects.as_raw_fd())
             .with_context(|| format!("sending pane {pane_id}'s pty"))?;
+        #[cfg(windows)]
+        {
+            let handles: Vec<RawHandle> = objects.iter().map(|h| h.as_raw_handle()).collect();
+            successor
+                .send(stream, &handles)
+                .with_context(|| format!("sending pane {pane_id}'s console"))?;
+        }
         expect(stream, "Ack").with_context(|| format!("pane {pane_id}"))?;
     }
 
     write_message(stream, &HandoffMessage::Topology(clone_topology(&capture.topology)))?;
     expect(stream, "Ack").context("topology")?;
 
+    // On Windows the successor binds the socket itself once this server
+    // has exited; the message stays, for the shape of the exchange.
     write_message(stream, &HandoffMessage::Listener)?;
+    #[cfg(unix)]
     send_fd(stream, listener_fd).context("sending the listening socket")?;
     expect(stream, "Ack").context("listener")?;
 
@@ -637,7 +929,8 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
     for pane in mux.iter_panes() {
         let pane_id = pane.pane_id();
         let parts = match pane.downcast_ref::<LocalPane>() {
-            Some(local) if pane.domain_id() == local_domain => local.handoff_parts(),
+            Some(local) if pane.domain_id() == local_domain => travelling_parts(local)
+                .with_context(|| format!("pane {pane_id} cannot be handed over"))?,
             _ => None,
         };
         let Some(parts) = parts else {
@@ -656,7 +949,7 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
                 pane_id,
                 description: parts.description,
                 pid: parts.pid,
-                tty_name: parts.tty_name.map(|name| name.to_string_lossy().into_owned()),
+                tty_name: parts.tty_name,
                 snapshot: encode_snapshot(
                     &snapshot,
                     &graphics,
@@ -664,7 +957,7 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
                     mux.pane_label(pane_id).as_deref(),
                 )?,
             },
-            parts.pty_fd,
+            parts.objects,
         ));
         carried.insert(pane_id);
     }
@@ -720,6 +1013,52 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
     })
 }
 
+/// A pane's share of the handoff besides its terminal.
+struct Parts {
+    pid: u32,
+    tty_name: Option<String>,
+    description: String,
+    objects: PaneObjects,
+}
+
+/// None for a pane that stays behind by design (see the module comment).
+#[cfg(unix)]
+fn travelling_parts(local: &LocalPane) -> anyhow::Result<Option<Parts>> {
+    Ok(local.handoff_parts().map(|parts| Parts {
+        pid: parts.pid,
+        tty_name: parts
+            .tty_name
+            .map(|name| name.to_string_lossy().into_owned()),
+        description: parts.description,
+        objects: parts.pty_fd,
+    }))
+}
+
+/// None for a pane that stays behind, by design or, as on unix, because
+/// its parts could not be taken; an error only when no pane here can
+/// travel (the system's pseudo console), which refuses the whole takeover
+/// and leaves this server serving.
+#[cfg(windows)]
+fn travelling_parts(local: &LocalPane) -> anyhow::Result<Option<Parts>> {
+    let parts = match local.handoff_parts() {
+        None => return Ok(None),
+        Some(Ok(parts)) => parts,
+        Some(Err(err)) if !portable_pty::win::conpty::handoff_supported() => return Err(err),
+        Some(Err(err)) => {
+            log::warn!("a pane stays behind, its console could not be taken: {err:#}");
+            return Ok(None);
+        }
+    };
+    let mut objects = parts.conpty.into_handles();
+    objects.push(parts.process);
+    Ok(Some(Parts {
+        pid: parts.pid,
+        tty_name: None,
+        description: parts.description,
+        objects,
+    }))
+}
+
 /// The tree without the panes that stay behind: a stack keeps the rest of
 /// its panes, a split with one empty side becomes the other side.
 fn prune_tree(node: PaneNode, keep: &HashSet<PaneId>) -> PaneNode {
@@ -766,7 +1105,7 @@ fn prune_tree(node: PaneNode, keep: &HashSet<PaneId>) -> PaneNode {
 pub struct Takeover {
     stream: UnixStream,
     pub hello: Hello,
-    pub pid_file_fd: Option<OwnedFd>,
+    pub pid_file: Option<PidFile>,
 }
 
 /// Connect to the running server's handoff socket and learn who it is.
@@ -802,8 +1141,14 @@ pub fn begin(socket_path: &Path) -> anyhow::Result<Takeover> {
         ))
         .into());
     }
-    let pid_file_fd = if hello.pid_file {
-        Some(recv_owned_fd(&stream)?)
+    let pid_file = if hello.pid_file {
+        #[cfg(unix)]
+        let pid_file = recv_owned_fd(&stream)?;
+        #[cfg(windows)]
+        let pid_file = recv_handles(&mut stream, 1)
+            .context("receiving the pid file")?
+            .remove(0);
+        Some(pid_file)
     } else {
         None
     };
@@ -812,7 +1157,7 @@ pub fn begin(socket_path: &Path) -> anyhow::Result<Takeover> {
     Ok(Takeover {
         stream,
         hello,
-        pid_file_fd,
+        pid_file,
     })
 }
 
@@ -851,7 +1196,7 @@ impl Drop for Staged {
 /// nothing built from them yet.
 struct Received {
     pane: HandoffPane,
-    fd: OwnedFd,
+    objects: PaneObjects,
     snapshot: TerminalSnapshot,
     graphics: Option<wezterm_term::KittyGraphicsSnapshot>,
     shell: Option<wezterm_term::ShellCommandsSnapshot>,
@@ -873,6 +1218,7 @@ pub fn complete(
     let mut stream = takeover.stream;
     let mut received: Vec<Received> = Vec::new();
     let mut windows: Vec<HandoffWindow> = Vec::new();
+    #[cfg(unix)]
     let mut listener: Option<OwnedFd> = None;
     let started = Instant::now();
 
@@ -880,11 +1226,18 @@ pub fn complete(
         match read_message(&mut stream)? {
             HandoffMessage::Pane(pane) => {
                 let pane_id = pane.pane_id;
-                let fd = recv_owned_fd(&stream)?;
+                #[cfg(unix)]
+                let objects = recv_owned_fd(&stream)?;
+                #[cfg(windows)]
+                let objects = recv_handles(
+                    &mut stream,
+                    portable_pty::win::conpty::ConPtyHandoff::HANDLES + 1,
+                )
+                .with_context(|| format!("receiving pane {pane_id}'s console"))?;
                 fail_at("pane")?;
                 let (snapshot, graphics, shell, label) = decode_snapshot(&pane.snapshot)
                     .with_context(|| format!("pane {pane_id}'s snapshot"))?;
-                received.push(Received { pane, fd, snapshot, graphics, shell, label });
+                received.push(Received { pane, objects, snapshot, graphics, shell, label });
                 write_message(&mut stream, &HandoffMessage::Ack)?;
             }
             HandoffMessage::Topology(list) => {
@@ -906,14 +1259,22 @@ pub fn complete(
                 write_message(&mut stream, &HandoffMessage::Ack)?;
             }
             HandoffMessage::Listener => {
-                listener = Some(recv_owned_fd(&stream)?);
+                #[cfg(unix)]
+                {
+                    listener = Some(recv_owned_fd(&stream)?);
+                }
                 fail_at("listener")?;
                 write_message(&mut stream, &HandoffMessage::Ack)?;
             }
             HandoffMessage::Commit => {
                 fail_at("commit")?;
+                #[cfg(unix)]
                 let listener = listener.ok_or_else(|| anyhow!("Commit without a listener"))?;
-                install(received, windows, listener, local_domain, socket_path)?;
+                install(received, windows, local_domain)?;
+                #[cfg(unix)]
+                start_listener(listener, socket_path)?;
+                #[cfg(windows)]
+                let _ = socket_path;
                 write_message(&mut stream, &HandoffMessage::Owned)?;
                 log::info!("took over from the running server in {:?}", started.elapsed());
                 return Ok(stream);
@@ -928,9 +1289,7 @@ pub fn complete(
 fn install(
     received: Vec<Received>,
     windows: Vec<HandoffWindow>,
-    listener: OwnedFd,
     local_domain: DomainId,
-    socket_path: &Path,
 ) -> anyhow::Result<()> {
     let mut staged = Staged {
         panes: Vec::new(),
@@ -962,7 +1321,12 @@ fn install(
     for (pane_id, label) in labels {
         mux.set_pane_label(pane_id, Some(&label));
     }
+    Ok(())
+}
 
+/// Accept on the listening socket the predecessor handed over.
+#[cfg(unix)]
+fn start_listener(listener: OwnedFd, socket_path: &Path) -> anyhow::Result<()> {
     unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     let listener = unsafe { wezterm_uds::UnixListener::from_raw_fd(listener.into_raw_fd()) };
     crate::local::remember_listener(socket_path.to_path_buf(), &listener);
@@ -976,6 +1340,7 @@ fn install(
 
 /// A session imported from another program keeps that program's O_NONBLOCK
 /// until the next handoff. Ordinary panes read and write blocking.
+#[cfg(unix)]
 fn ensure_blocking(fd: &OwnedFd) -> anyhow::Result<()> {
     let flags = rustix::fs::fcntl_getfl(fd)?;
     if flags.contains(rustix::fs::OFlags::NONBLOCK) {
@@ -984,10 +1349,79 @@ fn ensure_blocking(fd: &OwnedFd) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn adopt_pane(item: Received, domain_id: DomainId) -> anyhow::Result<Arc<dyn Pane>> {
-    let Received { pane, fd, snapshot, mut graphics, shell, label: _ } = item;
+/// The pty and the process of a received pane.
+#[cfg(unix)]
+fn adopt_pty(
+    pane: &HandoffPane,
+    fd: OwnedFd,
+    _size: TerminalSize,
+) -> anyhow::Result<(Box<dyn portable_pty::MasterPty>, Box<dyn portable_pty::Child + Send + Sync>)> {
     ensure_blocking(&fd).context("making an adopted pty blocking")?;
-    let master = portable_pty::unix::master_from_raw_fd(fd, pane.tty_name.map(PathBuf::from))?;
+    let master =
+        portable_pty::unix::master_from_raw_fd(fd, pane.tty_name.clone().map(PathBuf::from))?;
+    Ok((master, portable_pty::adopted_child(pane.pid)))
+}
+
+/// The pseudo console and the process of a received pane, rebuilt from the
+/// handles the predecessor put here. `size` is the snapshot's: a pseudo
+/// console cannot be asked its size.
+#[cfg(windows)]
+fn adopt_pty(
+    _pane: &HandoffPane,
+    mut handles: Vec<OwnedHandle>,
+    size: TerminalSize,
+) -> anyhow::Result<(Box<dyn portable_pty::MasterPty>, Box<dyn portable_pty::Child + Send + Sync>)> {
+    let process = handles
+        .pop()
+        .ok_or_else(|| anyhow!("a pane arrived without its process"))?;
+    let console = portable_pty::win::conpty::ConPtyHandoff::from_handles(handles)?;
+    let master = portable_pty::win::conpty::master_from_handoff(
+        console,
+        portable_pty::PtySize {
+            rows: size.rows as u16,
+            cols: size.cols as u16,
+            pixel_width: size.pixel_width as u16,
+            pixel_height: size.pixel_height as u16,
+        },
+    )?;
+    Ok((master, portable_pty::win::adopted_child(process)))
+}
+
+fn adopt_pane(item: Received, domain_id: DomainId) -> anyhow::Result<Arc<dyn Pane>> {
+    let Received { pane, objects, snapshot, graphics, shell, label: _ } = item;
+    let (master, child) = adopt_pty(&pane, objects, snapshot.size)?;
+    match build_terminal(&*master, snapshot, graphics, shell) {
+        Ok((terminal, pane_writer)) => {
+            let local = LocalPane::new(
+                pane.pane_id,
+                terminal,
+                child,
+                master,
+                pane_writer,
+                domain_id,
+                pane.description,
+            );
+            Ok(Arc::new(local))
+        }
+        Err(err) => {
+            // Closing an adopted pseudo console waits for its host to exit,
+            // which it does not while the predecessor holds it: leave it to
+            // this process's exit, as `Staged` does with whole panes.
+            #[cfg(windows)]
+            std::mem::forget(master);
+            Err(err)
+        }
+    }
+}
+
+/// The terminal of an adopted pane, restored from its snapshot, and the
+/// pane's writer.
+fn build_terminal(
+    master: &dyn portable_pty::MasterPty,
+    snapshot: TerminalSnapshot,
+    mut graphics: Option<wezterm_term::KittyGraphicsSnapshot>,
+    shell: Option<wezterm_term::ShellCommandsSnapshot>,
+) -> anyhow::Result<(wezterm_term::Terminal, Box<dyn std::io::Write + Send>)> {
     let writer = master.take_writer()?;
     let snapshot_size = snapshot.size;
     let mut terminal = wezterm_term::Terminal::new(
@@ -1041,16 +1475,7 @@ fn adopt_pane(item: Received, domain_id: DomainId) -> anyhow::Result<Arc<dyn Pan
         }
     }
     let pane_writer = terminal.writer_handle();
-    let local = LocalPane::new(
-        pane.pane_id,
-        terminal,
-        portable_pty::adopted_child(pane.pid),
-        master,
-        pane_writer,
-        domain_id,
-        pane.description,
-    );
-    Ok(Arc::new(local))
+    Ok((terminal, pane_writer))
 }
 
 fn build_window(
@@ -1148,6 +1573,7 @@ pub fn wait_for_predecessor_exit(stream: &mut UnixStream, limit: Option<Duration
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn an_adopted_nonblocking_descriptor_becomes_blocking() {
         let (end, _peer) = UnixStream::pair().unwrap();
@@ -1158,6 +1584,7 @@ mod tests {
         assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_descriptor_waits_for_room_in_a_full_stream() {
         let (sender, mut receiver) = UnixStream::pair().unwrap();
@@ -1270,6 +1697,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn messages_and_snapshots_survive_their_bytes() {
         let (mut a, mut b) = UnixStream::pair().unwrap();
@@ -1487,6 +1915,7 @@ mod tests {
         assert!(terminal.kitty_frame_selections(None).unwrap().1.iter().all(|s| s.image_id != 2));
     }
 
+    #[cfg(unix)]
     #[test]
     fn waiting_for_the_predecessor_tells_whether_it_let_go() {
         let (mut ours, theirs) = UnixStream::pair().unwrap();
