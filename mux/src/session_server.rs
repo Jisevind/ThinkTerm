@@ -205,10 +205,14 @@ pub fn stop(_pid_file: &Path, _socket: &Path, _wait: Duration) -> anyhow::Result
 #[cfg(windows)]
 pub use windows::{create_stop_event, StopEvent};
 
+/// Whether `pid` is a live mux server, by its program's name: the one test
+/// for "this process is the server", shared with the handoff.
+#[cfg(windows)]
+pub use windows::is_mux_server_process;
+
 #[cfg(windows)]
 mod windows {
     use anyhow::Context as _;
-    use std::os::windows::ffi::OsStringExt as _;
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -216,7 +220,7 @@ mod windows {
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
     use winapi::um::processthreadsapi::OpenProcess;
     use winapi::um::synchapi::{CreateEventW, OpenEventW, SetEvent, WaitForSingleObject};
-    use winapi::um::winbase::{QueryFullProcessImageNameW, INFINITE};
+    use winapi::um::winbase::INFINITE;
     use winapi::um::winnt::{
         EVENT_MODIFY_STATE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, HANDLE,
         PROCESS_QUERY_LIMITED_INFORMATION,
@@ -244,22 +248,19 @@ mod windows {
     }
 
     /// Whether `pid` is a live process whose image is the mux server.
-    pub(super) fn is_mux_server_process(pid: u32) -> bool {
+    pub fn is_mux_server_process(pid: u32) -> bool {
+        use std::os::windows::io::FromRawHandle as _;
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             return false;
         }
-        let mut buf = vec![0u16; 32 * 1024];
-        let mut len = buf.len() as u32;
-        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
-        unsafe { CloseHandle(handle) };
-        if ok == 0 {
-            return false;
-        }
-        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]));
-        path.file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| stem.eq_ignore_ascii_case(SERVER_IMAGE_STEM))
+        let process = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) };
+        portable_pty::win::process_image_name(&process).is_ok_and(|name| {
+            Path::new(&name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(SERVER_IMAGE_STEM))
+        })
     }
 
     fn holder_pid(pid_file: &Path) -> Option<u32> {

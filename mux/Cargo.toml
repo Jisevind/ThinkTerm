@@ -58,6 +58,7 @@ wezterm-uds.workspace = true
 winapi = { workspace=true, features = [
     "errhandlingapi",
     "handleapi",
+    "ioapiset",
     "memoryapi",
     "psapi",
     "processthreadsapi",
