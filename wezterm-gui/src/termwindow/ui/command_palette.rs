@@ -15,6 +15,9 @@ use crate::overlay::selector::{matcher_pattern, matcher_score};
 use crate::workspace_threads::{ThreadSearchEntry, WorkspaceThreadWorkStatus};
 use crate::termwindow::palette::{build_commands, format_key_label, frecency_scores, save_recent};
 use crate::termwindow::ui::icons::SvgIcon;
+use crate::native_settings::NativeThreadIcons;
+use crate::termwindow::ui::sidebar::ThreadRowMarks;
+use crate::thread_marks::Mark;
 use crate::termwindow::{GuiWin, TermWindowNotif, UIItem, UIItemType, COMMAND_PALETTE_ZINDEX};
 use crate::ui::{
     apply_wheel_to_area, char_index_for_x, contains, text_width_to_char, DrawContext,
@@ -763,37 +766,67 @@ fn nerd_icon_to_svg(name: Option<&str>) -> Option<SvgIcon> {
     })
 }
 
-/// The hues the sidebar's thread dots use, so a row reads the same in both.
-const THREAD_LIVE_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
-const THREAD_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
-const DOT_SIZE: f32 = 12.0;
 
 enum RowIcon {
     None,
     Glyph(SvgIcon),
-    Tinted(SvgIcon, LinearRgba),
-    Dot(LinearRgba),
+    /// A thread: its programs' icons where the others have theirs, and its
+    /// mark at the row's end, as the sidebar draws them.
+    Thread(ThreadRow),
 }
 
-/// Thread rows carry their state in the icon name — `tt_thread:<work>:<tone>`
-/// — so the generic `ExpandedCommand` needs no colour of its own. Returns
-/// None for every other kind of row.
+struct ThreadRow {
+    mark: Mark,
+    color: LinearRgba,
+    live: bool,
+    thread_id: String,
+}
+
+/// Thread rows carry their state in the icon name --
+/// `tt_thread:<work>:<tone>:<live|saved>:<thread id>` -- so the generic
+/// `ExpandedCommand` needs no colour of its own. Returns None for every
+/// other kind of row.
 fn thread_row_indicator(name: Option<&str>, palette: &UiPalette) -> Option<RowIcon> {
-    let (work, tone) = name?.strip_prefix("tt_thread:")?.split_once(':')?;
-    // Same ladder as sidebar_thread_dot_color, minus the active case: the
-    // palette closes before the thread it opens becomes active.
-    let color = match tone {
-        "unread" => palette.selected_bg,
-        "pinned" => palette.text.mul_alpha(0.68),
-        "live" => THREAD_LIVE_COLOR,
-        _ => palette.text.mul_alpha(0.28),
+    let mut parts = name?.strip_prefix("tt_thread:")?.splitn(4, ':');
+    let (work, tone, open, thread_id) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    // The colours every status is shown in, as the sidebar shows them.
+    let rest = if open != "live" {
+        crate::thread_marks::closed_color(palette.text)
+    } else if tone == "unread" {
+        crate::thread_marks::unread_color(palette.text)
+    } else {
+        crate::thread_marks::OPEN_COLOR
     };
-    Some(match work {
-        "done" => RowIcon::Tinted(SvgIcon::CircleCheck, THREAD_DONE_COLOR),
-        "running" => RowIcon::Tinted(SvgIcon::LoaderCircle, color),
-        "attention" => RowIcon::Tinted(SvgIcon::CircleAlert, color),
-        _ => RowIcon::Dot(color),
-    })
+    let (mark, color) = match work {
+        "done" => (Mark::Finished, crate::thread_marks::FINISHED_COLOR),
+        "running" => (Mark::Working, crate::thread_marks::WORKING_COLOR),
+        "attention" => (Mark::Waiting, crate::thread_marks::WAITING_COLOR),
+        "failed" => (Mark::Failed, palette.danger),
+        _ => (Mark::Still, rest),
+    };
+    Some(RowIcon::Thread(ThreadRow {
+        mark,
+        color,
+        live: open == "live",
+        thread_id: thread_id.to_string(),
+    }))
+}
+
+/// How a thread row's program icons are drawn on a row of `surface`.
+fn thread_icon_style<'a>(
+    marks: &'a ThreadRowMarks,
+    surface: LinearRgba,
+    palette: &UiPalette,
+    count_color: LinearRgba,
+) -> crate::thread_marks::IconStyle<'a> {
+    crate::thread_marks::IconStyle {
+        surface,
+        dark: palette.is_dark(),
+        count_font: &marks.count_font,
+        count_metrics: &marks.count_metrics,
+        count_color,
+    }
 }
 
 /// A command row's icon: a thread's state indicator when it has one, else
@@ -812,6 +845,12 @@ fn row_icon(cmd: &ExpandedCommand, palette: &UiPalette) -> RowIcon {
 fn thread_icon_name(entry: &ThreadSearchEntry) -> String {
     let work = match entry.work_status {
         WorkspaceThreadWorkStatus::Running => "running",
+        // A program that stopped on an error, as the sidebar marks it.
+        WorkspaceThreadWorkStatus::NeedsAttention
+            if crate::termwindow::ui::sidebar::thread_has_errored_agent(&entry.thread_id) =>
+        {
+            "failed"
+        }
         WorkspaceThreadWorkStatus::NeedsAttention => "attention",
         WorkspaceThreadWorkStatus::FinishedUnseen => "done",
         WorkspaceThreadWorkStatus::Idle => "idle",
@@ -825,7 +864,8 @@ fn thread_icon_name(entry: &ThreadSearchEntry) -> String {
     } else {
         "plain"
     };
-    format!("tt_thread:{work}:{tone}")
+    let open = if entry.is_live { "live" } else { "saved" };
+    format!("tt_thread:{work}:{tone}:{open}:{}", entry.thread_id)
 }
 
 /// The searchable part of a project path. Matching the whole thing would
@@ -2189,6 +2229,8 @@ impl crate::TermWindow {
 
         let mut row_heap = crate::quad::HeapQuadAllocator::default();
         let mut row_layers = crate::quad::TripleLayerQuadAllocator::Heap(&mut row_heap);
+        // Worked out on the first thread row, for every one after it.
+        let mut row_marks: Option<ThreadRowMarks> = None;
 
         // Runs until a row starts past the viewport; the clip pass trims the
         // partial rows at both edges.
@@ -2333,28 +2375,79 @@ impl crate::TermWindow {
                     color,
                 )
             };
-            match icon {
+            // A thread row's icons and mark are set off from what is behind
+            // the row, as the card shows it.
+            let row_surface = if selected {
+                crate::termwindow::ui::sidebar::over(palette.selected_bg, palette.control_bg)
+            } else if hovered {
+                crate::termwindow::ui::sidebar::over(palette.control_hover_bg, palette.control_bg)
+            } else {
+                palette.control_bg
+            };
+            let thread_diameter = ctx.px(ICON_SIZE).round();
+            let row_cy = row_y + row_h / 2.0;
+            if matches!(icon, RowIcon::Thread(_)) && row_marks.is_none() {
+                row_marks = Some(self.sidebar_thread_row_marks()?);
+            }
+            match &icon {
                 RowIcon::None => {}
-                RowIcon::Glyph(icon) => draw_glyph(&mut row_layers, icon, text_color)?,
-                RowIcon::Tinted(icon, color) => draw_glyph(&mut row_layers, icon, color)?,
-                RowIcon::Dot(color) => {
-                    let dot = ctx.px(DOT_SIZE);
-                    ctx.draw_rounded_rect(
-                        &mut row_layers,
-                        1,
-                        icon_x + (ctx.px(ICON_SIZE) - dot) / 2.0,
-                        row_y + (row_h - dot) / 2.0,
-                        dot,
-                        dot,
-                        color,
-                        dot / 2.0,
-                    )?;
+                RowIcon::Glyph(icon) => draw_glyph(&mut row_layers, *icon, text_color)?,
+                RowIcon::Thread(row) => {
+                    if let Some(marks) = row_marks.as_ref() {
+                        if marks.layout != NativeThreadIcons::Trailing {
+                            crate::thread_marks::draw_slot(
+                                &ctx,
+                                &mut row_layers,
+                                marks.layout,
+                                marks.icons(&row.thread_id, row.live),
+                                icon_x,
+                                row_cy,
+                                thread_diameter,
+                                &thread_icon_style(marks, row_surface, &palette, dim_color),
+                            )?;
+                        }
+                    }
                 }
             }
-            let label_x = icon_x + ctx.px(ICON_SLOT);
+            let mut label_x = icon_x + ctx.px(ICON_SLOT);
+            // A thread's icons can be wider than a glyph; its name keeps
+            // clear of them.
+            if let (RowIcon::Thread(_), Some(marks)) = (&icon, row_marks.as_ref()) {
+                let slot = crate::thread_marks::slot_width(marks.layout, thread_diameter);
+                if slot > 0.0 {
+                    label_x = label_x.max(icon_x + slot + ctx.px(12.0));
+                }
+            }
 
             // Right-aligned accessory: shortcut, or current value + chevron.
             let mut accessory_right = card_x + card_w - ctx.px(PAD_X);
+            // A thread's mark at the end, and its icons before it when they
+            // trail.
+            if let (RowIcon::Thread(row), Some(marks)) = (&icon, row_marks.as_ref()) {
+                let size = ctx.px(20.0).round();
+                let mark_x = accessory_right - size;
+                self.paint_thread_mark(
+                    &mut row_layers,
+                    marks.status,
+                    row.mark,
+                    mark_x,
+                    (row_cy - size / 2.0).round(),
+                    size,
+                    row.color,
+                )?;
+                accessory_right = mark_x - ctx.px(LABEL_GAP);
+                if marks.layout == NativeThreadIcons::Trailing {
+                    accessory_right = crate::thread_marks::draw_trailing(
+                        &ctx,
+                        &mut row_layers,
+                        marks.icons(&row.thread_id, row.live),
+                        accessory_right,
+                        row_cy,
+                        thread_diameter,
+                        &thread_icon_style(marks, row_surface, &palette, dim_color),
+                    )? - ctx.px(LABEL_GAP);
+                }
+            }
             if chevron {
                 let chev = ctx.px(CHEVRON_SIZE);
                 ctx.draw_svg_icon(
@@ -2903,12 +2996,12 @@ mod tests {
     fn a_running_thread_shows_its_status_glyph_not_a_dot() {
         let mut running = entry("Default", "ThinkTerm", "/x/thinkterm", "GUI", false, false, 0);
         running.work_status = WorkspaceThreadWorkStatus::Running;
-        assert_eq!(thread_icon_name(&running), "tt_thread:running:plain");
+        assert!(thread_icon_name(&running).starts_with("tt_thread:running:plain:saved:"));
         let idle = entry("Default", "ThinkTerm", "/x/thinkterm", "MUX", false, false, 0);
-        assert_eq!(thread_icon_name(&idle), "tt_thread:idle:plain");
+        assert!(thread_icon_name(&idle).starts_with("tt_thread:idle:plain:saved:"));
         let mut live = idle.clone();
         live.is_live = true;
-        assert_eq!(thread_icon_name(&live), "tt_thread:idle:live");
+        assert!(thread_icon_name(&live).starts_with("tt_thread:idle:live:live:"));
     }
 
     #[test]
