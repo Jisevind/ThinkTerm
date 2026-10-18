@@ -5,6 +5,7 @@
 //! probes.
 
 use crate::agent_status::{self, AgentIcon, AgentPanelAction, ProgramReport, ProgramReportState};
+use crate::native_settings::NativeThreadStatus;
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{
@@ -302,6 +303,7 @@ impl TermWindow {
         // One clock reading for the whole panel, so its spinners and
         // shimmers step together.
         let frames = crate::termwindow::ui::status_icon::spinner_frames();
+        let status_style = crate::native_settings::agents_status();
         // Card titles and group headings: the rows' size, semibold. Shaped
         // once and cached like every sidebar line, so the second weight
         // costs nothing per frame. Headings take the grey, so a heading
@@ -525,10 +527,36 @@ impl TermWindow {
 
             let shown = agent.shown_state();
             let state_y = title_mid.saturating_sub(state_size / 2);
-            let state_icon = agent_state_icon(shown, chrome, muted_fg);
+            let in_active_pane = Some(agent.pane_id) == active_pane_id;
+            let own_color = |color| agent_state_color_where(shown, color, in_active_pane);
+            let state_icon = agent_state_icon(shown, chrome, muted_fg)
+                .map(|(icon, color, spinning)| (icon, own_color(color), spinning));
             let has_state_icon = state_icon.is_some();
-            if let Some((icon, color, spinning)) =
-                state_icon.filter(|_| visible(state_y, state_size))
+            // The ring is these icons; the other styles draw the state as
+            // the sidebar does.
+            let marks = (status_style != NativeThreadStatus::Ring)
+                .then(|| agent_state_mark(shown, chrome, muted_fg))
+                .flatten()
+                .map(|(mark, color)| (mark, own_color(color)))
+                .filter(|_| visible(state_y, state_size));
+            if let Some((mark, color)) = marks {
+                // As large as the sidebar draws it, in the middle of where
+                // the icon goes: a grid at the icon's size looks heavy.
+                let size = self
+                    .ui_px(crate::termwindow::ui::sidebar::SESSION_STATUS_ICON_SIZE)
+                    .min(state_size) as f32;
+                let inset = (state_size as f32 - size) / 2.0;
+                self.paint_thread_mark(
+                    layers,
+                    status_style,
+                    mark,
+                    (state_x as f32 + inset).round(),
+                    (state_y as f32 + inset).round(),
+                    size,
+                    color,
+                )?;
+            } else if let Some((icon, color, spinning)) = state_icon
+                .filter(|_| status_style == NativeThreadStatus::Ring && visible(state_y, state_size))
             {
                 if spinning {
                     self.paint_spinning_ui_icon_at(
@@ -2050,6 +2078,42 @@ pub(crate) fn agent_state_icon(
         ShownState::Idle => Some((SvgIcon::CircleCheck, muted_fg, false)),
         ShownState::Unknown => None,
     }
+}
+
+/// `color`, an agent's state colour, as it shows for an agent in the pane
+/// the user is in: working or at rest in green, as the sidebar marks the
+/// thread they are in. A wait or an error keeps its own colour.
+pub(crate) fn agent_state_color_where(
+    state: agent_status::ShownState,
+    color: LinearRgba,
+    in_active_pane: bool,
+) -> LinearRgba {
+    use agent_status::ShownState;
+    if in_active_pane && matches!(state, ShownState::Working | ShownState::Idle) {
+        crate::thread_marks::CURRENT_COLOR
+    } else {
+        color
+    }
+}
+
+/// An agent's state as the status style draws it, in the colour its icon
+/// has; `None` where it shows nothing.
+pub(crate) fn agent_state_mark(
+    state: agent_status::ShownState,
+    chrome: UiPalette,
+    muted_fg: LinearRgba,
+) -> Option<(crate::thread_marks::Mark, LinearRgba)> {
+    use agent_status::ShownState;
+    use crate::thread_marks::Mark;
+    let (_, color, _) = agent_state_icon(state, chrome, muted_fg)?;
+    let mark = match state {
+        ShownState::Working => Mark::Working,
+        ShownState::Blocked => Mark::Waiting,
+        ShownState::Error => Mark::Failed,
+        ShownState::Done => Mark::Finished,
+        ShownState::Idle | ShownState::Unknown => Mark::Still,
+    };
+    Some((mark, color))
 }
 
 pub(crate) fn agent_state_key(state: agent_status::ShownState) -> &'static str {

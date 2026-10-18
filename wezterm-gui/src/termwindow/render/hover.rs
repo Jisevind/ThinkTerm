@@ -382,20 +382,58 @@ impl TermWindow {
         (x, y)
     }
 
+    /// `in_active_pane`: the agent is in the pane the user is in.
+    #[allow(clippy::too_many_arguments)]
     fn paint_hover_state_icon(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         state: ShownState,
+        in_active_pane: bool,
         x: f32,
         y: f32,
         size: f32,
         style: &HoverStyle,
     ) -> anyhow::Result<()> {
         let palette = style.palette;
+        // The ring is these icons; the other styles draw the state as the
+        // sidebar does.
+        let status_style = crate::native_settings::agents_status();
+        if status_style != crate::native_settings::NativeThreadStatus::Ring {
+            let Some((mark, color)) =
+                crate::termwindow::ui::agent_panel::agent_state_mark(state, palette, palette.muted_text)
+            else {
+                return Ok(());
+            };
+            let color = crate::termwindow::ui::agent_panel::agent_state_color_where(
+                state,
+                color,
+                in_active_pane,
+            );
+            // As large as the sidebar draws it, centred where the icon goes.
+            let mark_size = (self
+                .ui_px(crate::termwindow::ui::sidebar::SESSION_STATUS_ICON_SIZE)
+                as f32)
+                .min(size);
+            let inset = (size - mark_size) / 2.0;
+            return self.paint_thread_mark(
+                layers,
+                status_style,
+                mark,
+                (x + inset).round(),
+                (y + inset).round(),
+                mark_size.round(),
+                color,
+            );
+        }
         let Some((icon, color, spinning)) = agent_state_icon(state, palette, palette.muted_text)
         else {
             return Ok(());
         };
+        let color = crate::termwindow::ui::agent_panel::agent_state_color_where(
+            state,
+            color,
+            in_active_pane,
+        );
         let (x, y, size) = (
             x.round() as usize,
             y.round() as usize,
@@ -532,6 +570,7 @@ impl TermWindow {
         cy += 1.0 + gap;
 
         let right = x + text_x + text_w;
+        let active_pane_id = self.get_active_pane_no_overlay().map(|pane| pane.pane_id());
         for agent in &agents[..rows] {
             let state = agent.shown_state();
             let brand = brand_of(agent);
@@ -546,6 +585,7 @@ impl TermWindow {
             self.paint_hover_state_icon(
                 &mut layers,
                 state,
+                Some(agent.pane_id) == active_pane_id,
                 x + card_w - pad_x - mark,
                 cy,
                 mark,
