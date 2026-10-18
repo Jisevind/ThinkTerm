@@ -954,7 +954,19 @@ fn allocate_socketpair() -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
 /// has been applied to the terminal.
 pub struct ReaderControl {
     /// A byte written here breaks the reader out of its poll.
+    #[cfg(unix)]
     wake: parking_lot::Mutex<FileDescriptor>,
+    /// The reader thread. A pipe cannot be polled on Windows, so a pause
+    /// cancels the blocking read the thread is in instead; a cancelled read
+    /// takes nothing from the pipe.
+    #[cfg(windows)]
+    thread: std::os::windows::io::OwnedHandle,
+    /// Whether the reader is inside its read, the only call a cancel may
+    /// hit. A lock, not a flag: the reader cannot leave the read for its
+    /// write to the parser while a cancel is being issued, so the cancel
+    /// never lands on that write.
+    #[cfg(windows)]
+    in_read: parking_lot::Mutex<bool>,
     paused: AtomicBool,
     /// Whether the reader is parked; `changed` is signalled by both sides.
     parked: std::sync::Mutex<bool>,
@@ -969,6 +981,7 @@ pub struct ReaderControl {
 }
 
 impl ReaderControl {
+    #[cfg(unix)]
     fn new(wake: FileDescriptor) -> Self {
         Self {
             wake: parking_lot::Mutex::new(wake),
@@ -980,6 +993,28 @@ impl ReaderControl {
         }
     }
 
+    /// For the calling thread, which is the reader.
+    #[cfg(windows)]
+    fn for_this_thread() -> anyhow::Result<Self> {
+        // A real handle: GetCurrentThread's means "the calling thread".
+        let thread = unsafe {
+            std::os::windows::io::BorrowedHandle::borrow_raw(
+                winapi::um::processthreadsapi::GetCurrentThread() as _,
+            )
+        }
+        .try_clone_to_owned()
+        .context("a handle on the reader thread")?;
+        Ok(Self {
+            thread,
+            in_read: parking_lot::Mutex::new(false),
+            paused: AtomicBool::new(false),
+            parked: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+            pending_bytes: AtomicUsize::new(0),
+            holding: AtomicBool::new(false),
+        })
+    }
+
     /// Park the reader and wait until what it read has been applied.
     /// Times out on a reader that never parks, or on a parser that never
     /// finishes: an output batch held for synchronized output, or a pane
@@ -987,10 +1022,17 @@ impl ReaderControl {
     fn pause(&self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         self.paused.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
         if let Err(err) = self.wake.lock().write_all(&[1]) {
             self.resume();
             return Err(err).context("waking the pane reader");
         }
+        // A cancel finds nothing when the reader is between checking the
+        // flag and entering its read, so it is repeated until the park.
+        #[cfg(windows)]
+        let interval = Duration::from_millis(10);
+        #[cfg(not(windows))]
+        let interval = timeout;
         {
             let mut parked = self.parked.lock().unwrap();
             while !*parked {
@@ -1000,7 +1042,19 @@ impl ReaderControl {
                     self.resume();
                     anyhow::bail!("the pane reader did not park within {timeout:?}");
                 }
-                parked = self.changed.wait_timeout(parked, left).unwrap().0;
+                #[cfg(windows)]
+                {
+                    let in_read = self.in_read.lock();
+                    if *in_read {
+                        use std::os::windows::io::AsRawHandle;
+                        unsafe {
+                            winapi::um::ioapiset::CancelSynchronousIo(
+                                self.thread.as_raw_handle() as _,
+                            )
+                        };
+                    }
+                }
+                parked = self.changed.wait_timeout(parked, left.min(interval)).unwrap().0;
             }
         }
         loop {
@@ -1073,7 +1127,8 @@ impl Drop for PausedReader {
 /// applied to the terminal, so that the terminal is exactly what the pty
 /// produced up to the park. Output the program writes meanwhile waits in
 /// the kernel's pty buffer for whoever reads next. Panes without a pty
-/// (or on a platform without poll) cannot be paused.
+/// cannot be paused on unix; on Windows every reader can, as a pause
+/// cancels the read it blocks in.
 pub fn pause_pane_reader(pane_id: PaneId, timeout: Duration) -> anyhow::Result<PausedReader> {
     let control = PANE_READERS
         .lock()
@@ -1124,6 +1179,7 @@ fn read_from_pane_pty(
 
     // The wake pipe and the control exist only when the pty can be polled;
     // without them the loop below is the plain blocking read.
+    #[cfg(unix)]
     let pausable = pty_fd.and_then(|fd| match filedescriptor::Pipe::new() {
         Ok(pipe) => Some((fd, pipe)),
         Err(err) => {
@@ -1131,6 +1187,7 @@ fn read_from_pane_pty(
             None
         }
     });
+    #[cfg(unix)]
     let (control, mut wake_read, poll_fd) = match pausable {
         Some((fd, pipe)) => {
             let control = Arc::new(ReaderControl::new(pipe.write));
@@ -1138,6 +1195,22 @@ fn read_from_pane_pty(
             (Some(control), Some(pipe.read), Some(fd))
         }
         None => (None, None, None),
+    };
+    // Every reader can be paused here: a cancel ends the read it blocks in.
+    #[cfg(windows)]
+    let control = {
+        let _ = pty_fd;
+        match ReaderControl::for_this_thread() {
+            Ok(control) => {
+                let control = Arc::new(control);
+                PANE_READERS.lock().insert(pane_id, Arc::clone(&control));
+                Some(control)
+            }
+            Err(err) => {
+                log::warn!("pane {pane_id}: the reader cannot be paused: {err:#}");
+                None
+            }
+        }
     };
 
     let heartbeat = parse_watchdog::register(pane_id);
@@ -1153,6 +1226,14 @@ fn read_from_pane_pty(
     }
 
     while !dead.load(Ordering::Relaxed) {
+        #[cfg(windows)]
+        if let Some(control) = &control {
+            if control.paused.load(Ordering::SeqCst) {
+                control.park();
+                continue;
+            }
+        }
+        #[cfg(unix)]
         if let (Some(control), Some(wake_read), Some(fd)) = (&control, &mut wake_read, poll_fd) {
             let mut pfd = [
                 pollfd {
@@ -1197,7 +1278,22 @@ fn read_from_pane_pty(
                 continue;
             }
         }
-        match reader.read(&mut buf) {
+        #[cfg(windows)]
+        if let Some(control) = &control {
+            *control.in_read.lock() = true;
+        }
+        let read = reader.read(&mut buf);
+        #[cfg(windows)]
+        if let Some(control) = &control {
+            *control.in_read.lock() = false;
+            // A pause cancelled the read; nothing was taken from the pipe.
+            if matches!(&read, Err(err) if err.raw_os_error()
+                == Some(winapi::shared::winerror::ERROR_OPERATION_ABORTED as i32))
+            {
+                continue;
+            }
+        }
+        match read {
             Ok(size) if size == 0 => {
                 log::trace!("read_pty EOF: pane_id {}", pane_id);
                 break;

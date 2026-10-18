@@ -51,7 +51,6 @@ struct Opt {
     /// Take over from the mux server already running on this socket:
     /// its panes, windows and clients continue under this binary, and
     /// the running server exits. The running server must support it.
-    #[cfg(unix)]
     #[arg(long = "takeover")]
     takeover: bool,
 
@@ -84,6 +83,12 @@ struct Opt {
     #[arg(long, hide = true)]
     pid_file_handle: Option<usize>,
 
+    /// The pipe a daemonized takeover reports its outcome on, as a raw
+    /// handle value: the Windows sibling of `--takeover-report-fd`.
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    takeover_report_handle: Option<usize>,
+
     /// Instead of executing your shell, run PROG.
     /// For example: `thinkterm start -- bash -l` will spawn bash
     /// as if it were a login shell.
@@ -108,9 +113,9 @@ fn main() {
     if let Err(err) = run() {
         wezterm_blob_leases::clear_storage();
         log::error!("{:#}", err);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let status = wezterm_mux_server_impl::handoff::report_takeover_failure(&err);
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let status = 1;
         std::process::exit(status);
     }
@@ -140,7 +145,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     #[cfg(windows)]
-    windows_daemon::adopt(opts.pid_file_handle)?;
+    windows_daemon::adopt(opts.pid_file_handle, opts.takeover_report_handle)?;
 
     config::common_init(
         opts.config_file.as_ref(),
@@ -202,7 +207,6 @@ fn run() -> anyhow::Result<()> {
         if opts.skip_config {
             cmd.arg("-n");
         }
-        #[cfg(unix)]
         if opts.takeover {
             cmd.arg("--takeover");
         }
@@ -230,7 +234,7 @@ fn run() -> anyhow::Result<()> {
 
         #[cfg(windows)]
         {
-            return windows_daemon::spawn_detached(cmd, &config);
+            return windows_daemon::spawn_detached(cmd, &config, opts.takeover);
         }
 
         #[cfg(unix)]
@@ -325,7 +329,6 @@ fn run() -> anyhow::Result<()> {
 
     // A takeover learns who the running server is before the mux exists:
     // the runtime server id and the id counters are inherited.
-    #[cfg(unix)]
     let takeover = if opts.takeover {
         let socket_path = takeover_socket_path(&config)?;
         let takeover = wezterm_mux_server_impl::handoff::begin(&socket_path)?;
@@ -343,10 +346,7 @@ fn run() -> anyhow::Result<()> {
     } else {
         None
     };
-    #[cfg(not(unix))]
-    let takeover: Option<()> = None;
 
-    #[cfg(unix)]
     let mux = match &takeover {
         Some(takeover) => Arc::new(mux::Mux::new_with_runtime_server_id(
             Some(domain.clone()),
@@ -354,8 +354,6 @@ fn run() -> anyhow::Result<()> {
         )),
         None => Arc::new(mux::Mux::new(Some(domain.clone()))),
     };
-    #[cfg(not(unix))]
-    let mux = Arc::new(mux::Mux::new(Some(domain.clone())));
     Mux::set_mux(&mux);
     // Before the listener: a client registering earlier than the stored
     // mode is loaded gets the default one and never accepts the fix-up.
@@ -395,8 +393,9 @@ fn run() -> anyhow::Result<()> {
             e
         })?;
     } else {
-        // The listener arrives with the handoff; the environment is set
-        // now for the same reason spawn_listener sets it early.
+        // The listener arrives with the handoff (on Windows it is bound once
+        // the predecessor has exited); the environment is set now for the
+        // same reason spawn_listener sets it early.
         if let Some(unix_dom) = config.unix_domains.last() {
             std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
         }
@@ -411,6 +410,12 @@ fn run() -> anyhow::Result<()> {
 
     let activity = Activity::new();
 
+    // The detached child of a `--daemonize --takeover` launcher is the
+    // daemon, though it is not started with --daemonize: the report pipe it
+    // was given says so.
+    #[cfg(windows)]
+    let daemonized = opts.daemonize || opts.takeover_report_handle.is_some();
+    #[cfg(not(windows))]
     let daemonized = opts.daemonize;
     promise::spawn::spawn(async move {
         if let Err(err) = async_run(cmd, takeover, daemonized, no_initial_pane).await {
@@ -433,13 +438,9 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 type TakeoverHandle = wezterm_mux_server_impl::handoff::Takeover;
-#[cfg(not(unix))]
-type TakeoverHandle = ();
 
 /// The socket a takeover connects to: the one WEZTERM_UNIX_SOCKET names.
-#[cfg(unix)]
 fn takeover_socket_path(config: &config::ConfigHandle) -> anyhow::Result<std::path::PathBuf> {
     config
         .unix_domains
@@ -476,14 +477,10 @@ async fn async_run(
     update_mux_domains_for_server(&config)?;
     mux::spawn_idle_image_sweeper();
 
-    #[cfg(unix)]
     if let Some(mut takeover) = takeover {
         // The pid file outlives the takeover handle: it stays open, locked,
         // for the life of this process.
-        let pid_file_fd = takeover.pid_file_fd.take().map(|fd| {
-            use std::os::unix::io::IntoRawFd;
-            fd.into_raw_fd()
-        });
+        let pid_file = takeover.pid_file.take();
         let local_domain = mux.default_domain().domain_id();
         let socket_path = takeover_socket_path(&config)?;
         let stream = match wezterm_mux_server_impl::handoff::complete(
@@ -500,19 +497,16 @@ async fn async_run(
                 std::process::exit(2);
             }
         };
-        match pid_file_fd {
-            Some(fd) => adopt_pid_file(fd),
+        match pid_file {
+            Some(file) => adopt_pid_file(file),
             // The predecessor ran in the foreground and had no pid file to
             // hand over; a daemon takes one of its own, or the next
             // `--daemonize` would bind the socket out from under it.
-            None if daemonized => match daemonize::lock_pid_file(&config) {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    writeln!(file, "{}", std::process::id()).ok();
-                    std::mem::forget(file);
+            None if daemonized => {
+                if let Err(err) = lock_own_pid_file(&config) {
+                    log::warn!("no pid file after the takeover: {err:#}");
                 }
-                Err(err) => log::warn!("no pid file after the takeover: {err:#}"),
-            },
+            }
             None => {}
         }
         // The report and the listeners wait for the old server to exit (or,
@@ -531,7 +525,18 @@ async fn async_run(
                 &mut stream,
                 Some(wezterm_mux_server_impl::handoff::LET_GO_TIMEOUT),
             );
+            // The listening socket did not travel: it is free to bind only
+            // once the old server is gone, and the report says "reconnect".
+            #[cfg(windows)]
+            {
+                if !let_go {
+                    log::warn!("the old server has not let go yet; waiting for it");
+                    wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(&mut stream, None);
+                }
+                listen_after_takeover();
+            }
             wezterm_mux_server_impl::handoff::report_takeover(Ok(()));
+            #[cfg(unix)]
             if !let_go {
                 log::warn!("the old server has not let go yet; reported the takeover all the same");
                 wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(&mut stream, None);
@@ -584,8 +589,6 @@ async fn async_run(
             }
         });
     }
-    #[cfg(not(unix))]
-    let _ = (takeover, daemonized);
     #[cfg(feature = "tailnet")]
     if !took_over {
         keep_tailnet_node();
@@ -642,10 +645,73 @@ fn keep_tailnet_node() {
     thinkterm_tailnet::keep_node();
 }
 
+/// A pid file of this daemon's own, locked, with its pid in it.
+#[cfg(unix)]
+fn lock_own_pid_file(config: &config::ConfigHandle) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = daemonize::lock_pid_file(config)?;
+    writeln!(file, "{}", std::process::id()).ok();
+    std::mem::forget(file);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn lock_own_pid_file(config: &config::ConfigHandle) -> anyhow::Result<()> {
+    windows_daemon::take_own_pid_file(config)
+}
+
+/// The pid file the predecessor handed over: same lock, our pid in it.
+#[cfg(windows)]
+fn adopt_pid_file(handle: std::os::windows::io::OwnedHandle) {
+    let mut file = std::fs::File::from(handle);
+    if let Err(err) = mux::session_server::write_pid(&mut file) {
+        log::warn!("rewriting the pid file after the takeover: {err:#}");
+    }
+    windows_daemon::keep_pid_file(file);
+}
+
+/// Bind the socket the predecessor listened on, now that it has exited:
+/// on Windows the listening socket does not travel with the panes. This
+/// server holds every pane by now, so it never gives up: past half a minute
+/// the launcher hears of the failure, and the binding goes on being tried.
+#[cfg(windows)]
+fn listen_after_takeover() {
+    let config = configuration();
+    let Some(unix_dom) = config.unix_domains.last() else {
+        wezterm_mux_server_impl::handoff::report_takeover(Err("no unix domain is configured"));
+        return;
+    };
+    let started = std::time::Instant::now();
+    let mut reported = false;
+    loop {
+        match wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom) {
+            Ok(mut listener) => {
+                thread::spawn(move || listener.run());
+                if reported {
+                    log::info!("listening on the socket after all");
+                }
+                return;
+            }
+            // Its socket closes a moment after its process is reported gone.
+            Err(err) if !reported && started.elapsed() >= std::time::Duration::from_secs(30) => {
+                log::error!("cannot listen on the socket yet; still trying: {err:#}");
+                wezterm_mux_server_impl::handoff::report_takeover(Err(&format!(
+                    "the panes were taken over, but the socket cannot be bound yet: {err:#}"
+                )));
+                reported = true;
+            }
+            Err(_) => {}
+        }
+        thread::sleep(std::time::Duration::from_millis(if reported { 1000 } else { 100 }));
+    }
+}
+
 /// The pid file the predecessor handed over: same lock, our pid in it.
 #[cfg(unix)]
-fn adopt_pid_file(fd: std::os::unix::io::RawFd) {
+fn adopt_pid_file(fd: std::os::unix::io::OwnedFd) {
     use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::io::IntoRawFd;
+    let fd = fd.into_raw_fd();
     daemonize::set_cloexec(fd, true);
     wezterm_mux_server_impl::handoff::remember_pid_file_fd(fd);
     let mut file = std::mem::ManuallyDrop::new(unsafe {
@@ -707,9 +773,9 @@ fn install_shutdown_signal_handler() -> anyhow::Result<()> {
 
 /// What `daemonize.rs` does on unix, for Windows: the launching process
 /// locks the pid file and hands it to a detached child, the child publishes
-/// its pid and answers a named stop event instead of SIGTERM. There is no
-/// takeover: an in-place update passes descriptors, which this platform
-/// cannot, so a running server keeps serving until it is stopped.
+/// its pid and answers a named stop event instead of SIGTERM. A takeover's
+/// launcher locks nothing -- the running server hands its pid file over --
+/// and waits for the child's one-line report instead, as on unix.
 #[cfg(windows)]
 mod windows_daemon {
     use anyhow::Context as _;
@@ -720,9 +786,11 @@ mod windows_daemon {
     use winapi::shared::minwindef::{BOOL, DWORD, TRUE};
     use winapi::shared::winerror::ERROR_ACCESS_DENIED;
     use winapi::um::consoleapi::SetConsoleCtrlHandler;
-    use winapi::um::handleapi::SetHandleInformation;
+    use winapi::um::handleapi::{SetHandleInformation, INVALID_HANDLE_VALUE};
+    use winapi::um::processenv::GetStdHandle;
     use winapi::um::winbase::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, HANDLE_FLAG_INHERIT,
+        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use winapi::um::winnt::HANDLE;
 
@@ -732,15 +800,20 @@ mod windows_daemon {
     /// Runs first thing after argument parsing, in every server process:
     /// create the stop event, and when a launcher handed over the locked pid
     /// file, take it out of inheritance (shells spawned later must not carry
-    /// it, as `set_cloexec` does on unix) and write this pid into it.
-    pub fn adopt(pid_file_handle: Option<usize>) -> anyhow::Result<()> {
+    /// it, as `set_cloexec` does on unix) and write this pid into it. The
+    /// pipe a takeover reports on is taken out of inheritance the same way.
+    pub fn adopt(pid_file_handle: Option<usize>, report_handle: Option<usize>) -> anyhow::Result<()> {
+        if let Some(raw) = report_handle {
+            unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) };
+            wezterm_mux_server_impl::handoff::remember_report_handle(raw as RawHandle);
+        }
         let event = mux::session_server::create_stop_event()?;
         *STOP_EVENT.lock().unwrap() = Some(event);
         if let Some(raw) = pid_file_handle {
             let mut file = unsafe { std::fs::File::from_raw_handle(raw as RawHandle) };
             unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) };
             match mux::session_server::write_pid(&mut file) {
-                Ok(()) => std::mem::forget(file),
+                Ok(()) => keep_pid_file(file),
                 Err(err) => {
                     // The handle did not survive the spawn. The launcher is
                     // exiting and lets go of its lock; `lock_own_pid_file`
@@ -767,28 +840,66 @@ mod windows_daemon {
         if !NEEDS_OWN_LOCK.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
+        take_own_pid_file(config)
+    }
+
+    /// Lock the pid file directly and publish this pid in it.
+    pub fn take_own_pid_file(config: &config::ConfigHandle) -> anyhow::Result<()> {
         let mut own = mux::session_server::lock_pid_file(&config.daemon_options.pid_file())?;
         mux::session_server::write_pid(&mut own)?;
-        std::mem::forget(own);
+        keep_pid_file(own);
         Ok(())
+    }
+
+    /// Hold the pid file -- the lock -- for the life of this process, and
+    /// note it for a takeover to hand on.
+    pub fn keep_pid_file(file: std::fs::File) {
+        wezterm_mux_server_impl::handoff::remember_pid_file_handle(file.as_raw_handle());
+        std::mem::forget(file);
     }
 
     /// The `--daemonize` launcher: lock the pid file (a second launcher
     /// fails here with the unix wording), then start the server detached,
     /// with the locked file inherited. Returns once the child is running;
-    /// the client connects to the socket with retries, as on unix.
+    /// the client connects to the socket with retries, as on unix. For a
+    /// takeover it waits for the child's report and exits with its outcome.
     pub fn spawn_detached(
         mut cmd: std::process::Command,
         config: &config::ConfigHandle,
+        takeover: bool,
     ) -> anyhow::Result<()> {
-        let pid_file = mux::session_server::lock_pid_file(&config.daemon_options.pid_file())?;
-        let raw = pid_file.as_raw_handle();
-        if unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0
-        {
-            return Err(std::io::Error::last_os_error()).context("making the pid file inheritable");
+        let pid_file = if takeover {
+            None
+        } else {
+            let pid_file = mux::session_server::lock_pid_file(&config.daemon_options.pid_file())?;
+            let raw = pid_file.as_raw_handle();
+            if unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                == 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("making the pid file inheritable");
+            }
+            cmd.arg("--pid-file-handle");
+            cmd.arg((raw as usize).to_string());
+            Some(pid_file)
+        };
+        let report = if takeover {
+            let (read, write) = report_pipe()?;
+            cmd.arg("--takeover-report-handle");
+            cmd.arg((write.as_raw_handle() as usize).to_string());
+            Some((read, write))
+        } else {
+            None
+        };
+        // This launcher's own stdio may be the pipes a client reads to the
+        // end (a takeover's is): the server outlives it and must not hold
+        // them. Its own stdio is the log, given below.
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(which) };
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            }
         }
-        cmd.arg("--pid-file-handle");
-        cmd.arg((raw as usize).to_string());
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(config.daemon_options.open_stdout()?);
         cmd.stderr(config.daemon_options.open_stderr()?);
@@ -814,7 +925,58 @@ mod windows_daemon {
         // The child holds its own copy of the lock; this one closes with us.
         drop(child);
         drop(pid_file);
+        if let Some((read, write)) = report {
+            // Only the child may hold the write end, or a child that died
+            // without a word would never read as one.
+            drop(write);
+            std::process::exit(relay_takeover_report(read));
+        }
         Ok(())
+    }
+
+    /// A pipe whose write end the child inherits.
+    fn report_pipe() -> anyhow::Result<(std::fs::File, std::os::windows::io::OwnedHandle)> {
+        use std::os::windows::io::OwnedHandle;
+        use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
+        use winapi::um::namedpipeapi::CreatePipe;
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: TRUE,
+        };
+        let mut read = std::ptr::null_mut();
+        let mut write = std::ptr::null_mut();
+        if unsafe { CreatePipe(&mut read, &mut write, &mut attributes, 0) } == 0 {
+            return Err(std::io::Error::last_os_error()).context("creating the takeover report pipe");
+        }
+        unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0) };
+        Ok((
+            unsafe { std::fs::File::from_raw_handle(read as RawHandle) },
+            unsafe { OwnedHandle::from_raw_handle(write as RawHandle) },
+        ))
+    }
+
+    /// The daemon's one-line report as an exit status, as `daemonize.rs`
+    /// reads it on unix: `ok` is 0, `refused: <why>` (it could not start at
+    /// all) is `TAKEOVER_CANNOT_HAND_OVER`, anything else is 1.
+    fn relay_takeover_report(mut pipe: std::fs::File) -> i32 {
+        use std::io::Read;
+        let mut report = String::new();
+        pipe.read_to_string(&mut report).ok();
+        let line = report.lines().next().unwrap_or("").trim();
+        if line == "ok" {
+            return 0;
+        }
+        if let Some(why) = line.strip_prefix("refused: ") {
+            eprintln!("takeover failed: {why}");
+            return mux::session_server::TAKEOVER_CANNOT_HAND_OVER;
+        }
+        if let Some(why) = line.strip_prefix("error: ") {
+            eprintln!("takeover failed: {why}");
+        } else {
+            eprintln!("the takeover did not report an outcome; see the server log");
+        }
+        1
     }
 
     unsafe extern "system" fn ctrl_handler(_ctrl_type: DWORD) -> BOOL {
@@ -878,7 +1040,6 @@ pub fn spawn_listener() -> anyhow::Result<()> {
             listener.run();
         });
         // Not fatal: a server that cannot be taken over is still a server.
-        #[cfg(unix)]
         if let Err(err) =
             wezterm_mux_server_impl::handoff::spawn_handoff_listener(unix_dom.socket_path())
         {

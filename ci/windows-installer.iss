@@ -82,6 +82,10 @@ Type: files; Name: "{app}\libEGL.dll"
 Type: files; Name: "{app}\libGLESv2.dll"
 
 #endif
+[UninstallDelete]
+; Files of an older build that were still running when an update replaced them
+Type: filesandordirs; Name: "{app}\.old"
+
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "com.roversx.thinkterm"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; AppUserModelID: "com.roversx.thinkterm"
@@ -220,10 +224,177 @@ begin
   else Log(Format('Error while removing the [%s] from PATH: [%s]', [instlPath, Paths]));
 end;
 
+// An update replaces files a running ThinkTerm still has open: the session
+// server, which holds every terminal, and a console host per pane. Windows
+// will not overwrite or delete a running program, but it will move one, so
+// before anything is installed each program and library of the old build
+// moves to .old\<stamp>\ in the app folder -- under the same name, as
+// ThinkTerm finds its server by its program's name -- and the new files go
+// in their place. Nothing is closed: a running ThinkTerm keeps the old build
+// until it restarts, and its session server hands its terminals to the new
+// one then. A moved file is deleted once nothing runs it: at the end of this
+// install, at the next one, or when Windows next starts.
+var
+  AsideStamp: String;
+  MovedFrom: TArrayOfString;
+  MovedTo: TArrayOfString;
+  Installed: Boolean;
+
+function AsideRoot(): String;
+begin
+  Result := ExpandConstant('{app}\.old');
+end;
+
+procedure DeleteTree(const Dir: String);
+var
+  FindRec: TFindRec;
+begin
+  if FindFirst(Dir + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
+          begin
+            DeleteTree(Dir + '\' + FindRec.Name);
+            RemoveDir(Dir + '\' + FindRec.Name);
+          end
+          else
+            DeleteFile(Dir + '\' + FindRec.Name);
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function IsProgramFile(const Name: String): Boolean;
+var
+  Ext: String;
+begin
+  Ext := Lowercase(ExtractFileExt(Name));
+  Result := ((Ext = '.exe') or (Ext = '.dll')) and (Pos('unins', Lowercase(Name)) <> 1);
+end;
+
+// Moves the programs and libraries of the app folder's Rel aside; returns
+// the first that could not be moved, or ''.
+function MoveAside(const Rel: String): String;
+var
+  FindRec: TFindRec;
+  Dir, Dest: String;
+  Names: TArrayOfString;
+  I, Tries: Integer;
+  Moved: Boolean;
+begin
+  Result := '';
+  Dir := ExpandConstant('{app}');
+  Dest := AsideRoot() + '\' + AsideStamp;
+  if Rel <> '' then
+  begin
+    Dir := Dir + '\' + Rel;
+    Dest := Dest + '\' + Rel;
+  end;
+  // Listed first: the folder is not changed while it is read.
+  if FindFirst(Dir + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY = 0) and IsProgramFile(FindRec.Name) then
+        begin
+          SetArrayLength(Names, GetArrayLength(Names) + 1);
+          Names[GetArrayLength(Names) - 1] := FindRec.Name;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  if GetArrayLength(Names) = 0 then
+    Exit;
+  ForceDirectories(Dest);
+  for I := 0 to GetArrayLength(Names) - 1 do
+  begin
+    Moved := False;
+    // A scanner may hold the file for a moment.
+    for Tries := 1 to 20 do
+    begin
+      Moved := RenameFile(Dir + '\' + Names[I], Dest + '\' + Names[I]);
+      if Moved then
+        Break;
+      Sleep(100);
+    end;
+    if not Moved then
+    begin
+      Result := Dir + '\' + Names[I];
+      Exit;
+    end;
+    SetArrayLength(MovedFrom, GetArrayLength(MovedFrom) + 1);
+    SetArrayLength(MovedTo, GetArrayLength(MovedTo) + 1);
+    MovedFrom[GetArrayLength(MovedFrom) - 1] := Dir + '\' + Names[I];
+    MovedTo[GetArrayLength(MovedTo) - 1] := Dest + '\' + Names[I];
+    Log(Format('Moved aside: %s', [Dir + '\' + Names[I]]));
+  end;
+end;
+
+// Runs before Setup checks for files in use, so that check finds none.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Failed: String;
+begin
+  Result := '';
+  DeleteTree(AsideRoot());
+  AsideStamp := GetDateTimeString('yyyymmddhhnnss', #0, #0);
+  Failed := MoveAside('');
+  if Failed = '' then
+    Failed := MoveAside('mesa');
+  if Failed <> '' then
+    Result := Format('%s is in use and could not be replaced. Close ThinkTerm and run Setup again.', [Failed]);
+end;
+
+// The folders this install moved files into, once they are empty.
+procedure RemoveEmptyAsideDirs();
+begin
+  RemoveDir(AsideRoot() + '\' + AsideStamp + '\mesa');
+  RemoveDir(AsideRoot() + '\' + AsideStamp);
+  RemoveDir(AsideRoot());
+end;
+
+// The moved files of this install that nothing runs any more go now; the
+// rest when Windows next starts.
+procedure DeleteMovedFiles();
+var
+  I: Integer;
+begin
+  for I := 0 to GetArrayLength(MovedTo) - 1 do
+    if not DeleteFile(MovedTo[I]) then
+      RestartReplace(MovedTo[I], '');
+  RemoveEmptyAsideDirs();
+end;
+
+// A cancelled or failed install puts back what it moved, wherever nothing
+// new took its place, so the old build keeps working.
+procedure DeinitializeSetup();
+var
+  I: Integer;
+begin
+  if Installed or (GetArrayLength(MovedFrom) = 0) then
+    Exit;
+  for I := GetArrayLength(MovedFrom) - 1 downto 0 do
+    if not FileExists(MovedFrom[I]) then
+      RenameFile(MovedTo[I], MovedFrom[I]);
+  RemoveEmptyAsideDirs();
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
     EnvAddPath(ExpandConstant('{app}'));
+    Installed := True;
+    DeleteMovedFiles();
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

@@ -17,6 +17,33 @@ mod psuedocon;
 
 use filedescriptor::OwnedHandle;
 
+/// The file name of the program `process` runs, e.g. `OpenConsole.exe`.
+pub fn process_image_name(process: &impl AsRawHandle) -> IoResult<String> {
+    use winapi::um::winbase::QueryFullProcessImageNameW;
+    let mut buf = vec![0u16; 32 * 1024];
+    let mut len = buf.len() as DWORD;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(process.as_raw_handle() as _, 0, buf.as_mut_ptr(), &mut len)
+    };
+    if ok == 0 {
+        return Err(IoError::last_os_error());
+    }
+    let path = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]));
+    Ok(path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default())
+}
+
+/// A process another server spawned and handed over with its pane, as the
+/// process handle that server held.
+pub fn adopted_child(process: std::os::windows::io::OwnedHandle) -> Box<dyn Child + Send + Sync> {
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+    Box::new(WinChild {
+        proc: Mutex::new(unsafe { OwnedHandle::from_raw_handle(process.into_raw_handle()) }),
+    })
+}
+
 #[derive(Debug)]
 pub struct WinChild {
     proc: Mutex<OwnedHandle>,

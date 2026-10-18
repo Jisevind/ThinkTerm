@@ -501,14 +501,17 @@ fn windows_installer_name(arch: &str, version: &str) -> String {
     }
 }
 
-/// Windows: fetch the release's installer and hand over to it. Inno Setup
-/// closes the running ThinkTerm, replaces the files and restarts it, so
-/// this process must not wait for it -- it is one of the files.
+/// Windows: fetch the release's installer and run it to the end. It moves
+/// the files of a running ThinkTerm aside rather than close it (see
+/// ci/windows-installer.iss), so this process -- one of those files --
+/// keeps running the old build until it is restarted, as on the other
+/// platforms, and can wait for the outcome.
 ///
 /// `/SILENT` keeps the progress window and drops every question; `/SP-`
-/// skips the "this will install" prompt; the two APPLICATIONS switches let
-/// the installer stop and restart a running ThinkTerm rather than fail on a
-/// locked file. Elevation is the installer's own UAC prompt.
+/// skips the "this will install" prompt; `/NOCLOSEAPPLICATIONS` keeps the
+/// installer from ever closing a running ThinkTerm -- a file it cannot move
+/// aside fails the install instead; `/LOG` keeps its log beside the
+/// download. Elevation is the installer's own UAC prompt.
 pub fn run_windows_installer(
     release: &Release,
     progress: &mut dyn FnMut(InstallProgress),
@@ -532,12 +535,32 @@ pub fn run_windows_installer(
     }
     progress(InstallProgress::Installing);
 
-    println!("starting the installer: {}", path.display());
-    std::process::Command::new(&path)
-        .args(["/SILENT", "/SP-", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/NORESTART"])
-        .spawn()
+    let log = dir.join(format!("{}.log", asset.name));
+    println!("running the installer: {}", path.display());
+    let status = std::process::Command::new(&path)
+        .args(["/SILENT", "/SP-", "/NOCLOSEAPPLICATIONS", "/NORESTART"])
+        .arg(format!("/LOG={}", log.display()))
+        .status()
         .with_context(|| format!("starting {}", path.display()))?;
-    Ok(())
+    installer_outcome(status.code(), &log)
+}
+
+/// What the installer's exit code says about the install.
+fn installer_outcome(code: Option<i32>, log: &std::path::Path) -> anyhow::Result<()> {
+    match code {
+        Some(0) => Ok(()),
+        // Before the install began (a declined UAC prompt among them), or
+        // during it.
+        Some(2) | Some(5) => Err(anyhow!("the installer was cancelled")),
+        Some(code) => Err(anyhow!(
+            "the installer failed (exit code {code}); its log is {}",
+            log.display()
+        )),
+        None => Err(anyhow!(
+            "the installer ended without an exit code; its log is {}",
+            log.display()
+        )),
+    }
 }
 
 fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
@@ -1720,6 +1743,20 @@ mod tests {
     fn windows_installer_follows_the_architecture() {
         assert_eq!(windows_installer_name("x86_64", "1.2.3"), "ThinkTerm-1.2.3-setup.exe");
         assert_eq!(windows_installer_name("aarch64", "1.2.3"), "ThinkTerm-1.2.3-arm64-setup.exe");
+    }
+
+    #[test]
+    fn only_a_clean_installer_exit_is_an_install() {
+        let log = std::path::Path::new("setup.log");
+        assert!(installer_outcome(Some(0), log).is_ok());
+        for cancelled in [2, 5] {
+            let err = installer_outcome(Some(cancelled), log).unwrap_err().to_string();
+            assert!(err.contains("cancelled"), "{cancelled}: {err}");
+        }
+        // Preparing failed: a file in use that could not be moved aside.
+        let err = installer_outcome(Some(7), log).unwrap_err().to_string();
+        assert!(err.contains("exit code 7") && err.contains("setup.log"), "{err}");
+        assert!(installer_outcome(None, log).is_err());
     }
 
     #[test]

@@ -636,7 +636,7 @@ pub(crate) fn update_capsule_status() -> Option<UpdateCapsuleStatus> {
             },
         },
         Some(UpdateInstall::Installed { .. }) => UpdateCapsuleStatus::Installed {
-            restart: !cfg!(windows) && !restart_ends_terminals_lately(),
+            restart: !restart_ends_terminals_lately(),
         },
         Some(UpdateInstall::Failed { .. }) => UpdateCapsuleStatus::Failed,
         None => UpdateCapsuleStatus::Available {
@@ -668,7 +668,6 @@ fn restart_ends_terminals_lately() -> bool {
 /// terminals after all.
 pub(crate) fn restart_into_update() -> bool {
     if !matches!(update_install(), Some(UpdateInstall::Installed { .. }))
-        || cfg!(windows)
         || restart_ends_terminals()
     {
         return false;
@@ -8493,14 +8492,7 @@ impl SettingsWindow {
                         tw,
                         band,
                         &crate::i18n::tr("settings-local-sessions-via-mux"),
-                        // Windows has no in-place handoff: sessions survive
-                        // quitting and crashing there, not updating, and the
-                        // text says so.
-                        if cfg!(windows) {
-                            "settings-local-sessions-via-mux-description-windows"
-                        } else {
-                            "settings-local-sessions-via-mux-description"
-                        },
+                        "settings-local-sessions-via-mux-description",
                         this.native_settings.workspaces.local_sessions_via_mux,
                         SettingsAction::ToggleLocalSessionsViaMux,
                     )?;
@@ -16141,7 +16133,7 @@ impl SettingsWindow {
         // this copy is ours to replace, with a check under it, as a newer
         // release may have come out since; restart once it has been
         // replaced; check otherwise. While an install runs there is nothing
-        // to click, and the Windows installer restarts ThinkTerm itself.
+        // to click.
         let self_updatable = self
             .ui
             .update_method
@@ -16152,10 +16144,8 @@ impl SettingsWindow {
             (_, Some(UpdateInstall::Running { .. })) => vec![],
             // Restart only where it ends no terminal: shells this process
             // runs itself would go with it, so there the person quits and
-            // reopens when ready. The Windows installer restarts by itself.
-            (_, Some(UpdateInstall::Installed { .. }))
-                if !cfg!(windows) && !restart_ends_terminals() =>
-            {
+            // reopens when ready.
+            (_, Some(UpdateInstall::Installed { .. })) if !restart_ends_terminals() => {
                 vec![(
                     crate::i18n::tr("settings-restart"),
                     SettingsAction::RestartApplication,
@@ -16229,14 +16219,6 @@ impl SettingsWindow {
                         &[("version", version.clone())],
                     ),
                     crate::i18n::tr("settings-update-installing"),
-                    None,
-                ),
-                (Some(UpdateInstall::Installed { version }), _) if cfg!(windows) => (
-                    crate::i18n::tr("settings-update-installer-started"),
-                    settings_tr(
-                        "settings-update-installer-started-detail",
-                        &[("version", version.clone())],
-                    ),
                     None,
                 ),
                 (Some(UpdateInstall::Installed { version }), _) => (

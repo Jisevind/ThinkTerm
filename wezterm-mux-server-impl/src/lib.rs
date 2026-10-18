@@ -7,7 +7,7 @@ use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 
 pub mod connections;
 pub mod dispatch;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod handoff;
 #[cfg(target_os = "macos")]
 pub mod hold;

@@ -1544,6 +1544,35 @@ pub struct PaneHandoffParts {
     pub description: String,
 }
 
+/// What a pane hands to a successor server besides its terminal, on
+/// Windows: see `LocalPane::handoff_parts`.
+#[cfg(windows)]
+pub struct PaneHandoffParts {
+    pub pid: u32,
+    /// Waitable, killable, and enough to read the exit code.
+    pub process: std::os::windows::io::OwnedHandle,
+    pub conpty: portable_pty::win::conpty::ConPtyHandoff,
+    pub description: String,
+}
+
+#[cfg(windows)]
+fn open_child_process(pid: u32) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winnt::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, SYNCHRONIZE};
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) })
+}
+
 impl LocalPane {
     /// The pieces a successor server needs to adopt this pane, or None
     /// for a pane that cannot travel: one over a channel rather than a
@@ -1573,6 +1602,34 @@ impl LocalPane {
             pty_fd,
             description: self.command_description.clone(),
         })
+    }
+
+    /// The Windows sibling of the above: the pseudo console's handles in
+    /// place of the pty descriptor, and the process itself, which a
+    /// successor can wait on only with a handle. Err for a pane that should
+    /// travel and whose parts could not be taken; the caller decides.
+    #[cfg(windows)]
+    pub fn handoff_parts(&self) -> Option<anyhow::Result<PaneHandoffParts>> {
+        if self.tmux_domain.lock().is_some() {
+            return None;
+        }
+        let pid = match &*self.process.lock() {
+            ProcessState::Running { pid: Some(pid), .. } => *pid,
+            _ => return None,
+        };
+        Some((|| {
+            // Its waiter holds a handle until it exits, so the pid names
+            // this process and no other.
+            let process = open_child_process(pid)
+                .map_err(|err| anyhow::anyhow!("opening process {pid}: {err}"))?;
+            let conpty = self.pty.lock().conpty_handoff()?;
+            Ok(PaneHandoffParts {
+                pid,
+                process,
+                conpty,
+                description: self.command_description.clone(),
+            })
+        })())
     }
 
     /// Forget the process without touching it: this pane was staged for
