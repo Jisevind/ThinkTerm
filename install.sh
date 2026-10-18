@@ -38,9 +38,10 @@
 # Deliberately not here: version comparison, uninstall. Re-running the script
 # is the upgrade: it overwrites whatever is installed with the release it
 # fetched, and going from --server to --desktop is the same run plus the GUI.
-# Removing ThinkTerm is deleting the files it lists at the end. A manifest
-# under share/thinkterm/ records what was installed for a future
-# `thinkterm update`.
+# Removing ThinkTerm is deleting what it put in place: ThinkTerm.app on
+# macOS, the commands in bin/, share/thinkterm/ with the completions beside
+# it, and on Linux the launcher and icon. A manifest under share/thinkterm/ records what was
+# installed for a future `thinkterm update`.
 
 set -eu
 
@@ -53,6 +54,8 @@ min_glibc_desktop="2.35"   # the GUI's alone; the rest need no more than the ser
 # Hosts that proxy github.com downloads, for --mirror auto, in the order
 # tried. thinkterm-update carries the same list for Settings.
 mirrors="ghfast.top gh-proxy.org ghproxy.net gh.llkk.cc"
+# Bytes a second under which a source that is not the last one is given up.
+min_rate=307200
 
 variant=""
 tag=""
@@ -89,41 +92,206 @@ Install ThinkTerm on Linux or macOS.
 EOF
 }
 
+# ---- output ----------------------------------------------------------------
+
+# What the terminal can show, decided once. Logged or piped output gets plain
+# lines; a terminal gets colour, and, when it can redraw a line in place,
+# spinners and a download bar. The opening wordmark and the bar need UTF-8.
+# 24-bit colour only where COLORTERM promises it -- Terminal.app does not, and
+# draws box-drawing glyphs badly, so its bar is coloured spaces instead.
+esc=$(printf '\033')
+tty_out=""
+if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then tty_out=1; fi
 ui_color=""
+if [ -n "$tty_out" ] && [ -z "${NO_COLOR:-}" ]; then ui_color=1; fi
 err_color=""
-if [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
-  if [ -t 1 ]; then ui_color=1; fi
-  if [ -t 2 ]; then err_color=1; fi
-fi
-color() {
-  if [ -n "$1" ]; then
-    printf '\033[%sm' "$2"
+if [ -t 2 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then err_color=1; fi
+# Redrawing waits between frames, and POSIX sleep only takes whole seconds.
+anim=""
+if [ -n "$tty_out" ] && sleep 0.01 2>/dev/null; then anim=1; fi
+unicode=""
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *UTF-8* | *utf-8* | *UTF8* | *utf8*) unicode=1 ;; esac
+case "${TERM_PROGRAM:-}" in Apple_Terminal | iTerm.app | vscode | WezTerm | ThinkTerm | ghostty) unicode=1 ;; esac
+palette=basic
+if [ -n "$ui_color" ]; then
+  case "${COLORTERM:-}" in truecolor | 24bit) palette=truecolor ;; esac
+  if [ "$palette" = basic ]; then
+    case "${TERM:-}:${TERM_PROGRAM:-}" in *256color*:* | *:Apple_Terminal) palette=256 ;; esac
   fi
+fi
+cols=$({ stty size </dev/tty; } 2>/dev/null | cut -d' ' -f2) || cols=""
+case "$cols" in "" | *[!0-9]*) cols=${COLUMNS:-80} ;; esac
+# Spinners and the bar draw on the terminal even inside $(...).
+exec 4>&1
+
+# One colour for each palette: truecolor "r;g;b", the nearest 256-colour
+# index, and a basic SGR code.
+color() {
+  if [ -z "$ui_color" ]; then return; fi
+  case "$palette" in
+    truecolor) printf '%s[38;2;%sm' "$esc" "$1" ;;
+    256)       printf '%s[38;5;%sm' "$esc" "$2" ;;
+    *)         printf '%s[%sm' "$esc" "$3" ;;
+  esac
 }
-ui_reset=$(color "$ui_color" 0)
-ui_accent=$(color "$ui_color" 36)
-ui_bold=$(color "$ui_color" 1)
-ui_dim=$(color "$ui_color" 2)
-ui_success=$(color "$ui_color" 32)
-err_reset=$(color "$err_color" 0)
-err_warning=$(color "$err_color" 33)
-err_failure=$(color "$err_color" 31)
+ui_reset=""; ui_bold=""; ui_dim=""
+if [ -n "$ui_color" ]; then ui_reset="$esc[0m"; ui_bold="$esc[1m"; ui_dim="$esc[2m"; fi
+ui_accent=$(color '150;160;255' 147 34)
+ui_success=$(color '120;210;140' 114 32)
+ui_warning=$(color '240;190;90' 221 33)
+err_reset=""; err_warning=""; err_failure=""
+if [ -n "$err_color" ]; then err_reset="$esc[0m"; err_warning="$esc[33m"; err_failure="$esc[31m"; fi
+if [ -n "$unicode" ]; then
+  mark_ok="✓"; mark_fail="✗"; dot="·"; arrow="→"
+else
+  mark_ok="+"; mark_fail="x"; dot="-"; arrow="->"
+fi
 
 say()  { printf '%s\n' "$*"; }
-step() { printf '  %s>%s %s\n' "$ui_accent" "$ui_reset" "$*"; }
-done_message() { printf '  %s+%s %s\n' "$ui_success" "$ui_reset" "$*"; }
-warn() { printf '  %s!%s install.sh: %s\n' "$err_warning" "$err_reset" "$*" >&2; }
-die()  { printf '  %sx%s install.sh: %s\n' "$err_failure" "$err_reset" "$*" >&2; exit 1; }
+ok()   { printf '  %s%s%s %s\n' "$ui_success" "$mark_ok" "$ui_reset" "$*"; }
+# A line under the step it belongs to.
+note() { printf '    %s%s%s\n' "$ui_dim" "$*" "$ui_reset"; }
+warn() { printf '  %s!%s %s\n' "$err_warning" "$err_reset" "$*" >&2; }
+die()  { printf '  %s%s%s %s\n' "$err_failure" "$mark_fail" "$err_reset" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# A path as the user would type it.
+pretty() {
+  case "$1" in
+    "$HOME") printf '~' ;;
+    "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 
+show_cursor() { [ -z "$anim" ] || printf '%s[?25h' "$esc" >&4; }
+hide_cursor() { [ -z "$anim" ] || printf '%s[?25l' "$esc" >&4; }
+# What a command running under a spinner or the bar prints on stderr is held
+# here, so it cannot land in the middle of a line being redrawn.
+errlog=""
+if [ -n "$anim" ]; then
+  errlog=$(mktemp "${TMPDIR:-/tmp}/thinkterm-install-err.XXXXXX") || anim=""
+fi
+leave() { show_cursor; [ -z "$errlog" ] || rm -f "$errlog"; }
+trap leave EXIT
+trap 'leave; exit 130' INT
+trap 'leave; exit 143' TERM
+# Prints the first line of that, once the redrawn line is gone, and empties it.
+show_error() {
+  if [ -s "$errlog" ]; then
+    printf '    %s%s%s\n' "$ui_dim" "$(head -n1 "$errlog")" "$ui_reset" >&2
+  fi
+  : > "$errlog"
+}
+
+spinner_frame() {
+  if [ -n "$unicode" ]; then
+    case $(($1 % 10)) in
+      0) printf '⠋' ;; 1) printf '⠙' ;; 2) printf '⠹' ;; 3) printf '⠸' ;; 4) printf '⠼' ;;
+      5) printf '⠴' ;; 6) printf '⠦' ;; 7) printf '⠧' ;; 8) printf '⠇' ;; *) printf '⠏' ;;
+    esac
+  else
+    case $(($1 % 4)) in 0) printf '-' ;; 1) printf '\\' ;; 2) printf '|' ;; *) printf '/' ;; esac
+  fi
+}
+
+# Runs a command with a spinner beside LABEL, and returns its status. Its
+# output goes wherever the caller sends it; the spinner draws on fd 4.
+bg_pid=""
+with_spinner() {
+  label=$1; shift
+  if [ -z "$anim" ]; then
+    printf '  %s>%s %s...\n' "$ui_accent" "$ui_reset" "$label" >&4
+    "$@"
+    return
+  fi
+  "$@" 2>"$errlog" &
+  bg_pid=$!
+  hide_cursor
+  i=0
+  while kill -0 "$bg_pid" 2>/dev/null; do
+    printf '\r%s[K  %s%s%s %s' "$esc" "$ui_accent" "$(spinner_frame "$i")" "$ui_reset" "$label" >&4
+    i=$((i + 1))
+    sleep 0.08
+  done
+  printf '\r%s[K' "$esc" >&4
+  show_cursor
+  if wait "$bg_pid"; then status=0; else status=$?; fi
+  bg_pid=""
+  [ "$status" -eq 0 ] || show_error
+  return "$status"
+}
+
+# THINKTERM in a 3x5 pixel font, two pixels to a character cell with the
+# half blocks, shaded lavender to blue from left to right. Draws the first
+# $1 letters with a cursor after them when $2 is 1.
+wordmark() {
+  awk -v shown="$1" -v cursor="$2" -v palette="$palette" -v color="$ui_color" -v esc="$esc" '
+    function shade(x,   f, r, g, b) {
+      if (!color) return ""
+      f = (x - 1) / (width - 1)
+      r = int(200 - 116 * f); g = int(206 - 106 * f); b = int(255 - 5 * f)
+      return rgb(r, g, b)
+    }
+    function rgb(r, g, b,   q) {
+      if (palette == "truecolor") return esc "[38;2;" r ";" g ";" b "m"
+      if (palette == "256") return esc "[38;5;" (16 + 36 * cube(r) + 6 * cube(g) + cube(b)) "m"
+      return esc "[34m"
+    }
+    function cube(v) { return v < 48 ? 0 : (v < 115 ? 1 : int((v - 35) / 40)) }
+    BEGIN {
+      row[1] = "###.#.#.###.#..#.#.#.###.###.##..#...#"
+      row[2] = ".#..#.#..#..##.#.#.#..#..#...#.#.##.##"
+      row[3] = ".#..###..#..#.##.##...#..##..##..#.#.#"
+      row[4] = ".#..#.#..#..#..#.#.#..#..#...#.#.#...#"
+      row[5] = ".#..#.#.###.#..#.#.#..#..###.#.#.#...#"
+      split("1 5 9 13 18 22 26 30 34", start, " ")
+      width = length(row[1])
+      edge = shown >= 9 ? width + 2 : start[shown + 1]
+      reset = color ? esc "[0m" : ""
+      for (line = 0; line < 3; line++) {
+        top = 2 * line; bottom = top + 1   # pixel row 0 is the blank above
+        out = ""
+        for (x = 1; x <= width + 2; x++) {
+          if (cursor && x == edge) {
+            t = top >= 1; b = bottom <= 5; paint = color ? rgb(225, 228, 255) : ""
+          } else {
+            t = x < edge && top >= 1 && substr(row[top], x, 1) == "#"
+            b = x < edge && bottom <= 5 && substr(row[bottom], x, 1) == "#"
+            paint = shade(x)
+          }
+          if (t && b) out = out paint "█" reset
+          else if (t) out = out paint "▀" reset
+          else if (b) out = out paint "▄" reset
+          else out = out " "
+        }
+        sub(/ +$/, "", out)
+        printf "  %s%s[K\n", out, esc
+      }
+    }'
+}
+
+# The wordmark types itself out on a terminal that can redraw; elsewhere it
+# is printed once, or, without UTF-8 or room, the name in plain text.
 banner() {
-  say
-  printf '  %s.--------.%s\n' "$ui_accent" "$ui_reset"
-  printf '  %s|        |%s\n' "$ui_accent" "$ui_reset"
-  printf '  %s|  >_    |%s  %sThinkTerm%s\n' "$ui_accent" "$ui_reset" "$ui_bold" "$ui_reset"
-  printf '  %s|        |%s  %sinstaller%s\n' "$ui_accent" "$ui_reset" "$ui_dim" "$ui_reset"
-  printf "  %s'--------'%s\n" "$ui_accent" "$ui_reset"
-  say
+  if [ -z "$tty_out" ] || [ -z "$unicode" ] || [ "$cols" -lt 44 ]; then
+    printf '\n  %sThinkTerm%s %sinstaller%s\n\n' "$ui_bold" "$ui_reset" "$ui_dim" "$ui_reset"
+    return
+  fi
+  if [ -z "$anim" ] || [ "${1:-}" = still ]; then
+    say; wordmark 9 0
+  else
+    hide_cursor
+    printf '%s[2J%s[H\n' "$esc" "$esc"
+    wordmark 0 1; sleep 0.3
+    for n in 1 2 3 4 5 6 7 8 9; do
+      printf '%s[2H' "$esc"; wordmark "$n" 1; sleep 0.06
+    done
+    for c in 0 1 0 1 0; do
+      printf '%s[2H' "$esc"; wordmark 9 "$c"; sleep 0.22
+    done
+    show_cursor
+  fi
+  printf '  %sinstaller%s\n\n' "$ui_dim" "$ui_reset"
 }
 
 while [ $# -gt 0 ]; do
@@ -141,13 +309,15 @@ while [ $# -gt 0 ]; do
     --mirror)   [ $# -ge 2 ] || die "--mirror needs a value"; mirror="$2"; shift ;;
     --mirror=*) mirror="${1#--mirror=}" ;;
     --dry-run)  dry_run=1 ;;
-    -h|--help)  banner; usage; exit 0 ;;
+    -h|--help)  banner still; usage; exit 0 ;;
     *) die "unknown option '$1' (try --help)" ;;
   esac
   shift
 done
 
 [ -n "$prefix" ] || die "--prefix needs a directory"
+tag_requested=""
+[ -z "$tag" ] || tag_requested=1
 # Where the archive is fetched from, in order: "github" or a mirror's host.
 case "$mirror" in
   direct) sources="github" ;;
@@ -184,7 +354,6 @@ case "$os/$arch" in
   macos/aarch64) arch=arm64 ;;
   *) die "no build for $os on '$arch'" ;;
 esac
-step "detected $os/$arch"
 [ "$os" = macos ] || [ -z "$app_dir_opt" ] || warn "--app-dir only applies on macOS; ignored"
 
 # ---- what is already here --------------------------------------------------
@@ -215,14 +384,15 @@ fi
 if [ -z "$variant" ]; then
   if [ -t 2 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
     if [ -n "$prev_variant" ]; then
-      printf '%s\n' "ThinkTerm $prev_variant${prev_version:+ $prev_version} is installed under $prefix." > /dev/tty
+      note "ThinkTerm $prev_variant${prev_version:+ $prev_version} is installed under $(pretty "$prefix")." > /dev/tty
     fi
-    printf '\n%s\n' "  Which ThinkTerm do you want on this machine?" > /dev/tty
-    printf '%s\n' \
-      "    1) desktop  GUI + CLI + TUI + mux server" \
-      "    2) server   CLI + TUI + mux server, no GUI (headless hosts, SSH targets)" > /dev/tty
-    printf '%s' "  Choice [1/2]: " > /dev/tty
+    printf '  %sWhich ThinkTerm do you want on this machine?%s\n' "$ui_bold" "$ui_reset" > /dev/tty
+    printf '    %s1%s  desktop  %sGUI + CLI + TUI + mux server%s\n' "$ui_accent" "$ui_reset" "$ui_dim" "$ui_reset" > /dev/tty
+    printf '    %s2%s  server   %sCLI + TUI + mux server, no GUI (headless hosts, SSH targets)%s\n' \
+      "$ui_accent" "$ui_reset" "$ui_dim" "$ui_reset" > /dev/tty
+    printf '  Choice %s[1/2]%s: ' "$ui_dim" "$ui_reset" > /dev/tty
     read -r choice < /dev/tty || choice=""
+    printf '\n' > /dev/tty
     case "$choice" in
       1 | d | desktop) variant=desktop ;;
       2 | s | server)  variant=server ;;
@@ -232,11 +402,11 @@ if [ -z "$variant" ]; then
     die "pass --desktop (GUI + CLI + TUI + mux server) or --server (the same without the GUI)"
   fi
 fi
-step "selected $variant"
+case "$os" in linux) os_name=Linux ;; *) os_name=macOS ;; esac
+ok "$os_name $arch $dot $variant"
 
 # ---- preflight -------------------------------------------------------------
 
-step "checking requirements..."
 if [ "$os" = linux ]; then
   # The binaries link against glibc; musl (Alpine) cannot run them at all,
   # and an older glibc fails at load time with a message that blames a
@@ -314,6 +484,7 @@ asset=""
 digest=""
 url=""
 asset_api_url=""
+size=""
 
 asset_name() {
   case "$os/$variant" in
@@ -326,12 +497,10 @@ asset_name() {
 
 if [ -z "$from" ]; then
   if [ -n "$tag" ]; then
-    step "fetching release $tag..."
-    release_json=$(fetch "$api/tags/$tag") \
+    release_json=$(with_spinner "looking up release $tag" fetch "$api/tags/$tag") \
       || die "release '$tag' not found at https://github.com/$repo/releases"
   else
-    step "fetching latest release..."
-    release_json=$(fetch "$api/latest") \
+    release_json=$(with_spinner "looking up the latest release" fetch "$api/latest") \
       || die "could not look up the latest release (is the network up? does https://github.com/$repo have a release yet?)"
     tag=$(printf '%s' "$release_json" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
     [ -n "$tag" ] || die "could not read the release tag from the GitHub API response"
@@ -358,6 +527,12 @@ if [ -z "$from" ]; then
   # Anything but a hex string means the field was absent or null: install
   # unverified with a warning rather than fail a good download against junk.
   case "$digest" in *[!0-9a-f]* | "") digest="" ;; esac
+  # Its size, from the same object, for the download bar.
+  size=$(printf '%s' "$release_json" \
+    | awk -v want="\"name\": \"$asset\"" '
+        index($0, want)      { inside = 1; next }
+        inside && /"name":/  { exit }
+        inside && /"size": *[0-9]/ { sub(/.*"size": */, ""); sub(/[^0-9].*/, ""); print; exit }')
   # The asset's own API address, for a private repository: the download URL
   # under github.com/.../releases/download answers only for public ones,
   # while the API serves the bytes to a token with Accept: octet-stream. In
@@ -388,29 +563,38 @@ else
   fi
 fi
 
-step "ThinkTerm${version:+ $version} ($variant)"
+if [ -n "$from" ]; then
+  ok "ThinkTerm${version:+ $ui_bold$version$ui_reset} $ui_dim(from $(pretty "$from"))$ui_reset"
+elif [ -n "$tag_requested" ]; then
+  ok "ThinkTerm $ui_bold$version$ui_reset"
+else
+  ok "ThinkTerm $ui_bold$version$ui_reset ${ui_dim}(latest)$ui_reset"
+fi
 if [ -n "$prev_variant" ]; then
   case "$prev_variant/$variant" in
-    server/desktop)  say "  was:    server${prev_version:+ $prev_version}; adding the GUI, everything else is kept" ;;
-    desktop/server)  say "  was:    desktop${prev_version:+ $prev_version}; the GUI and its launcher will be removed" ;;
-    *)               say "  was:    $prev_variant${prev_version:+ $prev_version}; reinstalling over it" ;;
+    server/desktop)  note "adds the GUI to server${prev_version:+ $prev_version}; everything else is kept" ;;
+    desktop/server)  note "replaces desktop${prev_version:+ $prev_version}; the GUI and its launcher will be removed" ;;
+    *)
+      if [ "$prev_version" = "$version" ]; then note "already installed; reinstalling it"
+      else note "replaces $prev_variant${prev_version:+ $prev_version}"; fi
+      ;;
   esac
 fi
-if [ -n "$from" ]; then
-  say "  from:   $from"
-else
-  say "  from:   $url"
-  [ "$sources" = github ] || say "  via:    $sources"
-fi
-say "  into:   $bindir"
-[ -z "$app_dir" ] || say "  app:    $app"
 if [ -z "$from" ] && [ -z "$digest" ]; then
-  say "  verify: no digest available for this asset; the download will not be checked"
+  warn "GitHub recorded no checksum for $asset; the download will not be verified"
 fi
 
 if [ -n "$dry_run" ]; then
+  if [ -n "$from" ]; then note "from  $(pretty "$from")"; else note "from  $url"; fi
+  case "$mirror" in
+    direct) ;;
+    auto) note "via   $mirrors, if GitHub is slow" ;;
+    *)    note "via   $mirror, then GitHub" ;;
+  esac
+  [ -z "$app_dir" ] || note "app   $(pretty "$app")"
+  note "bin   $(pretty "$bindir")"
   say
-  done_message "dry run complete. No files were changed."
+  ok "Dry run: nothing was changed."
   exit 0
 fi
 
@@ -421,6 +605,8 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/thinkterm-install.XXXXXX")
 # owned by this invocation. Never glob temporary files in the shared bin/.
 bin_stage=""
 cleanup() {
+  [ -z "$bg_pid" ] || kill "$bg_pid" 2>/dev/null || true
+  leave
   rm -rf "$tmp"
   [ -z "$bin_stage" ] || rm -rf "$bin_stage" 2>/dev/null || true
   [ -z "$app_dir" ] || rm -rf "$app_dir/.ThinkTerm.app.tmp" 2>/dev/null || true
@@ -430,15 +616,126 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
+mb() { t=$(($1 * 10 / 1048576)); printf '%d.%d' $((t / 10)) $((t % 10)); }
+
+# $1 of $2 bytes as a bar $3 cells wide. A line of light where 24-bit colour
+# and UTF-8 are both there; coloured spaces where only 256 colours are, which
+# every terminal draws exactly one cell wide; plain characters without colour.
+progress_bar() {
+  filled=$(($1 * $3 / $2)); [ "$filled" -le "$3" ] || filled=$3
+  out=""; k=0
+  while [ "$k" -lt "$3" ]; do
+    if [ -z "$ui_color" ]; then
+      if [ "$k" -lt "$filled" ]; then out="$out#"; else out="$out-"; fi
+    elif [ "$palette" = truecolor ] && [ -n "$unicode" ] && [ "${TERM_PROGRAM:-}" != Apple_Terminal ]; then
+      if [ "$k" -lt "$filled" ]; then
+        out="$out$esc[38;2;$((200 - 116 * k / $3));$((206 - 106 * k / $3));$((255 - 5 * k / $3))m━"
+      else
+        out="$out$esc[38;2;70;70;80m━"
+      fi
+    elif [ "$palette" = basic ]; then
+      if [ "$k" -lt "$filled" ]; then out="$out$esc[44m "; else out="$out$esc[0m$esc[2m-"; fi
+    else
+      if [ "$k" -ge "$filled" ]; then out="$out$esc[48;5;237m "
+      elif [ $((k * 2)) -lt "$3" ]; then out="$out$esc[48;5;147m "
+      else out="$out$esc[48;5;105m "; fi
+    fi
+    k=$((k + 1))
+  done
+  printf '%s%s' "$out" "$ui_reset"
+}
+
+# Runs curl with the remaining arguments in the background while drawing how
+# much of $1 has arrived: a line with the amount and rate, and the bar under
+# it. $2 names the mirror, if it is one; $3 is "token" to send GITHUB_TOKEN.
+# With $4 set, a transfer that averages under $min_rate over the five seconds
+# after its first byte is stopped there, rather than after curl's own twenty. Returns
+# curl's status, or 28 (curl's for too slow) when stopped, with both lines
+# gone. curl runs directly, not through a function, so $! is curl itself.
+download() {
+  dest=$1; via=$2; auth=$3; early=$4; shift 4
+  if [ "$auth" = token ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+    set -- -H "Authorization: Bearer $GITHUB_TOKEN" "$@"
+  fi
+  if [ -z "$anim" ]; then
+    printf '  %s>%s downloading%s...\n' "$ui_accent" "$ui_reset" "${via:+ from $via}" >&4
+    curl -fsSL "$@"
+    return
+  fi
+  curl -fsSL "$@" 2>"$errlog" &
+  bg_pid=$!
+  cut_short=""
+  hide_cursor
+  started=$(date +%s)
+  # The early check times the transfer from its first byte, so the DNS
+  # lookup, TLS and redirects to a far-away server do not count against it.
+  flowing=""
+  width=$((cols - 6)); [ "$width" -le 44 ] || width=44; [ "$width" -ge 10 ] || width=10
+  i=0
+  printf '\n' >&4
+  while kill -0 "$bg_pid" 2>/dev/null; do
+    got=0
+    # shellcheck disable=SC2046
+    if [ -f "$dest" ]; then set -- $(wc -c < "$dest"); got=${1:-0}; fi
+    now=$(date +%s)
+    if [ "$got" -gt 0 ] && [ -z "$flowing" ]; then flowing=$now; fi
+    # Whole seconds, so six on the clock is at least five gone.
+    if [ -n "$early" ] && [ -n "$flowing" ] && [ $((now - flowing)) -ge 6 ]; then
+      early=""
+      if [ "$got" -lt $((min_rate * (now - flowing - 1))) ]; then
+        cut_short=1
+        kill "$bg_pid" 2>/dev/null || true
+        break
+      fi
+    fi
+    # The parts of the status line, dropped from the least useful while the
+    # line would not fit: a wrapped line breaks the redraw a line above.
+    amount=" / $(mb "${size:-0}") MB"; [ -n "$size" ] || amount=" MB"
+    from_part=${via:+ from $via}
+    rate_part=""
+    elapsed=$((now - started))
+    if [ "$elapsed" -gt 0 ]; then
+      rate=$((got / elapsed))
+      if [ "$rate" -ge 1048576 ]; then rate_part=" $dot $(mb "$rate") MB/s"
+      else rate_part=" $dot $((rate / 1024)) KB/s"; fi
+    fi
+    got_mb=$(mb "$got")
+    for drop in none rate from amount; do
+      case $drop in
+        rate) rate_part="" ;;
+        from) from_part="" ;;
+        amount) amount=" MB" ;;
+      esac
+      plain="  x downloading$from_part  $got_mb$amount$rate_part"
+      [ "${#plain}" -ge "$cols" ] || break
+    done
+    line="downloading$from_part  $ui_bold$got_mb$ui_reset$ui_dim$amount$rate_part"
+    printf '%s[1A\r%s[K  %s%s%s %s%s\n\r%s[K' "$esc" "$esc" \
+      "$ui_accent" "$(spinner_frame "$i")" "$ui_reset" "$line" "$ui_reset" "$esc" >&4
+    [ -z "$size" ] || printf '    %s' "$(progress_bar "$got" "$size" "$width")" >&4
+    i=$((i + 1))
+    sleep 0.1
+  done
+  printf '\r%s[K%s[1A\r%s[K' "$esc" "$esc" "$esc" >&4
+  show_cursor
+  if wait "$bg_pid"; then status=0; else status=$?; fi
+  bg_pid=""
+  if [ -n "$cut_short" ]; then status=28; : > "$errlog"; fi
+  [ "$status" -eq 0 ] || show_error
+  return "$status"
+}
+
 if [ -n "$from" ]; then
   [ -f "$from" ] || die "no such file: $from"
   archive="$from"
 else
   archive="$tmp/$asset"
-  step "downloading${version:+ $version}..."
   verified=""
+  came_from=""
+  dl_started=$(date +%s)
   if [ -n "$asset_api_url" ]; then
-    fetch -H "Accept: application/octet-stream" -o "$archive" "$asset_api_url" || die "download failed: $asset_api_url"
+    download "$archive" "" token "" --retry 3 -H "Accept: application/octet-stream" -o "$archive" "$asset_api_url" \
+      || die "download failed: $asset_api_url"
   elif [ "$sources" != github ] && [ -n "$digest" ] && { have sha256sum || have shasum; }; then
     # Each source in turn, until one sends the file GitHub recorded. A
     # mirror is a third party serving the bytes, so mirrors are only used
@@ -447,30 +744,33 @@ else
     # never goes to a mirror. While another source is left, a transfer under
     # 300 KB/s for 20 seconds counts as failed: a working connection to
     # GitHub's CDN is far faster, and at that rate the server tarball still
-    # arrives in under three minutes.
+    # arrives in under three minutes. On a terminal, where the bar is
+    # watching the transfer anyway, a source that has averaged under that over
+    # the five seconds after its first byte is dropped then instead.
     left=$(printf '%s\n' $sources | wc -l)
     for source in $sources; do
       left=$((left - 1))
-      slow="--retry 3"
-      [ "$left" -eq 0 ] || slow="--retry 0 --connect-timeout 10 --speed-limit 307200 --speed-time 20"
+      slow="--retry 3"; early=""
+      [ "$left" -eq 0 ] || { slow="--retry 0 --connect-timeout 10 --speed-limit $min_rate --speed-time 20"; early=1; }
       rm -f "$archive"
+      dl_started=$(date +%s)
       if [ "$source" = github ]; then
-        say "  from GitHub..."
         # shellcheck disable=SC2086
-        fetch $slow -o "$archive" "$url" || { warn "download from GitHub failed or was too slow"; continue; }
+        download "$archive" "" token "$early" $slow -o "$archive" "$url" \
+          || { warn "GitHub failed or was too slow"; continue; }
       else
-        say "  from mirror $source..."
         # shellcheck disable=SC2086
-        curl -fsSL $slow -o "$archive" "https://$source/$url" || { warn "mirror $source failed or was too slow"; continue; }
+        download "$archive" "$source" "" "$early" $slow -o "$archive" "https://$source/$url" \
+          || { warn "mirror $source failed or was too slow"; continue; }
       fi
       if [ "$(sha256 "$archive")" = "$digest" ]; then
         verified=1
+        [ "$source" = github ] || came_from=$source
         break
       fi
       warn "checksum mismatch from $source; discarded"
     done
     [ -n "$verified" ] || die "could not download $asset from: $sources. Try another --mirror, or download $url yourself and pass it with --from"
-    step "verified SHA-256"
   else
     if [ "$sources" != github ]; then
       if [ -n "$digest" ]; then
@@ -479,26 +779,29 @@ else
         warn "GitHub recorded no checksum to check a mirror's download against; downloading from GitHub"
       fi
     fi
-    fetch -o "$archive" "$url" || die "download failed: $url"
+    download "$archive" "" token "" --retry 3 -o "$archive" "$url" || die "download failed: $url"
   fi
+  # shellcheck disable=SC2046
+  set -- $(wc -c < "$archive")
+  ok "downloaded $(mb "${1:-0}") MB${came_from:+ from $came_from} ${ui_dim}in $(($(date +%s) - dl_started))s$ui_reset"
   if [ -n "$digest" ] && [ -z "$verified" ]; then
-    step "verifying SHA-256..."
     if got=$(sha256 "$archive"); then
       [ "$got" = "$digest" ] || die "checksum mismatch for $asset
   expected $digest
   got      $got
 The download is corrupt or has been tampered with; nothing was installed."
+      verified=1
     else
       warn "neither sha256sum nor shasum is available; the download was not verified"
     fi
   fi
+  [ -z "$verified" ] || ok "verified SHA-256"
 fi
 
-step "unpacking..."
 mkdir "$tmp/x"
 case "$os" in
   linux)
-    tar xzf "$archive" -C "$tmp/x" || die "could not unpack $archive"
+    with_spinner "unpacking" tar xzf "$archive" -C "$tmp/x" || die "could not unpack $archive"
     # The tarball holds exactly one top-level directory named after itself.
     root=$(find "$tmp/x" -mindepth 1 -maxdepth 1 -type d | head -n1)
     [ -n "$root" ] && [ -d "$root/bin" ] || die "unexpected tarball layout: no bin/ directory inside"
@@ -518,7 +821,7 @@ case "$os" in
   macos)
     # ditto, not unzip: it is what packed the archive, and it restores the
     # resource forks and extended attributes the code signature covers.
-    ditto -x -k "$archive" "$tmp/x" || die "could not unpack $archive"
+    with_spinner "unpacking" ditto -x -k "$archive" "$tmp/x" || die "could not unpack $archive"
     root=$(find "$tmp/x" -maxdepth 2 -name ThinkTerm.app -type d | head -n1)
     [ -n "$root" ] && [ -x "$root/Contents/MacOS/thinkterm" ] || die "unexpected zip layout: no ThinkTerm.app inside"
     if [ -z "$version" ]; then
@@ -575,7 +878,7 @@ lib_package() {
 
 # ---- install ---------------------------------------------------------------
 
-step "installing files..."
+commands=0
 mkdir -p "$bindir" "$sharedir/thinkterm" \
   "$sharedir/bash-completion/completions" \
   "$sharedir/zsh/site-functions" \
@@ -613,7 +916,6 @@ if [ "$os" = macos ]; then
     mv "$app" "$app_dir/.ThinkTerm.app.old" || die "could not move the existing $app aside; nothing was changed"
   fi
   mv "$app_dir/.ThinkTerm.app.tmp" "$app"
-  say "  $app"
   # The new bundle is in place at this point, so a leftover that will not
   # delete (a locked file inside the old one) is worth a note, not a failure.
   if ! rm -rf "$app_dir/.ThinkTerm.app.old" 2>/dev/null; then
@@ -622,13 +924,13 @@ if [ "$os" = macos ]; then
   # The previous run put the bundle somewhere else (the other variant's
   # location, or another --app-dir): one ThinkTerm.app per machine.
   if [ -n "$prev_app" ] && [ "$prev_app" != "$app" ] && [ -d "$prev_app" ]; then
-    say "removing the previous bundle at $prev_app"
+    note "removing the previous bundle at $(pretty "$prev_app")"
     rm -rf "$prev_app"
   fi
   for name in thinkterm wezterm thinkterm-mux-server strip-ansi-escapes; do
     [ -x "$app/Contents/MacOS/$name" ] || continue
     ln -sfn "$app/Contents/MacOS/$name" "$bindir/$name"
-    say "  $bindir/$name -> ThinkTerm.app"
+    commands=$((commands + 1))
   done
   src_completion="$app/Contents/Resources/shell-completion"
   src_integration="$app/Contents/Resources"
@@ -655,7 +957,7 @@ else
     for other in "$bindir/thinkterm-gui" "$bindir/open-thinkterm-here" "$bindir/open-wezterm-here" \
                  "$desktop_entry" "$icon"; do
       if [ -e "$other" ]; then
-        say "removing $other (desktop variant, replaced by --server)"
+        note "removing $(pretty "$other") (desktop variant, replaced by --server)"
         rm -f "$other"
       fi
     done
@@ -664,7 +966,7 @@ else
   for f in "$src_bin"/*; do
     name=$(basename "$f")
     mv -f "$bin_stage/$name" "$bindir/$name"
-    say "  $bindir/$name"
+    commands=$((commands + 1))
   done
 
   if [ "$variant" = desktop ]; then
@@ -682,8 +984,6 @@ else
       /^TryExec=thinkterm$/ { $0 = "TryExec=" exe }
       { print }' "$root/share/applications/com.roversx.thinkterm.desktop" > "$desktop_entry"
     cp "$root/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png" "$icon"
-    say "  $desktop_entry"
-    say "  $icon"
   fi
 
   # Refresh the menu caches when the tools exist, after an install or a
@@ -726,8 +1026,59 @@ fi
 
 # ---- report ----------------------------------------------------------------
 
-say "  $sharedir/thinkterm/ (licenses, shell integration, install-manifest, web client)"
-say "  $sharedir/{bash-completion,zsh,fish}/... (completions)"
+if [ "$os" = macos ]; then
+  ok "installed ${ui_dim}ThinkTerm.app $arrow $(pretty "$app_dir")$ui_reset"
+  note "$commands commands $arrow $(pretty "$bindir")"
+else
+  ok "installed ${ui_dim}$commands commands $arrow $(pretty "$bindir")$ui_reset"
+  [ "$variant" != desktop ] || note "app launcher $arrow $(pretty "$sharedir/applications")"
+fi
+
+# What is left for the user, most pressing first: "!" for what stops
+# ThinkTerm working until it is done, "." for what is worth knowing.
+next_shown=""
+next() {
+  if [ -z "$next_shown" ]; then
+    printf '\n  %sNext%s\n' "$ui_bold" "$ui_reset"
+    next_shown=1
+  fi
+  case "$1" in
+    !) printf '  %s!%s %s\n' "$ui_warning" "$ui_reset" "$2" ;;
+    *) printf '  %s%s%s %s\n' "$ui_dim" "$dot" "$ui_reset" "$2" ;;
+  esac
+}
+# A command to copy, under the item that asks for it.
+cmd() { printf '      %s%s%s\n' "$ui_accent" "$1" "$ui_reset"; }
+# The same path, spelled so it still works pasted into a startup file.
+shell_path() {
+  case "$1" in
+    "$HOME"/*) printf '$HOME%s' "${1#"$HOME"}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Nothing is done to the shell startup files: editing them is the user's
+# call. But ~/.local/bin on Debian and Ubuntu only enters PATH at the next
+# login, and only if it existed then -- so say so.
+case ":$PATH:" in
+  *":$bindir:"*) ;;
+  *)
+    next ! "$(pretty "$bindir") is not on your PATH; add this to your shell startup file:"
+    cmd "export PATH=\"$(shell_path "$bindir"):\$PATH\""
+    ;;
+esac
+
+if system=$(command -v thinkterm 2>/dev/null) && [ "$system" != "$bindir/thinkterm" ]; then
+  next ! "another thinkterm comes first on PATH: $(pretty "$system")"
+fi
+
+if [ -n "$missing_libs" ]; then
+  next ! "the GUI needs these libraries; the CLI and mux server run without them:"
+  printf '      %s%-30s %s%s\n' "$ui_dim" "library" "package (apt / dnf / zypper)" "$ui_reset"
+  for lib in $missing_libs; do
+    printf '      %-30s %s\n' "$lib" "$(lib_package "$lib")"
+  done
+fi
 
 # The binaries were swapped under it, so a mux server that is still running
 # is the old build. Client and server refuse to talk across a protocol
@@ -736,61 +1087,62 @@ say "  $sharedir/{bash-completion,zsh,fish}/... (completions)"
 # Matched on the command line: Linux truncates process names to 15
 # characters, so -x with the full binary name never matches there.
 if have pgrep && pgrep -u "$(id -u)" -f '[t]hinkterm-mux-server' >/dev/null 2>&1; then
-  say
-  say "A thinkterm-mux-server from before this install is still running. Restart it to pick up the new"
-  say "version; until then a newer CLI or GUI may refuse to connect to it."
+  next . "the mux server still running is the old version; restart it to update it."
 fi
-if [ "$os" = macos ] && have pgrep && pgrep -u "$(id -u)" -f '[t]hinkterm-gui' >/dev/null 2>&1; then
-  say
-  say "ThinkTerm is running; the new version starts the next time you open it."
-fi
-
-# Nothing is done to the shell startup files: editing them is the user's
-# call. But ~/.local/bin on Debian and Ubuntu only enters PATH at the next
-# login, and only if it existed then -- so say so.
-case ":$PATH:" in
-  *":$bindir:"*) ;;
-  *)
-    say
-    say "$bindir is not on your PATH. Add this to your shell startup file, then open a new shell:"
-    say "  export PATH=\"$bindir:\$PATH\""
-    ;;
-esac
-
-if [ -f "$sharedir/thinkterm/shell-integration/wezterm.sh" ]; then
-  say
-  say "Shell integration (prompt marks, cwd tracking) is optional; to turn it on, add to your shell startup file:"
-  say "  . \"$sharedir/thinkterm/shell-integration/wezterm.sh\""
-fi
-
-if system=$(command -v thinkterm 2>/dev/null) && [ "$system" != "$bindir/thinkterm" ]; then
-  say
-  say "note: another thinkterm is already on PATH at $system and comes first; \`thinkterm\` will run that one."
-fi
-
-if [ -n "$missing_libs" ]; then
-  say
-  say "WARNING: thinkterm-gui needs libraries this machine does not have. The CLI and mux server"
-  say "work without them; the GUI will not start until they are installed."
-  say "  library                        package (apt / dnf / zypper)"
-  for lib in $missing_libs; do
-    printf '  %-30s %s\n' "$lib" "$(lib_package "$lib")"
-  done
+gui_running=""
+if have pgrep && pgrep -u "$(id -u)" -f '[t]hinkterm-gui' >/dev/null 2>&1; then
+  gui_running=1
+  next . "ThinkTerm is open; the new version starts next time."
 fi
 
 if [ "$variant" = server ]; then
-  say
-  say "The mux server needs no root and no service file to run: \`thinkterm-mux-server --daemonize\`."
+  next . "start the mux server (no root, no service file):"
+  cmd "thinkterm-mux-server --daemonize"
   if [ "$os" = linux ]; then
-    say "To keep it running after you log out from SSH: \`loginctl enable-linger \$USER\`."
+    next . "keep it running after you log out of SSH:"
+    cmd "loginctl enable-linger \$USER"
   fi
+fi
+
+if [ -f "$sharedir/thinkterm/shell-integration/wezterm.sh" ]; then
+  next . "optional: shell integration (prompt marks, cwd), in your startup file:"
+  cmd ". \"$(shell_path "$sharedir/thinkterm/shell-integration/wezterm.sh")\""
 fi
 
 say
 if [ -n "$missing_libs" ]; then
-  done_message "installed. The desktop app needs the libraries listed above."
-elif [ "$variant" = server ]; then
-  done_message "ready. Run 'thinkterm tui' to get started."
-else
-  done_message "ready. Run 'thinkterm' to get started."
+  ok "${ui_bold}Installed.$ui_reset The desktop app needs the libraries listed above."
+  exit 0
 fi
+if [ "$variant" = server ]; then
+  ok "${ui_bold}Ready.$ui_reset Run ${ui_accent}thinkterm tui$ui_reset to get started."
+  exit 0
+fi
+
+# Offer to open the app when there is someone to ask and a screen to open it
+# on -- not over SSH, and not while the old version is still running.
+can_open=""
+if [ -z "$gui_running" ] && [ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ] \
+    && [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  case "$os" in
+    macos) can_open=1 ;;
+    *) if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then can_open=1; fi ;;
+  esac
+fi
+if [ -z "$can_open" ]; then
+  ok "${ui_bold}Ready.$ui_reset Run ${ui_accent}thinkterm$ui_reset to get started."
+  exit 0
+fi
+printf '  %s%s%s %sReady.%s Open ThinkTerm now? %s[Y/n]%s ' \
+  "$ui_success" "$mark_ok" "$ui_reset" "$ui_bold" "$ui_reset" "$ui_dim" "$ui_reset" > /dev/tty
+read -r answer < /dev/tty || answer=n
+case "$answer" in
+  n | N | no | NO | No) ;;
+  *)
+    if [ "$os" = macos ]; then
+      open "$app" || warn "could not open $(pretty "$app")"
+    else
+      nohup "$bindir/thinkterm" >/dev/null 2>&1 &
+    fi
+    ;;
+esac
