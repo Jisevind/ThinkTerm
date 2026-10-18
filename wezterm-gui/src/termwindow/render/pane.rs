@@ -1610,7 +1610,7 @@ impl crate::TermWindow {
             .map(|dot| (dot, surface));
         let icon = pane
             .as_ref()
-            .and_then(|pane| crate::tab_icons::resolve(pane.as_ref()));
+            .map(|pane| crate::tab_icons::resolve(pane.as_ref()));
         let Some(icon) = icon else {
             let x = self.ui_px(TAB_CONTENT_INSET);
             let y = tab_y + (tab_height.saturating_sub(icon_size)) / 2;

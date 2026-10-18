@@ -1225,8 +1225,6 @@ settings-web-verify-certificate = Compare this SHA-256 with the browser certific
 
 # --- Tab icons: Settings › Tab Icons, and the pane tabs themselves ---
 settings-section-tab-icons = Tab Icons
-settings-tab-icons-enabled = Program icons on tabs
-settings-tab-icons-enabled-description = Each tab shows an icon for the program running in it.
 settings-tab-icons-cards-heading = Icons
 settings-tab-icons-cards-note = Click a card to change it. Drop an .svg file on a card to use its shape.
 settings-tab-icons-search-placeholder = Search icons or programs

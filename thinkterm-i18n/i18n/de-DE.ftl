@@ -1225,8 +1225,6 @@ settings-web-verify-certificate = Vergleichen Sie diesen SHA-256-Fingerabdruck m
 
 # --- Tab icons: Settings › Tab Icons, and the pane tabs themselves ---
 settings-section-tab-icons = Tab-Symbole
-settings-tab-icons-enabled = Programmsymbole auf Tabs
-settings-tab-icons-enabled-description = Jeder Tab zeigt das Symbol des Programms, das darin läuft.
 settings-tab-icons-cards-heading = Symbole
 settings-tab-icons-cards-note = Klicken Sie auf eine Karte, um sie zu bearbeiten. Ziehen Sie eine .svg-Datei auf eine Karte, um deren Form zu verwenden.
 settings-tab-icons-search-placeholder = Symbole oder Programme suchen

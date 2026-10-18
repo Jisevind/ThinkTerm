@@ -3503,7 +3503,7 @@ mod tests {
         assert_eq!(custom.svg, "<svg id='mine'/>");
         assert_eq!(custom.circle, "#112233");
         let text = serde_json::to_string(&Reply::TabIcons(wire)).unwrap();
-        assert!(text.starts_with(r#"{"op":"tab-icons","enabled":true,"terminal":"terminal","cards":["#));
+        assert!(text.starts_with(r#"{"op":"tab-icons","terminal":"terminal","cards":["#));
     }
 
     #[test]

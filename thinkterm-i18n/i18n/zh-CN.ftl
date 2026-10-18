@@ -1188,8 +1188,6 @@ settings-web-verify-certificate = 信任前，请核对浏览器证书的 SHA-25
 
 # --- Tab icons: Settings › Tab Icons, and the pane tabs themselves ---
 settings-section-tab-icons = 标签图标
-settings-tab-icons-enabled = 标签上显示程序图标
-settings-tab-icons-enabled-description = 每个标签显示里面正在运行的程序的图标。
 settings-tab-icons-cards-heading = 图标
 settings-tab-icons-cards-note = 点卡片修改；把 .svg 文件拖到卡片上，就换成它的图案。
 settings-tab-icons-search-placeholder = 搜索图标或程序

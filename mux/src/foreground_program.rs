@@ -94,17 +94,15 @@ pub fn program_for_pane(pane_id: PaneId) -> Option<ForegroundProgram> {
         .and_then(|record| record.published.clone())
 }
 
-/// Install a process-local switch. The GUI wires its tab-icon setting
-/// through this so a user who turned the icons off pays nothing for them;
-/// a mux server installs nothing and always observes, because its clients
-/// decide for themselves what to show.
+/// Install a process-local switch. Nothing installs one now -- tab icons
+/// are always on -- and a process without one always observes.
 pub fn set_process_preference(preference: impl Fn() -> bool + Send + Sync + 'static) {
     *PROCESS_PREFERENCE.write() = Some(Box::new(preference));
     refresh_enabled();
 }
 
-/// Re-read the switch. The GUI calls this when its setting changes; the
-/// flip itself is handled by the next drain.
+/// Re-read the switch, after it changes; the flip itself is handled by the
+/// next drain.
 pub fn refresh_enabled() {
     let enabled = PROCESS_PREFERENCE.read().as_ref().map_or(true, |f| f());
     let was = ENABLED.swap(enabled, Ordering::AcqRel);
@@ -120,8 +118,8 @@ pub fn refresh_enabled() {
     }
 }
 
-/// Whether this process observes: the GUI's tab icon switch, or always
-/// on a mux server.
+/// Whether this process observes: always, unless a switch was installed
+/// and is off.
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }

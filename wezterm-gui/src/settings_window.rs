@@ -1934,7 +1934,6 @@ enum SettingsAction {
     SidebarResize,
     SidebarScrollArea,
     ContentScrollArea,
-    ToggleTabIcons,
     /// A card, by its place in `tab_icon_cards` as last painted.
     TabIconSelect(u16),
     TabIconNew,
@@ -6691,11 +6690,6 @@ impl SettingsWindow {
                         self.status = format!("Unable to save sidebar panel setting: {err:#}");
                     }
                 }
-            }
-            SettingsAction::ToggleTabIcons => {
-                let enabled = !crate::tab_icons::catalog().enabled;
-                let result = crate::tab_icons::set_enabled(enabled);
-                self.after_tab_icon_change(result);
             }
             SettingsAction::TabIconSelect(index) => {
                 if let Some(id) = self.ui.tab_icon_cards.get(index as usize).cloned() {
@@ -11507,7 +11501,7 @@ impl SettingsWindow {
         Ok(())
     }
 
-    /// Tab icons: the switch, a card for every look a pane tab can take but
+    /// Tab icons: a card for every look a pane tab can take but
     /// the fixed terminal one, and the editor for the card picked. Cards sit
     /// beside the editor where the page is wide enough, above it where it is
     /// not; beside them, the editor stays in view while they scroll.
@@ -11540,23 +11534,8 @@ impl SettingsWindow {
             }
         }
 
-        let (switch_card_y, switch_row_y) = self.settings_card_geometry(section_y, 1);
-        let switch_card_height = self.settings_card_height(1);
-        let card_padding = self.ui_px(36.0);
-        self.paint_group_card(layers, x, switch_card_y, max_width, switch_card_height)?;
-        self.paint_toggle_setting_row(
-            layers,
-            x + card_padding,
-            switch_row_y,
-            max_width - card_padding * 2.0,
-            &crate::i18n::tr("settings-tab-icons-enabled"),
-            &crate::i18n::tr("settings-tab-icons-enabled-description"),
-            catalog.enabled,
-            SettingsAction::ToggleTabIcons,
-            false,
-        )?;
-
-        let heading_y = switch_card_y + switch_card_height + self.settings_section_card_gap();
+        // The page's first heading, where every page has its first.
+        let heading_y = section_y;
         self.draw_text(
             layers,
             &body_font,

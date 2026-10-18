@@ -56,47 +56,34 @@ thread_local! {
 /// The catalog as the settings currently describe it.
 pub(crate) fn catalog() -> Rc<Catalog> {
     let settings = native_settings::load_shared();
-    let (catalog, rebuilt) = CATALOG.with(|slot| {
+    CATALOG.with(|slot| {
         let mut slot = slot.borrow_mut();
         if let Some((built_from, catalog)) = slot.as_ref() {
             if Arc::ptr_eq(built_from, &settings) {
-                return (Rc::clone(catalog), false);
+                return Rc::clone(catalog);
             }
         }
         let catalog = Rc::new(Catalog::build(&settings.tab_icons, crate::i18n::tr));
         *slot = Some((settings, Rc::clone(&catalog)));
-        (catalog, true)
-    });
-    if rebuilt {
-        // The settings can change without `set_enabled` -- edited by hand,
-        // reloaded from disk, restored from a backup -- and the observer's
-        // switch has to follow the one the painters read.
-        mux::foreground_program::refresh_enabled();
-    }
-    catalog
-}
-
-/// How to draw the icon of the tab showing `pane`, or `None` when the user
-/// turned tab icons off and the tab keeps its plain terminal mark.
-pub(crate) fn resolve(pane: &dyn Pane) -> Option<ResolvedIcon> {
-    let catalog = catalog();
-    catalog.enabled.then(|| {
-        let agent = pane.agent_status().filter(|status| !status.ended);
         catalog
-            .card_for(
-                agent.as_ref().map(|status| status.agent_id.as_str()),
-                pane.foreground_program().as_ref(),
-            )
-            .resolved()
     })
 }
 
+/// How to draw the icon of the tab showing `pane`.
+pub(crate) fn resolve(pane: &dyn Pane) -> ResolvedIcon {
+    let agent = pane.agent_status().filter(|status| !status.ended);
+    catalog()
+        .card_for(
+            agent.as_ref().map(|status| status.agent_id.as_str()),
+            pane.foreground_program().as_ref(),
+        )
+        .resolved()
+}
+
 /// How to draw a window tab's icon: always the terminal card, as a window
-/// tab holds panes that may each run something else. `None` when the user
-/// turned tab icons off.
-pub(crate) fn resolve_window_tab() -> Option<ResolvedIcon> {
-    let catalog = catalog();
-    catalog.enabled.then(|| catalog.terminal_card().resolved())
+/// tab holds panes that may each run something else.
+pub(crate) fn resolve_window_tab() -> ResolvedIcon {
+    catalog().terminal_card().resolved()
 }
 
 
@@ -276,7 +263,7 @@ fn remove_unreferenced_svgs(settings: &NativeTabIconSettings) {
 /// top and darkens toward black at the bottom, and the rim -- one point on
 /// a 25pt icon -- does the same more strongly, so the edge reads as a bevel
 /// in the circle's own colour. The shadow is in its hue too.
-const PLATE: TileStyle = TileStyle {
+pub(crate) const PLATE: TileStyle = TileStyle {
     fill_top_lighten: 0.18,
     fill_bottom_darken: 0.13,
     rim_top_lighten: 0.42,
@@ -417,20 +404,6 @@ fn entry<'a>(settings: &'a mut NativeTabIconSettings, id: &str) -> &'a mut Nativ
         }
     };
     &mut settings.cards[index]
-}
-
-pub(crate) fn set_enabled(enabled: bool) -> Result<()> {
-    edit(|settings| settings.enabled = (!enabled).then_some(false))?;
-    mux::foreground_program::refresh_enabled();
-    Ok(())
-}
-
-/// Whether tab icons are on; the foreground program observer asks this.
-pub(crate) fn enabled() -> bool {
-    native_settings::load_shared()
-        .tab_icons
-        .enabled
-        .unwrap_or(true)
 }
 
 /// Add a card of the user's own, wearing `svg` if one was just imported,

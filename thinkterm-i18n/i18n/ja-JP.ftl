@@ -1188,8 +1188,6 @@ settings-web-verify-certificate = 信頼する前に、この SHA-256 指紋を�
 
 # --- Tab icons: Settings › Tab Icons, and the pane tabs themselves ---
 settings-section-tab-icons = タブアイコン
-settings-tab-icons-enabled = タブにプログラムのアイコンを表示
-settings-tab-icons-enabled-description = 各タブに、中で動いているプログラムのアイコンを表示します。
 settings-tab-icons-cards-heading = アイコン
 settings-tab-icons-cards-note = カードをクリックして編集します。.svg ファイルをカードにドロップすると、その形に置き換わります。
 settings-tab-icons-search-placeholder = アイコンまたはプログラムを検索

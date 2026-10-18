@@ -1392,8 +1392,6 @@ fn setup_mux(
     mux::agent_status::set_process_preference(|| {
         crate::native_settings::agent_panel_enabled()
     });
-    // Tab icons turned off: this process stops watching what its panes run.
-    mux::foreground_program::set_process_preference(crate::tab_icons::enabled);
     // The user-facing shell choice reaches every local spawn from here.
     // A headless mux server installs nothing, so this preference can only
     // ever decide what *this* process spawns, never what a remote server

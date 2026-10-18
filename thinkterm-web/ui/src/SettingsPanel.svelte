@@ -6,7 +6,7 @@
   import { clients, handle } from './client';
   import { s, views } from './client.svelte';
   import {
-    aLargeSmall, arrowLeft, bot, braces, contrast, gitBranch, globe, grid2x2, info, minus, mouse, packageIcon, palette, panelLeft,
+    aLargeSmall, arrowLeft, bot, braces, contrast, gitBranch, globe, info, minus, mouse, packageIcon, palette, panelLeft,
     panelLeftOpen, panelRightOpen, plus, puzzle, rotateCcw, rotateCw, scale as scaleIcon, search, server,
     slidersHorizontal, squareTerminal, x,
   } from './icons';
@@ -470,18 +470,6 @@
               </div>
             </div>
           {/if}
-        </div>
-      {/if}
-
-      {#if shows('appearance', s('settings-tab-icons-enabled'))}
-        <!-- The desktop's Tab Icons switch, under that page's square. The
-             cards themselves are set on the desktop, and come from it. -->
-        <div class="card">
-          <div class="srow">
-            <span class="tile" style:--tile={TILE.pink}>{@html grid2x2}</span>
-            <div class="tx"><div class="lab">{s('settings-tab-icons-enabled')}</div><div class="desc">{d('settings-tab-icons-enabled-description')}</div></div>
-            <label class="switch"><input type="checkbox" data-setting="tab-icons" checked={settings['tab-icons']} onchange={(ev) => onFlag('tab-icons', ev)} /><span class="knob"></span></label>
-          </div>
         </div>
       {/if}
 

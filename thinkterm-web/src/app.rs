@@ -1250,9 +1250,9 @@ impl<P: Platform, L: Link> App<P, L> {
     }
 
     /// The cards to dress the tabs with: none until the page has handed
-    /// them over, or with tab icons off.
+    /// them over.
     fn tab_icons(inner: &Inner<P, L>) -> Option<&crate::tab_icons::TabIcons> {
-        inner.tab_icons.as_ref().filter(|_| inner.settings.tab_icons)
+        inner.tab_icons.as_ref()
     }
 
     /// The card heading a pane's tab: its agent's, else its program's,

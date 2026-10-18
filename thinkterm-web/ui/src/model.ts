@@ -370,8 +370,6 @@ export type WebSettings = {
   'scroll-mode': ScrollMode;
   /** `"desktop"` follows the server's configuration; else a scheme's name. */
   'terminal-scheme': string;
-  /** The program's icon at the head of each tab (tabicons.svelte.ts). */
-  'tab-icons': boolean;
 };
 
 /** One entry of `schemes.json`, built by `thinkterm cli color-schemes

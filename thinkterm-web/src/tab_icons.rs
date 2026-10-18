@@ -13,8 +13,6 @@ use thinkterm_tab_icons::{Matcher, WireCatalog};
 pub struct TabIcons {
     /// The cards' ids, in the catalog's order: what `Matcher` indexes.
     ids: Vec<String>,
-    /// The machine's own switch: off, no tab gets an icon.
-    enabled: bool,
     matcher: Matcher,
 }
 
@@ -27,7 +25,6 @@ impl TabIcons {
     pub fn new(catalog: &WireCatalog) -> Self {
         Self {
             ids: catalog.cards.iter().map(|card| card.id.clone()).collect(),
-            enabled: catalog.enabled,
             matcher: catalog.matcher(),
         }
     }
@@ -43,9 +40,6 @@ impl TabIcons {
     }
 
     fn id(&self, index: usize) -> Option<&str> {
-        if !self.enabled {
-            return None;
-        }
         self.ids.get(index).map(String::as_str)
     }
 }
@@ -54,9 +48,8 @@ impl TabIcons {
 mod tests {
     use super::*;
 
-    fn catalog(enabled: bool) -> String {
+    fn catalog() -> String {
         serde_json::json!({
-            "enabled": enabled,
             "terminal": "terminal",
             "cards": [
                 { "id": "terminal", "circle": "#333333", "glyph": "#ffffff", "svg": "<svg/>", "programs": [], "agents": [] },
@@ -76,19 +69,12 @@ mod tests {
 
     #[test]
     fn a_pane_gets_its_agents_card_then_its_programs_then_the_terminals() {
-        let icons = TabIcons::parse(&catalog(true)).unwrap();
+        let icons = TabIcons::parse(&catalog()).unwrap();
         assert_eq!(icons.card(Some("claude"), Some(&program("node"))), Some("claude"));
         assert_eq!(icons.card(None, Some(&program("nvim"))), Some("vim"));
         assert_eq!(icons.card(None, Some(&program("zsh"))), Some("terminal"));
         assert_eq!(icons.card(None, None), Some("terminal"));
         assert_eq!(icons.terminal(), Some("terminal"));
-    }
-
-    #[test]
-    fn the_machines_switch_turns_every_icon_off() {
-        let icons = TabIcons::parse(&catalog(false)).unwrap();
-        assert_eq!(icons.card(None, Some(&program("vim"))), None);
-        assert_eq!(icons.terminal(), None);
     }
 
     #[test]

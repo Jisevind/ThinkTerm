@@ -227,7 +227,6 @@ mod tests {
     #[test]
     fn the_built_in_cards_carry_their_glyphs() {
         let catalog = catalog();
-        assert!(catalog.enabled);
         let terminal = catalog.cards.iter().find(|card| card.id == catalog.terminal).expect("the terminal's card");
         assert!(terminal.circle.starts_with('#') && terminal.glyph.starts_with('#'));
         let mask = mask(&terminal.svg, 48).expect("a glyph");

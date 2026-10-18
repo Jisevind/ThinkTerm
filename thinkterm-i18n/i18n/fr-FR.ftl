@@ -1219,8 +1219,6 @@ settings-web-verify-certificate = Comparez cette empreinte SHA-256 à celle du c
 
 # --- Tab icons: Settings › Tab Icons, and the pane tabs themselves ---
 settings-section-tab-icons = Icônes d’onglet
-settings-tab-icons-enabled = Icônes de programme sur les onglets
-settings-tab-icons-enabled-description = Chaque onglet affiche l’icône du programme qui s’y exécute.
 settings-tab-icons-cards-heading = Icônes
 settings-tab-icons-cards-note = Cliquez sur une carte pour la modifier. Déposez un fichier .svg sur une carte pour utiliser sa forme.
 settings-tab-icons-search-placeholder = Rechercher une icône ou un programme

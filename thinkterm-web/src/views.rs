@@ -31,7 +31,7 @@ pub struct TabsView {
     pub tabs: Vec<TabView>,
     pub controls: Controls,
     /// The card heading every window tab: the terminal's, as on the
-    /// desktop (`tab_icons`); none with tab icons off.
+    /// desktop (`tab_icons`); none until the cards arrive.
     pub icon: Option<String>,
 }
 
@@ -158,9 +158,6 @@ pub const STRING_KEYS: &[&str] = &[
     // The page's toolbar, as the desktop's Remote Hosts page has it.
     "ssh-new-host",
     "ssh-search",
-    // The desktop's Tab Icons switch.
-    "settings-tab-icons-enabled",
-    "settings-tab-icons-enabled-description",
     "menu-add-remote-host",
     "menu-new-space-here",
     "sidebar-new-thread",

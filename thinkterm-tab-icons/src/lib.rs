@@ -716,7 +716,6 @@ impl Card {
 
 /// Every card, and the tables that find one for a pane.
 pub struct Catalog {
-    pub enabled: bool,
     pub cards: Vec<Card>,
     matcher: Matcher,
 }
@@ -813,11 +812,7 @@ impl Catalog {
                 .iter()
                 .map(|card| (card.id.as_str(), &card.programs[..], &card.agents[..])),
         );
-        Self {
-            enabled: settings.enabled.unwrap_or(true),
-            cards,
-            matcher,
-        }
+        Self { cards, matcher }
     }
 
     pub fn card(&self, id: &str) -> Option<&Card> {
@@ -857,7 +852,6 @@ impl Catalog {
             })
             .collect();
         WireCatalog {
-            enabled: self.enabled,
             terminal: self.terminal_card().id.clone(),
             cards,
         }
@@ -941,8 +935,6 @@ pub struct WireCard {
 /// Every card a page needs, and which one is the terminal's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireCatalog {
-    /// The machine's own switch; a page has its own as well.
-    pub enabled: bool,
     pub terminal: String,
     pub cards: Vec<WireCard>,
 }
@@ -1032,8 +1024,6 @@ pub fn svg_key(id: Option<&str>) -> Option<GlyphKey> {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct TabIconSettings {
-    /// Absent means on.
-    pub enabled: Option<bool>,
     /// Built-in cards the user changed, and the user's own cards, in the
     /// order they are shown.
     pub cards: Vec<TabIconCard>,
@@ -1113,7 +1103,6 @@ mod tests {
     #[test]
     fn a_card_of_the_users_own_wins_over_a_built_in() {
         let settings = TabIconSettings {
-            enabled: None,
             cards: vec![TabIconCard {
                 id: "custom-1".to_string(),
                 programs: Some(vec!["deploy.sh".to_string(), "python".to_string()]),
@@ -1129,9 +1118,16 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_file_that_turned_the_icons_off_still_reads() {
+        // Tab icons were once switchable; the old key is passed over.
+        let settings: TabIconSettings =
+            serde_json::from_str(r#"{"enabled":false,"cards":[{"id":"python"}]}"#).unwrap();
+        assert_eq!(settings.cards.len(), 1);
+    }
+
+    #[test]
     fn a_built_in_card_keeps_its_defaults_where_unchanged() {
         let settings = TabIconSettings {
-            enabled: Some(false),
             cards: vec![TabIconCard {
                 id: "python".to_string(),
                 circle: Some("#112233".to_string()),
@@ -1140,7 +1136,6 @@ mod tests {
             }],
         };
         let catalog = build(&settings);
-        assert!(!catalog.enabled);
         let python = catalog.card("python").unwrap();
         assert_eq!(python.circle, Rgb(0x11, 0x22, 0x33));
         assert_eq!(python.glyph_color, WHITE);
@@ -1153,7 +1148,6 @@ mod tests {
     #[test]
     fn the_terminal_card_ignores_saved_changes() {
         let settings = TabIconSettings {
-            enabled: None,
             cards: vec![TabIconCard {
                 id: TERMINAL_CARD.to_string(),
                 circle: Some("#112233".to_string()),
@@ -1171,7 +1165,6 @@ mod tests {
     #[test]
     fn a_default_saved_as_a_change_is_no_change() {
         let settings = TabIconSettings {
-            enabled: None,
             cards: vec![TabIconCard {
                 id: "monitor".to_string(),
                 circle: Some(
@@ -1229,7 +1222,6 @@ mod tests {
     #[test]
     fn a_page_matches_the_cards_it_is_sent_as_the_desktop_does() {
         let settings = TabIconSettings {
-            enabled: None,
             cards: vec![TabIconCard {
                 id: "custom-1".to_string(),
                 programs: Some(vec!["deploy.sh".to_string()]),
