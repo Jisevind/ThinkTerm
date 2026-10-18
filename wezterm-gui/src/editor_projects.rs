@@ -1,5 +1,6 @@
-//! The folders VS Code and the editors built from it have opened, for the
-//! Import page and first-run setup to offer as projects.
+//! The folders VS Code and the editors built from it have opened, and the
+//! ones coding agents -- Claude Code, Codex, Pi -- worked in, for
+//! the Import page and first-run setup to offer as projects.
 //!
 //! Each of these editors keeps a directory per opened folder under
 //! `<user data>/User/workspaceStorage`, holding a `workspace.json` that
@@ -51,6 +52,9 @@ pub(crate) enum EditorKind {
     Cursor,
     Windsurf,
     Other,
+    Claude,
+    Codex,
+    Pi,
 }
 
 impl EditorKind {
@@ -60,7 +64,8 @@ impl EditorKind {
             Self::Cursor => Some(BrandIcon::Cursor),
             Self::Windsurf => Some(BrandIcon::Windsurf),
             Self::VsCodium => Some(BrandIcon::VSCodium),
-            Self::VsCode | Self::Other => None,
+            Self::Claude => Some(BrandIcon::AgentClaude),
+            _ => None,
         }
     }
 
@@ -68,6 +73,8 @@ impl EditorKind {
     fn glyph(self) -> SvgIcon {
         match self {
             Self::VsCode => SvgIcon::VsCode,
+            Self::Codex => SvgIcon::AgentCodex,
+            Self::Pi => SvgIcon::AgentPi,
             _ => SvgIcon::CodeXml,
         }
     }
@@ -80,6 +87,9 @@ impl EditorKind {
             Self::Cursor => (0x14, 0x14, 0x14),
             Self::Windsurf => (0x0B, 0x10, 0x0F),
             Self::Other => (0x48, 0x48, 0x4A),
+            Self::Claude => (0x2B, 0x2B, 0x30),
+            Self::Codex => (0x14, 0x14, 0x14),
+            Self::Pi => (0x1F, 0x1F, 0x22),
         };
         LinearRgba::with_srgba(r, g, b, 0xFF)
     }
@@ -173,6 +183,115 @@ pub(crate) fn draw_stack(
     Ok(())
 }
 
+/// The most marks [`draw_ring`] sets round its circle.
+pub(crate) const RING_MAX: usize = 6;
+
+/// The kinds a ring shows: each once, in the order given, at most
+/// [`RING_MAX`].
+pub(crate) fn ring_kinds(kinds: impl IntoIterator<Item = EditorKind>) -> Vec<EditorKind> {
+    let mut ring = Vec::new();
+    for kind in kinds {
+        if ring.len() == RING_MAX {
+            break;
+        }
+        if !ring.contains(&kind) {
+            ring.push(kind);
+        }
+    }
+    ring
+}
+
+/// Editors' marks on round tiles set round a circle in the square of side
+/// `side` at `x`, `y`: the first at the top, the rest clockwise, each over
+/// the one after it and ringed with `ground` -- what they sit on -- so the
+/// edge it covers shows. A single kind is a plain square tile filling the
+/// square. `dark` is the chrome's appearance.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_ring(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    kinds: &[EditorKind],
+    x: f32,
+    y: f32,
+    side: f32,
+    ground: LinearRgba,
+    dark: bool,
+) -> anyhow::Result<()> {
+    if let [only] = kinds {
+        return draw_stack(ctx, layers, &[*only], x, y, side, ground, dark);
+    }
+    let count = kinds.len() as f32;
+    // Fewer marks have room to be larger; each still just overlaps the
+    // next round the circle.
+    let tile = (side
+        * match kinds.len() {
+            2 => 0.52,
+            3 => 0.5,
+            4 => 0.47,
+            5 => 0.43,
+            _ => 0.39,
+        })
+    .round();
+    let orbit = (side - tile) / 2.0;
+    let ring = (tile * 0.08).round().max(1.0);
+    let hair = ctx.px(1.0).round().max(1.0);
+    let mark = (tile * 0.6).round();
+    let (cx, cy) = (x + side / 2.0, y + side / 2.0);
+    for (index, kind) in kinds.iter().enumerate().rev() {
+        let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * index as f32 / count;
+        let tile_x = (cx + orbit * angle.cos() - tile / 2.0).round();
+        let tile_y = (cy + orbit * angle.sin() - tile / 2.0).round();
+        ctx.draw_rounded_rect(
+            layers,
+            2,
+            tile_x - ring,
+            tile_y - ring,
+            tile + ring * 2.0,
+            tile + ring * 2.0,
+            ground,
+            tile / 2.0 + ring,
+        )?;
+        // A faint edge, so a dark tile still reads as round on a dark card.
+        ctx.draw_rounded_rect(
+            layers,
+            2,
+            tile_x,
+            tile_y,
+            tile,
+            tile,
+            LinearRgba::with_components(1.0, 1.0, 1.0, 0.16),
+            tile / 2.0,
+        )?;
+        let inner = tile - hair * 2.0;
+        crate::ui::tile::draw_tile(
+            ctx,
+            layers,
+            2,
+            tile_x + hair,
+            tile_y + hair,
+            inner,
+            inner / 2.0,
+            kind.tile(),
+            dark,
+            &crate::settings_window::ROW_TILE,
+        )?;
+        let mark_x = tile_x + (tile - mark) / 2.0;
+        let mark_y = tile_y + (tile - mark) / 2.0;
+        match kind.brand() {
+            Some(brand) => ctx.draw_brand_icon(layers, brand, mark_x, mark_y, mark)?,
+            None => ctx.draw_svg_icon(
+                layers,
+                kind.glyph(),
+                mark_x,
+                mark_y,
+                mark,
+                LinearRgba::with_srgba(0xFF, 0xFF, 0xFF, 0xFF),
+            )?,
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Editor {
     pub name: String,
@@ -191,7 +310,8 @@ pub(crate) struct Folder {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Scan {
-    /// The editors with a folder here to offer, in the order found.
+    /// The editors with a folder here to offer: the ones used this week
+    /// first, then the ones in the most folders, then the latest used.
     pub editors: Vec<Editor>,
     /// One per folder, the most recently used first.
     pub folders: Vec<Folder>,
@@ -223,6 +343,12 @@ pub(crate) fn installed() -> &'static [EditorKind] {
                 }
             }
         }
+        kinds.extend(
+            AGENTS
+                .iter()
+                .filter(|agent| (agent.present)(&config::HOME_DIR))
+                .map(|agent| agent.kind),
+        );
         kinds
     })
 }
@@ -231,10 +357,7 @@ pub(crate) fn installed() -> &'static [EditorKind] {
 /// it: two it names alike are one folder, and one it names None -- no
 /// longer there, say -- is left out.
 pub(crate) fn scan(resolve: &dyn Fn(&Path) -> Option<PathBuf>) -> Scan {
-    match user_data_root() {
-        Some(root) => scan_root(&root, resolve),
-        None => Scan::default(),
-    }
+    scan_roots(user_data_root().as_deref(), &config::HOME_DIR, resolve)
 }
 
 /// Where the editors keep their user data.
@@ -258,11 +381,16 @@ struct Opened {
     uri: String,
 }
 
-/// The editors under `root`, and what they opened, as for [`scan`].
-fn scan_root(root: &Path, resolve: &dyn Fn(&Path) -> Option<PathBuf>) -> Scan {
+/// The editors under `root`, the agents under `home`, and what they
+/// opened, as for [`scan`].
+fn scan_roots(
+    root: Option<&Path>,
+    home: &Path,
+    resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Scan {
     let mut editors = Vec::new();
     let mut opened = Vec::new();
-    for (name, kind, storage) in editor_storages(root) {
+    for (name, kind, storage) in root.map(editor_storages).unwrap_or_default() {
         let index = editors.len();
         editors.push(Editor { name, kind });
         for (workspace_json, last_used) in newest_entries(&storage) {
@@ -275,7 +403,208 @@ fn scan_root(root: &Path, resolve: &dyn Fn(&Path) -> Option<PathBuf>) -> Scan {
             }
         }
     }
+    for agent in AGENTS {
+        let worked_in: Vec<_> = (agent.read)(home)
+            .into_iter()
+            .filter(|(path, _)| !is_scratch(path))
+            .collect();
+        if worked_in.is_empty() {
+            continue;
+        }
+        let index = editors.len();
+        editors.push(Editor {
+            name: agent.name.to_string(),
+            kind: agent.kind,
+        });
+        for (path, last_used) in worked_in {
+            if let Ok(uri) = url::Url::from_directory_path(&path) {
+                opened.push(Opened {
+                    editor: index,
+                    last_used,
+                    uri: uri.to_string(),
+                });
+            }
+        }
+    }
     merge(editors, opened, resolve)
+}
+
+/// A coding agent: what to call it, whether this machine has used it, and
+/// the folders it worked in with when each was last used. Only where each
+/// keeps its record of those folders is read -- never a conversation.
+struct Agent {
+    name: &'static str,
+    kind: EditorKind,
+    present: fn(&Path) -> bool,
+    read: fn(&Path) -> Vec<(PathBuf, SystemTime)>,
+}
+
+const AGENTS: &[Agent] = &[
+    Agent {
+        name: "Claude Code",
+        kind: EditorKind::Claude,
+        present: |home| home.join(".claude.json").is_file(),
+        read: claude_folders,
+    },
+    Agent {
+        name: "Codex",
+        kind: EditorKind::Codex,
+        present: |home| home.join(".codex").join("sessions").is_dir(),
+        read: codex_folders,
+    },
+    Agent {
+        name: "Pi",
+        kind: EditorKind::Pi,
+        present: |home| pi_sessions(home).is_dir(),
+        read: pi_folders,
+    },
+];
+
+/// A file read whole for a list of folders is not one past this.
+const MAX_AGENT_FILE: u64 = 64 * 1024 * 1024;
+/// How much of a session's first line is read for its folder: Codex puts
+/// its whole system prompt on that line, after the folder.
+const SESSION_HEAD: usize = 64 * 1024;
+/// How much of it is read first: the folder comes early on the line.
+const SESSION_PEEK: usize = 4 * 1024;
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    path.metadata().and_then(|meta| meta.modified()).ok()
+}
+
+/// Claude Code lists every folder it was started in under `projects` in
+/// `~/.claude.json`, and keeps a directory of sessions per folder under
+/// `~/.claude/projects`, named for the path with every other character
+/// than a letter or a digit made `-`. Its newest session is the folder's
+/// last use; a folder whose sessions are gone is not offered. (The
+/// directory's own time is not it: clearing old sessions changes it, and
+/// adding to a session does not.)
+fn claude_folders(home: &Path) -> Vec<(PathBuf, SystemTime)> {
+    /// Only the folders' names are wanted, not what is kept for each.
+    #[derive(serde::Deserialize)]
+    struct Config {
+        #[serde(default)]
+        projects: HashMap<String, serde::de::IgnoredAny>,
+    }
+    let config = home.join(".claude.json");
+    if config.metadata().map_or(true, |meta| meta.len() > MAX_AGENT_FILE) {
+        return Vec::new();
+    }
+    let Some(config) = std::fs::read(&config)
+        .ok()
+        .and_then(|text| serde_json::from_slice::<Config>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let sessions = home.join(".claude").join("projects");
+    config
+        .projects
+        .into_keys()
+        .filter_map(|path| {
+            let encoded: String = path
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let (last_used, _) = newest_session(&sessions.join(encoded))?;
+            Some((PathBuf::from(path), last_used))
+        })
+        .collect()
+}
+
+/// The newest `.jsonl` session directly in `dir`, and when it last changed.
+fn newest_session(dir: &Path) -> Option<(SystemTime, PathBuf)> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|session| session.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|path| Some((modified(&path)?, path)))
+        .max_by_key(|(when, _)| *when)
+}
+
+/// Codex writes a session per run under `~/.codex/sessions/<y>/<m>/<d>`,
+/// its first line naming the folder (`cwd`). The newest are read.
+fn codex_folders(home: &Path) -> Vec<(PathBuf, SystemTime)> {
+    let mut files = Vec::new();
+    let mut dirs = vec![home.join(".codex").join("sessions")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                if let Some(when) = modified(&path) {
+                    files.push((path, when));
+                }
+            }
+        }
+    }
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.truncate(PER_EDITOR);
+    files
+        .into_iter()
+        .filter_map(|(file, when)| Some((PathBuf::from(session_cwd(&file)?), when)))
+        .collect()
+}
+
+fn pi_sessions(home: &Path) -> PathBuf {
+    home.join(".pi").join("agent").join("sessions")
+}
+
+/// Pi keeps a directory of sessions per folder under
+/// `~/.pi/agent/sessions`, each session's first line naming the folder
+/// (`cwd`). The newest session of each directory is read.
+fn pi_folders(home: &Path) -> Vec<(PathBuf, SystemTime)> {
+    std::fs::read_dir(pi_sessions(home))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let (last_used, newest) = newest_session(&entry.path())?;
+            Some((PathBuf::from(session_cwd(&newest)?), last_used))
+        })
+        .collect()
+}
+
+/// The folder a session file's first line names, as `"cwd": "..."`, read
+/// from at most the start of the file. It is near the start, so a little
+/// is read first and more only when that falls short.
+fn session_cwd(file: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let mut file = std::fs::File::open(file).ok()?;
+    for limit in [SESSION_PEEK, SESSION_HEAD] {
+        let want = (limit - head.len()) as u64;
+        let read = (&mut file).take(want).read_to_end(&mut head).ok()?;
+        let line = head.split(|&b| b == b'\n').next()?;
+        if let Some(cwd) = json_string_after(&String::from_utf8_lossy(line), "\"cwd\"") {
+            return Some(cwd);
+        }
+        // The first line ended, or the file did, without one.
+        if line.len() < head.len() || (read as u64) < want {
+            return None;
+        }
+    }
+    None
+}
+
+/// The JSON string that follows `key` and a colon in `text`.
+fn json_string_after(text: &str, key: &str) -> Option<String> {
+    let rest = text[text.find(key)? + key.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    // The string ends at the first quote not escaped by a backslash.
+    let mut escaped = false;
+    for (index, c) in rest.char_indices().skip(1) {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '"' if !escaped => return serde_json::from_str(&rest[..=index]).ok(),
+            _ => escaped = false,
+        }
+    }
+    None
 }
 
 /// Each known editor's `workspaceStorage` under `root`, where it has one.
@@ -337,6 +666,9 @@ fn merge(
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     // Each path resolved once, however many editors opened it.
     let mut resolved: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+    // Each app's own last use of a folder it is offered for: a folder's
+    // time is its latest use by any of them.
+    let mut app_last: HashMap<usize, SystemTime> = HashMap::new();
     for item in opened {
         let Some(local) = local_path(&item.uri) else {
             // Opened on another machine: an SSH host, WSL, a container.
@@ -352,6 +684,8 @@ fn merge(
         else {
             continue;
         };
+        let last = app_last.entry(item.editor).or_insert(item.last_used);
+        *last = (*last).max(item.last_used);
         if let Some(&index) = by_path.get(&path) {
             let folder = &mut folders[index];
             if !folder.editors.contains(&item.editor) {
@@ -372,13 +706,28 @@ fn merge(
         });
     }
 
+    // The apps in the order they are shown -- in the stack of marks, the
+    // filters and each folder's marks: those used in the last week first,
+    // by how many folders they were used in, then by their last use.
+    let now = SystemTime::now();
+    let mut order: Vec<(usize, bool, usize, SystemTime)> = (0..editors.len())
+        .filter_map(|index| {
+            let last = *app_last.get(&index)?;
+            let used = folders
+                .iter()
+                .filter(|folder| folder.editors.contains(&index))
+                .count();
+            let this_week = now.duration_since(last).map_or(true, |age| age <= THIS_WEEK);
+            Some((index, this_week, used, last))
+        })
+        .collect();
+    order.sort_by(|a, b| (b.1, b.2, b.3).cmp(&(a.1, a.2, a.3)));
     let mut renumber = HashMap::new();
+    let mut slots: Vec<Option<Editor>> = editors.into_iter().map(Some).collect();
     let mut kept = Vec::new();
-    for (index, editor) in editors.into_iter().enumerate() {
-        if folders.iter().any(|folder| folder.editors.contains(&index)) {
-            renumber.insert(index, kept.len());
-            kept.push(editor);
-        }
+    for (index, ..) in order {
+        renumber.insert(index, kept.len());
+        kept.extend(slots[index].take());
     }
     for folder in &mut folders {
         for editor in &mut folder.editors {
@@ -390,6 +739,28 @@ fn merge(
         folders,
         remote: remote.len(),
     }
+}
+
+/// How recent an app's last use has to be to come before the ones used in
+/// more folders but not lately.
+const THIS_WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// A folder an agent worked in that no one means to keep working in: the
+/// root, the home folder itself or its Desktop, Documents and Downloads --
+/// though not the folders in them -- or one under a temporary directory,
+/// where agents run for tests and scratch work.
+fn is_scratch(path: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    let home: &Path = &config::HOME_DIR;
+    path.parent().is_none()
+        || path == home
+        || ["Desktop", "Documents", "Downloads"]
+            .iter()
+            .any(|dir| path == home.join(dir))
+        || path.starts_with(&temp)
+        || ["/tmp", "/private/tmp", "/private/var/folders", "/var/folders"]
+            .iter()
+            .any(|dir| path.starts_with(dir))
 }
 
 /// A `file:` URI as the path it names on this machine. One naming another
@@ -498,13 +869,16 @@ mod tests {
         // Laid out like an editor but not a known one: not looked in.
         write("Some Fork", "d", format!(r#"{{"folder":"{uri}"}}"#));
 
-        let scan = scan_root(root.path(), &|path: &Path| {
+        let home = tempfile::tempdir().unwrap();
+        let scan = scan_roots(Some(root.path()), home.path(), &|path: &Path| {
             path.is_dir().then(|| path.to_path_buf())
         });
-        let names: Vec<_> = scan.editors.iter().map(|e| e.name.as_str()).collect();
+        let mut names: Vec<_> = scan.editors.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
         // VS Code opened only a multi-root workspace, which is skipped.
         assert_eq!(names, ["Cursor", "Trae"]);
-        assert_eq!(scan.editors[0].kind, EditorKind::Cursor);
+        let cursor = scan.editors.iter().find(|e| e.name == "Cursor").unwrap();
+        assert_eq!(cursor.kind, EditorKind::Cursor);
         assert_eq!(scan.folders.len(), 1);
         assert_eq!(scan.folders[0].editors.len(), 2);
     }
@@ -546,6 +920,84 @@ mod tests {
         );
         assert!(scan.folders.is_empty());
         assert_eq!(scan.remote, 1);
+    }
+
+    #[test]
+    fn a_sessions_folder_is_read_from_the_start_of_its_first_line() {
+        let line = r#"{"type":"session_meta","payload":{"id":"x","cwd":"/home/user/a \"b\"","base":"long"}}"#;
+        assert_eq!(
+            json_string_after(line, "\"cwd\"").as_deref(),
+            Some("/home/user/a \"b\"")
+        );
+        assert_eq!(json_string_after(r#"{"cwd": 3}"#, "\"cwd\""), None);
+        assert_eq!(json_string_after(r#"{"other":"x"}"#, "\"cwd\""), None);
+    }
+
+    #[test]
+    fn the_agents_folders_are_read_where_each_keeps_them() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let write = |path: PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // Claude Code: listed, and with sessions; listed without is old.
+        write(
+            home.join(".claude.json"),
+            r#"{"projects":{"/home/user/api":{},"/home/user/old":{}}}"#,
+        );
+        write(home.join(".claude/projects/-home-user-api/a.jsonl"), "{}");
+        // A directory with no session left is not a sign of use.
+        std::fs::create_dir_all(home.join(".claude/projects/-home-user-old")).unwrap();
+        let claude: Vec<_> = claude_folders(home).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(claude, [PathBuf::from("/home/user/api")]);
+        // Codex: the folder on each session's first line.
+        write(
+            home.join(".codex/sessions/2026/01/02/rollout-a.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/home/user/web\"}}\n{}\n",
+        );
+        let codex: Vec<_> = codex_folders(home).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(codex, [PathBuf::from("/home/user/web")]);
+        // Pi: the newest session of each folder's directory.
+        write(
+            home.join(".pi/agent/sessions/--home-user-cli--/1.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/home/user/cli\"}\n",
+        );
+        let pi: Vec<_> = pi_folders(home).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(pi, [PathBuf::from("/home/user/cli")]);
+    }
+
+    #[test]
+    fn scratch_folders_are_not_offered() {
+        assert!(is_scratch(Path::new("/")));
+        assert!(is_scratch(&config::HOME_DIR));
+        assert!(is_scratch(&std::env::temp_dir().join("work")));
+        assert!(is_scratch(Path::new("/private/tmp/agent-test")));
+        assert!(!is_scratch(&config::HOME_DIR.join("code").join("app")));
+        assert!(is_scratch(&config::HOME_DIR.join("Desktop")));
+        assert!(!is_scratch(&config::HOME_DIR.join("Documents").join("app")));
+    }
+
+    #[test]
+    fn apps_used_this_week_come_first_then_by_how_much() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b, c) = (root.path().join("a"), root.path().join("b"), root.path().join("c"));
+        let scan = merge(
+            vec![editor("Old"), editor("Busy"), editor("Fresh")],
+            vec![
+                // Old: three folders, none this week.
+                opened(0, 20, &a),
+                opened(0, 21, &b),
+                opened(0, 22, &c),
+                // Busy: two this week; Fresh: one, but the latest.
+                opened(1, 2, &a),
+                opened(1, 3, &b),
+                opened(2, 1, &c),
+            ],
+            &as_given,
+        );
+        let names: Vec<_> = scan.editors.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Busy", "Fresh", "Old"]);
     }
 
     #[cfg(windows)]

@@ -1306,10 +1306,10 @@ session-import-project-meta = { $threads } Thread · { $tabs } Haupttabs · { $p
 session-import-terminal-untitled = Terminal { $number }
 settings-import-description = Wähle eine Quelle, um die importierbaren Inhalte zu sehen.
 settings-import-wezterm-description = Einstellungen und Tastenkürzel
-settings-import-editors = Code-Editoren
-settings-import-editors-description = Projektordner
+settings-import-editors = Projektordner
+settings-import-editors-description = Aus Editoren und Coding-Agents
 settings-import-editors-title = Projekte zum Hinzufügen auswählen
-settings-import-editors-subtitle = Ordner, die du in VS Code und darauf aufbauenden Editoren geöffnet hast. Nur die Pfade werden übernommen; der Inhalt der Ordner wird nicht gelesen.
+settings-import-editors-subtitle = Ordner, in denen du mit deinen Editoren und Coding-Agents gearbeitet hast. Nur die Pfade werden übernommen; der Inhalt der Ordner wird nicht gelesen.
 settings-import-editors-all = Alle
 settings-import-editors-in-sidebar = Bereits in der Seitenleiste
 settings-import-editors-add-to = Hinzufügen zu
@@ -1318,7 +1318,7 @@ settings-import-editors-remote = { $count ->
         [one] 1 über SSH, in WSL oder in einem Container geöffneter Ordner kann noch nicht hinzugefügt werden.
        *[other] { $count } über SSH, in WSL oder in Containern geöffnete Ordner können noch nicht hinzugefügt werden.
     }
-settings-import-editors-reading = Die in den Editoren geöffneten Ordner werden gelesen…
+settings-import-editors-reading = Die Ordner, in denen du gearbeitet hast, werden gelesen…
 settings-import-editors-empty = Es wurden keine Ordner zum Hinzufügen gefunden.
 settings-import-editors-add = { $count ->
         [one] 1 Projekt hinzufügen

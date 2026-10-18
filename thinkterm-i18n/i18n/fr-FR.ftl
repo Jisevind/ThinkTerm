@@ -1300,10 +1300,10 @@ session-import-project-meta = { $threads } fil · { $tabs } onglets principaux �
 session-import-terminal-untitled = Terminal { $number }
 settings-import-description = Choisissez une source pour voir ce que vous pouvez importer.
 settings-import-wezterm-description = Réglages et raccourcis
-settings-import-editors = Éditeurs de code
-settings-import-editors-description = Dossiers de projet
+settings-import-editors = Dossiers de projet
+settings-import-editors-description = Des éditeurs et des agents de code
 settings-import-editors-title = Choisir les projets à ajouter
-settings-import-editors-subtitle = Les dossiers ouverts dans VS Code et les éditeurs qui en dérivent. Seuls les chemins sont repris ; le contenu des dossiers n'est pas lu.
+settings-import-editors-subtitle = Les dossiers où vous avez travaillé avec vos éditeurs et vos agents de code. Seuls les chemins sont repris ; le contenu des dossiers n'est pas lu.
 settings-import-editors-all = Tous
 settings-import-editors-in-sidebar = Déjà dans la barre latérale
 settings-import-editors-add-to = Ajouter à
@@ -1312,7 +1312,7 @@ settings-import-editors-remote = { $count ->
         [one] 1 dossier ouvert via SSH, dans WSL ou dans un conteneur ne peut pas encore être ajouté.
        *[other] { $count } dossiers ouverts via SSH, dans WSL ou dans des conteneurs ne peuvent pas encore être ajoutés.
     }
-settings-import-editors-reading = Lecture des dossiers ouverts dans vos éditeurs…
+settings-import-editors-reading = Lecture des dossiers où vous avez travaillé…
 settings-import-editors-empty = Aucun dossier à ajouter n'a été trouvé.
 settings-import-editors-add = { $count ->
         [one] Ajouter 1 projet

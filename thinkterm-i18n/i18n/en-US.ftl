@@ -1306,10 +1306,10 @@ session-import-project-meta = { $threads } Thread · { $tabs } primary tabs · {
 session-import-terminal-untitled = Terminal { $number }
 settings-import-description = Choose a source to see what you can import.
 settings-import-wezterm-description = Settings and shortcuts
-settings-import-editors = Code editors
-settings-import-editors-description = Project folders
+settings-import-editors = Project folders
+settings-import-editors-description = From editors and coding agents
 settings-import-editors-title = Choose projects to add
-settings-import-editors-subtitle = Folders you opened in VS Code and the editors built on it. Only the paths come over; nothing inside the folders is read.
+settings-import-editors-subtitle = Folders you worked in with your editors and coding agents. Only the paths come over; nothing inside the folders is read.
 settings-import-editors-all = All
 settings-import-editors-in-sidebar = Already in the sidebar
 settings-import-editors-add-to = Add to
@@ -1318,7 +1318,7 @@ settings-import-editors-remote = { $count ->
         [one] 1 folder opened over SSH, in WSL or in a container can't be added yet.
        *[other] { $count } folders opened over SSH, in WSL or in containers can't be added yet.
     }
-settings-import-editors-reading = Reading the folders your editors opened…
+settings-import-editors-reading = Reading the folders you worked in…
 settings-import-editors-empty = No folders to add were found.
 settings-import-editors-add = { $count ->
         [one] Add 1 project
