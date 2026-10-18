@@ -80,6 +80,7 @@ mod tab_icons;
 mod tabbar;
 mod tailnet;
 mod termwindow;
+mod thread_marks;
 mod ui;
 mod unicode_names;
 mod uniforms;

@@ -14,7 +14,10 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
     WINDOW_TAB_TOP_SPACER,
 };
+use crate::native_settings::{NativeThreadIcons, NativeThreadStatus};
 use crate::termwindow::{UIItem, UIItemType};
+use crate::thread_marks::{self, Mark};
+use crate::ui::draw::DrawContext;
 use crate::ui::{scale_ui_f32, scale_ui_usize, unscale_ui_usize, UiPalette};
 use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
@@ -65,10 +68,10 @@ const SESSION_ACTION_MIN_SIZE: usize = 48;
 const SESSION_ACTION_MAX_SIZE: usize = 52;
 const SESSION_ACTION_ICON_INSET: usize = 12;
 const SESSION_STATUS_DOT_SIZE: usize = 10;
-const SESSION_STATUS_ICON_SIZE: usize = 20;
+/// The square a thread's mark sits in; the Agents panel and the hover
+/// cards draw theirs at this size too.
+pub(crate) const SESSION_STATUS_ICON_SIZE: usize = 20;
 const SESSION_STATUS_ACTIVE_ICON_SIZE: usize = 26;
-pub(crate) const SESSION_STATUS_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
-const SESSION_STATUS_OPEN_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
 const SPACE_DISCONNECTED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
 const NOTIFICATION_BADGE_COLOR: LinearRgba = LinearRgba::with_components(0.96, 0.16, 0.22, 1.0);
 const NOTIFICATION_BADGE_PULSE_DURATION: Duration = Duration::from_millis(1800);
@@ -145,8 +148,52 @@ pub fn workspace_sidebar_width_for_metrics(render_metrics: &RenderMetrics, dpi: 
         .clamp(min_width, max_width)
 }
 
+/// What every thread row of one paint draws its icons and mark with,
+/// worked out once for the paint: the sidebar's and the thread search's.
+pub(crate) struct ThreadRowMarks {
+    pub(crate) layout: NativeThreadIcons,
+    pub(crate) status: NativeThreadStatus,
+    /// The icons by workspace.
+    icons: Rc<HashMap<String, Vec<crate::tab_icons::ResolvedIcon>>>,
+    /// Each thread's workspace, by thread id.
+    workspaces: HashMap<workspace_threads::WorkspaceThreadId, String>,
+    /// The terminal's, for a thread with nothing running.
+    terminal: crate::tab_icons::ResolvedIcon,
+    pub(crate) count_font: Rc<LoadedFont>,
+    pub(crate) count_metrics: RenderMetrics,
+}
+
+impl ThreadRowMarks {
+    /// The icons of thread `thread_id`'s programs; for one with nothing
+    /// running -- closed, or not yet opened -- the terminal it would open
+    /// to.
+    pub(crate) fn icons(&self, thread_id: &str, live: bool) -> &[crate::tab_icons::ResolvedIcon] {
+        live.then(|| self.workspaces.get(thread_id))
+            .flatten()
+            .and_then(|workspace| self.icons.get(workspace))
+            .filter(|icons| !icons.is_empty())
+            .map(Vec::as_slice)
+            .unwrap_or(std::slice::from_ref(&self.terminal))
+    }
+}
+
+/// `top` laid over `bottom`.
+pub(crate) fn over(top: LinearRgba, bottom: LinearRgba) -> LinearRgba {
+    let alpha = top.3 + bottom.3 * (1.0 - top.3);
+    if alpha <= 0.0 {
+        return top;
+    }
+    let mix = |t: f32, b: f32| (t * top.3 + b * bottom.3 * (1.0 - top.3)) / alpha;
+    LinearRgba::with_components(
+        mix(top.0, bottom.0),
+        mix(top.1, bottom.1),
+        mix(top.2, bottom.2),
+        alpha,
+    )
+}
+
 /// Whether a program in the thread reported that it stopped on an error.
-fn thread_has_errored_agent(thread_id: &str) -> bool {
+pub(crate) fn thread_has_errored_agent(thread_id: &str) -> bool {
     workspace_threads::thread_workspace_name(thread_id).is_some_and(|workspace| {
         crate::agent_status::any_agent_in_workspace(&workspace, |agent| {
             agent.state == crate::agent_status::AgentState::Error
@@ -674,43 +721,33 @@ impl crate::TermWindow {
         }
     }
 
+    /// A thread at rest, in the status colours (`thread_marks`): the one
+    /// the user is in, `current`, in green.
     fn sidebar_thread_dot_color(
         &self,
         session: &workspace_threads::WorkspaceThreadView,
-        chrome: &UiPalette,
+        current: bool,
         foreground: LinearRgba,
-        suppress_active: bool,
     ) -> LinearRgba {
-        if session.is_active && !suppress_active {
-            LinearRgba::with_components(0.20, 0.78, 0.36, 1.0)
+        if current {
+            thread_marks::CURRENT_COLOR
+        } else if !session.is_materialized {
+            thread_marks::closed_color(foreground)
         } else if session.is_unread {
-            chrome.selected_bg
-        } else if session.is_pinned {
-            foreground.mul_alpha(0.68)
-        } else if session.is_materialized {
-            SESSION_STATUS_OPEN_COLOR
+            thread_marks::unread_color(foreground)
         } else {
-            foreground.mul_alpha(0.16)
+            thread_marks::OPEN_COLOR
         }
     }
 
-    fn sidebar_thread_status_color(
-        &self,
-        session: &workspace_threads::WorkspaceThreadView,
-        status: UiStatusKind,
-        chrome: &UiPalette,
-        foreground: LinearRgba,
-        suppress_active: bool,
-    ) -> LinearRgba {
-        if status == UiStatusKind::Done {
-            SESSION_STATUS_DONE_COLOR
-        } else if session.is_active && !suppress_active {
-            foreground
-        } else if status == UiStatusKind::NeedsAttention {
-            // The amber the Agents panel and the tabs use for a wait.
-            crate::termwindow::ui::agent_panel::AGENT_BLOCKED_COLOR
-        } else {
-            self.sidebar_thread_dot_color(session, chrome, foreground, suppress_active)
+    /// A thread's state in the status colours; the one the user is in,
+    /// `current`, works in its own green.
+    fn sidebar_thread_status_color(status: UiStatusKind, current: bool) -> LinearRgba {
+        match status {
+            UiStatusKind::Running if current => thread_marks::CURRENT_COLOR,
+            UiStatusKind::Running => thread_marks::WORKING_COLOR,
+            UiStatusKind::NeedsAttention => thread_marks::WAITING_COLOR,
+            UiStatusKind::Done => thread_marks::FINISHED_COLOR,
         }
     }
 
@@ -722,16 +759,17 @@ impl crate::TermWindow {
         scale_ui_f32(value, self.dimensions.dpi)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_sidebar_thread_status(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         session: &workspace_threads::WorkspaceThreadView,
+        current: bool,
         x: usize,
         y: usize,
         row_height: usize,
         chrome: &UiPalette,
         foreground: LinearRgba,
-        suppress_active: bool,
     ) -> anyhow::Result<()> {
         let icon_y = y + ((row_height.saturating_sub(self.ui_px(SESSION_STATUS_ICON_SIZE))) / 2);
         if let Some(status) = self.sidebar_thread_status_kind(session) {
@@ -761,13 +799,7 @@ impl crate::TermWindow {
                 centered_inner_start(x, self.ui_px(SESSION_STATUS_ICON_SIZE), status_size),
                 centered_inner_start(y, row_height, status_size),
                 status_size,
-                self.sidebar_thread_status_color(
-                    session,
-                    status,
-                    chrome,
-                    foreground,
-                    suppress_active,
-                ),
+                Self::sidebar_thread_status_color(status, current),
             );
         }
 
@@ -786,10 +818,228 @@ impl crate::TermWindow {
                 self.ui_px(SESSION_STATUS_DOT_SIZE) as f32,
                 self.ui_px(SESSION_STATUS_DOT_SIZE) as f32,
             ),
-            self.sidebar_thread_dot_color(session, chrome, foreground, suppress_active),
+            self.sidebar_thread_dot_color(session, current, foreground),
             self.ui_px(SESSION_STATUS_DOT_SIZE) as f32 / 2.0,
         )
         .context("sidebar thread status dot")
+    }
+
+    /// What every thread row of one paint draws its icons and mark with.
+    pub(crate) fn sidebar_thread_row_marks(&self) -> anyhow::Result<ThreadRowMarks> {
+        let count_font = self
+            .fonts
+            .title_font_with_size_and_weight(
+                crate::native_settings::sidebar_font_size() * 0.55,
+                700,
+            )
+            .context("sidebar thread count font")?;
+        let count_metrics = RenderMetrics::with_font_metrics(&count_font.metrics());
+        Ok(ThreadRowMarks {
+            layout: crate::native_settings::sidebar_thread_icons(),
+            status: crate::native_settings::sidebar_thread_status(),
+            icons: thread_marks::icons_by_workspace(),
+            workspaces: workspace_threads::thread_workspace_names(),
+            terminal: crate::tab_icons::resolve_window_tab(),
+            count_font,
+            count_metrics,
+        })
+    }
+
+    /// A thread row's program icons and the mark at its end. The icons go
+    /// at `start_x`, or before the mark when they trail; the mark ends at
+    /// `end_x`. With `show_end` false the row's buttons have the end, and
+    /// neither the mark nor trailing icons are drawn. A `dimmed` row -- a
+    /// ref whose machine is away -- has no mark: it cannot say what the
+    /// thread is doing. Returns
+    /// where the name starts and the right edge it must keep clear of.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_sidebar_thread_marks(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        marks: &ThreadRowMarks,
+        session: &workspace_threads::WorkspaceThreadView,
+        start_x: usize,
+        end_x: usize,
+        y: usize,
+        row_height: usize,
+        surface: LinearRgba,
+        show_end: bool,
+        dimmed: bool,
+        current: bool,
+        chrome: &UiPalette,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<(usize, usize)> {
+        // As far in from the row's end as the icons sit from its start,
+        // centre for centre, rather than against the edge.
+        let mark_x = end_x
+            .saturating_sub(self.ui_px(SESSION_STATUS_ICON_SIZE) + self.ui_px(SIDEBAR_INSET));
+        let mut text_right = end_x;
+        if show_end && !dimmed {
+            self.paint_sidebar_thread_mark(
+                layers,
+                marks,
+                session,
+                current,
+                mark_x,
+                y,
+                row_height,
+                chrome,
+                foreground,
+            )?;
+            text_right = mark_x;
+        }
+        let icons = marks.icons(&session.id, session.is_materialized);
+        let diameter = (row_height as f32 * 0.56).round();
+        let cy = y as f32 + row_height as f32 / 2.0;
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        let style = thread_marks::IconStyle {
+            surface,
+            dark: chrome.is_dark(),
+            count_font: &marks.count_font,
+            count_metrics: &marks.count_metrics,
+            count_color: chrome.secondary_text,
+        };
+        if marks.layout == NativeThreadIcons::Trailing {
+            if show_end {
+                // Where a mark would be even when there is none, so a row
+                // without one lines its icons up with the rest.
+                let gap = self.ui_f32(SIDEBAR_ICON_GAP as f32 * 2.0);
+                let left = thread_marks::draw_trailing(
+                    &ctx,
+                    layers,
+                    icons,
+                    mark_x as f32 - gap,
+                    cy,
+                    diameter,
+                    &style,
+                )?;
+                text_right = left.max(0.0) as usize;
+            }
+            return Ok((start_x, text_right));
+        }
+        thread_marks::draw_slot(
+            &ctx,
+            layers,
+            marks.layout,
+            icons,
+            start_x as f32,
+            cy,
+            diameter,
+            &style,
+        )?;
+        let slot = thread_marks::slot_width(marks.layout, diameter).round() as usize;
+        Ok((start_x + slot + self.ui_px(SIDEBAR_ICON_GAP), text_right))
+    }
+
+    /// The mark at a thread row's end, in the style Settings chose: the
+    /// ring is the spinner and dots the sidebar always drew.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_sidebar_thread_mark(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        marks: &ThreadRowMarks,
+        session: &workspace_threads::WorkspaceThreadView,
+        current: bool,
+        x: usize,
+        y: usize,
+        row_height: usize,
+        chrome: &UiPalette,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if marks.status == NativeThreadStatus::Ring {
+            return self.paint_sidebar_thread_status(
+                layers,
+                session,
+                current,
+                x,
+                y,
+                row_height,
+                chrome,
+                foreground,
+            );
+        }
+        let (mark, color) = match self.sidebar_thread_status_kind(session) {
+            Some(UiStatusKind::NeedsAttention) if thread_has_errored_agent(&session.id) => {
+                (Mark::Failed, chrome.danger)
+            }
+            Some(status) => (
+                match status {
+                    UiStatusKind::Running => Mark::Working,
+                    UiStatusKind::NeedsAttention => Mark::Waiting,
+                    UiStatusKind::Done => Mark::Finished,
+                },
+                Self::sidebar_thread_status_color(status, current),
+            ),
+            None => (
+                Mark::Still,
+                self.sidebar_thread_dot_color(session, current, foreground),
+            ),
+        };
+        let size = self.ui_px(SESSION_STATUS_ICON_SIZE) as f32;
+        let top = (y as f32 + (row_height as f32 - size) / 2.0).round();
+        self.paint_thread_mark(layers, marks.status, mark, x as f32, top, size, color)
+            .context("sidebar thread mark")
+    }
+
+    /// A thread's or an agent's mark in `status`'s style, in the `size`
+    /// square at `x`, `y`, moving while it works. The ring is the spinner
+    /// and the status icons.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_thread_mark(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        status: NativeThreadStatus,
+        mark: Mark,
+        x: f32,
+        y: f32,
+        size: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if status == NativeThreadStatus::Ring {
+            let icon = match mark {
+                Mark::Working => {
+                    let spinner = (size * 1.3).round();
+                    let inset = (spinner - size) / 2.0;
+                    return self.paint_spinning_ui_icon(
+                        layers,
+                        2,
+                        SvgIcon::LoaderCircle,
+                        (x - inset).max(0.0) as usize,
+                        (y - inset).max(0.0) as usize,
+                        spinner as usize,
+                        color,
+                    );
+                }
+                Mark::Waiting => SvgIcon::CircleAlert,
+                Mark::Failed => SvgIcon::CircleX,
+                Mark::Finished => SvgIcon::CircleCheck,
+                Mark::Still => {
+                    let dot = (size / 2.0).round();
+                    let inset = (size - dot) / 2.0;
+                    return self.fill_rounded_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(x + inset, y + inset, dot, dot),
+                        color,
+                        dot / 2.0,
+                    );
+                }
+            };
+            return self.paint_ui_icon(layers, 2, icon, x as usize, y as usize, size as usize, color);
+        }
+        let step = (mark == Mark::Working).then(|| {
+            self.update_next_frame_time(Some(thread_marks::next_mark_step()));
+            thread_marks::mark_step()
+        });
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        let draw = match status {
+            NativeThreadStatus::Pulse => thread_marks::draw_pulse,
+            NativeThreadStatus::Dots => thread_marks::draw_dots,
+            _ => thread_marks::draw_pixels,
+        };
+        draw(&ctx, layers, mark, step, x, y, size, color)
     }
 
     /// Visual size of the expanded-sidebar toggle button; shares
@@ -1157,6 +1407,7 @@ impl crate::TermWindow {
             .title_font_with_size(crate::native_settings::sidebar_font_size())
             .context("sidebar ui font")?;
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
+        let row_marks = self.sidebar_thread_row_marks()?;
         let ui_cell_height = ui_metrics.cell_size.height as usize;
         let icon_size = (ui_cell_height + self.ui_px(12)).clamp(self.ui_px(30), self.ui_px(36));
         let layout = self.workspace_sidebar_layout(rect, ui_cell_height, icon_size);
@@ -1744,10 +1995,6 @@ impl crate::TermWindow {
             let pinned_x = item_x + self.ui_px(SIDEBAR_INSET);
             let pinned_width = item_width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2);
             let pinned_status_x = pinned_x + self.ui_px(SIDEBAR_INSET);
-            let pinned_text_x = pinned_status_x
-                + self.ui_px(SESSION_STATUS_ICON_SIZE)
-                + self.ui_px(SIDEBAR_ICON_GAP)
-                + 6;
             for session in &view.pinned_threads {
                 let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                 let row_bottom = row_top + session_row_height as f32;
@@ -1825,23 +2072,32 @@ impl crate::TermWindow {
                         .saturating_sub(self.ui_px(SIDEBAR_INSET) + action_size);
                     let pin_x = delete_x.saturating_sub(action_size + 4);
                     let action_y = y + ((session_row_height.saturating_sub(action_size)) / 2);
-                    let text_right = if is_hovered && !is_renaming_session {
-                        pin_x
+                    let shows_actions = is_hovered && !is_renaming_session;
+                    let surface = if is_selected {
+                        over(selected_bg, sidebar_bg)
+                    } else if shows_actions {
+                        over(chrome.sidebar_row_hover_bg, sidebar_bg)
                     } else {
-                        pinned_x
-                            .saturating_add(pinned_width)
-                            .saturating_sub(self.ui_px(SIDEBAR_INSET))
+                        sidebar_bg
                     };
-                    self.paint_sidebar_thread_status(
+                    let (pinned_text_x, marks_right) = self.paint_sidebar_thread_marks(
                         layers,
+                        &row_marks,
                         session,
                         pinned_status_x,
+                        pinned_x
+                            .saturating_add(pinned_width)
+                            .saturating_sub(self.ui_px(SIDEBAR_INSET)),
                         y,
                         session_row_height,
+                        surface,
+                        !shows_actions,
+                        false,
+                        is_selected,
                         &chrome,
                         foreground,
-                        suppress_own_active,
                     )?;
+                    let text_right = if shows_actions { pin_x } else { marks_right };
                     let title = self.sidebar_thread_title(&session.id, &session.name);
                     self.paint_sidebar_text(
                         layers,
@@ -2181,10 +2437,6 @@ impl crate::TermWindow {
                         self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING) * 2,
                     );
                     let session_status_x = session_x + self.ui_px(SIDEBAR_INSET) + 2;
-                    let session_text_x = session_status_x
-                        + self.ui_px(SESSION_STATUS_ICON_SIZE)
-                        + self.ui_px(SIDEBAR_ICON_GAP)
-                        + 6;
 
                     for session in &project.threads {
                         let row_top = list_top_f + virtual_y as f32 - scroll_offset;
@@ -2251,15 +2503,6 @@ impl crate::TermWindow {
                             let pin_x = delete_x.saturating_sub(action_size + 4);
                             let action_y =
                                 y + ((session_row_height.saturating_sub(action_size)) / 2);
-                            let text_right = if is_hovered && !is_renaming_session {
-                                pin_x
-                            } else {
-                                session_x
-                                    .saturating_add(session_width)
-                                    .saturating_sub(self.ui_px(SIDEBAR_INSET))
-                            };
-                            let text_width = text_right
-                                .saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET));
                             if is_hovered && !is_selected && !is_renaming_session {
                                 self.fill_rounded_rectangle(
                                     layers,
@@ -2275,16 +2518,35 @@ impl crate::TermWindow {
                                 )
                                 .context("sidebar hovered thread")?;
                             }
-                            self.paint_sidebar_thread_status(
-                                layers,
-                                session,
-                                session_status_x,
-                                y,
-                                session_row_height,
-                                &chrome,
-                                foreground,
-                                suppress_own_active,
-                            )?;
+                            let shows_actions = is_hovered && !is_renaming_session;
+                            let surface = if is_selected {
+                                over(selected_bg, sidebar_bg)
+                            } else if shows_actions {
+                                over(chrome.sidebar_row_hover_bg, sidebar_bg)
+                            } else {
+                                sidebar_bg
+                            };
+                            let (session_text_x, marks_right) = self
+                                .paint_sidebar_thread_marks(
+                                    layers,
+                                    &row_marks,
+                                    session,
+                                    session_status_x,
+                                    session_x
+                                        .saturating_add(session_width)
+                                        .saturating_sub(self.ui_px(SIDEBAR_INSET)),
+                                    y,
+                                    session_row_height,
+                                    surface,
+                                    !shows_actions,
+                                    false,
+                                    is_selected,
+                                    &chrome,
+                                    foreground,
+                                )?;
+                            let text_right = if shows_actions { pin_x } else { marks_right };
+                            let text_width = text_right
+                                .saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET));
                             let session_title =
                                 self.sidebar_thread_title(&session.id, &session.name);
                             self.paint_sidebar_text(
@@ -2535,10 +2797,6 @@ impl crate::TermWindow {
                     self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING) * 2,
                 );
                 let session_status_x = session_x + self.ui_px(SIDEBAR_INSET) + 2;
-                let session_text_x = session_status_x
-                    + self.ui_px(SESSION_STATUS_ICON_SIZE)
-                    + self.ui_px(SIDEBAR_ICON_GAP)
-                    + 6;
                 for reference in &group.threads {
                     let session = &reference.thread;
                     let row_top = list_top_f + virtual_y as f32 - scroll_offset;
@@ -2621,25 +2879,33 @@ impl crate::TermWindow {
                             .saturating_add(session_width)
                             .saturating_sub(self.ui_px(SIDEBAR_INSET) + action_size);
                         let action_y = y + ((session_row_height.saturating_sub(action_size)) / 2);
-                        let text_right = if is_hovered {
-                            delete_x
+                        let surface = if is_selected {
+                            over(selected_bg, sidebar_bg)
+                        } else if is_hovered {
+                            over(chrome.sidebar_row_hover_bg, sidebar_bg)
                         } else {
+                            sidebar_bg
+                        };
+                        // A ref whose machine is away says nothing of what
+                        // it is doing: it keeps its icons, not its mark.
+                        let (session_text_x, marks_right) = self.paint_sidebar_thread_marks(
+                            layers,
+                            &row_marks,
+                            session,
+                            session_status_x,
                             session_x
                                 .saturating_add(session_width)
-                                .saturating_sub(self.ui_px(SIDEBAR_INSET))
-                        };
-                        if !dimmed {
-                            self.paint_sidebar_thread_status(
-                                layers,
-                                session,
-                                session_status_x,
-                                y,
-                                session_row_height,
-                                &chrome,
-                                foreground,
-                                false,
-                            )?;
-                        }
+                                .saturating_sub(self.ui_px(SIDEBAR_INSET)),
+                            y,
+                            session_row_height,
+                            surface,
+                            !is_hovered,
+                            dimmed,
+                            is_selected,
+                            &chrome,
+                            foreground,
+                        )?;
+                        let text_right = if is_hovered { delete_x } else { marks_right };
                         let text_fg = if dimmed {
                             muted_fg.mul_alpha(0.7)
                         } else if is_selected {

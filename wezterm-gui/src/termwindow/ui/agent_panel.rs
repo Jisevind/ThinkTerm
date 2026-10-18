@@ -26,17 +26,11 @@ use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{MouseEvent, MouseEventKind as WMEK, MousePress, RectF, WindowOps};
 
-/// An agent that is working, in the same blue the left sidebar uses for a
-/// live thread (`SESSION_STATUS_OPEN_COLOR`).
-const AGENT_WORKING_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
-/// An agent waiting on the user: amber, matching the sidebar's other
-/// "needs a human" signal. Deliberately not the notification red, which is
-/// reserved for something being wrong rather than something being asked.
-pub(crate) const AGENT_BLOCKED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
-/// A finished result nobody has looked at yet: the green the left sidebar
-/// gives a finished thread, the same constant so the two cannot drift.
-pub(crate) const AGENT_DONE_COLOR: LinearRgba =
-    crate::termwindow::ui::sidebar::SESSION_STATUS_DONE_COLOR;
+/// An agent's states in the colours every status is shown in
+/// (`thread_marks`), so the panel and the sidebar cannot drift.
+const AGENT_WORKING_COLOR: LinearRgba = crate::thread_marks::WORKING_COLOR;
+pub(crate) const AGENT_BLOCKED_COLOR: LinearRgba = crate::thread_marks::WAITING_COLOR;
+pub(crate) const AGENT_DONE_COLOR: LinearRgba = crate::thread_marks::FINISHED_COLOR;
 /// The progress bar under a row's description.
 pub(crate) const AGENT_PROGRESS_HEIGHT: usize = 6;
 /// Between two agent rows; a hairline sits in the middle of it.

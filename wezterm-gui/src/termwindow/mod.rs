@@ -6125,7 +6125,8 @@ impl TermWindow {
                     self.invalidate_window_if(self.agent_status_change_is_visible(pane_id));
                 }
                 MuxNotification::ForegroundProgramChanged(pane_id) => {
-                    self.invalidate_if_pane_tab_shown(pane_id);
+                    // The pane's tab, or its thread's row in the sidebar.
+                    self.invalidate_window_if(self.agent_status_change_is_visible(pane_id));
                 }
                 MuxNotification::WindowInvalidated(_) => {
                     window.invalidate();
@@ -6596,19 +6597,6 @@ impl TermWindow {
             image.as_raw(),
         ));
         Ok(())
-    }
-
-    /// Repaint when the pane's tab could be on screen: its tab strip shows
-    /// every pane of the stack, so any pane of the active tab counts.
-    fn invalidate_if_pane_tab_shown(&self, pane_id: PaneId) {
-        let shown = Mux::get()
-            .get_active_tab_for_window(self.mux_window_id)
-            .is_some_and(|tab| tab.contains_pane(pane_id));
-        if shown {
-            if let Some(window) = self.window.as_ref() {
-                window.invalidate();
-            }
-        }
     }
 
     fn agent_status_change_is_visible(&self, pane_id: PaneId) -> bool {

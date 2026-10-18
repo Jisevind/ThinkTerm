@@ -1129,6 +1129,12 @@ impl SettingsSection {
                 "Theme",
                 "Font",
                 "Weight",
+                "Thread Icons",
+                "Thread Status",
+                "Sidebar Icons",
+                "Status Style",
+                "Agent Status",
+                "Icons and Status",
             ],
             Self::Terminal => &[
                 "Default Shell",
@@ -1322,9 +1328,15 @@ impl SettingsSection {
                     .to_lowercase()
                     .contains(query))
             || (self == Self::Appearance
-                && crate::i18n::tr("settings-window-opacity")
-                    .to_lowercase()
-                    .contains(query))
+                && [
+                    "settings-window-opacity",
+                    "settings-thread-icons",
+                    "settings-thread-status",
+                    "settings-agents-status",
+                    "settings-appearance-sidebar-heading",
+                ]
+                .iter()
+                .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
             || (self == Self::Terminal
                 && [
                     "settings-terminal-mouse-heading",
@@ -1524,6 +1536,34 @@ fn localized_mac_glass_label(glass: crate::native_settings::NativeMacGlass) -> S
         NativeMacGlass::Regular => "settings-mac-glass-regular",
         NativeMacGlass::Clear => "settings-mac-glass-clear",
         NativeMacGlass::ClearOverBlur => "settings-mac-glass-clear-over-blur",
+    })
+}
+
+/// Which of the Icons and status card's rows is being painted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadChoice {
+    Icons,
+    SidebarStatus,
+    AgentStatus,
+}
+
+fn localized_thread_icons_label(layout: crate::native_settings::NativeThreadIcons) -> String {
+    use crate::native_settings::NativeThreadIcons;
+    crate::i18n::tr(match layout {
+        NativeThreadIcons::Badge => "settings-thread-icons-badge",
+        NativeThreadIcons::Coins => "settings-thread-icons-coins",
+        NativeThreadIcons::Cluster => "settings-thread-icons-cluster",
+        NativeThreadIcons::Trailing => "settings-thread-icons-trailing",
+    })
+}
+
+fn localized_thread_status_label(status: crate::native_settings::NativeThreadStatus) -> String {
+    use crate::native_settings::NativeThreadStatus;
+    crate::i18n::tr(match status {
+        NativeThreadStatus::Ring => "settings-thread-status-ring",
+        NativeThreadStatus::Pulse => "settings-thread-status-pulse",
+        NativeThreadStatus::Pixels => "settings-thread-status-pixels",
+        NativeThreadStatus::Dots => "settings-thread-status-dots",
     })
 }
 
@@ -1870,6 +1910,9 @@ enum SettingsAction {
     SetSidebarShade(crate::native_settings::NativeShade),
     SetTabBarShade(crate::native_settings::NativeShade),
     SetTerminalShade(crate::native_settings::NativeShade),
+    SetThreadIcons(crate::native_settings::NativeThreadIcons),
+    SetThreadStatus(crate::native_settings::NativeThreadStatus),
+    SetAgentStatus(crate::native_settings::NativeThreadStatus),
     ToggleDownloadSourceMenu,
     SetDownloadSource(thinkterm_update::DownloadSource),
     /// Swallows clicks that land in an open dropdown's padding or row
@@ -6109,6 +6152,21 @@ impl SettingsWindow {
                 localized_shade_label(shade),
                 |appearance| appearance.terminal_shade = shade,
             ),
+            SettingsAction::SetThreadIcons(layout) => self.apply_window_areas(
+                "settings-thread-icons",
+                localized_thread_icons_label(layout),
+                |appearance| appearance.sidebar_thread_icons = layout,
+            ),
+            SettingsAction::SetThreadStatus(status) => self.apply_window_areas(
+                "settings-thread-status",
+                localized_thread_status_label(status),
+                |appearance| appearance.sidebar_thread_status = status,
+            ),
+            SettingsAction::SetAgentStatus(status) => self.apply_window_areas(
+                "settings-agents-status",
+                localized_thread_status_label(status),
+                |appearance| appearance.agents_status = status,
+            ),
             SettingsAction::ToggleMainRendererMenu => {
                 self.ui.open_dropdown =
                     if self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer) {
@@ -8686,6 +8744,66 @@ impl SettingsWindow {
             Ok(rows.bottom)
         })?;
 
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            bottom,
+            max_width,
+            &crate::i18n::tr("settings-appearance-sidebar-heading"),
+        )?;
+        let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Layers,
+                TileColor::Orange,
+            )?;
+            rows.add(this.paint_thread_choice_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                rows.rule(),
+                ThreadChoice::Icons,
+            )?);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Grid2x2,
+                TileColor::Green,
+            )?;
+            rows.add(this.paint_thread_choice_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                rows.rule(),
+                ThreadChoice::SidebarStatus,
+            )?);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Bot,
+                TileColor::Blue,
+            )?;
+            rows.add(this.paint_thread_choice_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                rows.rule(),
+                ThreadChoice::AgentStatus,
+            )?);
+            Ok(rows.bottom)
+        })?;
+
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
             self.settings_content_extent(bottom + scroll),
@@ -9175,6 +9293,320 @@ impl SettingsWindow {
             &crate::i18n::tr("settings-effective-color-scheme-description"),
             text_width,
         )
+    }
+
+    /// How the sidebar's thread rows draw their programs (`icons`) or
+    /// their status: the title and description, and under them a tile per
+    /// choice showing it as the sidebar draws it -- still, so an open page
+    /// costs nothing.
+    fn paint_thread_choice_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+        choice: ThreadChoice,
+    ) -> anyhow::Result<f32> {
+        use crate::native_settings::{NativeThreadIcons, NativeThreadStatus};
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+        let appearance = &self.native_settings.appearance;
+        let title = match choice {
+            ThreadChoice::Icons => "settings-thread-icons",
+            ThreadChoice::SidebarStatus => "settings-thread-status",
+            ThreadChoice::AgentStatus => "settings-agents-status",
+        };
+        let (status_action, current_status): (fn(NativeThreadStatus) -> SettingsAction, _) =
+            match choice {
+                ThreadChoice::AgentStatus => (SettingsAction::SetAgentStatus, appearance.agents_status),
+                _ => (SettingsAction::SetThreadStatus, appearance.sidebar_thread_status),
+            };
+        let choices: Vec<(String, SettingsAction, bool)> = if choice == ThreadChoice::Icons {
+            NativeThreadIcons::ALL
+                .iter()
+                .map(|layout| {
+                    (
+                        localized_thread_icons_label(*layout),
+                        SettingsAction::SetThreadIcons(*layout),
+                        *layout == appearance.sidebar_thread_icons,
+                    )
+                })
+                .collect()
+        } else {
+            NativeThreadStatus::ALL
+                .iter()
+                .map(|status| {
+                    (
+                        localized_thread_status_label(*status),
+                        status_action(*status),
+                        *status == current_status,
+                    )
+                })
+                .collect()
+        };
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            &crate::i18n::tr(title),
+            palette.text,
+            width,
+        )?;
+        let extra = self.draw_row_description(
+            layers,
+            x,
+            y,
+            &crate::i18n::tr(&format!("{title}-description")),
+            width,
+        )?;
+        let tiles_y = self.settings_row_description_y(y)
+            + self.description_line_step()
+            + extra
+            + self.ui_px(14.0);
+        let count = choices.len() as f32;
+        let gap = self.ui_px(16.0);
+        let tile_width = ((width - gap * (count - 1.0)) / count)
+            .min(self.ui_px(220.0))
+            .floor();
+        let tile_height = (tile_width * 0.44).round();
+        let ring = self.ui_px(3.0).max(2.0).round();
+        let edge = self.ui_px(2.0).max(1.0).round();
+        let radius = self.ui_px(20.0);
+        let accent = self.chrome_palette.accent;
+        let tile_bg = self.chrome_palette.workspace_sidebar_bg;
+        let cell_height = self.metrics.cell_size.height as f32;
+        let label_y = tiles_y + tile_height + self.ui_px(10.0);
+        for (index, (label, action, selected)) in choices.iter().enumerate() {
+            let tile_x = x + (tile_width + gap) * index as f32;
+            let hovered = self.ui.interaction.hovered == Some(*action)
+                || self.ui.interaction.pressed == Some(*action);
+            let (outline, outline_width) = if *selected {
+                (accent, ring)
+            } else if hovered {
+                (accent.mul_alpha(0.4), ring)
+            } else {
+                (palette.rule, edge)
+            };
+            self.draw_rounded_rect(
+                layers,
+                0,
+                tile_x - outline_width,
+                tiles_y - outline_width,
+                tile_width + outline_width * 2.0,
+                tile_height + outline_width * 2.0,
+                outline,
+                radius + outline_width,
+            )?;
+            self.draw_rounded_rect(
+                layers,
+                0,
+                tile_x,
+                tiles_y,
+                tile_width,
+                tile_height,
+                tile_bg,
+                radius,
+            )?;
+            match action {
+                SettingsAction::SetThreadIcons(layout) => self.draw_thread_icons_preview(
+                    layers,
+                    *layout,
+                    tile_x,
+                    tiles_y,
+                    tile_width,
+                    tile_height,
+                )?,
+                SettingsAction::SetThreadStatus(status) | SettingsAction::SetAgentStatus(status) => self.draw_thread_status_preview(
+                    layers,
+                    *status,
+                    tile_x,
+                    tiles_y,
+                    tile_width,
+                    tile_height,
+                )?,
+                _ => {}
+            }
+            let label_width = self.measure_text_width(&body_font, label).min(tile_width);
+            self.draw_text(
+                layers,
+                &body_font,
+                tile_x + (tile_width - label_width) / 2.0,
+                label_y,
+                label,
+                if *selected {
+                    palette.text
+                } else {
+                    palette.secondary_text
+                },
+                tile_width,
+            )?;
+            let top = tiles_y - ring;
+            self.ui_context.push(
+                rect(tile_x, top, tile_width, label_y + cell_height - top),
+                WidgetKind::Button,
+                *action,
+            );
+        }
+        let bottom = label_y + cell_height + self.ui_px(6.0);
+        Ok((bottom - (y + self.settings_row_visual_height())).max(0.0))
+    }
+
+    /// Two sidebar rows in little, their programs drawn in `layout`: one
+    /// thread running Claude in a terminal, one with Codex as well.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_thread_icons_preview(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layout: crate::native_settings::NativeThreadIcons,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> anyhow::Result<()> {
+        use crate::native_settings::NativeThreadIcons;
+        let catalog = crate::tab_icons::catalog();
+        let claude = catalog.card_for(Some("claude"), None).resolved();
+        let codex = catalog.card_for(Some("codex"), None).resolved();
+        let terminal = catalog.terminal_card().resolved();
+        let rows = [
+            vec![claude.clone(), terminal.clone()],
+            vec![claude, codex, terminal],
+        ];
+        let ctx = crate::ui::draw::DrawContext::new(
+            self.render_state.as_ref().unwrap(),
+            self.dimensions,
+            &self.metrics,
+        );
+        let diameter = (height * 0.3).round();
+        let pt_per_px = 72.0 / self.dimensions.dpi.max(1) as f64;
+        let count_font = self.fonts.title_font_with_size_and_weight(
+            (diameter as f64 * pt_per_px * 0.38).max(5.0),
+            700,
+        )?;
+        let count_metrics = RenderMetrics::with_font_metrics(&count_font.metrics());
+        let style = crate::thread_marks::IconStyle {
+            surface: self.chrome_palette.workspace_sidebar_bg,
+            dark: self.chrome_palette.is_dark(),
+            count_font: &count_font,
+            count_metrics: &count_metrics,
+            count_color: self.palette().secondary_text,
+        };
+        let pad = (height * 0.22).round();
+        let bar_height = (height * 0.09).round().max(2.0);
+        let gap = (diameter * 0.35).round();
+        let bar_color = self.palette().secondary_text.mul_alpha(0.35);
+        for (index, icons) in rows.iter().enumerate() {
+            let cy = (y + height * (0.3 + 0.4 * index as f32)).round();
+            let (left, right) = (x + pad, x + width - pad);
+            let (bar_left, bar_right) = if layout == NativeThreadIcons::Trailing {
+                let start =
+                    crate::thread_marks::draw_trailing(&ctx, layers, icons, right, cy, diameter, &style)?;
+                (left, start - gap)
+            } else {
+                crate::thread_marks::draw_slot(&ctx, layers, layout, icons, left, cy, diameter, &style)?;
+                (
+                    left + crate::thread_marks::slot_width(layout, diameter) + gap,
+                    right,
+                )
+            };
+            self.draw_rounded_rect(
+                layers,
+                1,
+                bar_left,
+                cy - bar_height / 2.0,
+                (bar_right - bar_left).max(0.0),
+                bar_height,
+                bar_color,
+                bar_height / 2.0,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A thread's mark in `status`, still, three times over: working,
+    /// waiting for an answer, and open with nothing to say -- in the colours
+    /// every status is shown in.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_thread_status_preview(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        status: crate::native_settings::NativeThreadStatus,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> anyhow::Result<()> {
+        use crate::native_settings::NativeThreadStatus;
+        use crate::thread_marks::Mark;
+        let ctx = crate::ui::draw::DrawContext::new(
+            self.render_state.as_ref().unwrap(),
+            self.dimensions,
+            &self.metrics,
+        );
+        let size = (height * 0.3).round();
+        let marks = [
+            (Mark::Working, crate::thread_marks::WORKING_COLOR),
+            (
+                Mark::Waiting,
+                crate::termwindow::ui::agent_panel::AGENT_BLOCKED_COLOR,
+            ),
+            (Mark::Still, crate::thread_marks::OPEN_COLOR),
+        ];
+        let cy = y + height / 2.0;
+        for (index, &(mark, color)) in marks.iter().enumerate() {
+            let cx = x + width * (1.0 + 2.0 * index as f32) / 6.0;
+            if index > 0 {
+                let rule = self.ui_px(2.0).max(1.0).round();
+                self.draw_rounded_rect(
+                    layers,
+                    1,
+                    (x + width * index as f32 / 3.0 - rule / 2.0).round(),
+                    (cy - size / 2.0).round(),
+                    rule,
+                    size,
+                    self.palette().rule,
+                    rule / 2.0,
+                )?;
+            }
+            let (left, top) = ((cx - size / 2.0).round(), (cy - size / 2.0).round());
+            match status {
+                NativeThreadStatus::Ring => match mark {
+                    Mark::Working => {
+                        // The spinner, a little larger, as the sidebar
+                        // draws it.
+                        let spinner = (size * 1.3).round();
+                        ctx.draw_svg_icon(
+                            layers,
+                            SvgIcon::LoaderCircle,
+                            (cx - spinner / 2.0).round(),
+                            (cy - spinner / 2.0).round(),
+                            spinner,
+                            color,
+                        )?
+                    }
+                    Mark::Waiting => {
+                        ctx.draw_svg_icon(layers, SvgIcon::CircleAlert, left, top, size, color)?
+                    }
+                    _ => ctx.draw_disc(layers, 2, cx, cy, (size * 0.5).round(), color)?,
+                },
+                NativeThreadStatus::Pulse => {
+                    crate::thread_marks::draw_pulse(&ctx, layers, mark, None, left, top, size, color)?
+                }
+                NativeThreadStatus::Pixels => {
+                    crate::thread_marks::draw_pixels(&ctx, layers, mark, None, left, top, size, color)?
+                }
+                NativeThreadStatus::Dots => {
+                    crate::thread_marks::draw_dots(&ctx, layers, mark, None, left, top, size, color)?
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The app icons to switch between, shown as themselves.

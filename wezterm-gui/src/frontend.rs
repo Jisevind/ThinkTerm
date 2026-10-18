@@ -253,6 +253,21 @@ impl GuiFrontEnd {
         });
 
         mux.subscribe(move |n| {
+            // The sidebar shows the programs each thread's panes run: any of
+            // them starting, ending or moving makes those icons stale.
+            if matches!(
+                n,
+                MuxNotification::PaneAdded(_)
+                    | MuxNotification::PaneRemoved(_)
+                    | MuxNotification::ForegroundProgramChanged(_)
+                    | MuxNotification::AgentStatusChanged(_)
+                    | MuxNotification::TabAddedToWindow { .. }
+                    | MuxNotification::WindowCreated(_)
+                    | MuxNotification::WindowRemoved(_)
+                    | MuxNotification::WindowWorkspaceChanged(_)
+            ) {
+                crate::thread_marks::programs_changed();
+            }
             match n {
                 MuxNotification::WorkspaceRenamed {
                     old_workspace,

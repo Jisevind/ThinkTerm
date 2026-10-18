@@ -1744,6 +1744,25 @@ pub fn move_thread_to_space(thread_id: &str, target_space_id: &str) -> Option<Mo
     outcome
 }
 
+/// [`thread_workspace_name`] for every thread at once, by thread id: for a
+/// painter that would otherwise look each row up on its own.
+pub fn thread_workspace_names() -> std::collections::HashMap<WorkspaceThreadId, String> {
+    let store = THREAD_STORE.lock();
+    store
+        .projects
+        .iter()
+        .flat_map(|project| {
+            project.threads.iter().map(move |thread| {
+                let workspace = thread
+                    .materialized_workspace_name
+                    .clone()
+                    .unwrap_or_else(|| workspace_name_for_thread(&project.id, &thread.id));
+                (thread.id.clone(), workspace)
+            })
+        })
+        .collect()
+}
+
 /// The workspace `thread_id`'s terminal shows under right now — its
 /// materialized name, or the one its project derives. The window compares
 /// this against its own workspace to learn whether an action just detached

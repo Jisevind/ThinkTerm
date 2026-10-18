@@ -433,6 +433,59 @@ pub(crate) struct NativeAppearanceSettings {
     /// The terminal's shade.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) terminal_shade: NativeShade,
+    /// How a sidebar thread row draws the programs its panes run.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) sidebar_thread_icons: NativeThreadIcons,
+    /// The mark at the end of a sidebar thread row.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) sidebar_thread_status: NativeThreadStatus,
+    /// The mark an agent's state is drawn with in the Agents panel and the
+    /// hover cards.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) agents_status: NativeThreadStatus,
+}
+
+/// How a sidebar thread row draws the programs its panes run. All but
+/// `Trailing` keep the icons in a slot of one width, so the names line up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeThreadIcons {
+    /// The first program's icon, the second's small at its corner -- or,
+    /// with more, how many more.
+    #[default]
+    Badge,
+    /// The first program's icon with the others stacked behind it, only
+    /// their edges showing.
+    Coins,
+    /// Every program smaller, sharing the one slot.
+    Cluster,
+    /// The icons side by side at the row's end, before its status.
+    Trailing,
+}
+
+impl NativeThreadIcons {
+    /// Every layout, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 4] = [Self::Badge, Self::Coins, Self::Cluster, Self::Trailing];
+}
+
+/// The mark at the end of a sidebar thread row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeThreadStatus {
+    /// The spinner and dots the sidebar always had.
+    Ring,
+    /// A heartbeat trace while working, a flat line otherwise.
+    Pulse,
+    /// A three-by-three grid of pixels.
+    #[default]
+    Pixels,
+    /// Three dots rising in turn while working, one dot otherwise.
+    Dots,
+}
+
+impl NativeThreadStatus {
+    /// Every mark, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 4] = [Self::Ring, Self::Pulse, Self::Pixels, Self::Dots];
 }
 
 /// What a see-through window shows behind it on macOS: the plain blur, or
@@ -2136,6 +2189,9 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.sidebar_shade != after.appearance.sidebar_shade
         || before.appearance.tab_bar_shade != after.appearance.tab_bar_shade
         || before.appearance.terminal_shade != after.appearance.terminal_shade
+        || before.appearance.sidebar_thread_icons != after.appearance.sidebar_thread_icons
+        || before.appearance.sidebar_thread_status != after.appearance.sidebar_thread_status
+        || before.appearance.agents_status != after.appearance.agents_status
     {
         // Language, theme, colour scheme, opacity, chrome and app icon.
         apply_to_app(after);
@@ -2756,6 +2812,18 @@ pub(crate) fn right_sidebar_note_pane_expanded() -> bool {
 
 pub(crate) fn right_sidebar_open_with_app() -> Option<NativeOpenWithApp> {
     load().chrome.right_sidebar_open_with_app
+}
+
+pub(crate) fn sidebar_thread_icons() -> NativeThreadIcons {
+    load_shared().appearance.sidebar_thread_icons
+}
+
+pub(crate) fn sidebar_thread_status() -> NativeThreadStatus {
+    load_shared().appearance.sidebar_thread_status
+}
+
+pub(crate) fn agents_status() -> NativeThreadStatus {
+    load_shared().appearance.agents_status
 }
 
 pub(crate) fn workspace_sidebar_hidden_statuses() -> Vec<String> {
