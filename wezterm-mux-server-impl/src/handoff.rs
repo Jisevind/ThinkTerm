@@ -1116,17 +1116,30 @@ fn register(
     Ok(())
 }
 
-/// Blocks until the old server has closed its end: it is gone, or on macOS
-/// holds nothing any more (see `hold`).
-pub fn wait_for_predecessor_exit(mut stream: UnixStream) {
-    stream.set_read_timeout(None).ok();
+/// How long the successor waits for the old server to let go before it
+/// reports the takeover as done all the same (see `wait_for_predecessor_exit`).
+pub const LET_GO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Blocks until the old server has closed its end -- it is gone, or on
+/// macOS holds nothing any more (see `hold`) -- or for `limit` at most:
+/// whether it did. Until then it may still accept on the socket.
+pub fn wait_for_predecessor_exit(stream: &mut UnixStream, limit: Option<Duration>) -> bool {
+    stream.set_read_timeout(limit).ok();
     let mut buf = [0u8; 64];
     loop {
         match stream.read(&mut buf) {
-            Ok(0) => return,
+            Ok(0) => return true,
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return false
+            }
+            Err(_) => return true,
         }
     }
 }
@@ -1472,6 +1485,14 @@ mod tests {
         }
         terminal.advance_bytes("\x1b_Ga=d,d=i,i=1\x1b\\");
         assert!(terminal.kitty_frame_selections(None).unwrap().1.iter().all(|s| s.image_id != 2));
+    }
+
+    #[test]
+    fn waiting_for_the_predecessor_tells_whether_it_let_go() {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        assert!(!wait_for_predecessor_exit(&mut ours, Some(Duration::from_millis(50))));
+        drop(theirs);
+        assert!(wait_for_predecessor_exit(&mut ours, Some(Duration::from_millis(50))));
     }
 
     #[test]

@@ -500,7 +500,6 @@ async fn async_run(
                 std::process::exit(2);
             }
         };
-        wezterm_mux_server_impl::handoff::report_takeover(Ok(()));
         match pid_file_fd {
             Some(fd) => adopt_pid_file(fd),
             // The predecessor ran in the foreground and had no pid file to
@@ -516,15 +515,27 @@ async fn async_run(
             },
             None => {}
         }
-        // The handoff listener and the TCP listeners wait for the old
-        // server to exit: it still answers on the handoff path and holds
-        // the ports until then, and a path someone answers on is not bound
-        // over. Everything is ours already; not listening for the next
-        // successor is worth a log line, not an exit.
+        // The report and the listeners wait for the old server to exit (or,
+        // on macOS, to become a process that only waits): until then it may
+        // still accept on the socket, and a client told "ok" that reconnects
+        // at once could reach it and be refused as another build. It also
+        // still answers on the handoff path and holds the ports, and a path
+        // someone answers on is not bound over. Everything is ours already;
+        // not listening for the next successor is worth a log line, not an
+        // exit.
         let tls_servers = config.tls_servers.clone();
         let web_servers = config.web_servers.clone();
         thread::spawn(move || {
-            wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(stream);
+            let mut stream = stream;
+            let let_go = wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(
+                &mut stream,
+                Some(wezterm_mux_server_impl::handoff::LET_GO_TIMEOUT),
+            );
+            wezterm_mux_server_impl::handoff::report_takeover(Ok(()));
+            if !let_go {
+                log::warn!("the old server has not let go yet; reported the takeover all the same");
+                wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(&mut stream, None);
+            }
             // The predecessor's node goes with it, as its `thinkterm-tailnet`
             // ends with it: two processes on one node's keys would take the
             // node from each other.
