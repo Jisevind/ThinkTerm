@@ -827,11 +827,18 @@ onboarding-skip = スキップ
 onboarding-start = 使ってみる
 onboarding-found-title = このコンピュータで見つかったもの
 onboarding-found-sessions = { $count } 個のセッション
+onboarding-found-sessions-live = { $count } 個のセッション（{ $running } 個が実行中、引き継いだ後も動き続けます）
 onboarding-found-sessions-running = { $count } 個のセッション（{ $running } 個が実行中）
 onboarding-found-wezterm = 設定ファイルがあります
 onboarding-found-import = インポート
 onboarding-found-import-settings = 設定をインポート
-onboarding-found-editors = 開いたフォルダ
+onboarding-found-sessions-title = ターミナルセッション
+onboarding-found-bring-over = 引き継ぐ
+onboarding-found-projects = プロジェクトフォルダ
+onboarding-found-projects-detail = { $apps } から
+onboarding-found-projects-more = { $apps } などから
+onboarding-found-projects-any = エディタとコーディングエージェントから
+onboarding-found-projects-separator = 、
 onboarding-found-choose-projects = プロジェクトを選択
 
 # エージェント状態検出 + Agents パネル

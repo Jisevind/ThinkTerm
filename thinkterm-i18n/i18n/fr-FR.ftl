@@ -839,6 +839,7 @@ onboarding-found-sessions = { $count ->
         [one] 1 session
        *[other] { $count } sessions
     }
+onboarding-found-sessions-live = { $running } sur { $count } en cours ; elles continuent une fois récupérées
 onboarding-found-sessions-running = { $count ->
         [one] 1 session
        *[other] { $count } sessions
@@ -846,7 +847,13 @@ onboarding-found-sessions-running = { $count ->
 onboarding-found-wezterm = Un fichier de configuration
 onboarding-found-import = Importer
 onboarding-found-import-settings = Importer les réglages
-onboarding-found-editors = Dossiers ouverts
+onboarding-found-sessions-title = Sessions de terminal
+onboarding-found-bring-over = Récupérer
+onboarding-found-projects = Dossiers de projet
+onboarding-found-projects-detail = Depuis { $apps }
+onboarding-found-projects-more = Depuis { $apps } et d'autres
+onboarding-found-projects-any = Depuis vos éditeurs et agents de code
+onboarding-found-projects-separator = { ", " }
 onboarding-found-choose-projects = Choisir les projets
 
 # Détection d'état des agents + panneau Agents

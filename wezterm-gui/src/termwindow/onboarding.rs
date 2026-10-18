@@ -74,6 +74,8 @@ const MENU_RADIUS: f32 = 20.0;
 const FOUND_PAD_X: f32 = 28.0;
 const FOUND_PAD_Y: f32 = 22.0;
 const FOUND_ICON: f32 = 48.0;
+/// How much larger than one mark the ring of project apps' marks is.
+const FOUND_RING: f32 = 1.35;
 const FOUND_ICON_GAP: f32 = 24.0;
 const FOUND_LINE_GAP: f32 = 4.0;
 const FOUND_RADIUS: f32 = 24.0;
@@ -212,12 +214,9 @@ fn focus_order(found: &found::Found) -> Vec<OnboardingAction> {
         ]
         .map(OnboardingAction::Appearance),
     );
-    order.extend(
-        found
-            .sessions
-            .iter()
-            .map(|sessions| OnboardingAction::Import(Some(sessions.id))),
-    );
+    if let Some(target) = found.sessions_target() {
+        order.push(OnboardingAction::Import(Some(target)));
+    }
     if found.wezterm_config {
         order.push(OnboardingAction::Import(None));
     }
@@ -231,10 +230,89 @@ fn focus_order(found: &found::Found) -> Vec<OnboardingAction> {
     order
 }
 
+/// Programs' marks on overlapping tiles, laid out as
+/// [`crate::editor_projects::draw_stack`] lays out editors': the first in
+/// front, each ringed with the card so the ones behind show where they are
+/// cut. A mark with a square of its own is drawn on it; the rest sit on a
+/// plain grey tile.
+#[allow(clippy::too_many_arguments)]
+fn paint_program_stack(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    icons: &[Option<BrandIcon>],
+    x: f32,
+    y: f32,
+    tile: f32,
+    skin: Skin,
+) -> anyhow::Result<()> {
+    let (x, y, tile) = (x.round(), y.round(), tile.round());
+    let step = crate::editor_projects::stack_width(2, tile) - tile;
+    let ring = (tile * 0.05).round().max(1.0);
+    let radius = tile * 0.27;
+    let mark = (tile * 0.56).round();
+    for (index, icon) in icons.iter().enumerate().rev() {
+        let tile_x = x + step * index as f32;
+        ctx.draw_rounded_rect(
+            layers,
+            2,
+            tile_x - ring,
+            y - ring,
+            tile + ring * 2.0,
+            tile + ring * 2.0,
+            skin.chip_bg,
+            radius + ring,
+        )?;
+        match icon {
+            Some(brand) if brand.app_icon_ground().is_some() => {
+                crate::ui::tile::draw_brand_tile(
+                    ctx,
+                    layers,
+                    *brand,
+                    tile_x,
+                    y,
+                    tile,
+                    skin.dark,
+                    &crate::settings_window::ROW_TILE,
+                )?
+            }
+            _ => {
+                crate::ui::tile::draw_tile(
+                    ctx,
+                    layers,
+                    2,
+                    tile_x,
+                    y,
+                    tile,
+                    radius,
+                    LinearRgba::with_srgba(0x48, 0x48, 0x4A, 0xFF),
+                    skin.dark,
+                    &crate::settings_window::ROW_TILE,
+                )?;
+                let mark_x = tile_x + (tile - mark) / 2.0;
+                let mark_y = y + (tile - mark) / 2.0;
+                match icon {
+                    Some(brand) => ctx.draw_brand_icon(layers, *brand, mark_x, mark_y, mark)?,
+                    None => ctx.draw_svg_icon(
+                        layers,
+                        SvgIcon::Terminal,
+                        mark_x,
+                        mark_y,
+                        mark,
+                        LinearRgba::with_srgba(0xFF, 0xFF, 0xFF, 0xFF),
+                    )?,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What heads a row of the found card.
 enum FoundMark {
     /// A program's own mark, or a terminal where it has none.
     Program(Option<BrandIcon>),
+    /// Several programs' marks on overlapping tiles.
+    Programs(Vec<Option<BrandIcon>>),
     /// Editors' marks on overlapping tiles.
     Editors(Vec<crate::editor_projects::EditorKind>),
 }
@@ -1400,61 +1478,105 @@ impl OnboardingView {
             fx(FOUND_RADIUS),
         )?;
 
-        let mut rows: Vec<(FoundMark, String, String, String, OnboardingAction)> = self
-            .found
-            .sessions
-            .iter()
-            .map(|sessions| {
-                let mut args = FluentArgs::new();
-                args.set("count", sessions.count as i64);
-                let detail = match sessions.running() {
-                    Some(running) if running > 0 => {
-                        args.set("running", running as i64);
-                        crate::i18n::tr_args("onboarding-found-sessions-running", &args)
-                    }
-                    _ => crate::i18n::tr_args("onboarding-found-sessions", &args),
-                };
+        // Each row's detail comes as choices, the fullest first; the row
+        // shows the first that fits beside its button.
+        let mut rows: Vec<(FoundMark, String, Vec<String>, String, OnboardingAction)> =
+            Vec::new();
+        // Every program's sessions in one row. Running ones come over still
+        // running, which is the thing to say about them.
+        if let Some(target) = self.found.sessions_target() {
+            let sessions = &self.found.sessions;
+            let (count, running) = self.found.sessions_total();
+            let mut args = FluentArgs::new();
+            args.set("count", count as i64);
+            let running = running.unwrap_or(0);
+            let (details, button) = if running > 0 {
+                args.set("running", running as i64);
                 (
-                    FoundMark::Program(sessions.icon),
-                    sessions.name.to_string(),
-                    detail,
-                    crate::i18n::tr("onboarding-found-import"),
-                    OnboardingAction::Import(Some(sessions.id)),
+                    vec![
+                        crate::i18n::tr_args("onboarding-found-sessions-live", &args),
+                        crate::i18n::tr_args("onboarding-found-sessions-running", &args),
+                    ],
+                    crate::i18n::tr("onboarding-found-bring-over"),
                 )
-            })
-            .collect();
+            } else {
+                (
+                    vec![crate::i18n::tr_args("onboarding-found-sessions", &args)],
+                    crate::i18n::tr("onboarding-found-import"),
+                )
+            };
+            let (mark, name) = match sessions.as_slice() {
+                [only] => (FoundMark::Program(only.icon), only.name.to_string()),
+                many => (
+                    FoundMark::Programs(many.iter().take(3).map(|found| found.icon).collect()),
+                    crate::i18n::tr("onboarding-found-sessions-title"),
+                ),
+            };
+            rows.push((
+                mark,
+                name,
+                details,
+                button,
+                OnboardingAction::Import(Some(target)),
+            ));
+        }
         if self.found.wezterm_config {
             rows.push((
                 FoundMark::Program(Some(BrandIcon::WezTerm)),
                 "WezTerm".to_string(),
-                crate::i18n::tr("onboarding-found-wezterm"),
+                vec![crate::i18n::tr("onboarding-found-wezterm")],
                 crate::i18n::tr("onboarding-found-import-settings"),
                 OnboardingAction::Import(None),
             ));
         }
         if let Some(editors) = &self.found.editors {
+            // As many apps named as fit; the marks say which when none does.
+            // No count: the folders are not looked at before the user asks,
+            // so ones deleted since would be counted.
+            let mut details: Vec<String> = (1..=editors.apps.len().min(3))
+                .rev()
+                .map(|named| {
+                    let (apps, more) = editors.apps_line(named);
+                    let mut args = FluentArgs::new();
+                    args.set("apps", apps);
+                    let key = if more {
+                        "onboarding-found-projects-more"
+                    } else {
+                        "onboarding-found-projects-detail"
+                    };
+                    crate::i18n::tr_args(key, &args)
+                })
+                .collect();
+            details.push(crate::i18n::tr("onboarding-found-projects-any"));
             rows.push((
                 FoundMark::Editors(editors.kinds.clone()),
-                editors.names.clone(),
-                crate::i18n::tr("onboarding-found-editors"),
+                crate::i18n::tr("onboarding-found-projects"),
+                details,
                 crate::i18n::tr("onboarding-found-choose-projects"),
                 OnboardingAction::Import(Some(crate::settings_window::EDITORS_SOURCE)),
             ));
         }
 
         let pad_x = fx(FOUND_PAD_X);
-        let icon = fx(FOUND_ICON);
+        // The marks take no height of their own, so squeezing them gains the
+        // page nothing: full size, unless the row is too short to hold it.
+        let room = body_h * 2.0 + fx(FOUND_LINE_GAP) + fx(FOUND_PAD_Y);
+        let icon = ctx.px(FOUND_ICON).min(room);
+        // A ring of marks needs a larger square to keep each one legible.
+        let ring = (ctx.px(FOUND_ICON) * FOUND_RING).min(row_h - fx(FOUND_LINE_GAP) * 2.0);
         // A row of editors is wider than one mark; every mark is centred
         // in the widest, so the names still line up.
         let mark_width = |mark: &FoundMark| match mark {
             FoundMark::Program(_) => icon,
-            FoundMark::Editors(kinds) => crate::editor_projects::stack_width(kinds.len(), icon),
+            FoundMark::Programs(icons) => crate::editor_projects::stack_width(icons.len(), icon),
+            FoundMark::Editors(kinds) if kinds.len() > 1 => ring,
+            FoundMark::Editors(_) => icon,
         };
         let column = rows
             .iter()
             .map(|(mark, ..)| mark_width(mark))
             .fold(icon, f32::max);
-        for (index, (mark, name, detail, button, action)) in rows.iter().enumerate() {
+        for (index, (mark, name, details, button, action)) in rows.iter().enumerate() {
             let top = card.origin.y + index as f32 * row_h;
             if index > 0 {
                 ctx.draw_rect(
@@ -1468,7 +1590,8 @@ impl OnboardingView {
                 )?;
             }
             let column_x = card.origin.x + pad_x;
-            let icon_x = column_x + (column - mark_width(mark)) / 2.0;
+            let mark_w = mark_width(mark);
+            let icon_x = column_x + (column - mark_w) / 2.0;
             let icon_y = top + (row_h - icon) / 2.0;
             match mark {
                 FoundMark::Program(Some(brand)) => crate::ui::tile::draw_brand_tile(
@@ -1489,13 +1612,16 @@ impl OnboardingView {
                     icon,
                     skin.secondary_text,
                 )?,
-                FoundMark::Editors(kinds) => crate::editor_projects::draw_stack(
+                FoundMark::Programs(icons) => {
+                    paint_program_stack(ctx, layers, icons, icon_x, icon_y, icon, skin)?
+                }
+                FoundMark::Editors(kinds) => crate::editor_projects::draw_ring(
                     ctx,
                     layers,
                     kinds,
                     icon_x,
-                    icon_y,
-                    icon,
+                    top + (row_h - mark_w) / 2.0,
+                    mark_w,
                     skin.chip_bg,
                     skin.dark,
                 )?,
@@ -1519,6 +1645,16 @@ impl OnboardingView {
             let text_w = (button_x - fx(FOUND_ICON_GAP) - text_x).max(1.0);
             let text_y = top + (row_h - body_h * 2.0 - fx(FOUND_LINE_GAP)) / 2.0;
             self.text(ctx, layers, font, text_x, text_y, name, skin.text, text_w)?;
+            let detail = details
+                .iter()
+                .find(|detail| self.width(ctx, font, detail) <= text_w)
+                // None fits: the shortest loses the least to the ellipsis.
+                .or_else(|| {
+                    details.iter().min_by(|a, b| {
+                        self.width(ctx, font, a).total_cmp(&self.width(ctx, font, b))
+                    })
+                })
+                .map_or("", String::as_str);
             self.text(
                 ctx,
                 layers,

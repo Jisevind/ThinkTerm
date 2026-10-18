@@ -1,6 +1,7 @@
-//! What first-run setup offers to bring in from this computer: another
-//! program's terminal sessions, a WezTerm configuration, and the folders
-//! code editors have opened.
+//! What first-run setup offers to bring in from this computer: other
+//! programs' terminal sessions, a WezTerm configuration, and the folders
+//! code editors and coding agents were used in -- a row for each kind,
+//! however many programs it is found in.
 //!
 //! What is on disk is read when the page opens, so the page has its final
 //! height from the first frame. Whether a session is running means asking
@@ -29,12 +30,22 @@ impl FoundSessions {
     }
 }
 
-/// Code editors that opened folders no local Space has yet.
+/// Editors and agents that were used in folders no local Space has yet.
 pub(super) struct FoundEditors {
-    /// The editors, by name, as one line: "VS Code, Cursor".
-    pub names: String,
-    /// The editors whose marks the row shows.
+    /// The apps, by name, the most used first.
+    pub apps: Vec<String>,
+    /// The apps whose marks the row shows.
     pub kinds: Vec<crate::editor_projects::EditorKind>,
+}
+
+impl FoundEditors {
+    /// The first `named` apps as one line, "Claude Code, Codex", and
+    /// whether more were left out.
+    pub fn apps_line(&self, named: usize) -> (String, bool) {
+        let named = named.min(self.apps.len());
+        let separator = crate::i18n::tr("onboarding-found-projects-separator");
+        (self.apps[..named].join(&separator), self.apps.len() > named)
+    }
 }
 
 #[derive(Default)]
@@ -57,9 +68,32 @@ impl Found {
         self.sessions.is_empty() && !self.wezterm_config && self.editors.is_none()
     }
 
-    /// One per program the page offers to import from.
+    /// One per kind of thing the page offers to import: sessions, however
+    /// many programs they are in; a configuration; folders.
     pub fn rows(&self) -> usize {
-        self.sessions.len() + usize::from(self.wezterm_config) + usize::from(self.editors.is_some())
+        usize::from(!self.sessions.is_empty())
+            + usize::from(self.wezterm_config)
+            + usize::from(self.editors.is_some())
+    }
+
+    /// The sessions' row opens the Import page on this program: the one
+    /// with the most sessions. Not the most running: the checks answer
+    /// late, and the row would change what it opens under the user.
+    pub fn sessions_target(&self) -> Option<&'static str> {
+        self.sessions
+            .iter()
+            .max_by_key(|found| found.count)
+            .map(|found| found.id)
+    }
+
+    /// Every program's sessions together, and how many of them the checks
+    /// that have answered found running; `None` until one has, so one slow
+    /// check does not hide what the others found.
+    pub fn sessions_total(&self) -> (usize, Option<usize>) {
+        let count = self.sessions.iter().map(|found| found.count).sum();
+        let answers: Vec<usize> = self.sessions.iter().filter_map(FoundSessions::running).collect();
+        let running = (!answers.is_empty()).then(|| answers.iter().sum());
+        (count, running)
     }
 
     /// Whether a running check is still out.
@@ -87,13 +121,14 @@ fn editors() -> Option<FoundEditors> {
                 .map(std::path::PathBuf::from),
         );
     }
+    // Whether any is left to offer. How many is for the Import page to say:
+    // it drops the folders gone since, which here are still counted.
     if scan.folders.iter().all(|folder| known.contains(&folder.path)) {
         return None;
     }
-    let names: Vec<&str> = scan.editors.iter().map(|editor| editor.name.as_str()).collect();
     Some(FoundEditors {
-        names: names.join(", "),
-        kinds: crate::editor_projects::stack_kinds(scan.editors.iter().map(|editor| editor.kind)),
+        apps: scan.editors.iter().map(|editor| editor.name.clone()).collect(),
+        kinds: crate::editor_projects::ring_kinds(scan.editors.iter().map(|editor| editor.kind)),
     })
 }
 

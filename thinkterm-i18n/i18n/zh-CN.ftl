@@ -827,11 +827,18 @@ onboarding-skip = 跳过
 onboarding-start = 开始使用
 onboarding-found-title = 在这台电脑上找到
 onboarding-found-sessions = { $count } 个会话
+onboarding-found-sessions-live = { $count } 个会话，{ $running } 个正在运行，接过来后继续跑
 onboarding-found-sessions-running = { $count } 个会话，{ $running } 个在运行
 onboarding-found-wezterm = 找到配置文件
 onboarding-found-import = 导入
 onboarding-found-import-settings = 导入设置
-onboarding-found-editors = 打开过的文件夹
+onboarding-found-sessions-title = 终端会话
+onboarding-found-bring-over = 接过来
+onboarding-found-projects = 项目文件夹
+onboarding-found-projects-detail = 来自 { $apps }
+onboarding-found-projects-more = 来自 { $apps } 等
+onboarding-found-projects-any = 来自你的编辑器和编程 agent
+onboarding-found-projects-separator = 、
 onboarding-found-choose-projects = 选择项目
 
 # Agent 状态检测 + Agents 面板

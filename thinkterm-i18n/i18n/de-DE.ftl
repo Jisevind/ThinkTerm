@@ -839,6 +839,7 @@ onboarding-found-sessions = { $count ->
         [one] 1 Sitzung
        *[other] { $count } Sitzungen
     }
+onboarding-found-sessions-live = { $running } von { $count } aktiv; sie laufen nach der Übernahme weiter
 onboarding-found-sessions-running = { $count ->
         [one] 1 Sitzung
        *[other] { $count } Sitzungen
@@ -846,7 +847,13 @@ onboarding-found-sessions-running = { $count ->
 onboarding-found-wezterm = Eine Konfigurationsdatei
 onboarding-found-import = Importieren
 onboarding-found-import-settings = Einstellungen importieren
-onboarding-found-editors = Geöffnete Ordner
+onboarding-found-sessions-title = Terminal-Sitzungen
+onboarding-found-bring-over = Übernehmen
+onboarding-found-projects = Projektordner
+onboarding-found-projects-detail = Aus { $apps }
+onboarding-found-projects-more = Aus { $apps } und mehr
+onboarding-found-projects-any = Aus deinen Editoren und Coding-Agents
+onboarding-found-projects-separator = { ", " }
 onboarding-found-choose-projects = Projekte auswählen
 
 # Agent-Statuserkennung + Agents-Panel
