@@ -122,6 +122,13 @@ pub trait MasterPty: Downcast + Send {
     fn get_termios(&self) -> Option<nix::sys::termios::Termios> {
         None
     }
+
+    /// Duplicates of the handles a successor process needs to adopt this
+    /// pseudo console; only a ConPTY has them.
+    #[cfg(windows)]
+    fn conpty_handoff(&self) -> Result<win::conpty::ConPtyHandoff, Error> {
+        anyhow::bail!("this pty cannot be handed over")
+    }
 }
 impl_downcast!(MasterPty);
 

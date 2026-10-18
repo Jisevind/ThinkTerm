@@ -32,8 +32,11 @@ winapi = { workspace=true, features = [
     "consoleapi",
     "handleapi",
     "fileapi",
+    "libloaderapi",
     "namedpipeapi",
+    "processthreadsapi",
     "synchapi",
+    "winbase",
 ]}
 winreg.workspace = true
 

@@ -8,14 +8,19 @@ use shared_library::shared_library;
 use std::ffi::OsString;
 use std::io::Error as IoError;
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::{
+    AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle as StdOwnedHandle,
+};
 use std::path::Path;
 use std::sync::Mutex;
 use std::{mem, ptr};
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::winerror::{HRESULT, S_OK};
+use winapi::um::fileapi::GetFileType;
 use winapi::um::handleapi::*;
+use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
 use winapi::um::processthreadsapi::*;
+use winapi::um::winbase::FILE_TYPE_PIPE;
 use winapi::um::winbase::{
     CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
@@ -42,7 +47,18 @@ shared_library!(ConPtyFuncs,
     pub fn ClosePseudoConsole(hpc: HPCON),
 );
 
-fn load_conpty() -> ConPtyFuncs {
+/// `ConptyPackPseudoConsole(hServerProcess, hRef, hSignal, phPC)`: a pseudo
+/// console made of handles another process handed over.
+type PackPseudoConsole = unsafe extern "system" fn(HANDLE, HANDLE, HANDLE, *mut HPCON) -> HRESULT;
+
+struct ConPty {
+    funcs: ConPtyFuncs,
+    /// Only the conpty.dll shipped alongside has it; with the system's
+    /// pseudo console nothing can be handed over.
+    pack: Option<PackPseudoConsole>,
+}
+
+fn load_conpty() -> ConPty {
     // If the kernel doesn't export these functions then their system is
     // too old and we cannot run.
     let kernel = ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
@@ -53,14 +69,41 @@ fn load_conpty() -> ConPtyFuncs {
     // alongside the application.  We check for this after checking for kernel
     // support so that we don't try to proceed and do something crazy.
     if let Ok(sideloaded) = ConPtyFuncs::open(Path::new("conpty.dll")) {
-        sideloaded
+        ConPty {
+            funcs: sideloaded,
+            pack: sideloaded_pack_function(),
+        }
     } else {
-        kernel
+        ConPty {
+            funcs: kernel,
+            pack: None,
+        }
+    }
+}
+
+fn sideloaded_pack_function() -> Option<PackPseudoConsole> {
+    let name: Vec<u16> = "conpty.dll\0".encode_utf16().collect();
+    let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+    if module.is_null() {
+        return None;
+    }
+    let function =
+        unsafe { GetProcAddress(module, b"ConptyPackPseudoConsole\0".as_ptr() as *const i8) };
+    if function.is_null() {
+        None
+    } else {
+        Some(unsafe { mem::transmute::<_, PackPseudoConsole>(function) })
     }
 }
 
 lazy_static! {
-    static ref CONPTY: ConPtyFuncs = load_conpty();
+    static ref CONPTY: ConPty = load_conpty();
+}
+
+/// Whether the pseudo consoles of this process can be handed to another:
+/// only with the conpty.dll shipped alongside.
+pub fn handoff_supported() -> bool {
+    CONPTY.pack.is_some()
 }
 
 pub struct PsuedoCon {
@@ -72,15 +115,78 @@ unsafe impl Sync for PsuedoCon {}
 
 impl Drop for PsuedoCon {
     fn drop(&mut self) {
-        unsafe { (CONPTY.ClosePseudoConsole)(self.con) };
+        unsafe { (CONPTY.funcs.ClosePseudoConsole)(self.con) };
     }
 }
 
 impl PsuedoCon {
+    /// Duplicates of the three handles the pseudo console is made of -- its
+    /// signal pipe, the reference that keeps it open and the console host
+    /// process, in that order -- for a successor process to rebuild it with
+    /// `from_handoff`. conpty.dll has no function that returns them: its
+    /// HPCON points at exactly these three, so they are read from there, and
+    /// only from the conpty.dll shipped alongside, which can pack them again.
+    /// What is read is checked before it is used.
+    pub fn handoff_handles(&self) -> Result<[StdOwnedHandle; 3], Error> {
+        ensure!(
+            CONPTY.pack.is_some(),
+            "the system's pseudo console cannot be handed over"
+        );
+        let [signal, reference, server] = unsafe { ptr::read(self.con as *const [HANDLE; 3]) };
+        let duplicate = |handle: HANDLE| {
+            unsafe { BorrowedHandle::borrow_raw(handle as _) }.try_clone_to_owned()
+        };
+        let signal = duplicate(signal)?;
+        let reference = duplicate(reference)?;
+        let server = duplicate(server)?;
+        ensure!(
+            unsafe { GetFileType(signal.as_raw_handle() as _) } == FILE_TYPE_PIPE,
+            "the pseudo console's signal handle is not a pipe"
+        );
+        let host = super::process_image_name(&server)?;
+        ensure!(
+            ["openconsole.exe", "conhost.exe"]
+                .iter()
+                .any(|name| host.eq_ignore_ascii_case(name)),
+            "the pseudo console's host process is {host}, not a console host"
+        );
+        Ok([signal, reference, server])
+    }
+
+    /// The pseudo console a predecessor handed over (see `handoff_handles`).
+    /// The handles become the console's own.
+    pub fn from_handoff(handles: [StdOwnedHandle; 3]) -> Result<Self, Error> {
+        let pack = CONPTY
+            .pack
+            .ok_or_else(|| anyhow::anyhow!("this conpty.dll cannot adopt a handed-over console"))?;
+        let [signal, reference, server] = handles;
+        let mut con: HPCON = INVALID_HANDLE_VALUE;
+        let result = unsafe {
+            pack(
+                server.as_raw_handle() as _,
+                reference.as_raw_handle() as _,
+                signal.as_raw_handle() as _,
+                &mut con,
+            )
+        };
+        ensure!(
+            result == S_OK,
+            "failed to adopt a pseudo console: HRESULT {}",
+            result
+        );
+        // Closed by ClosePseudoConsole from now on.
+        let _ = (
+            signal.into_raw_handle(),
+            reference.into_raw_handle(),
+            server.into_raw_handle(),
+        );
+        Ok(Self { con })
+    }
+
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
         let mut con: HPCON = INVALID_HANDLE_VALUE;
         let result = unsafe {
-            (CONPTY.CreatePseudoConsole)(
+            (CONPTY.funcs.CreatePseudoConsole)(
                 size,
                 input.as_raw_handle() as _,
                 output.as_raw_handle() as _,
@@ -99,7 +205,7 @@ impl PsuedoCon {
     }
 
     pub fn resize(&self, size: COORD) -> Result<(), Error> {
-        let result = unsafe { (CONPTY.ResizePseudoConsole)(self.con, size) };
+        let result = unsafe { (CONPTY.funcs.ResizePseudoConsole)(self.con, size) };
         ensure!(
             result == S_OK,
             "failed to resize console to {}x{}: HRESULT: {}",
