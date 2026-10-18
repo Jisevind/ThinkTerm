@@ -28,10 +28,8 @@ static HOST: OnceLock<Option<String>> = OnceLock::new();
 static FELL_BACK: Mutex<bool> = Mutex::new(false);
 
 /// Whether this build and platform can run local sessions in a server.
-/// Unix and Windows both can; what Windows lacks is the handoff that keeps
-/// sessions across an update (it passes descriptors), so there the server
-/// simply keeps serving and a newly launched GUI reconnects to it, and an
-/// update stops it.
+/// Unix and Windows both can, and both keep the sessions across an update:
+/// the new build's server takes them over from the running one.
 pub(crate) fn supported() -> bool {
     cfg!(any(unix, windows))
 }

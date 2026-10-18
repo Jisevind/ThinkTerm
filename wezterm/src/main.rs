@@ -862,7 +862,10 @@ impl UpdateCommand {
 
         if matches!(method, InstallMethod::WindowsInstaller) || (cfg!(windows) && matches!(method, InstallMethod::Unknown)) {
             if !self.yes {
-                print!("Download the {target_version} installer and run it? It will close ThinkTerm and reopen it. [y/N] ");
+                print!(
+                    "Download the {target_version} installer and run it? ThinkTerm keeps running \
+                     and moves to {target_version} when it restarts. [y/N] "
+                );
                 std::io::stdout().flush()?;
                 let mut answer = String::new();
                 std::io::stdin().read_line(&mut answer)?;
@@ -875,7 +878,10 @@ impl UpdateCommand {
                 let mut progress = CliInstallProgress::new();
                 thinkterm_update::run_windows_installer(&target, &mut |p| progress.report(p))?;
             }
-            println!("The installer is running; it finishes on its own.");
+            println!(
+                "Installed {target_version}. A running thinkterm-mux-server or GUI keeps the old \
+                 build until it is restarted."
+            );
             return Ok(());
         }
 
