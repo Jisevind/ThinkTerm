@@ -70,6 +70,9 @@ const SESSION_ACTION_ICON_INSET: usize = 12;
 const SESSION_STATUS_DOT_SIZE: usize = 10;
 /// The square a thread's mark sits in; the Agents panel and the hover
 /// cards draw theirs at this size too.
+/// A thread's program icons against the row's height: about the size
+/// of a window tab's.
+const SIDEBAR_ICON_SCALE: f32 = 0.7;
 pub(crate) const SESSION_STATUS_ICON_SIZE: usize = 20;
 const SESSION_STATUS_ACTIVE_ICON_SIZE: usize = 26;
 const SPACE_DISCONNECTED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
@@ -889,7 +892,7 @@ impl crate::TermWindow {
             text_right = mark_x;
         }
         let icons = marks.icons(&session.id, session.is_materialized);
-        let diameter = (row_height as f32 * 0.56).round();
+        let diameter = (row_height as f32 * SIDEBAR_ICON_SCALE).round();
         let cy = y as f32 + row_height as f32 / 2.0;
         let gl_state = self.render_state.as_ref().unwrap();
         let ctx = DrawContext::new(gl_state, self.dimensions, &self.render_metrics);

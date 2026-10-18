@@ -139,7 +139,7 @@ fn build(catalog: &Catalog) -> HashMap<String, Vec<ResolvedIcon>> {
 /// `diameter` across; the trailing layout keeps none.
 pub(crate) fn slot_width(layout: NativeThreadIcons, diameter: f32) -> f32 {
     match layout {
-        NativeThreadIcons::Badge => diameter * 1.25,
+        NativeThreadIcons::Badge => diameter * 1.33,
         NativeThreadIcons::Coins => diameter * 1.35,
         NativeThreadIcons::Cluster => diameter * 1.2,
         NativeThreadIcons::Trailing => 0.0,
@@ -179,8 +179,9 @@ pub(crate) fn draw_slot(
         NativeThreadIcons::Badge | NativeThreadIcons::Trailing => {
             let y = cy - d / 2.0;
             draw_icon(ctx, layers, first, x, y, d, style, true, 0.0)?;
+            // Out to the right rather than down, so it stays within the row.
             let small = (d * 0.55).round();
-            let (bx, by) = (x + d * 0.7, y + d * 0.65);
+            let (bx, by) = (x + d * 0.78, y + d * 0.55);
             match icons.len() {
                 1 => {}
                 2 => draw_icon(ctx, layers, &icons[1], bx, by, small, style, true, gap)?,
