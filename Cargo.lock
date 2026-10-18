@@ -12201,6 +12201,7 @@ dependencies = [
  "nix 0.29.0",
  "passfd",
  "portable-pty",
+ "procinfo",
  "promise",
  "rangeset",
  "rcgen",

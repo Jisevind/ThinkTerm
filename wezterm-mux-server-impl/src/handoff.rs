@@ -18,7 +18,8 @@
 //! reads or writes a pty in two places. If either side fails before the
 //! new server answers `Owned`, the old server's readers resume and it
 //! keeps serving; the new server exits. After `Owned` the old server
-//! exits without touching the layout files, which the new one owns now.
+//! exits without touching the layout files, which the new one owns now
+//! (on macOS it stays as a process that only waits; see `hold`).
 //!
 //! Left behind: panes that hold a channel rather than a pty (ssh-domain
 //! and tmux-domain panes) and panes whose process already exited. They
@@ -486,9 +487,13 @@ fn serve(mut stream: UnixStream, socket_path: &Path) {
     match serve_inner(&mut stream, socket_path) {
         Ok(()) => {
             log::info!(
-                "handed every pane to the successor in {:?}; this server exits",
+                "handed every pane to the successor in {:?}; this server stops serving",
                 started.elapsed()
             );
+            // Its panes' processes keep their local network access only
+            // while it runs (see hold).
+            #[cfg(target_os = "macos")]
+            crate::hold::hold_instead_of_exiting();
             std::process::exit(0);
         }
         Err(err) => {
@@ -1111,7 +1116,8 @@ fn register(
     Ok(())
 }
 
-/// Blocks until the old server has closed its end: it is gone.
+/// Blocks until the old server has closed its end: it is gone, or on macOS
+/// holds nothing any more (see `hold`).
 pub fn wait_for_predecessor_exit(mut stream: UnixStream) {
     stream.set_read_timeout(None).ok();
     let mut buf = [0u8; 64];

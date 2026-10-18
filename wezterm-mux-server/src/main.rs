@@ -92,6 +92,12 @@ struct Opt {
 }
 
 fn main() {
+    // A server that handed its panes over, staying on as the same process
+    // only to wait: before anything else starts, as it serves nothing.
+    #[cfg(target_os = "macos")]
+    if let Some(watch) = wezterm_mux_server_impl::hold::requested() {
+        wezterm_mux_server_impl::hold::run(&watch, env_bootstrap::setup_logger);
+    }
     #[cfg(unix)]
     {
         thinkterm_import_herdr::register().expect("register built-in session importer");
