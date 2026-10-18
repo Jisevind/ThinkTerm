@@ -6355,23 +6355,54 @@ impl ClientDomain {
                         // not something a takeover repairs.
                         Err(_) => return Err(verified.unwrap_err()),
                     };
-                    if needs_takeover && !cfg!(unix) {
-                        // No handoff on this platform (it passes descriptors).
+                    let taken_over = if needs_takeover {
+                        let outcome = {
+                            let unix = unix.clone();
+                            let ui = ui.clone();
+                            spawn_into_new_thread(move || {
+                                crate::local_update::take_over_local_server(&unix, &ui)
+                            })
+                            .await
+                        };
+                        match outcome {
+                            Ok(true) => {
+                                ui.output_str("Reconnecting to the updated server\n");
+                                // The lease state stashed from the old server
+                                // carries its generations; the successor's
+                                // start over.
+                                *self.early_remote_state.lock().unwrap() =
+                                    EarlyRemoteState::default();
+                                client = connect(config.clone(), ui.clone()).await?;
+                                client.verify_version_compat(&ui).await?;
+                                true
+                            }
+                            Ok(false) => false,
+                            Err(takeover_err) => {
+                                ui.output_str(&format!("Local update failed: {takeover_err:#}\n"));
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if needs_takeover && !taken_over && !cfg!(unix) {
+                        // The running server could not hand over: one from
+                        // before Windows had the handoff, or one that refused.
                         // A server that still speaks our codec keeps serving;
                         // one that does not is stopped, and the reconnect
                         // starts this build's server. Its terminals end, which
                         // is what an update without a handoff means here.
                         match &verified {
                             Ok(info) => log::info!(
-                                "the session server runs ThinkTerm {} and this is {}; it keeps \
-                                 serving, since this platform has no in-place handoff",
+                                "the session server runs ThinkTerm {} and this is {}; it could \
+                                 not hand over, so it keeps serving",
                                 info.version_string,
                                 config::wezterm_version()
                             ),
                             Err(err) => {
                                 ui.output_str(&format!(
-                                    "The running session server cannot be used ({err:#}) and this \
-                                     platform cannot hand its sessions over; stopping it and \
+                                    "The running session server cannot be used ({err:#}) and \
+                                     could not hand its sessions over; stopping it and \
                                      starting this build's server. Its terminals end.\n"
                                 ));
                                 let pid_file = config::configuration().daemon_options.pid_file();
@@ -6412,34 +6443,8 @@ impl ClientDomain {
                                 }
                             }
                         }
-                    } else if needs_takeover {
-                        let outcome = {
-                            let unix = unix.clone();
-                            let ui = ui.clone();
-                            spawn_into_new_thread(move || {
-                                crate::local_update::take_over_local_server(&unix, &ui)
-                            })
-                            .await
-                        };
-                        match outcome {
-                            Ok(true) => {
-                                ui.output_str("Reconnecting to the updated server\n");
-                                // The lease state stashed from the old server
-                                // carries its generations; the successor's
-                                // start over.
-                                *self.early_remote_state.lock().unwrap() =
-                                    EarlyRemoteState::default();
-                                client = connect(config.clone(), ui.clone()).await?;
-                                client.verify_version_compat(&ui).await?;
-                            }
-                            Ok(false) => {
-                                verified?;
-                            }
-                            Err(takeover_err) => {
-                                ui.output_str(&format!("Local update failed: {takeover_err:#}\n"));
-                                verified?;
-                            }
-                        }
+                    } else if needs_takeover && !taken_over {
+                        verified?;
                     }
                 } else if let Err(err) = verified {
                     // A codec mismatch over ssh is the one connect failure

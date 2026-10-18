@@ -137,6 +137,13 @@ fn run_takeover(argv: &[std::ffi::OsString], ui: &ConnectionUI) -> anyhow::Resul
             });
         }
     }
+    // A console program started from the GUI would get a window of its own.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("running {:?}", argv))?;
