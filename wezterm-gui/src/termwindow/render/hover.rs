@@ -398,7 +398,11 @@ impl TermWindow {
         // The ring is these icons; the other styles draw the state as the
         // sidebar does.
         let status_style = crate::native_settings::agents_status();
-        if status_style != crate::native_settings::NativeThreadStatus::Ring {
+        // A finished result keeps the card's own tick, at the card's icon
+        // size, whatever the style.
+        if status_style != crate::native_settings::NativeThreadStatus::Ring
+            && state != ShownState::Done
+        {
             let Some((mark, color)) =
                 crate::termwindow::ui::agent_panel::agent_state_mark(state, palette, palette.muted_text)
             else {

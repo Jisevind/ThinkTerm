@@ -534,7 +534,11 @@ impl TermWindow {
             let has_state_icon = state_icon.is_some();
             // The ring is these icons; the other styles draw the state as
             // the sidebar does.
-            let marks = (status_style != NativeThreadStatus::Ring)
+            // A finished result keeps the panel's own tick, at the panel's
+            // icon size, whatever the style.
+            let as_icon = status_style == NativeThreadStatus::Ring
+                || shown == agent_status::ShownState::Done;
+            let marks = (!as_icon)
                 .then(|| agent_state_mark(shown, chrome, muted_fg))
                 .flatten()
                 .map(|(mark, color)| (mark, own_color(color)))
@@ -555,8 +559,8 @@ impl TermWindow {
                     size,
                     color,
                 )?;
-            } else if let Some((icon, color, spinning)) = state_icon
-                .filter(|_| status_style == NativeThreadStatus::Ring && visible(state_y, state_size))
+            } else if let Some((icon, color, spinning)) =
+                state_icon.filter(|_| as_icon && visible(state_y, state_size))
             {
                 if spinning {
                     self.paint_spinning_ui_icon_at(

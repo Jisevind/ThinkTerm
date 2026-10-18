@@ -996,6 +996,23 @@ impl crate::TermWindow {
         size: f32,
         color: LinearRgba,
     ) -> anyhow::Result<()> {
+        // A result waiting to be seen is a tick in every style: it is the
+        // one state that asks to be looked at rather than waited on.
+        // As large as the ring style draws it, the marks' own size being
+        // too small for an outline icon.
+        if mark == Mark::Finished {
+            let tick = (size * 1.5).round();
+            let inset = (tick - size) / 2.0;
+            return self.paint_ui_icon(
+                layers,
+                2,
+                SvgIcon::CircleCheck,
+                (x - inset).max(0.0) as usize,
+                (y - inset).max(0.0) as usize,
+                tick as usize,
+                color,
+            );
+        }
         if status == NativeThreadStatus::Ring {
             let icon = match mark {
                 Mark::Working => {
