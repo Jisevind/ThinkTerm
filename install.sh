@@ -1099,8 +1099,8 @@ if [ "$variant" = server ]; then
   next . "start the mux server (no root, no service file):"
   cmd "thinkterm-mux-server --daemonize"
   if [ "$os" = linux ]; then
-    next . "keep it running after you log out of SSH:"
-    cmd "loginctl enable-linger \$USER"
+    next . "it usually keeps running after you log out of SSH; if it does not:"
+    cmd "loginctl enable-linger \$USER   # some servers need an admin for this"
   fi
 fi
 
