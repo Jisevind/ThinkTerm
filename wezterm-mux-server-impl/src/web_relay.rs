@@ -1355,30 +1355,13 @@ impl Probe {
         // glibc it would not name) it may not.
         os != "linux"
             || matches!(
-                (thinkterm_update::parse_glibc_version(&self.libc), local_glibc()),
+                (
+                    thinkterm_update::parse_glibc_version(&self.libc),
+                    thinkterm_update::local_glibc()
+                ),
                 (Some(there), Some(here)) if there >= here
             )
     }
-}
-
-/// The glibc this server runs on; None off Linux, or where it cannot say.
-fn local_glibc() -> Option<(u32, u32)> {
-    static GLIBC: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    *GLIBC.get_or_init(|| {
-        let out = std::process::Command::new("getconf")
-            .arg("GNU_LIBC_VERSION")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        thinkterm_update::parse_glibc_version(&String::from_utf8_lossy(&out.stdout))
-    })
 }
 
 /// The version `thinkterm --version` printed, among whatever else a login
@@ -3099,7 +3082,7 @@ mod tests {
             }
         };
         // On Linux, a host with this server's glibc or newer.
-        let glibc = local_glibc();
+        let glibc = thinkterm_update::local_glibc();
         if os == "Linux" && glibc.is_none() {
             return;
         }
@@ -3353,9 +3336,11 @@ mod tests {
         assert_eq!(linux("x86_64", "glibc 2.39").cannot_take_a_release(), None);
         assert!(linux("armv7l", "glibc 2.39").cannot_take_a_release().is_some());
         assert!(linux("x86_64", "musl libc (x86_64)").cannot_take_a_release().is_some());
-        assert!(linux("aarch64", "glibc 2.31").cannot_take_a_release().is_some());
+        assert!(linux("aarch64", "glibc 2.28").cannot_take_a_release().is_some());
         // RHEL 9 and its kin: what is installed there is the server.
         assert_eq!(linux("aarch64", "glibc 2.34").cannot_take_a_release(), None);
+        // Ubuntu 20.04, Debian 11: the server built for older glibc.
+        assert_eq!(linux("x86_64", "glibc 2.31").cannot_take_a_release(), None);
         let mac = Probe {
             os: "Darwin".into(),
             arch: "arm64".into(),

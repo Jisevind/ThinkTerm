@@ -48,9 +48,13 @@ set -eu
 repo="RoversX/thinkterm"
 # The oldest glibc each variant's Linux binaries load on: the newest glibc
 # symbol version any of them needs. ci/check-glibc.sh holds every release to
-# these, and thinkterm-update carries the same two numbers.
-min_glibc_server="2.34"
-min_glibc_desktop="2.35"   # the GUI's alone; the rest need no more than the server
+# these, and thinkterm-update carries the same numbers.
+min_glibc_server="2.31"
+min_glibc_desktop="2.35"   # the GUI's alone; the rest need min_glibc_server_main
+# The server is built twice. From this glibc on, a host gets the build made
+# beside the desktop's, which links the host's OpenSSL 3; an older host has
+# only OpenSSL 1.1 and gets the one made on Ubuntu 20.04 with OpenSSL built in.
+min_glibc_server_main="2.34"
 # Hosts that proxy github.com downloads, for --mirror auto, in the order
 # tried. thinkterm-update carries the same list for Settings.
 mirrors="ghfast.top gh-proxy.org ghproxy.net gh.llkk.cc"
@@ -65,6 +69,7 @@ app_dir_opt=""
 from=""
 mirror="auto"
 dry_run=""
+old_glibc=""
 
 usage() {
   cat <<'EOF'
@@ -413,7 +418,7 @@ if [ "$os" = linux ]; then
   # symbol version rather than the real cause. Check here, in words.
   if [ "$variant" = server ]; then
     min_glibc=$min_glibc_server
-    newer="Ubuntu 22.04, Debian 12, RHEL 9"
+    newer="Ubuntu 20.04, Debian 11, RHEL 9"
   else
     min_glibc=$min_glibc_desktop
     newer="Ubuntu 22.04, Debian 12, RHEL 10"
@@ -432,6 +437,10 @@ if [ "$os" = linux ]; then
       also=" The server variant (--server) runs on it."
     fi
     die "glibc $glibc is too old: the $variant binaries need >= $min_glibc ($newer or newer). Build from source instead.$also"
+  elif [ "$variant" = server ] && [ "$(printf '%s\n%s\n' "$min_glibc_server_main" "$glibc" \
+      | sort -V 2>/dev/null | head -n1)" != "$min_glibc_server_main" ]; then
+    old_glibc=1
+    note "glibc $glibc: the server built for older glibc, with OpenSSL built in"
   fi
   have tar || die "tar is required"
 else
@@ -489,7 +498,7 @@ size=""
 asset_name() {
   case "$os/$variant" in
     linux/desktop) echo "thinkterm-$1-linux-$arch.tar.gz" ;;
-    linux/server)  echo "thinkterm-server-$1-linux-$arch.tar.gz" ;;
+    linux/server)  echo "thinkterm-server-$1-linux-$arch${old_glibc:+-glibc$min_glibc_server}.tar.gz" ;;
     # One bundle serves both variants: it already holds every binary.
     macos/*)       echo "ThinkTerm-macos-$arch-$1.zip" ;;
   esac
@@ -559,7 +568,7 @@ else
   else
     version=$(basename "$from" | sed -n \
       -e 's/^ThinkTerm-macos-[^-]*-\([0-9A-Za-z][0-9A-Za-z.+-]*\)\.zip$/\1/p' \
-      -e 's/^thinkterm-\(server-\)\{0,1\}\([0-9A-Za-z][0-9A-Za-z.+-]*\)-linux-[^-]*\.tar\.gz$/\2/p')
+      -e 's/^thinkterm-\(server-\)\{0,1\}\([0-9A-Za-z][0-9A-Za-z.+-]*\)-linux-[^-]*\(-glibc[0-9.]*\)\{0,1\}\.tar\.gz$/\2/p')
   fi
 fi
 
@@ -813,9 +822,9 @@ case "$os" in
     fi
     # With --from there was no release lookup, so the version comes from the
     # directory name ci/deploy.sh gave the tarball:
-    # thinkterm[-server]-<ver>-linux-<arch>.
+    # thinkterm[-server]-<ver>-linux-<arch>[-glibc<floor>].
     if [ -z "$version" ]; then
-      version=$(basename "$root" | sed -n 's/^thinkterm-\(server-\)\{0,1\}\([0-9A-Za-z][0-9A-Za-z.+-]*\)-linux-[^-]*$/\2/p')
+      version=$(basename "$root" | sed -n 's/^thinkterm-\(server-\)\{0,1\}\([0-9A-Za-z][0-9A-Za-z.+-]*\)-linux-[^-]*\(-glibc[0-9.]*\)\{0,1\}$/\2/p')
     fi
     ;;
   macos)

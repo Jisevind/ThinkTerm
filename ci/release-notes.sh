@@ -92,10 +92,12 @@ fi
 linux=''
 # The tarballs are what install.sh fetches; the links are here for anyone who
 # would rather unpack by hand. The desktop glob pins the digit after the
-# name so it cannot also match thinkterm-server-*.
+# name so it cannot also match thinkterm-server-*, and the server glob the
+# 64 of the arch so it cannot also match the build for older glibc.
 desktop=$(links_by_arch 'thinkterm-[0-9]*-linux-*.tar.gz') || desktop=''
-server=$(links_by_arch 'thinkterm-server-*.tar.gz') || server=''
-if [ -n "$desktop$server" ]; then
+server=$(links_by_arch 'thinkterm-server-*-linux-*64.tar.gz') || server=''
+server_old=$(links_by_arch 'thinkterm-server-*-glibc*.tar.gz') || server_old=''
+if [ -n "$desktop$server$server_old" ]; then
   linux="$linux
 **Install script** — \`curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh\` puts ThinkTerm under \`~/.local\` without root and asks which variant you want; \`--desktop\` or \`--server\` (headless remote host, no GUI) skips the question
 "
@@ -104,6 +106,9 @@ Desktop tarball: $desktop
 "
   [ -z "$server" ] || linux="$linux
 Server tarball: $server
+"
+  [ -z "$server_old" ] || linux="$linux
+Server tarball for older glibc (Ubuntu 20.04, Debian 11; OpenSSL built in): $server_old
 "
 fi
 if appimage=$(links_by_arch '*.AppImage'); then

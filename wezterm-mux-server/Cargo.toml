@@ -21,6 +21,10 @@ default = ["tailnet"]
 # server keeps `thinkterm-tailnet` running, which holds the machine's node in
 # a process of its own (see thinkterm-tailnet-node).
 tailnet = ["dep:thinkterm-tailnet"]
+# OpenSSL built in rather than the host's: the Linux server made for hosts
+# whose own is 1.1 (see install.sh). Cargo unifies features, so everything
+# built alongside this server in one `cargo build` gets the same OpenSSL.
+vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
 thinkterm-tailnet = { workspace = true, optional = true }

@@ -544,7 +544,11 @@ mod tests {
         assert_eq!(release_refusal(rhel9, "server"), None);
         let refused = release_refusal(rhel9, "desktop").expect("the GUI needs 2.35");
         assert!(refused.contains("glibc 2.34"), "{refused}");
-        assert!(release_refusal("Linux\nx86_64\nglibc 2.31\n", "server").is_some());
+        // Ubuntu 20.04, Debian 11: the server built for older glibc, no GUI.
+        let focal = "Linux\nx86_64\nglibc 2.31\n";
+        assert_eq!(release_refusal(focal, "server"), None);
+        assert!(release_refusal(focal, "desktop").is_some());
+        assert!(release_refusal("Linux\nx86_64\nglibc 2.28\n", "server").is_some());
         assert_eq!(
             release_refusal("Linux\nx86_64\nglibc 2.39\n", "desktop"),
             None

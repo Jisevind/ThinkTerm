@@ -7,20 +7,27 @@
 # why the desktop needs 2.35) would leave hosts that install.sh lets through
 # with binaries that fail to load.
 #
-#   ci/check-glibc.sh target/release
+#   ci/check-glibc.sh target/release              the Ubuntu 22.04 leg
+#   ci/check-glibc.sh target/release old-server   the Ubuntu 20.04 leg
 
 set -eu
 
-dir=${1:?usage: ci/check-glibc.sh <directory of the built binaries>}
+dir=${1:?usage: ci/check-glibc.sh <directory of the built binaries> [old-server]}
+mode=${2:-}
+case "$mode" in
+  "" | old-server) ;;
+  *) echo "unknown mode '$mode'; the only one is old-server" >&2; exit 2 ;;
+esac
 script="$(dirname "$0")/../install.sh"
 
 floor() {
   sed -n "s/^$1=\"\([0-9.]*\)\".*/\1/p" "$script"
 }
 server=$(floor min_glibc_server)
+server_main=$(floor min_glibc_server_main)
 desktop=$(floor min_glibc_desktop)
-if [ -z "$server" ] || [ -z "$desktop" ]; then
-  echo "install.sh sets no min_glibc_server or min_glibc_desktop" >&2
+if [ -z "$server" ] || [ -z "$server_main" ] || [ -z "$desktop" ]; then
+  echo "install.sh sets no min_glibc_server, min_glibc_server_main or min_glibc_desktop" >&2
   exit 1
 fi
 
@@ -42,10 +49,23 @@ check() {
 }
 
 # The server tarball's binaries; the desktop's are the same and the GUI.
-for bin in thinkterm wezterm thinkterm-mux-server thinkterm-plugin-server \
-    thinkterm-tailnet strip-ansi-escapes; do
-  check "$bin" "$server"
-done
-check thinkterm-gui "$desktop"
+servers="thinkterm wezterm thinkterm-mux-server thinkterm-plugin-server thinkterm-tailnet strip-ansi-escapes"
+
+if [ "$mode" = old-server ]; then
+  # The server for hosts below min_glibc_server_main. Their own OpenSSL is
+  # 1.1, which upstream no longer fixes, so this build has to carry its own.
+  for bin in $servers; do
+    check "$bin" "$server"
+    if objdump -p "$dir/$bin" | grep -qE 'NEEDED +lib(ssl|crypto)\.so'; then
+      echo "$bin links the host's OpenSSL; the old-glibc server has to carry its own" >&2
+      status=1
+    fi
+  done
+else
+  for bin in $servers; do
+    check "$bin" "$server_main"
+  done
+  check thinkterm-gui "$desktop"
+fi
 
 exit $status

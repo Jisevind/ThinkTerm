@@ -145,13 +145,42 @@ const API_COMMITS: &str = "https://api.github.com/repos/RoversX/thinkterm/commit
 /// The oldest glibc the Linux release binaries of `variant` ("server" or
 /// "desktop", as `install.sh` takes it) load on: the newest glibc symbol
 /// version any of them needs, which `ci/check-glibc.sh` holds every release
-/// to. Only the GUI needs 2.35. `install.sh` carries the same numbers and
-/// refuses older hosts; this copy lets a client refuse before it even offers.
+/// to. Only the GUI needs 2.35; the server reaches back to 2.31 by way of a
+/// second build (see `MAIN_SERVER_GLIBC`). `install.sh` carries the same
+/// numbers and refuses older hosts; this copy lets a client refuse before it
+/// even offers.
 pub fn min_glibc(variant: &str) -> (u32, u32) {
     match variant {
-        "server" => (2, 34),
+        "server" => (2, 31),
         _ => (2, 35),
     }
+}
+
+/// From this glibc on, a host gets the server built beside the desktop,
+/// which links the host's OpenSSL 3. An older host has only OpenSSL 1.1 and
+/// gets the build made on Ubuntu 20.04 with OpenSSL built in, its archive
+/// named for the glibc it needs. `install.sh` calls this
+/// `min_glibc_server_main`.
+const MAIN_SERVER_GLIBC: (u32, u32) = (2, 34);
+
+/// The glibc this machine runs on; None off Linux, or where it cannot say.
+pub fn local_glibc() -> Option<(u32, u32)> {
+    static GLIBC: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    *GLIBC.get_or_init(|| {
+        let out = std::process::Command::new("getconf")
+            .arg("GNU_LIBC_VERSION")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_glibc_version(&String::from_utf8_lossy(&out.stdout))
+    })
 }
 
 /// Parse `getconf GNU_LIBC_VERSION` output ("glibc 2.31") or a bare
@@ -1158,17 +1187,36 @@ pub fn takeover_command() -> String {
 /// The release archive `install.sh` installs for `variant` on this machine,
 /// named exactly as its `asset_name` names it; None where it has no build.
 pub fn install_asset_name(variant: &str, version: &str) -> Option<String> {
-    asset_name_for(std::env::consts::OS, std::env::consts::ARCH, variant, version)
+    asset_name_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        variant,
+        version,
+        local_glibc(),
+    )
 }
 
-fn asset_name_for(os: &str, arch: &str, variant: &str, version: &str) -> Option<String> {
+fn asset_name_for(
+    os: &str,
+    arch: &str,
+    variant: &str,
+    version: &str,
+    glibc: Option<(u32, u32)>,
+) -> Option<String> {
     match (os, arch, variant) {
         ("linux", "x86_64" | "aarch64", "desktop") => {
             Some(format!("thinkterm-{version}-linux-{arch}.tar.gz"))
         }
-        ("linux", "x86_64" | "aarch64", "server") => {
-            Some(format!("thinkterm-server-{version}-linux-{arch}.tar.gz"))
-        }
+        // A glibc it cannot read gets the main build, as in install.sh.
+        ("linux", "x86_64" | "aarch64", "server") => match glibc {
+            Some(glibc) if glibc < MAIN_SERVER_GLIBC => {
+                let (major, minor) = min_glibc("server");
+                Some(format!(
+                    "thinkterm-server-{version}-linux-{arch}-glibc{major}.{minor}.tar.gz"
+                ))
+            }
+            _ => Some(format!("thinkterm-server-{version}-linux-{arch}.tar.gz")),
+        },
         // One bundle serves both variants, named the way uname -m names
         // the architecture there.
         ("macos", "aarch64", _) => Some(format!("ThinkTerm-macos-arm64-{version}.zip")),
@@ -1714,29 +1762,58 @@ mod tests {
         let start = script.find("asset_name() {").expect("install.sh defines asset_name");
         let end = start + script[start..].find("\n}\n").expect("asset_name ends") + 3;
         let function = &script[start..end];
-        // (Rust's os and arch, install.sh's os and arch, variant)
+        // (Rust's os and arch, install.sh's os and arch, variant, glibc)
         let cases = [
-            ("linux", "x86_64", "linux", "x86_64", "desktop"),
-            ("linux", "aarch64", "linux", "aarch64", "server"),
-            ("macos", "aarch64", "macos", "arm64", "desktop"),
-            ("macos", "x86_64", "macos", "x86_64", "server"),
+            ("linux", "x86_64", "linux", "x86_64", "desktop", Some((2, 39))),
+            ("linux", "aarch64", "linux", "aarch64", "server", Some((2, 39))),
+            ("linux", "x86_64", "linux", "x86_64", "server", Some((2, 31))),
+            ("linux", "aarch64", "linux", "aarch64", "server", None),
+            ("macos", "aarch64", "macos", "arm64", "desktop", None),
+            ("macos", "x86_64", "macos", "x86_64", "server", None),
         ];
-        for (os, arch, sh_os, sh_arch, variant) in cases {
+        let (major, minor) = min_glibc("server");
+        for (os, arch, sh_os, sh_arch, variant, glibc) in cases {
+            // What install.sh's preflight sets on a host below the main
+            // server build's glibc.
+            let old = match glibc {
+                Some(glibc) if glibc < MAIN_SERVER_GLIBC => {
+                    format!("old_glibc=1; min_glibc_server={major}.{minor}; ")
+                }
+                _ => String::new(),
+            };
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
-                    "{function}os={sh_os}; arch={sh_arch}; variant={variant}; asset_name 1.2.3"
+                    "{function}{old}os={sh_os}; arch={sh_arch}; variant={variant}; asset_name 1.2.3"
                 ))
                 .output()
                 .unwrap();
             assert!(out.status.success());
             assert_eq!(
-                asset_name_for(os, arch, variant, "1.2.3").as_deref(),
+                asset_name_for(os, arch, variant, "1.2.3", glibc).as_deref(),
                 Some(String::from_utf8_lossy(&out.stdout).trim()),
-                "{os}/{arch}/{variant}"
+                "{os}/{arch}/{variant}/{glibc:?}"
             );
         }
-        assert_eq!(asset_name_for("windows", "x86_64", "desktop", "1.2.3"), None);
+        assert_eq!(asset_name_for("windows", "x86_64", "desktop", "1.2.3", None), None);
+    }
+
+    #[test]
+    fn an_old_glibc_gets_the_server_with_openssl_built_in() {
+        let name = |glibc| asset_name_for("linux", "x86_64", "server", "1.2.3", glibc);
+        // Ubuntu 20.04, Debian 11.
+        assert_eq!(
+            name(Some((2, 31))).as_deref(),
+            Some("thinkterm-server-1.2.3-linux-x86_64-glibc2.31.tar.gz")
+        );
+        // RHEL 9 and on, and a host that would not say.
+        for glibc in [Some((2, 34)), Some((2, 39)), None] {
+            assert_eq!(
+                name(glibc).as_deref(),
+                Some("thinkterm-server-1.2.3-linux-x86_64.tar.gz"),
+                "{glibc:?}"
+            );
+        }
     }
 
     #[test]
@@ -1764,16 +1841,18 @@ mod tests {
         assert_eq!(parse_glibc_version("glibc 2.31\n"), Some((2, 31)));
         assert_eq!(parse_glibc_version("2.35"), Some((2, 35)));
         assert_eq!(parse_glibc_version(""), None);
-        assert!(parse_glibc_version("glibc 2.31").unwrap() < min_glibc("server"));
+        assert!(parse_glibc_version("glibc 2.28").unwrap() < min_glibc("server"));
         assert!(parse_glibc_version("glibc 2.39").unwrap() >= min_glibc("desktop"));
     }
 
     #[test]
     fn a_server_takes_a_glibc_the_desktop_does_not() {
-        // RHEL 9 and its kin, Amazon Linux 2023.
-        let glibc = parse_glibc_version("glibc 2.34").unwrap();
-        assert!(glibc >= min_glibc("server"));
-        assert!(glibc < min_glibc("desktop"));
+        // RHEL 9 and its kin, Amazon Linux 2023; Ubuntu 20.04, Debian 11.
+        for text in ["glibc 2.34", "glibc 2.31"] {
+            let glibc = parse_glibc_version(text).unwrap();
+            assert!(glibc >= min_glibc("server"), "{text}");
+            assert!(glibc < min_glibc("desktop"), "{text}");
+        }
     }
 
     #[test]
@@ -1788,6 +1867,7 @@ mod tests {
         };
         assert_eq!(floor("min_glibc_server"), min_glibc("server"));
         assert_eq!(floor("min_glibc_desktop"), min_glibc("desktop"));
+        assert_eq!(floor("min_glibc_server_main"), MAIN_SERVER_GLIBC);
     }
 
     #[test]

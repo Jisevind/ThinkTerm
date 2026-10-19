@@ -711,9 +711,12 @@ EOF
           fi
           rm -rf "pkg/$variant"
         }
-        build_deb desktop
-        build_deb server
-        rm -rf pkg
+        # The Ubuntu 20.04 leg built the server alone, for the tarball below.
+        if [[ -z "${OLD_GLIBC_SERVER:-}" ]] ; then
+          build_deb desktop
+          build_deb server
+          rm -rf pkg
+        fi
 
         # The tarballs install.sh downloads: one per variant, both built here
         # rather than in the Fedora leg because this is the oldest glibc we
@@ -731,13 +734,23 @@ EOF
         # arch is uname -m as-is (x86_64, aarch64): install.sh runs the same
         # command on the target host and wants a name it can build without a
         # mapping table.
+        #
+        # With OLD_GLIBC_SERVER, the Ubuntu 20.04 leg, only the server is
+        # packed, for hosts below install.sh's min_glibc_server_main: OpenSSL
+        # is built into it, and its name ends -glibc<min_glibc_server>, the
+        # glibc it needs, which is how install.sh asks for it.
+        suffix=""
+        if [[ -n "${OLD_GLIBC_SERVER:-}" ]] ; then
+          suffix=-glibc$(sed -n 's/^min_glibc_server="\([0-9.]*\)".*/\1/p' install.sh)
+          [[ "$suffix" != -glibc ]] || { echo "error: install.sh sets no min_glibc_server" >&2 ; exit 1 ; }
+        fi
         linux_tarball() {
           local variant=$1 tardir
           shift
           if [[ "$BUILD_REASON" == "Schedule" ]] ; then
-            tardir=$variant-nightly-linux-$(uname -m)
+            tardir=$variant-nightly-linux-$(uname -m)$suffix
           else
-            tardir=$variant-$TAG_NAME-linux-$(uname -m)
+            tardir=$variant-$TAG_NAME-linux-$(uname -m)$suffix
           fi
           rm -rf "$tardir" "$tardir.tar.gz"
           install -Dsm755 -t "$tardir/bin" "$@"
@@ -756,14 +769,16 @@ EOF
           tar czf "$tardir.tar.gz" --owner=0 --group=0 "$tardir"
           rm -rf "$tardir"
         }
-        linux_tarball thinkterm \
-          $TARGET_DIR/$PROFILE/thinkterm \
-          $TARGET_DIR/$PROFILE/wezterm \
-          $TARGET_DIR/$PROFILE/thinkterm-mux-server \
-          $TARGET_DIR/$PROFILE/thinkterm-gui \
-          $TARGET_DIR/$PROFILE/thinkterm-plugin-server \
-          $TARGET_DIR/$PROFILE/thinkterm-tailnet \
-          $TARGET_DIR/$PROFILE/strip-ansi-escapes
+        if [[ -z "${OLD_GLIBC_SERVER:-}" ]] ; then
+          linux_tarball thinkterm \
+            $TARGET_DIR/$PROFILE/thinkterm \
+            $TARGET_DIR/$PROFILE/wezterm \
+            $TARGET_DIR/$PROFILE/thinkterm-mux-server \
+            $TARGET_DIR/$PROFILE/thinkterm-gui \
+            $TARGET_DIR/$PROFILE/thinkterm-plugin-server \
+            $TARGET_DIR/$PROFILE/thinkterm-tailnet \
+            $TARGET_DIR/$PROFILE/strip-ansi-escapes
+        fi
         linux_tarball thinkterm-server \
           $TARGET_DIR/$PROFILE/thinkterm \
           $TARGET_DIR/$PROFILE/wezterm \

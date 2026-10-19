@@ -155,7 +155,10 @@ jobs:
             # glibc 2.35) also covers Ubuntu 24.04, Debian 12/13 and their
             # derivatives -- a separate Debian 12 build would ship a strictly
             # less portable deb with the same dependencies.
+            # 20.04 builds only the server tarball, OpenSSL built in, for
+            # hosts below 22.04's glibc: theirs is OpenSSL 1.1.
             [ {name: "ubuntu22.04", container: "ubuntu:22.04", appimage: true},
+              {name: "ubuntu20.04", container: "ubuntu:20.04", appimage: false, old_glibc: true},
               {name: "fedora41",    container: "fedora:41",    appimage: false} ] as $distros
             | [ if $x then {arch: "x86_64", runs_on: "ubuntu-latest"}    else empty end,
                 if $a then {arch: "arm64",  runs_on: "ubuntu-24.04-arm"} else empty end ] as $arches
@@ -545,6 +548,8 @@ jobs:
       # Job-wide, not per-step: ./get-deps pulls in tzdata and friends, and a
       # debconf prompt there would hang until timeout-minutes with no output.
       DEBIAN_FRONTEND: noninteractive
+      # The 20.04 leg: build, check and pack the old-glibc server alone.
+      OLD_GLIBC_SERVER: ${{ matrix.old_glibc && '1' || '' }}
 
     steps:
       # git has to exist before actions/checkout runs, otherwise it silently
@@ -593,7 +598,7 @@ jobs:
         with:
           toolchain: stable
 
-      # rust-cache keys on the job id, which is just "linux" for all six legs.
+      # rust-cache keys on the job id, which is just "linux" for every leg.
       # Without an explicit key a fedora job would happily restore a target dir
       # built inside ubuntu, and whichever leg finishes first wins the write
       # while the others burn minutes compressing an entry they cannot save.
@@ -607,22 +612,34 @@ jobs:
       - name: Install system deps
         run: env CI=yes PATH=$PATH ./get-deps
 
+      # One cargo build for every program: features unify across it, so the
+      # 20.04 leg's vendored-openssl on the mux server reaches them all.
       - name: Build
         run: |
-          cargo build --profile "$CARGO_PROFILE" \
-            -p wezterm \
-            -p wezterm-gui \
-            -p wezterm-mux-server \
-            -p thinkterm-plugin-server \
-            -p thinkterm-tailnet-node \
-            -p strip-ansi-escapes
+          if [ -n "$OLD_GLIBC_SERVER" ]; then
+            cargo build --profile "$CARGO_PROFILE" \
+              -p wezterm \
+              -p wezterm-mux-server \
+              -p thinkterm-plugin-server \
+              -p thinkterm-tailnet-node \
+              -p strip-ansi-escapes \
+              --features wezterm-mux-server/vendored-openssl
+          else
+            cargo build --profile "$CARGO_PROFILE" \
+              -p wezterm \
+              -p wezterm-gui \
+              -p wezterm-mux-server \
+              -p thinkterm-plugin-server \
+              -p thinkterm-tailnet-node \
+              -p strip-ansi-escapes
+          fi
 
       # install.sh, and the clients that install over ssh, let a host in by
       # the glibc each variant needs; the tarballs they install come from
-      # the Ubuntu leg, so its binaries are held to those numbers.
+      # the Ubuntu legs, so their binaries are held to those numbers.
       - name: Check glibc floors
         if: startsWith(matrix.name, 'ubuntu')
-        run: bash ci/check-glibc.sh "target/$CARGO_PROFILE"
+        run: bash ci/check-glibc.sh "target/$CARGO_PROFILE" ${OLD_GLIBC_SERVER:+old-server}
 
       - name: Fetch the browser bundle
         uses: actions/download-artifact@v8
