@@ -1,5 +1,5 @@
 //! The folders VS Code and the editors built from it have opened, and the
-//! ones coding agents -- Claude Code, Codex, Pi -- worked in, for
+//! ones coding agents -- Claude Code, Codex, Pi -- and cmux worked in, for
 //! the Import page and first-run setup to offer as projects.
 //!
 //! Each of these editors keeps a directory per opened folder under
@@ -55,6 +55,7 @@ pub(crate) enum EditorKind {
     Claude,
     Codex,
     Pi,
+    Cmux,
 }
 
 impl EditorKind {
@@ -69,12 +70,22 @@ impl EditorKind {
         }
     }
 
-    /// The glyph drawn white where it has no mark in colour.
+    /// The colour its glyph is drawn in: white, but for cmux's blue
+    /// chevron on its light tile.
+    fn glyph_color(self) -> LinearRgba {
+        match self {
+            Self::Cmux => LinearRgba::with_srgba(0x3B, 0x7B, 0xF6, 0xFF),
+            _ => LinearRgba::with_srgba(0xFF, 0xFF, 0xFF, 0xFF),
+        }
+    }
+
+    /// The glyph drawn where it has no mark in colour, in `glyph_color`.
     fn glyph(self) -> SvgIcon {
         match self {
             Self::VsCode => SvgIcon::VsCode,
             Self::Codex => SvgIcon::AgentCodex,
             Self::Pi => SvgIcon::AgentPi,
+            Self::Cmux => SvgIcon::Cmux,
             _ => SvgIcon::CodeXml,
         }
     }
@@ -90,6 +101,7 @@ impl EditorKind {
             Self::Claude => (0x2B, 0x2B, 0x30),
             Self::Codex => (0x14, 0x14, 0x14),
             Self::Pi => (0x1F, 0x1F, 0x22),
+            Self::Cmux => (0xEE, 0xEF, 0xF2),
         };
         LinearRgba::with_srgba(r, g, b, 0xFF)
     }
@@ -176,7 +188,7 @@ pub(crate) fn draw_stack(
                 mark_x,
                 mark_y,
                 mark,
-                LinearRgba::with_srgba(0xFF, 0xFF, 0xFF, 0xFF),
+                kind.glyph_color(),
             )?,
         }
     }
@@ -285,7 +297,7 @@ pub(crate) fn draw_ring(
                 mark_x,
                 mark_y,
                 mark,
-                LinearRgba::with_srgba(0xFF, 0xFF, 0xFF, 0xFF),
+                kind.glyph_color(),
             )?,
         }
     }
@@ -429,9 +441,10 @@ fn scan_roots(
     merge(editors, opened, resolve)
 }
 
-/// A coding agent: what to call it, whether this machine has used it, and
-/// the folders it worked in with when each was last used. Only where each
-/// keeps its record of those folders is read -- never a conversation.
+/// A coding agent, or a terminal kept for them: what to call it, whether
+/// this machine has used it, and the folders it worked in with when each
+/// was last used. Only where each keeps its record of those folders is read
+/// -- never a conversation.
 struct Agent {
     name: &'static str,
     kind: EditorKind,
@@ -457,6 +470,12 @@ const AGENTS: &[Agent] = &[
         kind: EditorKind::Pi,
         present: |home| pi_sessions(home).is_dir(),
         read: pi_folders,
+    },
+    Agent {
+        name: "cmux",
+        kind: EditorKind::Cmux,
+        present: |home| cmux_session(home).is_file(),
+        read: cmux_folders,
     },
 ];
 
@@ -564,6 +583,78 @@ fn pi_folders(home: &Path) -> Vec<(PathBuf, SystemTime)> {
             Some((PathBuf::from(session_cwd(&newest)?), last_used))
         })
         .collect()
+}
+
+fn cmux_session(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("cmux")
+        .join("session-com.cmuxterm.app.json")
+}
+
+/// cmux saves its windows to one file to bring back on relaunch: each
+/// workspace's folder, and each of its terminals'. The file's last save is
+/// when they were last used.
+fn cmux_folders(home: &Path) -> Vec<(PathBuf, SystemTime)> {
+    #[derive(serde::Deserialize)]
+    struct Session {
+        #[serde(default)]
+        windows: Vec<Window>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Window {
+        tab_manager: Option<TabManager>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TabManager {
+        #[serde(default)]
+        workspaces: Vec<Workspace>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Workspace {
+        current_directory: Option<String>,
+        #[serde(default)]
+        panels: Vec<Panel>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Panel {
+        directory: Option<String>,
+    }
+    let path = cmux_session(home);
+    let Some(saved) = path
+        .metadata()
+        .ok()
+        .filter(|meta| meta.len() <= MAX_AGENT_FILE)
+        .and_then(|meta| meta.modified().ok())
+    else {
+        return Vec::new();
+    };
+    let Some(session) = std::fs::read(&path)
+        .ok()
+        .and_then(|text| serde_json::from_slice::<Session>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let mut folders: Vec<PathBuf> = Vec::new();
+    for workspace in session
+        .windows
+        .into_iter()
+        .filter_map(|window| window.tab_manager)
+        .flat_map(|tabs| tabs.workspaces)
+    {
+        let dirs = workspace
+            .current_directory
+            .into_iter()
+            .chain(workspace.panels.into_iter().filter_map(|panel| panel.directory));
+        for dir in dirs.filter(|dir| !dir.is_empty()).map(PathBuf::from) {
+            if !folders.contains(&dir) {
+                folders.push(dir);
+            }
+        }
+    }
+    folders.into_iter().map(|dir| (dir, saved)).collect()
 }
 
 /// The folder a session file's first line names, as `"cwd": "..."`, read
@@ -965,6 +1056,19 @@ mod tests {
         );
         let pi: Vec<_> = pi_folders(home).into_iter().map(|(p, _)| p).collect();
         assert_eq!(pi, [PathBuf::from("/home/user/cli")]);
+        // cmux: each workspace's folder and its terminals', once each.
+        write(
+            home.join("Library/Application Support/cmux/session-com.cmuxterm.app.json"),
+            r#"{"version":1,"windows":[{"tabManager":{"workspaces":[
+                {"currentDirectory":"/home/user/site","panels":[
+                    {"directory":"/home/user/site"},{"directory":"/home/user/site/docs"}]},
+                {"currentDirectory":"","panels":[{"type":"browser"}]}]}}]}"#,
+        );
+        let cmux: Vec<_> = cmux_folders(home).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            cmux,
+            [PathBuf::from("/home/user/site"), PathBuf::from("/home/user/site/docs")]
+        );
     }
 
     #[test]

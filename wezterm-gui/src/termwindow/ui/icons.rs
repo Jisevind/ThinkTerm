@@ -149,6 +149,8 @@ pub enum SvgIcon {
     // VS Code's mark, from the Material Icon Theme's file icons. Its own
     // blue is ignored like any glyph's colour: it takes the caller's tint.
     VsCode,
+    // cmux's chevron, drawn here rather than taken from its app.
+    Cmux,
 }
 
 impl SvgIcon {
@@ -426,6 +428,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lobe-icons/opencode.svg")
             }
             Self::AgentPi => include_bytes!("../../../../third_party/lobe-icons/pi.svg"),
+            Self::Cmux => include_bytes!("../../../../assets/ui/cmux.svg"),
             Self::VsCode => {
                 include_bytes!("../../../../third_party/material-icon-theme/icons/vscode.svg")
             }
@@ -949,6 +952,7 @@ mod tests {
             SvgIcon::AgentOpenCode,
             SvgIcon::AgentPi,
             SvgIcon::VsCode,
+            SvgIcon::Cmux,
         ] {
             let data: Vec<u8> = icon.rasterize(24).unwrap().into();
             assert_eq!(data.len(), 24 * 24 * 4);
