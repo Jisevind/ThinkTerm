@@ -156,7 +156,7 @@ jobs:
             # derivatives -- a separate Debian 12 build would ship a strictly
             # less portable deb with the same dependencies.
             # 20.04 builds only the server tarball, OpenSSL built in, for
-            # hosts below 22.04's glibc: theirs is OpenSSL 1.1.
+            # hosts older than 22.04: they have only OpenSSL 1.1.
             [ {name: "ubuntu22.04", container: "ubuntu:22.04", appimage: true},
               {name: "ubuntu20.04", container: "ubuntu:20.04", appimage: false, old_glibc: true},
               {name: "fedora41",    container: "fedora:41",    appimage: false} ] as $distros
