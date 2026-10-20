@@ -26,6 +26,11 @@ included at mux/src/agent_status/manifests/LICENSE. Each bundled file
 carries an attribution header naming the upstream commit it was taken
 from.
 
+One manifest, mux/src/agent_status/manifests/codebuddy.toml, is not from
+herdr: it was authored by ThinkTerm's contributors and is distributed
+under this repository's own license. Its header records that, and where
+each of its detection signals came from.
+
 ---
 
 This product embeds user-interface icons from Lucide
@@ -146,6 +151,11 @@ project, licensed under the Apache License, Version 2.0. The unmodified
 logo is included at third_party/herdr/logo.svg, and the full license at
 third_party/herdr/LICENSE. See third_party/herdr/README for the upstream
 commit.
+
+The CodeBuddy mark at third_party/codebuddy/codebuddy.svg is the glyph from
+the app icon published in Tencent's @tencent-ai/codebuddy-code package,
+included to identify that agent running in a pane. It remains Tencent's
+trademark; see third_party/codebuddy/README for its provenance.
 
 Brand marks and logos appearing in this product are trademarks of their
 respective owners. They are used solely to identify the corresponding

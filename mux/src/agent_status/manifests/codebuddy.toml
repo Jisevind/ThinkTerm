@@ -1,0 +1,97 @@
+# Hand-authored for ThinkTerm: Tencent's CodeBuddy Code CLI
+# (npm `@tencent-ai/codebuddy-code`, installed as `codebuddy`,
+# `codebuddy-code` or `cbc`). Not part of herdr's set, which has no
+# manifest for this agent. It is authored here and carries this
+# repository's own license, unlike the files around it, which are
+# Apache-2.0 from herdr; see NOTICE at the repository root.
+#
+# The signals below were read off a live session (2.171.0):
+#
+# - The OSC 0 title. CodeBuddy's TerminalTitleUpdater writes
+#   `<marker> <topic>` on every run-state change: while a turn runs it
+#   advances a ten-frame Braille spinner every 200 ms (SPINNER_FRAMES),
+#   and when the turn ends the marker becomes a static idle one. That
+#   prefix is an explicit report, not a guess at the TUI, which is why
+#   both directions are read from it.
+# - The permission dialog numbers its choices and always offers "1. Yes".
+# - The question panel's footer reads "Enter to select · ↑/↓ to navigate ·
+#   Esc to cancel" for as long as it is up.
+
+id = "codebuddy"
+version = "2026.10.21.1"
+min_engine_version = 3
+updated_at = "2026-10-21T00:00:00Z"
+aliases = ["codebuddy-code", "cbc", "code-buddy"]
+
+[[rules]]
+id = "permission_dialog"
+state = "blocked"
+# Above osc_title_working: CodeBuddy keeps the turn's spinner frame on
+# the OSC 0 title while the dialog waits, so a blocker below it would
+# never be seen. Read off a live session: dialog up, title `⠴ topic`.
+priority = 1200
+region = "whole_recent"
+visible_blocker = true
+# A numbered "1. Yes" plus one of the dialog's own questions. The shell
+# tool's title ("Bash command") and the confirm line differ per tool, so
+# the alternatives are its wording, not one tool's.
+contains = ["1. yes"]
+any = [
+  { contains = ["do you want to proceed"] },
+  { contains = ["do you want to create "] },
+  { contains = ["do you want to make this edit"] },
+  { contains = ["do you want to multi edit"] },
+  { contains = ["do you want to allow"] },
+  # The REPL tool confirms with its own sentence rather than "Do you
+  # want to proceed?"; read off a live 2.171.0 session.
+  { contains = ["are you sure you want to do this"] },
+]
+
+[[rules]]
+id = "question_panel"
+state = "blocked"
+# Same reason as permission_dialog: the spinner keeps running behind it.
+priority = 1190
+region = "whole_recent"
+visible_blocker = true
+# The footer, not the "Type something" placeholder: that row turns into
+# the user's own text as soon as they start typing, and the panel must
+# keep reading as blocked while they do.
+contains = ["enter to select", "esc to cancel"]
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1100
+region = "osc_title"
+visible_working = true
+# One of CodeBuddy's ten spinner frames, then a space and the topic.
+regex = ['^[\x{2800}-\x{28FF}] ']
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 1000
+region = "osc_title"
+visible_idle = true
+# U+2733, the marker the same updater leaves behind when the turn ends.
+regex = ['^\x{2733} ']
+
+[[rules]]
+id = "thinking_working"
+state = "working"
+priority = 900
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+# "∴ Thinking..." while a reasoning model is thinking; the same heading
+# settles to "∴ Thought" once the thought is done, so only the -ing form
+# counts. Both share the U+2234 prefix.
+line_regex = ['^\s*\x{2234} Thinking']
+
+[[rules]]
+id = "mcp_boot_working"
+state = "working"
+priority = 800
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = ['^\s*[\x{2022}\x{25E6}]\s*(?:Booting MCP server:|Starting MCP servers).*esc to interrupt\)']

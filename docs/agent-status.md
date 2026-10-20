@@ -1,10 +1,10 @@
 # Agent Status Protocol
 
-ThinkTerm can track the state of coding agents (Claude Code, Codex, Pi,
-OpenCode, …) running in its panes: **working**, **blocked** (waiting for a
-user decision), or **idle**. The state feeds the thread status indicators
-in the left sidebar and the Agents panel in the right sidebar
-(Settings → Agents → *Agent Panel*, off by default).
+ThinkTerm can track the state of coding agents (Claude Code, CodeBuddy
+Code, Codex, Pi, OpenCode, …) running in its panes: **working**,
+**blocked** (waiting for a user decision), or **idle**. The state feeds
+the thread status indicators in the left sidebar and the Agents panel in
+the right sidebar (Settings → Agents → *Agent Panel*, off by default).
 
 Detection arbitrates three signal layers, strongest contract first:
 
@@ -117,13 +117,44 @@ reports back over `thinkterm cli` — herdr's current approach — not a
 terminal sequence. (No such subcommand exists yet; `thinkterm cli agent`
 is query-only today.)
 
+## CodeBuddy Code integration
+
+Screen rules only — there is nothing to install. CodeBuddy Code reports
+its run state through its OSC 0 title, which it rewrites whenever the
+state changes: while a turn runs the title starts with one of ten Braille
+spinner frames it advances every 200 ms, and when the turn ends the same
+prefix becomes a static idle marker. Its npm shims (`codebuddy`,
+`codebuddy-code`, `cbc`) are `#!/usr/bin/env node` scripts, so the pane's
+foreground leader is the runtime and the agent is identified from the
+shim path in `node`'s argv. Both directions of the title marker are used:
+the spinner frames read as **working** and the static marker as **idle**,
+so on the common path nothing has to be inferred from redrawn content at
+all. Screen rules cover what the title does not speak for — the thinking
+heading and MCP startup, both of which run before the title moves — and
+both of its dialogs read as **blocked**: the permission prompt, which
+always numbers its choices and offers "1. Yes", and the
+`AskUserQuestion` panel, whose footer offers "Enter to select" beside
+"Esc to cancel" for as long as it is open (its free-text row cannot be
+used for this, because it turns into the user's own text as they type).
+The turn's spinner stays on the title while either dialog waits, so both
+blocker rules outrank the title's working rule.
+
+Identity needs process visibility. A pane whose foreground program is
+`ssh` only sees `ssh`; CodeBuddy runs on the remote host, so a bare SSH
+pane gets no row (the same holds for any agent identified by its
+process). Run it in a mux-domain pane — detection then happens on the
+host that owns the pane and the state is mirrored to the client — or
+have the agent report `THINKTERM_AGENT` itself, as OpenCode does.
+
 ## Screen-rule manifests
 
 Bundled manifests live in the ThinkTerm source under
 `mux/src/agent_status/manifests/` and are sourced from the
-[herdr](https://github.com/herdrdev/herdr) project (Apache-2.0). The
-format is herdr's agent-detection manifest format; a user override for an
-agent replaces the bundled file of the same id wholesale.
+[herdr](https://github.com/herdrdev/herdr) project (Apache-2.0), except
+`codebuddy.toml`, which is authored here because herdr has no manifest
+for that agent. The format is herdr's agent-detection manifest format; a
+user override for an agent replaces the bundled file of the same id
+wholesale.
 
 The `osc_title` and `osc_progress` regions see only what the application
 actually emitted: both are empty until an OSC title / OSC 9;4 progress

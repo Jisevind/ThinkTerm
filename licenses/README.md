@@ -50,13 +50,16 @@ The agent manifests under `mux/src/agent_status/manifests/` are sourced from
 2.0, reproduced verbatim in
 [`mux/src/agent_status/manifests/LICENSE`](../mux/src/agent_status/manifests/LICENSE).
 Each bundled manifest carries an attribution header naming the upstream commit
-it was taken from and any local changes.
+it was taken from and any local changes. One file, `codebuddy.toml`, is not
+from herdr: it is authored by ThinkTerm's contributors and carries this
+repository's own license.
 
 ## Icons
 
 Icons come from [Lucide](https://github.com/lucide-icons/lucide),
 [Simple Icons](https://github.com/simple-icons/simple-icons),
-[Lobe Icons](https://github.com/lobehub/lobe-icons), and material-icon-theme.
+[Lobe Icons](https://github.com/lobehub/lobe-icons), material-icon-theme, and
+the CodeBuddy Code app icon under `third_party/codebuddy`.
 Their provenance and license texts are recorded in [NOTICE](../NOTICE).
 
 ## Bundled Windows runtime components
