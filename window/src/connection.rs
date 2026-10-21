@@ -54,6 +54,10 @@ pub enum ApplicationEvent {
     /// One of the entries the app gave for its icon's menu in the Dock was
     /// chosen; this is its `DockMenuItem::id`.
     DockMenuItem(String),
+    /// The system is ending the process now -- a quit from the Dock, a
+    /// logout, a shutdown -- and will not return to the event loop: what is
+    /// to outlive it has to be written before the handler returns.
+    WillTerminate,
 }
 
 /// An entry for the app's icon menu in the Dock (macOS).

@@ -103,10 +103,14 @@ pub fn confirm_quit_program(
     mut term: TermWizTerminal,
     window: ::window::Window,
     tab_id: TabId,
+    stop_server: bool,
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation("🛑 Really Quit ThinkTerm?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
             use ::window::{Connection, ConnectionOps};
+            if stop_server {
+                crate::local_sessions::stop_server_at_exit();
+            }
             let con = Connection::get().expect("call on gui thread");
             con.terminate_message_loop();
         })

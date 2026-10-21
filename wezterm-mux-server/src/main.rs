@@ -731,6 +731,7 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
     if let Err(flush_err) = wezterm_mux_server_impl::thinkterm_layout::flush_now() {
         log::error!("flushing ThinkTerm layouts before termination: {flush_err:#}");
     }
+    wezterm_mux_server_impl::thinkterm_layout::keep_pane_output();
     std::process::exit(1);
 }
 
@@ -746,6 +747,7 @@ fn install_shutdown_signal_handler() -> anyhow::Result<()> {
                 if let Err(err) = wezterm_mux_server_impl::thinkterm_layout::flush_now() {
                     log::error!("flushing ThinkTerm layouts before shutdown: {err:#}");
                 }
+                wezterm_mux_server_impl::thinkterm_layout::keep_pane_output();
                 std::process::exit(0);
             })
             .detach();
@@ -777,19 +779,42 @@ fn install_shutdown_signal_handler() -> anyhow::Result<()> {
 mod windows_daemon {
     use anyhow::Context as _;
     use mux::session_server::StopEvent;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle};
     use std::os::windows::process::CommandExt as _;
     use std::sync::Mutex;
-    use winapi::shared::minwindef::{BOOL, DWORD, TRUE};
+    use std::time::Duration;
+    use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, LRESULT, TRUE, UINT, WPARAM};
+    use winapi::shared::windef::HWND;
     use winapi::shared::winerror::ERROR_ACCESS_DENIED;
     use winapi::um::consoleapi::SetConsoleCtrlHandler;
     use winapi::um::handleapi::{SetHandleInformation, INVALID_HANDLE_VALUE};
+    use winapi::um::libloaderapi::GetModuleHandleW;
     use winapi::um::processenv::GetStdHandle;
+    use winapi::um::processthreadsapi::SetProcessShutdownParameters;
     use winapi::um::winbase::{
         CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, HANDLE_FLAG_INHERIT,
         STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
     use winapi::um::winnt::HANDLE;
+    use winapi::um::winuser::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassExW,
+        TranslateMessage, MSG, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSEXW, WS_OVERLAPPED,
+    };
+
+    /// Windows ends the process as soon as the handlers below return; they
+    /// wait this long for the main thread to keep what it keeps and exit on
+    /// its own first.
+    const EXIT_GRACE: Duration = Duration::from_secs(5);
+
+    /// A logoff or shutdown ends processes a level at a time, highest first
+    /// and in no set order within one. Every process starts at 0x280, the
+    /// shells in the server's terminals among them: one level up, the server
+    /// keeps what its panes show while they are still there. The desktop
+    /// goes one further up, so it is gone before the server and never starts
+    /// a new one to rebuild Threads into while the session ends.
+    const SHUTDOWN_LEVEL: DWORD = 0x300;
 
     /// Held from `adopt` until `install_shutdown_handler` takes it.
     static STOP_EVENT: Mutex<Option<StopEvent>> = Mutex::new(None);
@@ -977,8 +1002,103 @@ mod windows_daemon {
     }
 
     unsafe extern "system" fn ctrl_handler(_ctrl_type: DWORD) -> BOOL {
-        request_shutdown();
+        shut_down_before_returning();
         TRUE
+    }
+
+    /// Windows announces a logoff or shutdown to a process only through its
+    /// top-level windows: a detached server has no console for the handler
+    /// above, and a console process that is not a service is not sent those
+    /// events either. So a window nobody sees waits for the announcement, on
+    /// a thread of its own.
+    fn watch_session_end() -> anyhow::Result<()> {
+        std::thread::Builder::new()
+            .name("session-end".into())
+            .spawn(|| {
+                if let Err(err) = run_session_end_window() {
+                    log::warn!("not watching for logoff and shutdown: {err:#}");
+                }
+            })
+            .context("spawning the session-end thread")?;
+        Ok(())
+    }
+
+    fn run_session_end_window() -> anyhow::Result<()> {
+        let wide =
+            |text: &str| -> Vec<u16> { OsStr::new(text).encode_wide().chain(Some(0)).collect() };
+        let name = wide("ThinkTermSessionEnd");
+        // Shown should Windows list the server among the programs still
+        // closing.
+        let title = wide("ThinkTerm session server");
+        // SAFETY: `class` and the strings outlive the calls that read them,
+        // the procedure has the signature Windows calls it with, and the
+        // window lives on this thread, which runs its message loop until the
+        // process ends.
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null());
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as UINT,
+                lpfnWndProc: Some(session_end_proc),
+                hInstance: instance,
+                lpszClassName: name.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            if RegisterClassExW(&class) == 0 {
+                anyhow::bail!(
+                    "registering the window class: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            // Top-level and never shown: a message-only window is not told.
+            let window = CreateWindowExW(
+                0,
+                name.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null_mut(),
+            );
+            if window.is_null() {
+                anyhow::bail!("creating the window: {}", std::io::Error::last_os_error());
+            }
+            let mut message: MSG = std::mem::zeroed();
+            while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        Ok(())
+    }
+
+    unsafe extern "system" fn session_end_proc(
+        window: HWND,
+        message: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            // Never the one holding a logoff or shutdown up.
+            WM_QUERYENDSESSION => TRUE as LRESULT,
+            WM_ENDSESSION if wparam != 0 => {
+                log::info!("the session is ending; flushing and exiting");
+                shut_down_before_returning();
+                0
+            }
+            _ => DefWindowProcW(window, message, wparam, lparam),
+        }
+    }
+
+    /// For a handler Windows ends the process after: the main thread is
+    /// asked to keep what it keeps and exit, and given the time to.
+    fn shut_down_before_returning() {
+        request_shutdown();
+        std::thread::sleep(EXIT_GRACE);
     }
 
     fn request_shutdown() {
@@ -986,6 +1106,7 @@ mod windows_daemon {
             if let Err(err) = wezterm_mux_server_impl::thinkterm_layout::flush_now() {
                 log::error!("flushing ThinkTerm layouts before shutdown: {err:#}");
             }
+            wezterm_mux_server_impl::thinkterm_layout::keep_pane_output();
             std::process::exit(0);
         })
         .detach();
@@ -1006,6 +1127,15 @@ mod windows_daemon {
             })
             .context("spawning the stop-event thread")?;
         unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), TRUE) };
+        if unsafe { SetProcessShutdownParameters(SHUTDOWN_LEVEL, 0) } == 0 {
+            log::warn!(
+                "setting the shutdown level: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if let Err(err) = watch_session_end() {
+            log::warn!("{err:#}");
+        }
         Ok(())
     }
 }

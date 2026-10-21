@@ -19,6 +19,7 @@ mod list_clients;
 mod move_pane_to_new_tab;
 mod proxy;
 mod rename_workspace;
+mod restore_output;
 mod send_key;
 mod send_text;
 mod set_pane_label;
@@ -330,6 +331,11 @@ Outputs the pane-id for the newly created pane on success"
     /// Stop the background session server; the terminals in it end
     #[command(name = "stop-server")]
     StopServer(stop_server::StopServerCommand),
+
+    /// Whether this machine keeps pane output to restore after its
+    /// terminals stop
+    #[command(name = "restore-output")]
+    RestoreOutput(restore_output::RestoreOutputCommand),
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
@@ -341,6 +347,11 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
     // Stopping must not start one: handled before a client is made.
     if let CliSubCommand::StopServer(cmd) = &cli.sub {
         return cmd.run(&crate::init_config(opts)?);
+    }
+    // A switch in a file on this machine, which the server reads when it
+    // needs it: nothing to ask a server.
+    if let CliSubCommand::RestoreOutput(cmd) = &cli.sub {
+        return cmd.run();
     }
 
     let mut ui = mux::connui::ConnectionUI::new_headless();
@@ -417,7 +428,9 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,
         CliSubCommand::Agent(cmd) => cmd.run(client).await,
-        CliSubCommand::ColorSchemes(_) | CliSubCommand::StopServer(_) => {
+        CliSubCommand::ColorSchemes(_)
+        | CliSubCommand::StopServer(_)
+        | CliSubCommand::RestoreOutput(_) => {
             unreachable!("handled without a client above")
         }
     }

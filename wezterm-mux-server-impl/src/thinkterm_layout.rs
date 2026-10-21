@@ -8,8 +8,9 @@
 use anyhow::{Context, Result};
 use config::keyassignment::SpawnTabDomain;
 use futures::future::LocalBoxFuture;
-use mux::domain::SplitSource;
-use mux::pane::PaneId;
+use mux::domain::{LocalDomain, SplitSource};
+use mux::kept_output::{self, Owner};
+use mux::pane::{Pane, PaneId};
 use mux::tab::{PaneEntry, PaneNode, SplitDirection, SplitRequest, SplitSize};
 use mux::window::WindowId;
 use mux::{Mux, MuxNotification};
@@ -369,6 +370,67 @@ pub fn flush_now() -> Result<()> {
     snapshot_live_layouts(generation, false)
 }
 
+/// Before a controlled exit, after `flush_now`: what each Thread's panes
+/// show, kept by workspace until its layout is restored, when this machine
+/// has that on. Only the panes the saved layout records, under its ids.
+pub fn keep_pane_output() {
+    if !kept_output::enabled() {
+        kept_output::discard(Owner::Server);
+        return;
+    }
+    let Some(mux) = Mux::try_get() else {
+        return;
+    };
+    let records = thread_records(&crate::thinkterm_tree::snapshot());
+    let recorded: Vec<(String, HashSet<PaneId>)> = {
+        let store = STORE.lock().unwrap();
+        records
+            .iter()
+            // A restore in flight has not replaced the saved layout yet, and
+            // one that failed is kept as it was: in both the saved ids are
+            // not the live panes', and a record under them would land in
+            // the wrong pane.
+            .filter(|(_, workspace)| {
+                !store.restoring_workspaces.contains(workspace)
+                    && !store.protected_failed_layouts.contains_key(workspace)
+            })
+            .filter_map(|(thread_id, workspace)| {
+                let layout = store.stored.layouts.get(thread_id)?;
+                let ids = layout
+                    .terminal_specs
+                    .iter()
+                    .map(|spec| spec.pane_id)
+                    .collect();
+                Some((workspace.clone(), ids))
+            })
+            .collect()
+    };
+    for (workspace, ids) in recorded {
+        let panes: Vec<(PaneId, Arc<dyn Pane>)> = mux
+            .iter_windows_in_workspace(&workspace)
+            .into_iter()
+            .filter_map(|window_id| {
+                let window = mux.get_window(window_id)?;
+                Some(
+                    window
+                        .iter()
+                        .flat_map(|tab| tab.iter_all_panes())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .filter(|pane| ids.contains(&pane.pane_id()))
+            .map(|pane| (pane.pane_id(), pane))
+            .collect();
+        kept_output::save(Owner::Server, &workspace, &panes);
+    }
+    let workspaces = records
+        .into_iter()
+        .map(|(_, workspace)| workspace)
+        .collect();
+    kept_output::prune(Owner::Server, &workspaces);
+}
+
 fn thread_records(tree: &codec::ThinkTermTree) -> Vec<(String, String)> {
     tree.projects
         .iter()
@@ -663,6 +725,8 @@ pub(crate) async fn restore_thread_layout(
         if let Some(window_id) = created_window {
             mux.kill_window(window_id);
         }
+    } else {
+        kept_output::finish(workspace);
     }
     result.map(|()| true)
 }
@@ -700,11 +764,12 @@ async fn restore_decoded_layout(
         let domain = first
             .map(|entry| domain_for_entry(mux, entry, &specs, true))
             .unwrap_or(SpawnTabDomain::DefaultDomain);
+        let command = first.and_then(|entry| kept_command(mux, workspace, entry, &domain, None));
         let (tab, pane, window_id) = mux
             .spawn_tab_or_window(
                 *created_window,
                 domain,
-                None,
+                command,
                 cwd,
                 size,
                 None,
@@ -722,6 +787,7 @@ async fn restore_decoded_layout(
             &specs,
             project_path,
             &mut pane_map,
+            workspace,
         )
         .await?;
         for (saved, restored) in &pane_map {
@@ -753,6 +819,7 @@ fn restore_node<'a>(
     specs: &'a HashMap<PaneId, StoredTerminalSpec>,
     project_path: &'a str,
     pane_map: &'a mut HashMap<PaneId, PaneId>,
+    workspace: &'a str,
 ) -> LocalBoxFuture<'a, Result<()>> {
     Box::pin(async move {
         match node {
@@ -776,11 +843,13 @@ fn restore_node<'a>(
                     dpi: dims.dpi,
                 };
                 for entry in stack.panes.iter().skip(1) {
+                    let domain = domain_for_entry(mux, entry, specs, false);
+                    let command = kept_command(mux, workspace, entry, &domain, Some(base_pane_id));
                     let pane = mux
                         .spawn_pane_in_stack(
                             base_pane_id,
-                            domain_for_entry(mux, entry, specs, false),
-                            None,
+                            domain,
+                            command,
                             cwd_for_entry(entry, specs, project_path),
                             stack_size,
                         )
@@ -806,22 +875,35 @@ fn restore_node<'a>(
                         node.second,
                     )),
                 };
+                let domain = right_entry
+                    .map(|entry| domain_for_entry(mux, entry, specs, false))
+                    .unwrap_or(SpawnTabDomain::CurrentPaneDomain);
+                let command = right_entry.and_then(|entry| {
+                    kept_command(mux, workspace, entry, &domain, Some(base_pane_id))
+                });
                 let (right_pane, _) = mux
                     .split_pane(
                         base_pane_id,
                         request,
                         SplitSource::Spawn {
-                            command: None,
+                            command,
                             command_dir: right_entry
                                 .and_then(|entry| cwd_for_entry(entry, specs, project_path)),
                         },
-                        right_entry
-                            .map(|entry| domain_for_entry(mux, entry, specs, false))
-                            .unwrap_or(SpawnTabDomain::CurrentPaneDomain),
+                        domain,
                     )
                     .await
                     .context("restore ThinkTerm split")?;
-                restore_node(mux, base_pane_id, left, specs, project_path, pane_map).await?;
+                restore_node(
+                    mux,
+                    base_pane_id,
+                    left,
+                    specs,
+                    project_path,
+                    pane_map,
+                    workspace,
+                )
+                .await?;
                 restore_node(
                     mux,
                     right_pane.pane_id(),
@@ -829,12 +911,32 @@ fn restore_node<'a>(
                     specs,
                     project_path,
                     pane_map,
+                    workspace,
                 )
                 .await?;
             }
         }
         Ok(())
     })
+}
+
+/// The command that starts `entry`'s replacement with what it showed at the
+/// last exit, when that was kept and a local domain here spawns it: the only
+/// kind that reads the record (`mux::kept_output`).
+fn kept_command(
+    mux: &Mux,
+    workspace: &str,
+    entry: &PaneEntry,
+    domain: &SpawnTabDomain,
+    current: Option<PaneId>,
+) -> Option<portable_pty::CommandBuilder> {
+    let local = mux
+        .resolve_spawn_tab_domain(current, domain)
+        .is_ok_and(|domain| domain.downcast_ref::<LocalDomain>().is_some());
+    if !local {
+        return None;
+    }
+    kept_output::with_seed(Owner::Server, workspace, entry.pane_id, None)
 }
 
 fn first_pane_entry(node: &PaneNode) -> Option<&PaneEntry> {

@@ -4,7 +4,8 @@ use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use fluent_bundle::FluentArgs;
 use futures::future::LocalBoxFuture;
 use mux::domain::SplitSource;
-use mux::pane::PaneId;
+use mux::kept_output::Owner;
+use mux::pane::{Pane, PaneId};
 use mux::tab::{PaneEntry, PaneNode, PaneStackEntry, SplitDirection, SplitRequest, SplitSize};
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
@@ -65,7 +66,6 @@ pub struct ImportedSession {
 }
 
 /// The most imports remembered; the oldest go first.
-#[cfg(unix)]
 const MAX_IMPORTED_SESSIONS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -248,6 +248,10 @@ pub struct TerminalSpawnSpec {
     /// The label the pane was given; the pane that replaces it gets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The pane's id in the local session server, when it ran there: what
+    /// that server keeps its output under (`mux::kept_output`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_pane_id: Option<PaneId>,
 }
 
 #[derive(Debug, Clone)]
@@ -1443,7 +1447,6 @@ pub fn create_space(name: Option<String>) -> SpaceId {
     id
 }
 
-#[cfg(unix)]
 pub(crate) fn persist_session_import(
     tree: &codec::ThinkTermTree,
     add: bool,
@@ -1467,7 +1470,6 @@ pub(crate) fn persist_session_import(
     Ok(())
 }
 
-#[cfg(unix)]
 fn store_with_session_import(
     store: &WorkspaceThreadStore,
     tree: &codec::ThinkTermTree,
@@ -1511,6 +1513,7 @@ fn store_with_session_import(
                                 domain: Some("local".into()),
                                 title: entry.title.clone(),
                                 label: None,
+                                host_pane_id: None,
                             },
                             font_scale: None,
                         })
@@ -1909,7 +1912,6 @@ pub fn remote_space_domains() -> Vec<String> {
 
 /// Remember that `session` of `source`, imported on `host`, became
 /// `space_id`.
-#[cfg(unix)]
 pub fn note_imported_session(source: &str, session: &str, host: Option<&str>, space_id: &str) {
     let mut store = THREAD_STORE.lock();
     store.note_imported_session(ImportedSession {
@@ -1923,7 +1925,6 @@ pub fn note_imported_session(source: &str, session: &str, host: Option<&str>, sp
 
 /// The name of the Space `session` of `source` on `host` was imported
 /// into, while that Space is still here.
-#[cfg(unix)]
 pub fn imported_session_space(source: &str, session: &str, host: Option<&str>) -> Option<String> {
     THREAD_STORE
         .lock()
@@ -3486,7 +3487,6 @@ pub(crate) async fn materialize_thread(
     // *from* this materialization, and no window is worse than the wrong cwd.
     strict_project_cwd: bool,
 ) -> Result<ThreadMaterializationOutcome> {
-    #[cfg(unix)]
     wezterm_mux_server_impl::session_import::wait_for_workspace(&workspace_name).await?;
     let mux = Mux::get();
     if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
@@ -3611,10 +3611,10 @@ pub(crate) async fn materialize_thread(
         Some((layout, tabs))
     });
     if let Some((layout, tabs)) = layout {
-        let _guard = MaterializeThreadLayoutGuard::new(workspace_name.clone());
+        let guard = MaterializeThreadLayoutGuard::new(workspace_name.clone());
         materialize_layout(
             mux,
-            workspace_name,
+            workspace_name.clone(),
             layout,
             tabs,
             initial_cwd,
@@ -3622,6 +3622,8 @@ pub(crate) async fn materialize_thread(
             term_config,
         )
         .await?;
+        drop(guard);
+        rekey_restored_layout(&workspace_name);
         Ok(ThreadMaterializationOutcome::RestoredLayout)
     } else {
         // A thread whose Space lives on a mux server needs its window tagged
@@ -3673,6 +3675,14 @@ pub(crate) async fn materialize_thread(
             command.set_require_cwd(true);
             command
         });
+        // A Thread back without a recorded layout only ever had one pane:
+        // it starts with what that pane showed when it stopped, if kept.
+        let command = if spawns_locally(&mux, &default_domain, None) {
+            mux::kept_output::with_lone_seed(&workspace_name, command)
+        } else {
+            command
+        };
+        let kept_key = workspace_name.clone();
 
         let spawned = mux
             .spawn_tab_or_window(
@@ -3690,6 +3700,7 @@ pub(crate) async fn materialize_thread(
 
         let (_tab, pane, _window_id) = spawned.context("spawn default thread window")?;
         pane.set_config(term_config);
+        mux::kept_output::finish(&kept_key);
         let _ = src_window_id;
         Ok(ThreadMaterializationOutcome::SpawnedFresh)
     }
@@ -3701,7 +3712,6 @@ pub async fn materialize_thread_spawn(
     size: TerminalSize,
     term_config: Arc<dyn TerminalConfiguration>,
 ) -> Result<()> {
-    #[cfg(unix)]
     wezterm_mux_server_impl::session_import::wait_for_workspace(&workspace_name).await?;
     let mux = Mux::get();
     if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
@@ -6452,7 +6462,6 @@ impl WorkspaceThreadStore {
     /// The newest import of a session replaces older ones. A local entry
     /// whose Space is gone was deleted with it; a remote one may only be
     /// missing until its host connects again, so it waits for the cap.
-    #[cfg(unix)]
     fn note_imported_session(&mut self, imported: ImportedSession) {
         let spaces = &self.spaces;
         self.imported_sessions.retain(|known| {
@@ -6469,7 +6478,6 @@ impl WorkspaceThreadStore {
         self.imported_sessions.drain(..excess);
     }
 
-    #[cfg(unix)]
     fn imported_session_space(
         &self,
         source: &str,
@@ -7238,6 +7246,25 @@ impl WorkspaceThreadStore {
         session.layout = Some(snapshot);
         session.last_active_at = now_ts();
         true
+    }
+
+    /// The layout of the Thread that restores into `workspace`, under the
+    /// name `keep_pane_output` keeps its panes' output by.
+    fn thread_layout_for_workspace_mut(
+        &mut self,
+        workspace: &str,
+    ) -> Option<&mut WorkspaceThreadLayoutSnapshot> {
+        self.projects
+            .iter_mut()
+            .flat_map(|project| project.threads.iter_mut())
+            .find(|thread| {
+                thread
+                    .materialized_workspace_name
+                    .as_deref()
+                    .or(thread.planned_workspace_name.as_deref())
+                    == Some(workspace)
+            })
+            .and_then(|thread| thread.layout.as_mut())
     }
 
     fn workspace_pane_font_scales(
@@ -9030,6 +9057,257 @@ fn schedule_workspace_thread_store_persist() {
     });
 }
 
+/// Set by the way out that kept the panes' output. See [`keep_pane_output`].
+static PANE_OUTPUT_KEPT: AtomicBool = AtomicBool::new(false);
+
+/// Before the app exits with its terminals inside it, rather than in the
+/// session server: what each Thread's panes show, kept until its layout is
+/// restored, when Settings has that on. See `mux::kept_output`.
+pub(crate) fn keep_pane_output() {
+    if crate::local_sessions::host_domain_name().is_some() {
+        // The session server keeps its own; its terminals outlive this.
+        mux::kept_output::prune_stale();
+        return;
+    }
+    let Some(mux) = Mux::try_get() else {
+        return;
+    };
+    if !mux::kept_output::enabled() {
+        mux::kept_output::discard(Owner::App);
+        return;
+    }
+    // The first way out to get here keeps (the last window closing, a
+    // restart, the system ending the app); a second in the same exit would
+    // write back what the next process may already have taken.
+    if PANE_OUTPUT_KEPT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // The workspaces Threads restore into, named as the server names them,
+    // and the layout each restores from.
+    let threads: HashMap<String, Option<WorkspaceThreadLayoutSnapshot>> = THREAD_STORE
+        .lock()
+        .projects
+        .iter()
+        .flat_map(|project| &project.threads)
+        .filter_map(|thread| {
+            let workspace = thread
+                .materialized_workspace_name
+                .clone()
+                .or_else(|| thread.planned_workspace_name.clone())?;
+            Some((workspace, thread.layout.clone()))
+        })
+        .collect();
+    for workspace in mux.iter_workspaces() {
+        let Some(layout) = threads.get(&workspace) else {
+            continue;
+        };
+        // Mid-restore its panes are not all there, and what was kept for
+        // the rest has not been taken yet: that stays as it is.
+        if is_materializing_thread_layout(&workspace) {
+            continue;
+        }
+        let panes = panes_under_saved_ids(&mux, &workspace, layout.as_ref());
+        mux::kept_output::save(Owner::App, &workspace, &panes);
+    }
+    if threads.is_empty() {
+        // Nothing known of any Thread, as when the app stopped before it
+        // read them: what was kept waits for a run that knows.
+        mux::kept_output::prune_stale();
+    } else {
+        mux::kept_output::prune(Owner::App, &threads.into_keys().collect());
+    }
+}
+
+/// The app goes on after a way out kept its panes' output: a restart whose
+/// new process did not start, a window opened again after the last one
+/// closed. Its own exit keeps what they show then.
+pub(crate) fn keep_pane_output_again() {
+    PANE_OUTPUT_KEPT.store(false, Ordering::SeqCst);
+}
+
+/// The panes of `workspace`, each under the id that `layout` -- what the
+/// Thread restores from -- has for its place, which is the id the restore
+/// asks for. A pane in a place the layout does not have is not kept: no
+/// restore would ask for it. With no layout, or one of another shape
+/// altogether -- the startup Thread comes back as its one pane whatever its
+/// layout says -- each is kept under its own id, and a Thread that comes
+/// back as one pane takes a lone record whatever its id.
+fn panes_under_saved_ids(
+    mux: &Mux,
+    workspace: &str,
+    layout: Option<&WorkspaceThreadLayoutSnapshot>,
+) -> Vec<(PaneId, Arc<dyn Pane>)> {
+    let saved: Option<Vec<PaneNode>> = layout
+        .filter(|layout| !layout.tabs.is_empty())
+        .and_then(|layout| {
+            layout
+                .tabs
+                .iter()
+                .map(|tab| serde_json::from_value(tab.clone()).ok())
+                .collect()
+        });
+    let mut pairs = HashMap::new();
+    if let (Some(saved), Some(live)) = (saved, live_tabs(mux, workspace)) {
+        for (saved, live) in saved.iter().zip(&live) {
+            pair_panes_by_place(saved, live, &mut pairs);
+        }
+    }
+    if pairs.is_empty() {
+        return mux
+            .iter_windows_in_workspace(workspace)
+            .into_iter()
+            .filter_map(|window_id| {
+                let window = mux.get_window(window_id)?;
+                Some(window.iter().flat_map(|tab| tab.iter_all_panes()).collect::<Vec<_>>())
+            })
+            .flatten()
+            .map(|pane| (pane.pane_id(), pane))
+            .collect();
+    }
+    pairs
+        .into_iter()
+        .filter_map(|(saved, live)| Some((saved, mux.get_pane(live)?)))
+        .collect()
+}
+
+/// The tabs of the window `workspace` shows in, as trees.
+fn live_tabs(mux: &Mux, workspace: &str) -> Option<Vec<PaneNode>> {
+    let window_id = mux.iter_windows_in_workspace(workspace).into_iter().next()?;
+    let window = mux.get_window(window_id)?;
+    Some(window.iter().map(|tab| tab.codec_pane_tree()).collect())
+}
+
+/// Pair each pane of `saved`, a tab of a saved layout, with the one standing
+/// in its place in `live`. Where the two differ in shape nothing is paired:
+/// a place there names no particular pane.
+fn pair_panes_by_place(saved: &PaneNode, live: &PaneNode, pairs: &mut HashMap<PaneId, PaneId>) {
+    match (saved, live) {
+        (PaneNode::Leaf(saved), PaneNode::Leaf(live)) => {
+            pairs.insert(saved.pane_id, live.pane_id);
+        }
+        (PaneNode::Stack(saved), PaneNode::Stack(live)) if saved.panes.len() == live.panes.len() => {
+            for (saved, live) in saved.panes.iter().zip(&live.panes) {
+                pairs.insert(saved.pane_id, live.pane_id);
+            }
+        }
+        (
+            PaneNode::Split {
+                left: saved_left,
+                right: saved_right,
+                node: saved_node,
+            },
+            PaneNode::Split {
+                left: live_left,
+                right: live_right,
+                node: live_node,
+            },
+        ) if saved_node.direction == live_node.direction => {
+            pair_panes_by_place(saved_left, live_left, pairs);
+            pair_panes_by_place(saved_right, live_right, pairs);
+        }
+        _ => {}
+    }
+}
+
+/// The layout `workspace` was just restored from, made to name the panes now
+/// standing in it -- by their ids here, and in the local session server for
+/// the ones that run there -- with everything else it records left as it
+/// was. An exit keeps each pane's output under those ids; a layout still
+/// naming the panes it was restored from, as a Thread brought back at
+/// startup and not changed since does, would have the next restore ask for
+/// the run before's, and could hand one pane's output to another.
+fn rekey_restored_layout(workspace: &str) {
+    let mux = Mux::get();
+    let Some(live) = live_tabs(&mux, workspace) else {
+        return;
+    };
+    let mut ids = vec![];
+    for tab in &live {
+        collect_pane_ids(tab, &mut ids);
+    }
+    let host_panes: HashMap<PaneId, PaneId> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let pane = mux.get_pane(id)?;
+            if !crate::local_sessions::is_host_domain_id(pane.domain_id()) {
+                return None;
+            }
+            let client = pane.downcast_ref::<wezterm_client::pane::ClientPane>()?;
+            Some((id, client.remote_pane_id))
+        })
+        .collect();
+    let changed = THREAD_STORE
+        .lock()
+        .thread_layout_for_workspace_mut(workspace)
+        .is_some_and(|layout| rekey_layout(layout, &live, &host_panes));
+    if changed {
+        schedule_workspace_thread_store_persist();
+    }
+}
+
+/// `layout` naming, for each of its panes, the one standing in that place in
+/// `live`, and that pane's id in the local session server from `host_panes`.
+/// Whether that changed it. A layout with a tab this build cannot read is
+/// left alone.
+fn rekey_layout(
+    layout: &mut WorkspaceThreadLayoutSnapshot,
+    live: &[PaneNode],
+    host_panes: &HashMap<PaneId, PaneId>,
+) -> bool {
+    let mut pairs = HashMap::new();
+    let mut saved = vec![];
+    for (tab, live) in layout.tabs.iter().zip(live) {
+        let Ok(tab) = serde_json::from_value::<PaneNode>(tab.clone()) else {
+            return false;
+        };
+        pair_panes_by_place(&tab, live, &mut pairs);
+        saved.push(tab);
+    }
+    let before = layout.clone();
+    for (value, mut tab) in layout.tabs.iter_mut().zip(saved) {
+        rename_panes(&mut tab, &pairs);
+        if let Ok(renamed) = serde_json::to_value(&tab) {
+            *value = renamed;
+        }
+    }
+    for entry in &mut layout.terminal_specs {
+        if let Some(&live) = pairs.get(&entry.pane_id) {
+            entry.pane_id = live;
+            entry.spec.host_pane_id = host_panes.get(&live).copied();
+        }
+    }
+    *layout != before
+}
+
+fn rename_panes(node: &mut PaneNode, pairs: &HashMap<PaneId, PaneId>) {
+    let rename = |entry: &mut PaneEntry| {
+        if let Some(&live) = pairs.get(&entry.pane_id) {
+            entry.pane_id = live;
+        }
+    };
+    match node {
+        PaneNode::Empty => {}
+        PaneNode::Leaf(entry) => rename(entry),
+        PaneNode::Stack(stack) => stack.panes.iter_mut().for_each(rename),
+        PaneNode::Split { left, right, .. } => {
+            rename_panes(left, pairs);
+            rename_panes(right, pairs);
+        }
+    }
+}
+
+fn collect_pane_ids(node: &PaneNode, ids: &mut Vec<PaneId>) {
+    match node {
+        PaneNode::Empty => {}
+        PaneNode::Leaf(entry) => ids.push(entry.pane_id),
+        PaneNode::Stack(stack) => ids.extend(stack.panes.iter().map(|entry| entry.pane_id)),
+        PaneNode::Split { left, right, .. } => {
+            collect_pane_ids(left, ids);
+            collect_pane_ids(right, ids);
+        }
+    }
+}
+
 fn snapshot_window_layout<F>(
     window_id: MuxWindowId,
     pane_font_scale: &F,
@@ -9290,6 +9568,19 @@ async fn materialize_layout(
         let domain = first_entry
             .map(|entry| spawn_domain_for_entry(&mux, entry, &terminal_specs, true))
             .unwrap_or(SpawnTabDomain::DefaultDomain);
+        // What the pane showed when its terminals last stopped, if kept.
+        let command = match first_entry {
+            Some(entry) => kept_command(
+                &mux,
+                &workspace_name,
+                entry,
+                &terminal_specs,
+                &domain,
+                None,
+                command,
+            ),
+            None => command,
+        };
         let (_tab, pane, win_id) = mux
             .spawn_tab_or_window(
                 window_id,
@@ -9313,6 +9604,7 @@ async fn materialize_layout(
             &terminal_specs,
             heal_root,
             Arc::clone(&term_config),
+            &workspace_name,
         )
         .await?;
         spawned_tabs += 1;
@@ -9327,6 +9619,7 @@ async fn materialize_layout(
     }
 
     rollback.commit();
+    mux::kept_output::finish(&workspace_name);
     Ok(())
 }
 
@@ -9337,6 +9630,7 @@ fn restore_node<'a>(
     terminal_specs: &'a HashMap<PaneId, TerminalSpawnSpec>,
     project_root: Option<&'a str>,
     term_config: Arc<dyn TerminalConfiguration>,
+    workspace: &'a str,
 ) -> LocalBoxFuture<'a, Result<()>> {
     Box::pin(async move {
         match node {
@@ -9350,6 +9644,7 @@ fn restore_node<'a>(
                     terminal_specs,
                     project_root,
                     term_config,
+                    workspace,
                 )
                 .await?;
             }
@@ -9365,12 +9660,26 @@ fn restore_node<'a>(
                         node.second,
                     )),
                 };
+                let domain = right_entry
+                    .map(|entry| spawn_domain_for_entry(&mux, entry, terminal_specs, false))
+                    .unwrap_or(SpawnTabDomain::CurrentPaneDomain);
+                let command = right_entry.and_then(|entry| {
+                    kept_command(
+                        &mux,
+                        workspace,
+                        entry,
+                        terminal_specs,
+                        &domain,
+                        Some(base_pane_id),
+                        None,
+                    )
+                });
                 let (right_pane, _size) = mux
                     .split_pane(
                         base_pane_id,
                         request,
                         SplitSource::Spawn {
-                            command: None,
+                            command,
                             command_dir: heal_fallback_cwd(
                                 right_entry.and_then(|entry| {
                                     working_dir_for_entry(entry, terminal_specs)
@@ -9378,9 +9687,7 @@ fn restore_node<'a>(
                                 project_root,
                             ),
                         },
-                        right_entry
-                            .map(|entry| spawn_domain_for_entry(&mux, entry, terminal_specs, false))
-                            .unwrap_or(SpawnTabDomain::CurrentPaneDomain),
+                        domain,
                     )
                     .await
                     .context("restore split pane")?;
@@ -9392,6 +9699,7 @@ fn restore_node<'a>(
                     terminal_specs,
                     project_root,
                     Arc::clone(&term_config),
+                    workspace,
                 )
                 .await?;
                 restore_node(
@@ -9401,6 +9709,7 @@ fn restore_node<'a>(
                     terminal_specs,
                     project_root,
                     term_config,
+                    workspace,
                 )
                 .await?;
             }
@@ -9416,14 +9725,25 @@ async fn restore_stack(
     terminal_specs: &HashMap<PaneId, TerminalSpawnSpec>,
     project_root: Option<&str>,
     term_config: Arc<dyn TerminalConfiguration>,
+    workspace: &str,
 ) -> Result<()> {
     let mut pane_ids = vec![base_pane_id];
     for entry in stack.panes.iter().skip(1) {
+        let domain = spawn_domain_for_entry(&mux, entry, terminal_specs, false);
+        let command = kept_command(
+            &mux,
+            workspace,
+            entry,
+            terminal_specs,
+            &domain,
+            Some(base_pane_id),
+            None,
+        );
         let pane = mux
             .spawn_pane_in_stack(
                 base_pane_id,
-                spawn_domain_for_entry(&mux, entry, terminal_specs, false),
-                None,
+                domain,
+                command,
                 heal_fallback_cwd(working_dir_for_entry(entry, terminal_specs), project_root),
                 entry.size,
             )
@@ -9440,6 +9760,48 @@ async fn restore_stack(
         let _ = mux.activate_pane_in_stack(pane_id);
     }
     Ok(())
+}
+
+/// `command` for the pane standing in for `entry`, made to start with what
+/// `entry` showed when its terminals last stopped, if that was kept
+/// (`mux::kept_output`): the session server's record when the pane ran
+/// there, this app's when it ran in here. Only a local domain, here or in
+/// the local session server, reads the record.
+fn kept_command(
+    mux: &Mux,
+    workspace: &str,
+    entry: &PaneEntry,
+    terminal_specs: &HashMap<PaneId, TerminalSpawnSpec>,
+    domain: &SpawnTabDomain,
+    current: Option<PaneId>,
+    command: Option<CommandBuilder>,
+) -> Option<CommandBuilder> {
+    if !spawns_locally(mux, domain, current) {
+        return command;
+    }
+    match terminal_specs
+        .get(&entry.pane_id)
+        .and_then(|spec| spec.host_pane_id)
+    {
+        Some(host_pane) => {
+            mux::kept_output::with_seed(Owner::Server, workspace, host_pane, command)
+        }
+        None => mux::kept_output::with_seed(Owner::App, workspace, entry.pane_id, command),
+    }
+}
+
+/// Whether a spawn in `domain` lands in a local domain, here or in the local
+/// session server: the ones that read a kept record.
+fn spawns_locally(mux: &Mux, domain: &SpawnTabDomain, current: Option<PaneId>) -> bool {
+    mux.resolve_spawn_tab_domain(current, domain)
+        .is_ok_and(|domain| reads_kept_output(&*domain))
+}
+
+/// Whether panes spawned in `domain` read a kept record: a local domain,
+/// here or in the local session server.
+pub(crate) fn reads_kept_output(domain: &dyn mux::domain::Domain) -> bool {
+    domain.downcast_ref::<mux::domain::LocalDomain>().is_some()
+        || crate::local_sessions::is_host_domain_id(domain.domain_id())
 }
 
 /// Give `pane_id` the label the pane it stands in for had.
@@ -9551,6 +9913,13 @@ fn collect_terminal_spec<F>(
                 domain.domain_name().to_string()
             }
         });
+    let host_pane_id = mux
+        .get_pane(entry.pane_id)
+        .filter(|pane| crate::local_sessions::is_host_domain_id(pane.domain_id()))
+        .and_then(|pane| {
+            pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                .map(|client| client.remote_pane_id)
+        });
     terminal_specs.push(TerminalSpecEntry {
         pane_id: entry.pane_id,
         spec: TerminalSpawnSpec {
@@ -9558,6 +9927,7 @@ fn collect_terminal_spec<F>(
             domain,
             title: entry.title.clone(),
             label: mux.pane_label(entry.pane_id),
+            host_pane_id,
         },
         font_scale: valid_font_scale(pane_font_scale(entry.pane_id)),
     });
@@ -13753,7 +14123,6 @@ mod tests {
         store
     }
 
-    #[cfg(unix)]
     fn imported(source: &str, session: &str, host: Option<&str>, space: &str) -> ImportedSession {
         ImportedSession {
             source: source.to_string(),
@@ -13763,7 +14132,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_imported_session_is_known_only_while_its_space_is_on_that_connection() {
         let mut store = remote_test_store("server-a");
@@ -13803,7 +14171,6 @@ mod tests {
         assert_eq!(name(&store, "work", Some("server-a")), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn imported_sessions_keep_the_newest_and_stay_bounded() {
         let mut store = remote_test_store("server-a");
@@ -14393,7 +14760,6 @@ mod tests {
         tree
     }
 
-    #[cfg(unix)]
     fn import_layout_fixture() -> (
         codec::ThinkTermTree,
         Vec<wezterm_mux_server_impl::session_import::ImportedThreadLayout>,
@@ -14485,7 +14851,6 @@ mod tests {
         (tree, layouts)
     }
 
-    #[cfg(unix)]
     #[test]
     fn imported_import_appends_and_rolls_back_only_its_own_rows() {
         let store = host_test_store();
@@ -14499,7 +14864,6 @@ mod tests {
         assert_eq!(rolled_back, store);
     }
 
-    #[cfg(unix)]
     #[test]
     fn unopened_imported_threads_keep_every_layout_after_reload() {
         let (tree, layouts) = import_layout_fixture();
@@ -15997,5 +16361,188 @@ mod tests {
             .collect();
         let before_ids: Vec<&str> = local_before.iter().map(|project| project.id.as_str()).collect();
         assert_eq!(ids, before_ids);
+    }
+}
+
+#[cfg(test)]
+mod kept_output_layout_tests {
+    use super::*;
+
+    fn entry(pane_id: PaneId) -> PaneEntry {
+        PaneEntry {
+            window_id: 0,
+            tab_id: 0,
+            pane_id,
+            title: format!("shell-{pane_id}"),
+            size: TerminalSize::default(),
+            working_dir: None,
+            is_active_pane: false,
+            is_zoomed_pane: false,
+            alt_screen: false,
+            workspace: "thinkterm:project-1:thread-2".into(),
+            cursor_pos: Default::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        }
+    }
+
+    fn split(direction: SplitDirection, left: PaneNode, right: PaneNode) -> PaneNode {
+        PaneNode::Split {
+            left: Box::new(left),
+            right: Box::new(right),
+            node: mux::tab::SplitDirectionAndSize {
+                direction,
+                first: TerminalSize::default(),
+                second: TerminalSize::default(),
+            },
+        }
+    }
+
+    fn stack(ids: &[PaneId]) -> PaneNode {
+        PaneNode::Stack(PaneStackEntry {
+            panes: ids.iter().map(|id| entry(*id)).collect(),
+            active: 0,
+            pane_stack_id: None,
+        })
+    }
+
+    fn spec(pane_id: PaneId) -> TerminalSpecEntry {
+        TerminalSpecEntry {
+            pane_id,
+            spec: TerminalSpawnSpec {
+                cwd: Some(format!("/home/user/project/pane-{pane_id}")),
+                domain: Some("local".into()),
+                title: format!("shell-{pane_id}"),
+                label: Some(format!("label-{pane_id}")),
+                host_pane_id: Some(90 + pane_id),
+            },
+            font_scale: Some(1.25),
+        }
+    }
+
+    fn layout(tabs: Vec<PaneNode>, specs: &[PaneId]) -> WorkspaceThreadLayoutSnapshot {
+        WorkspaceThreadLayoutSnapshot {
+            active_tab: 0,
+            tabs: tabs
+                .iter()
+                .map(|tab| serde_json::to_value(tab).unwrap())
+                .collect(),
+            terminal_specs: specs.iter().map(|id| spec(*id)).collect(),
+            strict_cwd_spawns: true,
+        }
+    }
+
+    fn pairs(saved: &PaneNode, live: &PaneNode) -> Vec<(PaneId, PaneId)> {
+        let mut pairs = HashMap::new();
+        pair_panes_by_place(saved, live, &mut pairs);
+        let mut pairs: Vec<_> = pairs.into_iter().collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn panes_pair_only_where_the_shapes_match() {
+        use SplitDirection::{Horizontal, Vertical};
+        let saved = split(Horizontal, PaneNode::Leaf(entry(0)), PaneNode::Leaf(entry(1)));
+        let live = split(Horizontal, PaneNode::Leaf(entry(5)), PaneNode::Leaf(entry(6)));
+        assert_eq!(pairs(&saved, &live), [(0, 5), (1, 6)]);
+        // Another shape names no particular pane.
+        assert_eq!(pairs(&saved, &PaneNode::Leaf(entry(5))), []);
+        let turned = split(Vertical, PaneNode::Leaf(entry(5)), PaneNode::Leaf(entry(6)));
+        assert_eq!(pairs(&saved, &turned), []);
+        assert_eq!(pairs(&stack(&[0, 1]), &stack(&[5])), []);
+        // Where one side of a split still matches, that side pairs.
+        let saved = split(
+            Horizontal,
+            PaneNode::Leaf(entry(0)),
+            split(Vertical, PaneNode::Leaf(entry(1)), PaneNode::Leaf(entry(2))),
+        );
+        let live = split(Horizontal, PaneNode::Leaf(entry(7)), PaneNode::Leaf(entry(8)));
+        assert_eq!(pairs(&saved, &live), [(0, 7)]);
+    }
+
+    /// A Thread restored at startup gets new ids, which may overlap the ones
+    /// its layout names: left was 0 and right 1, now left is 1 and right 2.
+    #[test]
+    fn a_restored_layout_names_the_panes_now_in_it() {
+        let saved = vec![
+            split(
+                SplitDirection::Horizontal,
+                PaneNode::Leaf(entry(0)),
+                PaneNode::Leaf(entry(1)),
+            ),
+            stack(&[2, 3]),
+        ];
+        let mut layout = layout(saved, &[0, 1, 2, 3]);
+        let live = vec![
+            split(
+                SplitDirection::Horizontal,
+                PaneNode::Leaf(entry(1)),
+                PaneNode::Leaf(entry(2)),
+            ),
+            stack(&[3, 4]),
+        ];
+        let host_panes: HashMap<PaneId, PaneId> = [(1, 41), (2, 42)].into();
+        assert!(rekey_layout(&mut layout, &live, &host_panes));
+
+        let tabs: Vec<PaneNode> = layout
+            .tabs
+            .iter()
+            .map(|tab| serde_json::from_value(tab.clone()).unwrap())
+            .collect();
+        let ids = |tab: &PaneNode| {
+            let mut ids = vec![];
+            collect_pane_ids(tab, &mut ids);
+            ids
+        };
+        assert_eq!(ids(&tabs[0]), [1, 2]);
+        assert_eq!(ids(&tabs[1]), [3, 4]);
+        // Only the ids change: what the tree recorded of each pane stays.
+        let PaneNode::Split { left, .. } = &tabs[0] else {
+            panic!("the split is still a split");
+        };
+        let PaneNode::Leaf(left) = &**left else {
+            panic!("its left is still a pane");
+        };
+        assert_eq!(left.title, "shell-0");
+        let specs: Vec<(PaneId, Option<PaneId>, String)> = layout
+            .terminal_specs
+            .iter()
+            .map(|entry| {
+                (
+                    entry.pane_id,
+                    entry.spec.host_pane_id,
+                    entry.spec.cwd.clone().unwrap(),
+                )
+            })
+            .collect();
+        // Each keeps what it recorded -- the cwd says which pane it was --
+        // under the id now standing in its place.
+        assert_eq!(
+            specs,
+            [
+                (1, Some(41), "/home/user/project/pane-0".to_string()),
+                (2, Some(42), "/home/user/project/pane-1".to_string()),
+                (3, None, "/home/user/project/pane-2".to_string()),
+                (4, None, "/home/user/project/pane-3".to_string()),
+            ]
+        );
+        assert!(layout
+            .terminal_specs
+            .iter()
+            .all(|entry| entry.font_scale == Some(1.25) && entry.spec.label.is_some()));
+        // Already naming them: nothing to change.
+        assert!(!rekey_layout(&mut layout, &live, &host_panes));
+    }
+
+    #[test]
+    fn a_layout_this_build_cannot_read_is_left_alone() {
+        let mut layout = layout(vec![PaneNode::Leaf(entry(0))], &[0]);
+        layout.tabs[0] = serde_json::json!({"not": "a pane tree"});
+        let before = layout.clone();
+        assert!(!rekey_layout(&mut layout, &[PaneNode::Leaf(entry(5))], &HashMap::new()));
+        assert_eq!(layout, before);
     }
 }

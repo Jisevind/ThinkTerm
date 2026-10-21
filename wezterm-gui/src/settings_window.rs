@@ -1079,6 +1079,8 @@ impl SettingsSection {
                 "Window Size",
                 "Window Position",
                 "Configuration",
+                "Restore Pane Contents",
+                "Scrollback",
             ],
             Self::Web => &[
                 "Web",
@@ -1321,9 +1323,9 @@ impl SettingsSection {
                 .iter()
                 .any(|term| term.to_lowercase().contains(query))
             || (self == Self::General
-                && crate::i18n::tr("settings-language")
-                    .to_lowercase()
-                    .contains(query))
+                && ["settings-language", "settings-restore-pane-output"]
+                    .iter()
+                    .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
             || (self == Self::Appearance
                 && [
                     "settings-window-opacity",
@@ -1830,6 +1832,7 @@ enum SettingsAction {
     ToggleAgentStatusPart(AgentStatusPart),
     ToggleRemoteUpdateKeepsSessions,
     ToggleLocalSessionsViaMux,
+    ToggleRestorePaneOutput,
     StopSessionServer,
     /// The ⓘ after a label; hovering it shows the text under this i18n key.
     Hint(&'static str),
@@ -2490,6 +2493,9 @@ impl ChromeFontArea {
 
 #[derive(Debug, Clone)]
 struct SettingsUiState {
+    /// This machine's switch for keeping pane output, which lives outside
+    /// the native settings (see `mux::kept_output`); read as the window opens.
+    restore_pane_output: bool,
     import_source: ImportSource,
     import_step: ImportStep,
     import_result: Option<String>,
@@ -2619,6 +2625,7 @@ impl SettingsUiState {
     fn new(dpi: usize) -> Self {
         let tokens = UiTokens::for_dpi(dpi);
         Self {
+            restore_pane_output: mux::kept_output::enabled(),
             session_import: session_import::ImportUi::default(),
             import_source: ImportSource::initial(),
             import_step: if session_import::remembered_source().is_some() {
@@ -6102,6 +6109,27 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleRestorePaneOutput => {
+                self.ui.open_dropdown = None;
+                let enabled = !self.ui.restore_pane_output;
+                // Turning it off removes what was kept, too.
+                match mux::kept_output::set_enabled(enabled) {
+                    Ok(()) => {
+                        self.ui.restore_pane_output = enabled;
+                        self.status = crate::i18n::tr(if enabled {
+                            "settings-status-restore-pane-output-on"
+                        } else {
+                            "settings-status-restore-pane-output-off"
+                        });
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-restore-pane-output-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::ToggleMacGlassMenu => {
                 self.ui.open_dropdown = if self.ui.open_dropdown == Some(SettingsDropdown::MacGlass)
                 {
@@ -8474,6 +8502,27 @@ impl SettingsWindow {
                         SettingsAction::ToggleLocalSessionsViaMux,
                     )?;
                     let mut end = y + band;
+                    let (tx, tw) = this.paint_band_tile(
+                        layers,
+                        row_x,
+                        end,
+                        band,
+                        row_width,
+                        SvgIcon::ArchiveRestore,
+                        TileColor::Slate,
+                    )?;
+                    this.paint_toggle_setting_row_with_hint(
+                        layers,
+                        tx,
+                        end,
+                        tw,
+                        band,
+                        &crate::i18n::tr("settings-restore-pane-output"),
+                        "settings-restore-pane-output-description",
+                        this.ui.restore_pane_output,
+                        SettingsAction::ToggleRestorePaneOutput,
+                    )?;
+                    end += band;
                     if server_running {
                         let button = crate::i18n::tr(if this.ui.confirm_stop_server {
                             "settings-stop-session-server-confirm"
@@ -20343,7 +20392,13 @@ return config
         if let Ok(cwd) = std::env::current_dir() {
             command.current_dir(cwd);
         }
-        command.spawn().context("spawn replacement ThinkTerm")?;
+        // Before the replacement starts: it restores what this one keeps.
+        crate::workspace_threads::keep_pane_output();
+        if let Err(err) = command.spawn() {
+            // Still running after all: its own exit keeps what it shows then.
+            crate::workspace_threads::keep_pane_output_again();
+            return Err(err).context("spawn replacement ThinkTerm");
+        }
         if let Some(conn) = Connection::get() {
             conn.terminate_message_loop();
         }

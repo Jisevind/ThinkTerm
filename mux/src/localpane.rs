@@ -1661,6 +1661,16 @@ impl LocalPane {
         )
     }
 
+    /// The last `max` rows of the primary screen with its scrollback,
+    /// oldest first, whichever screen is showing: what the shell printed,
+    /// not a full-screen program's frame.
+    pub fn primary_screen_lines(&self, max: usize) -> Vec<Line> {
+        let term = self.terminal.lock();
+        let screen = term.screen_for_alt(false);
+        let rows = screen.scrollback_rows();
+        screen.lines_in_phys_range(rows.saturating_sub(max)..rows)
+    }
+
     pub fn new(
         pane_id: PaneId,
         mut terminal: Terminal,

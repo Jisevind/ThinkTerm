@@ -200,6 +200,15 @@ pub(crate) fn stop_server_at_exit() {
     STOP_AT_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// The system is ending the app (a logout, a shutdown). A session server
+/// that goes away now goes with it, and rebuilding its Threads into a new
+/// one would spend what it kept on terminals about to end as well.
+static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn note_app_ending() {
+    ENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub(crate) fn finish_stop_at_exit(config: &ConfigHandle) {
     if !STOP_AT_EXIT.swap(false, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -302,6 +311,9 @@ pub(crate) fn fall_back_to_in_process(mux: &Mux, why: &anyhow::Error) {
 /// adopted. An activity guard keeps the GUI from quitting while the mux
 /// is briefly empty.
 pub(crate) fn on_host_replaced(domain_id: mux::domain::DomainId) {
+    if ENDING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     promise::spawn::spawn_into_main_thread(async move {
         let _activity = mux::activity::Activity::new();
         let mux = Mux::get();

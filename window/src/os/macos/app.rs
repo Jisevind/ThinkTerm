@@ -75,6 +75,9 @@ extern "C" fn application_should_terminate(
 
 fn terminate_now() -> u64 {
     if let Some(conn) = Connection::get() {
+        // AppKit exits inside `terminate:` once this answers: the loop below
+        // is asked to stop, but `run` never returns to the code after it.
+        conn.dispatch_app_event(ApplicationEvent::WillTerminate);
         conn.terminate_message_loop();
     }
     NSApplicationTerminateReply::NSTerminateNow as u64

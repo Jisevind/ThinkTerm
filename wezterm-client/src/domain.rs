@@ -2521,6 +2521,9 @@ impl ClientDomain {
             }
             None => {}
         }
+        // A restored pane's command made only to carry the name of what it
+        // showed carries the choice now too, which the server must keep.
+        mux::kept_output::filled_in(&mut cmd);
         Some(CommandSpec::from_command_builder(&cmd))
     }
 

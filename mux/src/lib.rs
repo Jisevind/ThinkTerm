@@ -46,6 +46,7 @@ pub mod default_prog;
 pub mod domain;
 pub mod foreground_program;
 pub mod geometrytrace;
+pub mod kept_output;
 pub mod localpane;
 pub mod pane;
 mod parse_watchdog;

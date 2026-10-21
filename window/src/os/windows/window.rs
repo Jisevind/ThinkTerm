@@ -2,11 +2,11 @@ use super::*;
 use crate::connection::ConnectionOps;
 use crate::parameters::{self, Parameters};
 use crate::{
-    Appearance, Clipboard, ClipboardContents, DeadKeyStatus, Dimensions, FilePickerOptions,
-    FolderPickerOptions, Handled, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor,
-    MouseEvent, MouseEventKind, MousePress, Point, RawKeyEvent, Rect, RequestedWindowGeometry,
-    ResolvedGeometry, ScreenPoint, ScreenRect, ULength, WindowDecorations, WindowEvent,
-    WindowEventSender, WindowOps, WindowState,
+    Appearance, ApplicationEvent, Clipboard, ClipboardContents, DeadKeyStatus, Dimensions,
+    FilePickerOptions, FolderPickerOptions, Handled, KeyCode, KeyEvent, Modifiers, MouseButtons,
+    MouseCursor, MouseEvent, MouseEventKind, MousePress, Point, RawKeyEvent, Rect,
+    RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength, WindowDecorations,
+    WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
@@ -3910,6 +3910,15 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         }
         WM_DROPFILES => drop_files(hwnd, msg, wparam, lparam),
         WM_ERASEBKGND => Some(1),
+        // A logoff or shutdown: the process ends once this returns, without
+        // going back to the event loop, so what is to outlive it is written
+        // now. Each window is told; what the app keeps, it keeps once.
+        WM_ENDSESSION if wparam != 0 => {
+            if let Some(conn) = Connection::get() {
+                conn.dispatch_app_event(ApplicationEvent::WillTerminate);
+            }
+            Some(0)
+        }
         WM_CLOSE => {
             if let Some(inner) = rc_from_hwnd(hwnd) {
                 let mut inner = inner.borrow_mut();

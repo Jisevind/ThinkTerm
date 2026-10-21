@@ -735,10 +735,12 @@ impl Domain for LocalDomain {
     async fn spawn_pane(
         &self,
         size: TerminalSize,
-        command: Option<CommandBuilder>,
+        mut command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let pane_id = alloc_pane_id();
+        // A pane a restored layout spawns starts with what it showed.
+        let kept = crate::kept_output::take_seed(&mut command);
         let cmd = self
             .build_command(command, command_dir, pane_id)
             .await
@@ -773,6 +775,10 @@ impl Domain for LocalDomain {
         if self.is_conpty() {
             terminal.enable_conpty_quirks();
         }
+        // Before the reader starts, so the shell's first output lands below.
+        if let Some(kept) = &kept {
+            terminal.advance_bytes(kept.bytes(size.rows, self.is_conpty()));
+        }
         let pane_writer = terminal.writer_handle();
 
         let pane: Arc<dyn Pane> = match child_result {
@@ -806,6 +812,11 @@ impl Domain for LocalDomain {
 
         let mux = Mux::get();
         mux.add_pane(&pane)?;
+        // Kept until here: a spawn that failed on the way leaves the record
+        // for the next try.
+        if let Some(kept) = kept {
+            kept.spend();
+        }
 
         Ok(pane)
     }

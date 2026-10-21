@@ -537,6 +537,10 @@ impl GuiFrontEnd {
                 })
                 .detach();
             }
+            ApplicationEvent::WillTerminate => {
+                crate::local_sessions::note_app_ending();
+                crate::workspace_threads::keep_pane_output();
+            }
             ApplicationEvent::PerformKeyAssignment(action) => {
                 // We should only get here when there are no windows open
                 // and the user picks an action from the menubar.
@@ -1027,8 +1031,10 @@ impl GuiFrontEnd {
         mux_window_id: MuxWindowId,
         recovery_slot: FrontendRecoverySlot,
     ) {
-        // A GUI window exists again: any pending last-window cleanup is moot.
+        // A GUI window exists again: any pending last-window cleanup is moot,
+        // and the app goes on past what the last window closing kept.
         self.detach_when_windowless.set(false);
+        crate::workspace_threads::keep_pane_output_again();
         self.any_window_recorded.set(true);
         // Mark this mux window as having a GUI window so the additive reconcile
         // never re-creates a window for it (e.g. after the user closes it while

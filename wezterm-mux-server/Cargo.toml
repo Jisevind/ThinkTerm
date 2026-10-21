@@ -56,10 +56,12 @@ wezterm-term.workspace = true
 winapi = { workspace=true, features = [
     "consoleapi",
     "handleapi",
+    "libloaderapi",
     "minwinbase",
     "minwindef",
     "namedpipeapi",
     "processenv",
+    "processthreadsapi",
     "winbase",
     "winerror",
     "winnt",

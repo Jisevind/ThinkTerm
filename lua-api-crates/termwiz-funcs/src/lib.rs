@@ -276,6 +276,11 @@ pub fn lines_to_escapes(lines: Vec<Line>) -> anyhow::Result<String> {
         }
     }
     changes.push(Change::AllAttributes(CellAttributes::blank()));
+    changes_to_escapes(&changes)
+}
+
+/// `changes` as the escape sequences a terminal would be sent for them.
+pub fn changes_to_escapes(changes: &[Change]) -> anyhow::Result<String> {
     let mut renderer = new_wezterm_terminfo_renderer();
 
     struct Target {
@@ -298,6 +303,6 @@ pub fn lines_to_escapes(lines: Vec<Line>) -> anyhow::Result<String> {
     }
 
     let mut target = Target { target: vec![] };
-    renderer.render_to(&changes, &mut target)?;
+    renderer.render_to(changes, &mut target)?;
     Ok(String::from_utf8(target.target)?)
 }

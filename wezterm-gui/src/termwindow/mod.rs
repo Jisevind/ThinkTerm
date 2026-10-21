@@ -3900,6 +3900,12 @@ impl TermWindow {
 
     fn close_gui_window_now(&self, window: &Window, preserve_mux_window: bool) {
         if !preserve_mux_window {
+            // The last window going takes the app with it, and its terminals
+            // end right here: what they show is kept first.
+            if self.config.quit_when_all_windows_are_closed && front_end().gui_windows().len() <= 1
+            {
+                crate::workspace_threads::keep_pane_output();
+            }
             // Local windows retain the established destructive close behavior.
             Mux::get().kill_window(self.mux_window_id);
         }
@@ -11094,13 +11100,19 @@ impl TermWindow {
                 let con = Connection::get().expect("call on gui thread");
                 con.hide_application();
             }
-            QuitApplication => {
+            QuitApplication | QuitAndStopSessionServer => {
                 let mux = Mux::get();
                 let config = &self.config;
                 log::info!("QuitApplication over here (window)");
+                // The server is stopped after the loop ends, and only if the
+                // quit goes ahead: one called off stops nothing later.
+                let stop_server = matches!(assignment, QuitAndStopSessionServer);
 
                 match config.window_close_confirmation {
                     WindowCloseConfirmation::NeverPrompt => {
+                        if stop_server {
+                            crate::local_sessions::stop_server_at_exit();
+                        }
                         let con = Connection::get().expect("call on gui thread");
                         con.terminate_message_loop();
                     }
@@ -11112,7 +11124,7 @@ impl TermWindow {
 
                         let window = self.window.clone().unwrap();
                         let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
-                            confirm_quit_program(term, window, tab_id)
+                            confirm_quit_program(term, window, tab_id, stop_server)
                         });
                         self.assign_overlay(tab.tab_id(), overlay);
                         promise::spawn::spawn(future).detach();
@@ -11544,12 +11556,6 @@ impl TermWindow {
                 crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
             }
             FocusPluginPanel(plugin) => self.focus_plugin_panel(plugin),
-            QuitAndStopSessionServer => {
-                // The stop happens after the loop ends; the quit itself
-                // goes through the same confirmation as any quit.
-                crate::local_sessions::stop_server_at_exit();
-                return self.perform_key_assignment(pane, &QuitApplication);
-            }
             CheckForUpdates => {
                 crate::settings_window::show_update_page_from(
                     self.mux_window_id,

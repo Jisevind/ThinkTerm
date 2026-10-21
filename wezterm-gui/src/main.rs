@@ -390,6 +390,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 ) -> anyhow::Result<()> {
     let mux = Mux::get();
 
+    let named_domain = domain.is_some();
     let domain = domain.unwrap_or_else(|| mux.default_domain());
 
     // The local session host was attached before this ran and its windows
@@ -459,6 +460,26 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
         true
     });
 
+    // A Thread living in the startup workspace takes this tab as its pane
+    // rather than being rebuilt, so on a plain launch of a shell in this
+    // machine's own terminals the tab starts with what that pane showed
+    // when they last stopped, if that was kept: as a Thread rebuilt without
+    // a recorded layout does. A program asked for by name is left alone,
+    // and the record with it.
+    let kept_key = if !named_domain
+        && cmd.is_none()
+        && crate::workspace_threads::reads_kept_output(&*domain)
+    {
+        mux.get_window(window_id)
+            .map(|window| window.get_workspace().to_string())
+    } else {
+        None
+    };
+    let cmd = match &kept_key {
+        Some(key) => mux::kept_output::with_lone_seed(key, cmd),
+        None => cmd,
+    };
+
     let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
     let spawned = domain
         .spawn(
@@ -470,6 +491,9 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
         .await;
     drop(held_window);
     spawned?;
+    if let Some(key) = &kept_key {
+        mux::kept_output::finish(key);
+    }
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
     Ok(())
 }
@@ -1622,7 +1646,46 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         .detach();
     }
 
-    gui.run_forever()
+    #[cfg(unix)]
+    install_session_end_handler();
+    let outcome = gui.run_forever();
+    crate::local_sessions::finish_stop_at_exit(&config::configuration());
+    outcome
+}
+
+/// A logout or shutdown ends the session with SIGTERM. With the terminals in
+/// this process and Settings keeping their output, that is a quit like any
+/// other: the loop ends and `main` keeps what they show. Otherwise, or when
+/// the app does not get out in time, the signal does what it always did.
+#[cfg(unix)]
+fn install_session_end_handler() {
+    use signal_hook::consts::signal::SIGTERM;
+    let mut signals = match signal_hook::iterator::Signals::new([SIGTERM]) {
+        Ok(signals) => signals,
+        Err(err) => {
+            log::warn!("not watching for SIGTERM: {err:#}");
+            return;
+        }
+    };
+    std::thread::spawn(move || {
+        for signal in signals.forever() {
+            if crate::local_sessions::host_domain_name().is_none()
+                && mux::kept_output::enabled()
+            {
+                promise::spawn::spawn_into_main_thread(async {
+                    if let Some(conn) = Connection::get() {
+                        conn.terminate_message_loop();
+                    }
+                })
+                .detach();
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+            if let Err(err) = signal_hook::low_level::emulate_default_handler(signal) {
+                log::error!("ending on signal {signal}: {err:#}");
+                std::process::exit(1);
+            }
+        }
+    });
 }
 
 fn fatal_toast_notification(title: &str, message: &str) {
@@ -1689,8 +1752,13 @@ fn main() {
     notify_on_panic();
     i18n::install();
     if let Err(e) = run() {
+        // The display going away, as at a logout, ends the loop with an
+        // error: what the terminals inside showed is kept all the same.
+        crate::workspace_threads::keep_pane_output();
         terminate_with_error(e);
     }
+    // Before the terminals inside this process end with it.
+    crate::workspace_threads::keep_pane_output();
     Mux::shutdown();
     frontend::shutdown();
 }
@@ -2054,6 +2122,17 @@ fn run() -> anyhow::Result<()> {
     };
 
     env_bootstrap::bootstrap();
+    // Ended by a logoff or shutdown ahead of the session server (whose
+    // `SHUTDOWN_LEVEL` this is one above) and of the shells in this
+    // process's own terminals: what those show is kept while they are still
+    // there, and the server is not started again as it goes.
+    #[cfg(windows)]
+    if unsafe { winapi::um::processthreadsapi::SetProcessShutdownParameters(0x301, 0) } == 0 {
+        log::warn!(
+            "setting the shutdown level: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     // window_funcs is not set up by env_bootstrap as window_funcs is
     // GUI environment specific and env_bootstrap is used to setup the
     // headless mux server.
