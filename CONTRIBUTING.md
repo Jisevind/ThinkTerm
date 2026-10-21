@@ -15,11 +15,11 @@ remains under its original MIT license, preserved in
 [LICENSE-MIT](LICENSE-MIT); other third-party components are listed in
 [licenses/README.md](licenses/README.md).
 
-### Contributor agreement (version 1.0)
+### Contributor agreement (version 1.1)
 
 ThinkTerm may move to the MIT License in the future. To make that possible,
-we ask contributors to explicitly accept the following terms for each pull
-request before it is merged. A contribution means the code, documentation,
+contributions are accepted under the following terms, which you agree to by
+opening a pull request. A contribution means the code, documentation,
 or other material you intentionally submit for inclusion in that pull request,
 including your subsequent updates to it.
 
@@ -46,27 +46,25 @@ including your subsequent updates to it.
    compatibility with both the current license and a possible MIT release.
 
 This agreement does not revoke GPL rights already granted for released copies.
-It does not automatically cover earlier contributions: any missing permission
-for those must be obtained separately from the relevant copyright holders.
-Changes to this agreement do not expand an earlier grant without new consent.
+It also covers pull requests opened before 22 October 2026, when agreeing
+came with opening one: their contributors agree in the same way unless they
+object, in that pull request or in an issue. Contributions merged before that
+date are not affected: they keep the terms they came under. Beyond that, changes to this agreement
+do not expand an earlier grant without new consent.
 
 ### Recording your agreement
 
-Check the contributor-agreement box in the pull request template, or post this
-statement from your own account in the pull request:
+Opening a pull request records it: you agree to the ThinkTerm Contributor
+Agreement version 1.1 for your contributions in that pull request, including
+the permission for a future MIT release, and confirm that you are authorized
+to make these grants and have identified any third-party material. The pull
+request template says so; there is nothing to check.
 
-> I have read and agree to the ThinkTerm Contributor Agreement version 1.0 in
-> CONTRIBUTING.md for my contributions in this pull request, including the
-> permission for a future MIT release. I confirm that I am authorized to make
-> these grants and have identified any third-party material.
-
-If a pull request includes work by multiple contributors, each must provide
-their own confirmation, unless an authorized rights holder explicitly grants
-permission for all of the identified contributions. Maintainers should verify
-and retain the agreement record before merging; an unchecked box or silence
-is not confirmation. This is a manual review requirement, not an automated
-merge check. If you cannot agree, explain that in the pull request so the
-licensing issue can be resolved before merging.
+If a pull request includes work by someone else, they agree by saying so in
+the pull request from their own account, unless an authorized rights holder
+grants permission for all of the identified contributions. If you cannot
+agree, explain that in the pull request so the licensing issue can be
+resolved before merging.
 
 ## Getting set up
 
