@@ -48,11 +48,12 @@ state = "working"
 priority = 1100
 region = "osc_title"
 visible_working = true
-# One spinner frame from any tui.titleSpinner style, then a space and
-# the session label (or the end of the title when there is no label).
-# The separator for idle/attention is `>`/`!`, and a disabled title
-# uses `:`, so those three are deliberately outside the frame sets.
-regex = ['^π (?:[\x{2800}-\x{28FF}]|[○◔◑◕●]|[-\\|/])(?:\s|$)']
+# One spinner frame from any tui.titleSpinner style, or the static `:`
+# OMP shows instead under WSL, then a space and the session label (or the
+# end of the title when there is no label). The separator for
+# idle/attention is `>`/`!`, so those two are outside the frame sets; a
+# disabled title is `π:`, with no space before the colon.
+regex = ['^π (?:[\x{2800}-\x{28FF}]|[○◔◑◕●]|[-\\|/:])(?:\s|$)']
 
 [[rules]]
 id = "osc_title_idle"

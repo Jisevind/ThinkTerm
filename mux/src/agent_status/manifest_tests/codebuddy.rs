@@ -44,6 +44,24 @@ mod tests {
             .as_deref(),
             Some("codebuddy")
         );
+        // The low-memory launcher passes node flags before the script.
+        let mut lowmem = || {
+            Some(vec![
+                "node".to_string(),
+                "--optimize-for-size".to_string(),
+                "--max-semi-space-size=2".to_string(),
+                "/home/u/.npm-global/bin/codebuddy-lowmem".to_string(),
+            ])
+        };
+        assert_eq!(
+            crate::agent_status::proc_match::identify(
+                "/usr/bin/node",
+                &mut lowmem,
+                &manifest_id_for_alias
+            )
+            .as_deref(),
+            Some("codebuddy")
+        );
         assert_eq!(manifest_id_for_alias("cbc").as_deref(), Some("codebuddy"));
         assert_eq!(
             manifest_id_for_alias("codebuddy-code").as_deref(),

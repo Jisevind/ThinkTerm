@@ -68,6 +68,11 @@ mod tests {
             eval_omp("π ⠋"),
             ScreenVerdict::State(AgentState::Working)
         ));
+        // Under WSL the spinner is a static ':'.
+        assert!(matches!(
+            eval_omp("π : omp-probe"),
+            ScreenVerdict::State(AgentState::Working)
+        ));
     }
 
     #[test]

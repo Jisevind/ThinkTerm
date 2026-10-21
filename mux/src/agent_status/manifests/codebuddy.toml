@@ -21,7 +21,7 @@ id = "codebuddy"
 version = "2026.10.21.1"
 min_engine_version = 3
 updated_at = "2026-10-21T00:00:00Z"
-aliases = ["codebuddy-code", "cbc", "code-buddy"]
+aliases = ["codebuddy-code", "cbc", "code-buddy", "codebuddy-lowmem"]
 
 [[rules]]
 id = "permission_dialog"

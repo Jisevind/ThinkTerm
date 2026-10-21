@@ -157,7 +157,8 @@ directly, and it carries the same state in its OSC 0 title. The title is
 `π > …` when it is your turn, `π <spinner> …` while a turn runs, and
 `π ! …` when it is waiting on you; the spinner follows
 `tui.titleSpinner` (Braille by default, with pulse, dots, and ASCII line
-alternatives). The manifest reads all four styles.
+alternatives; under WSL it is a static `:`). The manifest reads all of
+them.
 
 The title is not just a duplicate of the report. OMP's shell tool emits
 nested OSC 133 command markers, and ThinkTerm reads the `133;A` marker as
