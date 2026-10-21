@@ -71,7 +71,9 @@ regex = ['^[\x{2800}-\x{28FF}] ']
 [[rules]]
 id = "osc_title_idle"
 state = "idle"
-priority = 1000
+# Below the screen's working rules, as in claude.toml: the thinking
+# heading and MCP startup show while this marker is still on the title.
+priority = 250
 region = "osc_title"
 visible_idle = true
 # U+2733, the marker the same updater leaves behind when the turn ends.

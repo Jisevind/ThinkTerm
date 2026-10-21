@@ -5,3 +5,4 @@
 //! instead of growing the engine's generic test module.
 
 mod codebuddy;
+mod omp;

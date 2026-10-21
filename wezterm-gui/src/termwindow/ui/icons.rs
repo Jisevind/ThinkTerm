@@ -421,7 +421,7 @@ impl SvgIcon {
             Self::Wifi => include_bytes!("../../../../third_party/lucide/icons/wifi.svg"),
             Self::X => include_bytes!("../../../../third_party/lucide/icons/x.svg"),
             Self::AgentCodeBuddy => {
-                include_bytes!("../../../../third_party/codebuddy/codebuddy.svg")
+                include_bytes!("../../../../third_party/lobe-icons/codebuddy.svg")
             }
             Self::AgentCodex => include_bytes!("../../../../third_party/lobe-icons/openai.svg"),
             Self::AgentCursor => {

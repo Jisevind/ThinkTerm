@@ -115,6 +115,11 @@ mod tests {
             eval_codebuddy(screen, ""),
             ScreenVerdict::State(AgentState::Working)
         ));
+        // The last turn's idle marker can still be on the title.
+        assert!(matches!(
+            eval_codebuddy(screen, "\u{2733} add the CodeBuddy manifest"),
+            ScreenVerdict::State(AgentState::Working)
+        ));
         assert!(matches!(
             eval_codebuddy("● earlier output\n\n∴ Thought\n", ""),
             ScreenVerdict::NoMatch

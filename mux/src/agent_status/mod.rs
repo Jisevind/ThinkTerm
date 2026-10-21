@@ -28,8 +28,6 @@ mod proc_match;
 #[cfg(test)]
 mod manifest_tests;
 mod windows_select;
-#[cfg(test)]
-mod omp_tests;
 
 use crate::pane::{Pane, PaneId};
 use crate::{Mux, MuxNotification};

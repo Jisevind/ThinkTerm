@@ -1,7 +1,7 @@
 Lobe Icons
 ==========
 
-This directory contains a vendored snapshot of eight brand mark SVGs from
+This directory contains a vendored snapshot of nine brand mark SVGs from
 the Lobe Icons project.
 
 Repository: https://github.com/lobehub/lobe-icons
@@ -15,6 +15,7 @@ exports that ThinkTerm has no use for, which is why this is a copied
 snapshot rather than a submodule.
 
     claude-color.svg    Claude Code    colored
+    codebuddy.svg       CodeBuddy Code monochrome
     copilot-color.svg   Copilot CLI    colored
     kimi-color.svg      Kimi Code      colored, dark theme only
     kimi.svg            Kimi Code      monochrome, light theme

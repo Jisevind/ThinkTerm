@@ -153,11 +153,6 @@ logo is included at third_party/herdr/logo.svg, and the full license at
 third_party/herdr/LICENSE. See third_party/herdr/README for the upstream
 commit.
 
-The CodeBuddy mark at third_party/codebuddy/codebuddy.svg is the glyph from
-the app icon published in Tencent's @tencent-ai/codebuddy-code package,
-included to identify that agent running in a pane. It remains Tencent's
-trademark; see third_party/codebuddy/README for its provenance.
-
 Brand marks and logos appearing in this product are trademarks of their
 respective owners. They are used solely to identify the corresponding
 product or service (nominative use) and imply no affiliation with or
