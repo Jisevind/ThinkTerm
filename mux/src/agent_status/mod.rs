@@ -25,6 +25,8 @@ pub mod engine;
 mod hysteresis;
 pub mod identify;
 mod proc_match;
+#[cfg(test)]
+mod manifest_tests;
 mod windows_select;
 
 use crate::pane::{Pane, PaneId};

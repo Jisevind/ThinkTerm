@@ -437,6 +437,7 @@ pub(crate) fn display_order(a: &AgentPaneStatus, b: &AgentPaneStatus) -> std::cm
 pub(crate) fn display_name(agent_id: &str) -> String {
     match agent_id {
         "claude" => "Claude Code",
+        "codebuddy" => "CodeBuddy Code",
         "codex" => "Codex",
         "copilot" => "Copilot CLI",
         "cursor" => "Cursor Agent",
@@ -490,6 +491,7 @@ pub(crate) fn brand_icon(agent_id: &str, appearance: Appearance) -> Option<Agent
         "copilot" => AgentIcon::Color(BrandIcon::AgentCopilot),
         "kimi" if dark => AgentIcon::Color(BrandIcon::AgentKimi),
         "kimi" => AgentIcon::Mono(SvgIcon::AgentKimi),
+        "codebuddy" => AgentIcon::Mono(SvgIcon::AgentCodeBuddy),
         "codex" => AgentIcon::Mono(SvgIcon::AgentCodex),
         "cursor" => AgentIcon::Mono(SvgIcon::AgentCursor),
         "opencode" => AgentIcon::Mono(SvgIcon::AgentOpenCode),
@@ -513,6 +515,11 @@ pub(crate) enum IntegrationKind {
 /// display order: (agent id, PATH probe names, coverage).
 pub(crate) const SUPPORTED_AGENTS: &[(&str, &[&str], IntegrationKind)] = &[
     ("claude", &["claude"], IntegrationKind::ScreenRules),
+    (
+        "codebuddy",
+        &["codebuddy", "codebuddy-code", "cbc"],
+        IntegrationKind::ScreenRules,
+    ),
     ("codex", &["codex"], IntegrationKind::ScreenRules),
     ("copilot", &["copilot"], IntegrationKind::ScreenRules),
     ("cursor", &["cursor-agent", "cursor"], IntegrationKind::ScreenRules),
@@ -864,7 +871,9 @@ mod tests {
     fn brand_icon_covers_the_logos_we_vendor() {
         use super::{brand_icon, AgentIcon, Appearance};
         for appearance in [Appearance::Dark, Appearance::Light] {
-            for id in ["claude", "codex", "copilot", "cursor", "kimi", "opencode", "pi"] {
+            for id in [
+                "claude", "codebuddy", "codex", "copilot", "cursor", "kimi", "opencode", "pi",
+            ] {
                 assert!(
                     brand_icon(id, appearance).is_some(),
                     "{id} should have a brand mark in {appearance:?}"
@@ -902,6 +911,7 @@ mod tests {
     #[test]
     fn display_name_falls_back_to_the_raw_id() {
         assert_eq!(display_name("claude"), "Claude Code");
+        assert_eq!(display_name("codebuddy"), "CodeBuddy Code");
         assert_eq!(display_name("myagent"), "Myagent");
         assert_eq!(display_name(""), "Agent");
     }

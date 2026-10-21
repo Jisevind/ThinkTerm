@@ -194,6 +194,7 @@ mod panel_tests {
 pub fn display_name(agent_id: &str) -> String {
     match agent_id {
         "claude" => "Claude Code".into(),
+        "codebuddy" => "CodeBuddy Code".into(),
         "codex" => "Codex".into(),
         "copilot" => "Copilot CLI".into(),
         "cursor" => "Cursor Agent".into(),
@@ -217,6 +218,7 @@ pub fn display_name(agent_id: &str) -> String {
 pub fn icon(agent_id: &str) -> &'static str {
     match agent_id {
         "claude" => "brand-claude",
+        "codebuddy" => "brand-codebuddy",
         "copilot" => "brand-copilot",
         "kimi" => "brand-kimi",
         "codex" => "brand-codex",
@@ -369,8 +371,10 @@ mod tests {
     #[test]
     fn names_and_icons_follow_the_desktop() {
         assert_eq!(display_name("claude"), "Claude Code");
+        assert_eq!(display_name("codebuddy"), "CodeBuddy Code");
         assert_eq!(display_name("gemini"), "Gemini");
         assert_eq!(icon("claude"), "brand-claude");
+        assert_eq!(icon("codebuddy"), "brand-codebuddy");
         assert_eq!(icon("codex"), "brand-codex");
         assert_eq!(icon("kimi"), "brand-kimi");
         assert_eq!(icon("gemini"), "bot");

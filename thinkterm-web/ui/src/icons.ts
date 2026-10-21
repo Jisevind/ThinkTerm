@@ -90,6 +90,7 @@ import puzzle from '../../../third_party/lucide/icons/puzzle.svg?raw';
 // own colours, the others single-colour (`fill="currentColor"`), as their
 // makers publish them.
 import brandClaude from '../../../third_party/lobe-icons/claude-color.svg?raw';
+import brandCodeBuddy from '../../../third_party/codebuddy/codebuddy.svg?raw';
 import brandCopilot from '../../../third_party/lobe-icons/copilot-color.svg?raw';
 import brandKimi from '../../../third_party/lobe-icons/kimi-color.svg?raw';
 import brandKimiMono from '../../../third_party/lobe-icons/kimi.svg?raw';
@@ -255,6 +256,7 @@ const PANEL_ICONS: Record<string, string> = {
 // one and the theme shows one of the two (tokens.css), as on the desktop.
 const AGENT_ICONS: Record<string, string> = {
   'brand-claude': brandClaude,
+  'brand-codebuddy': brandCodeBuddy,
   'brand-copilot': brandCopilot,
   'brand-kimi': `<span class="dark-only">${brandKimi}</span><span class="light-only">${brandKimiMono}</span>`,
   'brand-codex': brandCodex,

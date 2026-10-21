@@ -141,6 +141,7 @@ pub enum SvgIcon {
     // the theme for free. Agents whose logo is genuinely colored live in
     // `BrandIcon` instead; Kimi is in both, because its colored mark is
     // white and vanishes on a light background.
+    AgentCodeBuddy,
     AgentCodex,
     AgentCursor,
     AgentKimi,
@@ -419,6 +420,9 @@ impl SvgIcon {
             Self::Upload => include_bytes!("../../../../third_party/lucide/icons/upload.svg"),
             Self::Wifi => include_bytes!("../../../../third_party/lucide/icons/wifi.svg"),
             Self::X => include_bytes!("../../../../third_party/lucide/icons/x.svg"),
+            Self::AgentCodeBuddy => {
+                include_bytes!("../../../../third_party/codebuddy/codebuddy.svg")
+            }
             Self::AgentCodex => include_bytes!("../../../../third_party/lobe-icons/openai.svg"),
             Self::AgentCursor => {
                 include_bytes!("../../../../third_party/lobe-icons/cursor.svg")
@@ -945,6 +949,7 @@ mod tests {
             // The agent marks come from a different upstream than the
             // rest, sized in `em` rather than pixels: keep them covered so
             // a re-vendored file that usvg cannot size fails here.
+            SvgIcon::AgentCodeBuddy,
             SvgIcon::AgentCodex,
             SvgIcon::AgentCursor,
             SvgIcon::AgentKimi,
