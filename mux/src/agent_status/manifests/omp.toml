@@ -1,0 +1,64 @@
+# Hand-authored for ThinkTerm: Oh My PI (`omp`, npm
+# `@oh-my-pi/pi-coding-agent`), a Pi fork. Not part of herdr's set, which
+# has no manifest for this agent. It is authored here and carries this
+# repository's own license, unlike the files around it, which are
+# Apache-2.0 from herdr; see NOTICE at the repository root.
+#
+# OMP already speaks OSC 7501 (`state=working/idle/blocked:app=omp`),
+# which ThinkTerm consumes directly. It also emits nested OSC 133 command
+# markers from its shell tool; ThinkTerm reads 133;A as the pane shell's
+# prompt and retires the OSC 7501 record. The process name and the
+# state-carrying title below keep the pane identified and classified
+# through that gap.
+#
+# Signals read off a live OMP 18.12.5 session:
+#
+# - The OSC 0 title carries the run state (tui.titleState, on by default):
+#     idle:      `π > <session>`
+#     working:   `π <spinner> <session>`
+#     attention: `π ! <session>`   (permission / ask)
+#   The spinner follows tui.titleSpinner: Braille (default), pulse,
+#   dots, or ASCII line. All four sets are matched below.
+# - The launcher is `omp` (a `#!/usr/bin/env bun` shim), so a pane's
+#   foreground leader is Bun and the launcher rides in its argv.
+#
+# With tui.titleState off the title is `π: <session>`; then only OSC 7501
+# can classify, and a nested command can still blank the row. See
+# docs/agent-status.md.
+
+id = "omp"
+version = "2026.10.21.1"
+min_engine_version = 1
+updated_at = "2026-10-21T00:00:00Z"
+aliases = ["oh-my-pi"]
+
+[[rules]]
+id = "osc_title_blocked"
+state = "blocked"
+priority = 1200
+region = "osc_title"
+visible_blocker = true
+# `π ! <session>` while a permission or ask prompt waits. Above the
+# working rule in case a spinner frame is left on the title.
+regex = ['^π !(?:\s|$)']
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1100
+region = "osc_title"
+visible_working = true
+# One spinner frame from any tui.titleSpinner style, then a space and
+# the session label (or the end of the title when there is no label).
+# The separator for idle/attention is `>`/`!`, and a disabled title
+# uses `:`, so those three are deliberately outside the frame sets.
+regex = ['^π (?:[\x{2800}-\x{28FF}]|[○◔◑◕●]|[-\\|/])(?:\s|$)']
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 1000
+region = "osc_title"
+visible_idle = true
+# `π > <session>` when the agent has handed the turn back to the user.
+regex = ['^π >(?:\s|$)']

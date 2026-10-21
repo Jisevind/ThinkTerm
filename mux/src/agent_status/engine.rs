@@ -165,6 +165,10 @@ const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("manifests/pi.toml"),
     include_str!("manifests/opencode.toml"),
     include_str!("manifests/kimi.toml"),
+    // Hand-authored here rather than sourced from herdr, which carries no
+    // manifest for it; the file's header records where its signals came
+    // from.
+    include_str!("manifests/omp.toml"),
 ];
 
 static MANIFESTS: RwLock<Option<HashMap<String, CompiledManifest>>> = RwLock::new(None);

@@ -1,10 +1,10 @@
 # Agent Status Protocol
 
-ThinkTerm can track the state of coding agents (Claude Code, Codex, Pi,
-OpenCode, …) running in its panes: **working**, **blocked** (waiting for a
-user decision), or **idle**. The state feeds the thread status indicators
-in the left sidebar and the Agents panel in the right sidebar
-(Settings → Agents → *Agent Panel*, off by default).
+ThinkTerm can track the state of coding agents (Claude Code, Codex, Oh My
+PI, Pi, OpenCode, …) running in its panes: **working**, **blocked**
+(waiting for a user decision), or **idle**. The state feeds the thread
+status indicators in the left sidebar and the Agents panel in the right
+sidebar (Settings → Agents → *Agent Panel*, off by default).
 
 Detection arbitrates three signal layers, strongest contract first:
 
@@ -117,13 +117,40 @@ reports back over `thinkterm cli` — herdr's current approach — not a
 terminal sequence. (No such subcommand exists yet; `thinkterm cli agent`
 is query-only today.)
 
+## Oh My PI (OMP) integration
+
+Screen rules plus native OSC 7501 — there is nothing to install. OMP
+(`omp`, npm `@oh-my-pi/pi-coding-agent`) is a Pi fork that reports its run
+state twice: it writes the OSC 7501 root record
+(`state=working/idle/blocked:app=omp`), which ThinkTerm consumes
+directly, and it carries the same state in its OSC 0 title. The title is
+`π > …` when it is your turn, `π <spinner> …` while a turn runs, and
+`π ! …` when it is waiting on you; the spinner follows
+`tui.titleSpinner` (Braille by default, with pulse, dots, and ASCII line
+alternatives). The manifest reads all four styles.
+
+The title is not just a duplicate of the report. OMP's shell tool emits
+nested OSC 133 command markers, and ThinkTerm reads the `133;A` marker as
+the pane shell's prompt and retires the OSC 7501 record — the same thing
+it does when a real shell gets its prompt back. Without a second signal
+the row would disappear for the rest of the turn and return only when
+OMP reported idle again. The process name and the title keep the pane
+identified and classified through that gap. Keep `tui.titleState` on (the
+default); with it off the title is `π: …` and only OSC 7501 can classify.
+
+As with every process-identified agent, a bare SSH pane gets no row: the
+local pane's foreground program is `ssh`, not `omp`. Run OMP in a
+mux-domain pane — detection happens on the host that owns the pane — or
+on the machine that owns the pane.
+
 ## Screen-rule manifests
 
 Bundled manifests live in the ThinkTerm source under
 `mux/src/agent_status/manifests/` and are sourced from the
-[herdr](https://github.com/herdrdev/herdr) project (Apache-2.0). The
-format is herdr's agent-detection manifest format; a user override for an
-agent replaces the bundled file of the same id wholesale.
+[herdr](https://github.com/herdrdev/herdr) project (Apache-2.0), except
+`omp.toml`, which is authored here because herdr has no manifest for that
+agent. The format is herdr's agent-detection manifest format; a user
+override for an agent replaces the bundled file of the same id wholesale.
 
 The `osc_title` and `osc_progress` regions see only what the application
 actually emitted: both are empty until an OSC title / OSC 9;4 progress
