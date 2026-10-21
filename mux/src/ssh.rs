@@ -73,6 +73,13 @@ pub fn ssh_connect_with_ui(
     ssh_connect_with_ui_and_password(ssh_config, ui, None)
 }
 
+/// How long one wait for the server may last while connecting: for the
+/// handshake, the host key and each authentication reply. sshd drops a login
+/// that is not done in 120s (its default LoginGraceTime), so no working server
+/// is given up on sooner than it would give up itself, and push-style second
+/// factors, which can keep the server waiting for a minute, still fit.
+const SERVER_SILENCE_LIMIT: Duration = Duration::from_secs(120);
+
 /// Like [`ssh_connect_with_ui`], but auto-answers password (non-echo) auth
 /// prompts with a stored password, if any. At most twice: servers commonly
 /// issue a second prompt (e.g. `password` then `keyboard-interactive`, or a
@@ -84,6 +91,15 @@ pub fn ssh_connect_with_ui_and_password(
     ui: &mut ConnectionUI,
     password: Option<String>,
 ) -> anyhow::Result<Session> {
+    ssh_connect_with_silence_limit(ssh_config, ui, password, SERVER_SILENCE_LIMIT)
+}
+
+fn ssh_connect_with_silence_limit(
+    ssh_config: wezterm_ssh::ConfigMap,
+    ui: &mut ConnectionUI,
+    password: Option<String>,
+    silence_limit: Duration,
+) -> anyhow::Result<Session> {
     let cloned_ui = ui.clone();
     cloned_ui.run_and_log_error(move || {
         let mut password_answers_left = if password.is_some() { 2usize } else { 0 };
@@ -93,7 +109,25 @@ pub fn ssh_connect_with_ui_and_password(
         ui.output_str(&format!("Connecting to {} using SSH\n", remote_address));
         let (session, events) = Session::connect(ssh_config.clone())?;
 
-        while let Ok(event) = smol::block_on(events.recv()) {
+        loop {
+            // Each wait gets the whole limit: time spent on a prompt below is
+            // the user's, not the server's.
+            let Some(event) = smol::block_on(smol::future::or(
+                async { Some(events.recv().await) },
+                async {
+                    smol::Timer::after(silence_limit).await;
+                    None
+                },
+            )) else {
+                // A connection that went half-open mid-login never answers,
+                // and a reconnect waiting on it would never try again.
+                // Shutting the socket down wakes the backend blocked on it.
+                session.shutdown();
+                bail!("no answer from {remote_address} for {silence_limit:?} while connecting");
+            };
+            let Ok(event) = event else {
+                break;
+            };
             match event {
                 SessionEvent::Banner(banner) => {
                     if let Some(banner) = banner {
@@ -1347,5 +1381,59 @@ mod tests {
         domain.prepare_connection_attempt().unwrap();
 
         assert_eq!(domain.connection_status(), SshConnectionStatus::Connecting);
+    }
+
+    #[test]
+    fn a_server_that_stops_answering_ends_the_attempt() {
+        // Accepts and then says nothing. libssh gives up on a handshake by
+        // itself after 10s, so ending well inside that shows the limit did
+        // it: the same limit that ends a login whose answer never comes,
+        // which libssh would wait for forever.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut buf = [0u8; 256];
+            // True once the client has let go of the connection.
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(err) => {
+                        return !matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        )
+                    }
+                }
+            }
+        });
+
+        let mut ssh_config = ConfigMap::new();
+        ssh_config.insert("hostname".to_string(), "127.0.0.1".to_string());
+        ssh_config.insert("port".to_string(), port.to_string());
+        ssh_config.insert("user".to_string(), "user".to_string());
+        let mut ui = ConnectionUI::new_headless();
+
+        let started = Instant::now();
+        let err = match ssh_connect_with_silence_limit(
+            ssh_config,
+            &mut ui,
+            None,
+            Duration::from_millis(500),
+        ) {
+            Ok(_) => panic!("a server that never answers cannot have let us in"),
+            Err(err) => err,
+        };
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            format!("{:#}", err).contains("no answer from 127.0.0.1"),
+            "{:#}",
+            err
+        );
+        assert!(server.join().unwrap(), "the connection was never closed");
     }
 }
