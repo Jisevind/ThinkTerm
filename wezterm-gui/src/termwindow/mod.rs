@@ -4625,6 +4625,17 @@ impl TermWindow {
         let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
         let workspace_sidebar_width =
             ui::workspace_sidebar_width_for_metrics(&render_metrics, dpi as usize);
+        // A right sidebar that starts open, as it was left, takes its width
+        // beside the terminal rather than out of it: the shell starts at the
+        // size asked for instead of being resized as the window opens.
+        let right_sidebar_shown =
+            crate::native_settings::right_sidebar_starts_shown(&native_settings.chrome)
+                && RightSidebarMode::any_panel_enabled();
+        let right_sidebar_width = if right_sidebar_shown {
+            ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize)
+        } else {
+            0
+        };
         let padding_right = resize::effective_right_padding(&config, h_context) as usize;
         let v_context = DimensionContext {
             dpi: dpi as f32,
@@ -4637,6 +4648,7 @@ impl TermWindow {
         let mut dimensions = Dimensions {
             pixel_width: (terminal_size.pixel_width
                 + workspace_sidebar_width
+                + right_sidebar_width
                 + padding_left
                 + padding_right) as usize,
             pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
@@ -4942,7 +4954,7 @@ impl TermWindow {
             workspace_notification_snapshot: None,
             workspace_notification_pulse_started_at: None,
             right_sidebar_width: ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize),
-            right_sidebar_collapsed: true,
+            right_sidebar_collapsed: !right_sidebar_shown,
             right_sidebar_mode: RightSidebarMode::initial(),
             right_sidebar_agents_scroll: 0.0,
             right_sidebar_agents_open_subtasks: HashSet::new(),

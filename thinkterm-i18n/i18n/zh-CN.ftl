@@ -974,6 +974,8 @@ settings-about-data-folder = 数据目录
 # --- 侧栏 ------------------------------------------------------------------
 settings-section-sidebar = 侧栏与插件
 settings-sidebar-description = 选择右侧栏提供哪些面板。全部关掉，侧栏就不显示了。
+settings-remember-right-sidebar = 记住右侧栏的开关状态
+settings-remember-right-sidebar-description = 右侧栏上次开着，新窗口和下次启动时也开着。关掉这个开关，每次都收起。
 settings-sidebar-files-description = 浏览工作目录，以及通过 SFTP 浏览远程目录。
 settings-sidebar-notes-description = 与项目放在一起的 Markdown 笔记。
 settings-sidebar-snippets-description = 保存的命令和文本，可以粘贴到面板中。

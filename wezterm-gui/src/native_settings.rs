@@ -1017,6 +1017,12 @@ pub(crate) struct NativeChromeSettings {
     /// or as source; the last choice is kept.
     pub(crate) right_sidebar_markdown_preview_rendered: Option<bool>,
     pub(crate) right_sidebar_width: Option<usize>,
+    /// Whether a new window's right sidebar opens the way the last one was
+    /// left. Absent means on; off, it starts closed every time.
+    pub(crate) remember_right_sidebar: Option<bool>,
+    /// Whether the right sidebar was left open. Kept either way, so turning
+    /// `remember_right_sidebar` on starts from how it really was left.
+    pub(crate) right_sidebar_shown: Option<bool>,
     pub(crate) right_sidebar_file_preview_width: Option<usize>,
     pub(crate) right_sidebar_note_pane_width: Option<usize>,
     pub(crate) right_sidebar_note_pane_expanded: Option<bool>,
@@ -2742,6 +2748,28 @@ pub(crate) fn save_workspace_sidebar_shown(shown: bool) {
     }
 }
 
+/// Whether a new window starts with the right sidebar open: as the last one
+/// was left, while that is remembered.
+pub(crate) fn right_sidebar_starts_shown(chrome: &NativeChromeSettings) -> bool {
+    chrome.remember_right_sidebar.unwrap_or(true) && chrome.right_sidebar_shown.unwrap_or(false)
+}
+
+/// Remember whether the right sidebar is open, as
+/// [`save_workspace_sidebar_shown`] does for the left one; Settings decides
+/// whether new windows go by it. Skipped when nothing changed: dragging the
+/// edge open calls this on every pointer move. The open Settings window is
+/// brought up to it, as it saves its whole copy.
+pub(crate) fn save_right_sidebar_shown(shown: bool) {
+    if load_shared().chrome.right_sidebar_shown.unwrap_or(false) == shown {
+        return;
+    }
+    if let Err(err) = update_ui_state_and_settings_window(|settings| {
+        settings.chrome.right_sidebar_shown = Some(shown)
+    }) {
+        log::warn!("failed to save right sidebar visibility: {err:#}");
+    }
+}
+
 /// Hover-reveal of the collapsed left sidebar. On unless explicitly turned
 /// off, so `None` reads as enabled. `load_shared` rather than `load`: this is
 /// asked once per mouse event and once per frame, and `load` deep-clones.
@@ -3024,6 +3052,24 @@ pub(crate) fn main_window_renderer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_right_sidebar_starts_as_it_was_left_while_that_is_remembered() {
+        let chrome = |json: &str| -> NativeChromeSettings { serde_json::from_str(json).unwrap() };
+        // Never opened: closed.
+        assert!(!right_sidebar_starts_shown(&chrome("{}")));
+        // Remembered unless turned off: as it was left.
+        assert!(right_sidebar_starts_shown(&chrome(
+            r#"{"right_sidebar_shown":true}"#
+        )));
+        assert!(!right_sidebar_starts_shown(&chrome(
+            r#"{"right_sidebar_shown":false}"#
+        )));
+        // Not remembered: closed, however it was left.
+        assert!(!right_sidebar_starts_shown(&chrome(
+            r#"{"remember_right_sidebar":false,"right_sidebar_shown":true}"#
+        )));
+    }
 
     #[test]
     fn keymap_entries_read_the_config_file_form_and_skip_bad_ones() {

@@ -974,6 +974,8 @@ settings-about-data-folder = データフォルダ
 # --- サイドバー ------------------------------------------------------------
 settings-section-sidebar = サイドバーとプラグイン
 settings-sidebar-description = 右サイドバーに表示するパネルを選びます。すべてオフにするとサイドバー自体が消えます。
+settings-remember-right-sidebar = 右サイドバーの開閉を記憶
+settings-remember-right-sidebar-description = 右サイドバーを開いたままにしておくと、新しいウィンドウや次回の起動でも開いた状態になります。オフにすると、毎回閉じた状態で始まります。
 settings-sidebar-files-description = 作業ディレクトリと、SFTP 経由のリモートディレクトリを閲覧します。
 settings-sidebar-notes-description = プロジェクトと一緒に置く Markdown のノートです。
 settings-sidebar-snippets-description = 保存したコマンドやテキストを、ペインに貼り付けられます。

@@ -998,6 +998,8 @@ settings-about-data-folder = Dossier de données
 # --- Barre latérale --------------------------------------------------------
 settings-section-sidebar = Panneaux et extensions
 settings-sidebar-description = Choisissez les panneaux proposés par la barre latérale droite. Désactivez-les tous et elle disparaît.
+settings-remember-right-sidebar = Mémoriser la barre latérale droite
+settings-remember-right-sidebar-description = Si la barre latérale droite était ouverte, les nouvelles fenêtres et le prochain lancement l’ouvrent aussi. Désactivé, elle démarre toujours fermée.
 settings-sidebar-files-description = Parcourir le répertoire de travail, et les répertoires distants via SFTP.
 settings-sidebar-notes-description = Notes Markdown conservées avec le projet.
 settings-sidebar-snippets-description = Commandes et textes enregistrés, à coller dans un panneau.

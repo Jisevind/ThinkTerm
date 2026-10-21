@@ -1004,6 +1004,8 @@ settings-about-data-folder = Data Folder
 # --- Sidebar ---------------------------------------------------------------
 settings-section-sidebar = Sidebar & Plugins
 settings-sidebar-description = Choose which panels the right sidebar offers. Turn them all off and the sidebar goes away.
+settings-remember-right-sidebar = Remember the right sidebar
+settings-remember-right-sidebar-description = If the right sidebar was left open, new windows and the next launch open it too. Off, it always starts closed.
 settings-sidebar-files-description = Browse the working directory, and remote directories over SFTP.
 settings-sidebar-notes-description = Markdown notes kept alongside the project.
 settings-sidebar-snippets-description = Saved commands and text you can paste into a pane.

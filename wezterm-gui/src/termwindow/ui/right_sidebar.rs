@@ -2470,6 +2470,7 @@ impl crate::TermWindow {
         self.right_sidebar_hover.suppress_until_pointer_leaves();
         self.right_sidebar_hover_was_presented = false;
         self.right_sidebar_collapsed = !self.right_sidebar_collapsed;
+        crate::native_settings::save_right_sidebar_shown(!self.right_sidebar_collapsed);
         if self.right_sidebar_collapsed {
             self.right_sidebar_contents_scratch.clear();
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
@@ -2494,6 +2495,7 @@ impl crate::TermWindow {
         self.right_sidebar_hover.suppress_until_pointer_leaves();
         self.right_sidebar_hover_was_presented = false;
         self.right_sidebar_collapsed = false;
+        crate::native_settings::save_right_sidebar_shown(true);
         self.kick_right_sidebar_file_rescan_cycle();
         self.request_right_sidebar_remote_files_connect(false);
         if self.right_sidebar_mode == RightSidebarMode::Tasks {

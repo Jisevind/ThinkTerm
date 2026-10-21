@@ -1336,6 +1336,10 @@ impl SettingsSection {
                 ]
                 .iter()
                 .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
+            || (self == Self::Sidebar
+                && crate::i18n::tr("settings-remember-right-sidebar")
+                    .to_lowercase()
+                    .contains(query))
             || (self == Self::Terminal
                 && [
                     "settings-terminal-mouse-heading",
@@ -1838,6 +1842,8 @@ enum SettingsAction {
     Hint(&'static str),
     /// Turn one right-sidebar panel on or off.
     ToggleRightSidebarPanel(crate::termwindow::RightSidebarMode),
+    /// Whether new windows open the right sidebar the way it was left.
+    ToggleRememberRightSidebar,
     /// Turn a plugin on or off. Carries `plugin_key(id)`, as RevokeWebToken
     /// carries its token's: the list can change between press and release.
     TogglePlugin(u64),
@@ -6753,6 +6759,19 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleRememberRightSidebar => {
+                self.ui.open_dropdown = None;
+                let chrome = &mut self.native_settings.chrome;
+                let remember = !chrome.remember_right_sidebar.unwrap_or(true);
+                chrome.remember_right_sidebar = Some(remember);
+                // Read only as a window opens, so saved without the
+                // configuration reload a whole-copy save sets off.
+                if let Err(err) = crate::native_settings::update_ui_state(|settings| {
+                    settings.chrome.remember_right_sidebar = Some(remember)
+                }) {
+                    self.status = format!("Unable to save sidebar setting: {err:#}");
+                }
+            }
             SettingsAction::TabIconSelect(index) => {
                 if let Some(id) = self.ui.tab_icon_cards.get(index as usize).cloned() {
                     self.select_tab_icon(id);
@@ -8164,6 +8183,10 @@ impl SettingsWindow {
 
     /// The bubble for the ⓘ under the pointer, painted after everything
     /// else so it sits on top; nothing when no ⓘ is hovered.
+    /// The ⓘ's text, set as the main window's hover tags are
+    /// (`termwindow::render::hover`): regular weight, as wide as the text
+    /// needs up to a limit, in the menu card's colours with a hairline and
+    /// the soft shadow.
     fn paint_hint_overlay(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -8173,17 +8196,28 @@ impl SettingsWindow {
         let Some((key, icon_x, icon_y, icon_size)) = self.ui.hint.take() else {
             return Ok(());
         };
-        let palette = self.palette();
-        let body_font = Rc::clone(&self.body_font);
+        let mut card = self.chrome_palette.as_menu_card();
+        crate::native_settings::apply_ui_colors(&mut card, configuration().ui_colors.as_ref());
+        let font = self.fonts.command_palette_font_with_size_and_weight(
+            crate::native_settings::settings_font_size(&self.native_settings),
+            400,
+        )?;
         let text = crate::i18n::tr(key);
-        let pad = self.ui_px(12.0);
-        let bubble_width = self.ui_px(380.0).min(max_width);
-        let lines = self.wrap_settings_text(&body_font, &text, bubble_width - pad * 2.0);
-        let line_step = self.metrics.cell_size.height as f32 + self.ui_px(4.0);
-        let height = pad * 2.0 + line_step * lines.len().max(1) as f32;
+        let (pad_x, pad_y) = (self.ui_px(18.0), self.ui_px(10.0));
+        let widest = self.ui_px(560.0).min(max_width);
+        let lines = self.wrap_settings_text(&font, &text, widest - pad_x * 2.0);
+        let text_width = lines
+            .iter()
+            .map(|line| self.measure_text_width(&font, line))
+            .fold(0.0f32, f32::max);
+        let bubble_width = (text_width.ceil() + pad_x * 2.0).min(widest);
+        let line_height = self.metrics.cell_size.height as f32;
+        let spacing = self.ui_px(2.0);
+        let count = lines.len().max(1) as f32;
+        let height = pad_y * 2.0 + line_height * count + spacing * (count - 1.0);
         // Left-aligned with the icon and above it; below when the top of
         // the content is too close.
-        let bubble_x = (icon_x - pad)
+        let bubble_x = (icon_x - pad_x)
             .min(content_x + max_width - bubble_width)
             .max(content_x);
         let gap = self.ui_px(8.0);
@@ -8192,27 +8226,33 @@ impl SettingsWindow {
         } else {
             icon_y + icon_size + gap
         };
-        self.draw_rounded_frame(
+        let ctx = crate::ui::draw::DrawContext::new(
+            self.render_state
+                .as_ref()
+                .context("settings render state")?,
+            self.dimensions,
+            &self.metrics,
+        );
+        let shadow = if card.is_dark() { 0.58 } else { 0.43 };
+        ctx.draw_elevated_surface(
             layers,
             2,
-            bubble_x,
-            bubble_y,
-            bubble_width,
-            height,
-            palette.control_bg,
-            palette.control_border,
-            self.ui_px(10.0),
+            euclid::rect(bubble_x, bubble_y, bubble_width, height),
+            card.control_bg,
+            card.control_border,
+            LinearRgba::with_components(0.0, 0.0, 0.0, shadow),
+            self.ui_px(16.0),
         )?;
         for (index, line) in lines.iter().enumerate() {
             self.draw_text_on_layer(
                 layers,
                 2,
-                &body_font,
-                bubble_x + pad,
-                bubble_y + pad + line_step * index as f32,
+                &font,
+                bubble_x + pad_x,
+                bubble_y + pad_y + (line_height + spacing) * index as f32,
                 line,
-                palette.text,
-                bubble_width - pad * 2.0,
+                card.text,
+                bubble_width - pad_x * 2.0,
             )?;
         }
         Ok(())
@@ -15488,7 +15528,45 @@ impl SettingsWindow {
             palette.secondary_text,
             max_width,
         )?;
-        let (grid_y, _) = self.settings_card_geometry(section_y, 0);
+        let (card_y, _) = self.settings_card_geometry(section_y, 0);
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        // The band carries its own air, so the card adds little.
+        let layout = CardLayout {
+            top: self.ui_px(12.0),
+            bottom: self.ui_px(12.0),
+            ..self.card_layout()
+        };
+        let card_bottom =
+            self.paint_card_as(layers, x, card_y, max_width, layout, |this, layers, top| {
+                let band = this.compact_row_step();
+                let (tx, tw) = this.paint_band_tile(
+                    layers,
+                    row_x,
+                    top,
+                    band,
+                    row_width,
+                    SvgIcon::PanelRightOpen,
+                    TileColor::Blue,
+                )?;
+                this.paint_toggle_setting_row_with_hint(
+                    layers,
+                    tx,
+                    top,
+                    tw,
+                    band,
+                    &crate::i18n::tr("settings-remember-right-sidebar"),
+                    "settings-remember-right-sidebar-description",
+                    this.native_settings
+                        .chrome
+                        .remember_right_sidebar
+                        .unwrap_or(true),
+                    SettingsAction::ToggleRememberRightSidebar,
+                )?;
+                Ok(top + band)
+            })?;
+        let grid_y = card_bottom + self.settings_section_card_gap();
         let grid_bottom = self.paint_panel_cards(layers, x, grid_y, max_width)?;
         // The plugins below the panels: whatever a plugin shows, it shows in
         // the sidebar.

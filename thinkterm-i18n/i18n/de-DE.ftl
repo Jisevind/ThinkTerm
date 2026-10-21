@@ -1004,6 +1004,8 @@ settings-about-data-folder = Datenordner
 # --- Seitenleiste ----------------------------------------------------------
 settings-section-sidebar = Seitenleiste & Plugins
 settings-sidebar-description = Wählen Sie aus, welche Panels die rechte Seitenleiste anbietet. Schalten Sie alle aus, verschwindet die Seitenleiste.
+settings-remember-right-sidebar = Rechte Seitenleiste merken
+settings-remember-right-sidebar-description = War die rechte Seitenleiste zuletzt offen, öffnen neue Fenster und der nächste Start sie ebenfalls. Ausgeschaltet beginnt sie immer geschlossen.
 settings-sidebar-files-description = Durchsuchen Sie das Arbeitsverzeichnis und Remote-Verzeichnisse über SFTP.
 settings-sidebar-notes-description = Markdown-Notizen, die beim Projekt liegen.
 settings-sidebar-snippets-description = Gespeicherte Befehle und Texte, die Sie in ein Pane einfügen können.
