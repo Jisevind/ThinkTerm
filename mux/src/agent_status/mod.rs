@@ -28,6 +28,8 @@ mod proc_match;
 #[cfg(test)]
 mod manifest_tests;
 mod windows_select;
+#[cfg(test)]
+mod omp_tests;
 
 use crate::pane::{Pane, PaneId};
 use crate::{Mux, MuxNotification};
@@ -1737,6 +1739,35 @@ mod tests {
         evaluate_pane(pane.as_ref());
         assert!(status_for_pane(pane.id).is_none());
         evict_pane(pane.id);
+    }
+
+    /// OMP's shell tool emits nested OSC 133 command markers. The terminal
+    /// retires the OSC 7501 record at the `133;A` prompt, just as it does
+    /// when a real shell gets its prompt back. OMP's process and its
+    /// state-carrying title still identify and classify the pane.
+    #[test]
+    fn omp_title_survives_its_report_being_retired_by_a_nested_prompt() {
+        let pane = FakeAgentPane::new(Some("/home/u/.bun/bin/bun"));
+        pane.set_argv(&["bun", "/home/u/.bun/bin/omp", "--no-session"]);
+        pane.set_foreground(9301, false);
+        pane.set_osc_title("π ⠋ omp-probe");
+        pane.report(ProgramState::Working, Some("omp"), |_| {});
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+        let status = status_for_pane(pane.pane_id()).expect("omp reports");
+        assert_eq!(status.agent_id, "omp");
+        assert_eq!(status.state, AgentState::Working);
+        assert_eq!(status.evidence, AgentEvidence::Report);
+
+        // The tool's shell prompt retires the report. The process and the
+        // title rules have to carry the pane from here.
+        pane.program.lock().end_of_program();
+        pane.set_osc_title("π ⠋ omp-probe");
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("omp still identified");
+        assert_eq!(status.agent_id, "omp");
+        assert_eq!(status.state, AgentState::Working);
+        assert_eq!(status.evidence, AgentEvidence::Screen);
+        evict_pane(pane.pane_id());
     }
 
     #[test]

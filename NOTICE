@@ -26,10 +26,11 @@ included at mux/src/agent_status/manifests/LICENSE. Each bundled file
 carries an attribution header naming the upstream commit it was taken
 from.
 
-One manifest, mux/src/agent_status/manifests/codebuddy.toml, is not from
-herdr: it was authored by ThinkTerm's contributors and is distributed
-under this repository's own license. Its header records that, and where
-each of its detection signals came from.
+Two manifests, mux/src/agent_status/manifests/codebuddy.toml and
+mux/src/agent_status/manifests/omp.toml, are not from herdr: they were
+authored by ThinkTerm's contributors and are distributed under this
+repository's own license. Each one's header records that, and where each
+of its detection signals came from.
 
 ---
 

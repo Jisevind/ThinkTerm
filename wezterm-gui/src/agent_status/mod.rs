@@ -526,7 +526,7 @@ pub(crate) const SUPPORTED_AGENTS: &[(&str, &[&str], IntegrationKind)] = &[
     ("pi", &["pi"], IntegrationKind::ScreenRules),
     ("opencode", &["opencode"], IntegrationKind::ScreenRules),
     ("kimi", &["kimi"], IntegrationKind::ScreenRules),
-    ("omp", &["omp"], IntegrationKind::Pending),
+    ("omp", &["omp"], IntegrationKind::ScreenRules),
     ("soul", &["soul"], IntegrationKind::Native),
 ];
 
