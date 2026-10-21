@@ -49,7 +49,6 @@ use crate::native_settings::{
 };
 use fluent_bundle::FluentArgs;
 
-#[cfg(unix)]
 mod session_import;
 mod editor_import;
 mod import;
@@ -976,7 +975,6 @@ fn initial_section() -> SettingsSection {
         "backup" => SettingsSection::Backup,
         "update" => SettingsSection::Update,
         "about" => SettingsSection::About,
-        #[cfg(unix)]
         id if thinkterm_import::source(id).is_ok() => SettingsSection::Import,
         _ => SettingsSection::Appearance,
     };
@@ -1808,19 +1806,12 @@ enum SettingsAction {
     ImportContinue,
     ImportBack,
     ImportStartOver,
-    #[cfg(unix)]
     SessionImportDetect,
-    #[cfg(unix)]
     SessionImportPreview(u64),
-    #[cfg(unix)]
     SessionImportHost(u64),
-    #[cfg(unix)]
     SessionImportBack,
-    #[cfg(unix)]
     SessionImportConfirm,
-    #[cfg(unix)]
     SessionImportRecover,
-    #[cfg(unix)]
     SessionImportOpen,
     WindowHide,
     WindowMaximize,
@@ -2502,7 +2493,6 @@ struct SettingsUiState {
     import_source: ImportSource,
     import_step: ImportStep,
     import_result: Option<String>,
-    #[cfg(unix)]
     session_import: session_import::ImportUi,
     tokens: UiTokens,
     sidebar: ResizablePaneState,
@@ -2629,20 +2619,12 @@ impl SettingsUiState {
     fn new(dpi: usize) -> Self {
         let tokens = UiTokens::for_dpi(dpi);
         Self {
-            #[cfg(unix)]
             session_import: session_import::ImportUi::default(),
             import_source: ImportSource::initial(),
-            import_step: {
-                #[cfg(unix)]
-                if session_import::remembered_source().is_some() {
-                    ImportStep::Review
-                } else {
-                    ImportStep::Source
-                }
-                #[cfg(not(unix))]
-                {
-                    ImportStep::Source
-                }
+            import_step: if session_import::remembered_source().is_some() {
+                ImportStep::Review
+            } else {
+                ImportStep::Source
             },
             import_result: None,
             sidebar: ResizablePaneState::new(
@@ -3426,7 +3408,6 @@ fn remember_origin(mux_window_id: MuxWindowId, space_id: &str) {
     OPENED_FROM.with(|slot| slot.set(Some(mux_window_id)));
     let changed = OPENED_FROM_SPACE
         .with(|slot| slot.replace(Some(space_id.to_string())).as_deref() != Some(space_id));
-    #[cfg(unix)]
     if changed {
         SETTINGS_WINDOW.with(|slot| {
             if let SettingsWindowSlot::Open { settings, .. } = &*slot.borrow() {
@@ -3439,8 +3420,6 @@ fn remember_origin(mux_window_id: MuxWindowId, space_id: &str) {
             }
         });
     }
-    #[cfg(not(unix))]
-    let _ = changed;
 }
 
 pub fn show() {
@@ -5878,7 +5857,6 @@ impl SettingsWindow {
         match action {
             SettingsAction::SelectImportSource(source) => {
                 if self.import_busy() { return; }
-                #[cfg(unix)]
                 if self.ui.import_source != source {
                     self.ui.session_import.abandon();
                     self.ui.session_import = session_import::ImportUi::default();
@@ -5890,7 +5868,6 @@ impl SettingsWindow {
             SettingsAction::ImportContinue
             | SettingsAction::ImportBack
             | SettingsAction::ImportStartOver => self.perform_import_navigation(action, window),
-            #[cfg(unix)]
             SettingsAction::SessionImportDetect
             | SettingsAction::SessionImportPreview(_)
             | SettingsAction::SessionImportHost(_)

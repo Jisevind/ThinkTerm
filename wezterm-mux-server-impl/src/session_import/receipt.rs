@@ -3,6 +3,7 @@ use codec::{ImportSessionRequest, ImportSessionResponse, ImportSessionStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -84,13 +85,12 @@ impl Store {
             .parent()
             .context("Import receipt directory is missing")?;
         std::fs::create_dir_all(parent)?;
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .open(self.path.with_extension("lock"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let lock = options.open(self.path.with_extension("lock"))?;
+        lock.lock()?;
         let mut records = match std::fs::File::open(&self.path) {
             Ok(file) => {
                 let mut bytes = Vec::new();
@@ -118,6 +118,8 @@ impl Store {
             file.write_all(&bytes)?;
             file.as_file().sync_all()?;
             file.persist(&self.path)?;
+            // Windows cannot open a directory as a file to sync it.
+            #[cfg(unix)]
             std::fs::File::open(parent)?.sync_all()?;
         }
         Ok(result)

@@ -1302,6 +1302,7 @@ settings-import-reload = 読み直す
 session-import-requirements-local = 同じユーザーのローカルセッションと、アクセス可能なセッションディレクトリが必要です。
 herdr-requirements-live = ライブ移行には Herdr の live_handoff 対応と、一時ファイル、ソケット、ThinkTerm 実行ファイルへの双方からのアクセスが必要です。
 herdr-requirements-linux = Linux の /tmp ではスクリプト実行が必要です（noexec は不可）。
+herdr-windows-layout-only = Windows の Herdr は実行中のセッションを引き継げないため、Herdr が保存したレイアウト（タブ、分割、ディレクトリ）だけを取り込み、それぞれ新しいシェルで開きます。Herdr は開いたままで構いません。その中で実行中のセッションには影響しません。
 session-import-requirements-layout = 停止中の保存済みレイアウトにはライブ引き継ぎは不要です。作業ディレクトリが存在し、ThinkTerm が形式に対応している必要があります。
 session-import-requirements-refresh = セッション構造やレイアウトが変わったら、プレビューを更新してください。
 session-import-refresh-preview = プレビューを更新

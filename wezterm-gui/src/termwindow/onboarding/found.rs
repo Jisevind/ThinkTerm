@@ -11,9 +11,7 @@
 use crate::termwindow::ui::icons::BrandIcon;
 use std::sync::{Arc, Mutex};
 
-/// One program whose sessions Settings can import. Session import is
-/// Unix-only, so elsewhere there are none.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// One program whose sessions Settings can import.
 pub(super) struct FoundSessions {
     /// The import source's id, which the Import page is opened on.
     pub id: &'static str,
@@ -132,7 +130,6 @@ fn editors() -> Option<FoundEditors> {
     })
 }
 
-#[cfg(unix)]
 fn sessions() -> Vec<FoundSessions> {
     let Ok(context) = wezterm_mux_server_impl::session_import::context() else {
         return Vec::new();
@@ -182,17 +179,11 @@ fn sessions() -> Vec<FoundSessions> {
 /// How many of `names` `live` says are running. A source that panics on one
 /// (a malformed session, say) still gets an answer, none running, so the
 /// page stops polling for it.
-#[cfg(unix)]
 fn count_running(names: &[String], live: impl Fn(&str) -> bool) -> usize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         names.iter().filter(|name| live(name)).count()
     }))
     .unwrap_or(0)
-}
-
-#[cfg(not(unix))]
-fn sessions() -> Vec<FoundSessions> {
-    Vec::new()
 }
 
 #[cfg(test)]
@@ -208,7 +199,7 @@ impl FoundSessions {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

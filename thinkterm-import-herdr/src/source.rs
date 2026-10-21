@@ -1,14 +1,19 @@
 use super::model::{Layout, Snapshot, Tab};
-use anyhow::{bail, ensure, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
-use rustix::net::RecvFlags;
-use std::io::{Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::net::UnixStream;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+#[cfg(unix)]
+use {
+    anyhow::bail,
+    rustix::net::RecvFlags,
+    serde_json::{json, Value},
+    std::io::Write,
+    std::os::unix::fs::{FileTypeExt, MetadataExt},
+    std::os::unix::net::UnixStream,
+    std::time::Duration,
+};
 
 pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 
@@ -20,8 +25,34 @@ pub fn config_root(context: &ImportContext) -> Result<PathBuf> {
         .config_home
         .clone()
         .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| context.home.join(".config"));
+        .unwrap_or_else(|| default_config_home(context));
     Ok(config.join("herdr"))
+}
+
+#[cfg(unix)]
+fn default_config_home(context: &ImportContext) -> PathBuf {
+    context.home.join(".config")
+}
+
+/// Herdr's Windows build keeps its folder under %APPDATA%.
+#[cfg(windows)]
+fn default_config_home(context: &ImportContext) -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| context.home.join("AppData").join("Roaming"))
+}
+
+#[cfg(unix)]
+fn owned(metadata: &fs::Metadata) -> bool {
+    metadata.uid() == rustix::process::geteuid().as_raw()
+}
+
+/// Windows has no uid to compare. Herdr's folder there is in this user's
+/// own profile, which other users cannot write to.
+#[cfg(windows)]
+fn owned(_: &fs::Metadata) -> bool {
+    true
 }
 
 pub fn session_dir(context: &ImportContext, name: &str) -> Result<PathBuf> {
@@ -30,6 +61,7 @@ pub fn session_dir(context: &ImportContext, name: &str) -> Result<PathBuf> {
             && name.len() <= 128
             && !name.contains('/')
             && !name.contains('\\')
+            && !name.contains(':')
             && name != "."
             && name != ".."
             && !name.chars().any(char::is_control),
@@ -47,16 +79,22 @@ pub fn session_dir(context: &ImportContext, name: &str) -> Result<PathBuf> {
         "Herdr session must be a directory"
     );
     ensure!(
-        metadata.uid() == rustix::process::geteuid().as_raw(),
+        owned(&metadata),
         "Herdr session belongs to a different user"
     );
     Ok(path)
 }
 
+/// A saved layout, or on unix a running server to hand its terminals
+/// over. Windows imports the saved layout alone.
+fn importable(dir: &Path) -> bool {
+    dir.join("session.json").exists() || (cfg!(unix) && dir.join("herdr.sock").exists())
+}
+
 pub fn discover(context: &ImportContext) -> Result<Vec<Session>> {
     let root = config_root(context)?;
     let mut sessions = Vec::new();
-    if root.join("session.json").exists() || root.join("herdr.sock").exists() {
+    if importable(&root) {
         sessions.push(Session {
             name: "default".into(),
         });
@@ -65,10 +103,7 @@ pub fn discover(context: &ImportContext) -> Result<Vec<Session>> {
         Ok(entries) => {
             for entry in entries.take(256) {
                 let entry = entry?;
-                if entry.file_type()?.is_dir()
-                    && (entry.path().join("session.json").exists()
-                        || entry.path().join("herdr.sock").exists())
-                {
+                if entry.file_type()?.is_dir() && importable(&entry.path()) {
                     if let Some(name) = entry.file_name().to_str() {
                         if session_dir(context, name).is_ok() {
                             sessions.push(Session { name: name.into() });
@@ -84,6 +119,7 @@ pub fn discover(context: &ImportContext) -> Result<Vec<Session>> {
     Ok(sessions)
 }
 
+#[cfg(unix)]
 pub fn read_line(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut byte = [0];
@@ -100,6 +136,7 @@ pub fn read_line(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>> {
 /// `read_line` for replies that can run to megabytes: a chunk at a time
 /// instead of a read per byte. It peeks first and consumes only through the
 /// newline, so whatever follows (descriptors on a handoff) stays queued.
+#[cfg(unix)]
 pub fn read_large_line(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>> {
     let mut line = Vec::new();
     let mut chunk = vec![0; limit.saturating_add(1).min(64 * 1024)];
@@ -125,6 +162,7 @@ pub fn read_large_line(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>>
     }
 }
 
+#[cfg(unix)]
 fn connect(path: &Path, timeout: Duration) -> Result<UnixStream> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
@@ -137,6 +175,7 @@ fn connect(path: &Path, timeout: Duration) -> Result<UnixStream> {
     Ok(stream)
 }
 
+#[cfg(unix)]
 pub fn request(dir: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value> {
     let mut stream = connect(&dir.join("herdr.sock"), timeout)?;
     serde_json::to_writer(
@@ -164,9 +203,7 @@ pub fn saved_snapshot(dir: &Path) -> Result<(Snapshot, String)> {
     let path = dir.join("session.json");
     let metadata = fs::symlink_metadata(&path)?;
     ensure!(
-        metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == rustix::process::geteuid().as_raw(),
+        metadata.is_file() && !metadata.file_type().is_symlink() && owned(&metadata),
         "Invalid Herdr snapshot owner or type"
     );
     let mut bytes = Vec::new();
@@ -178,6 +215,7 @@ pub fn saved_snapshot(dir: &Path) -> Result<(Snapshot, String)> {
     Ok((Snapshot::parse(&bytes)?, fingerprint))
 }
 
+#[cfg(unix)]
 pub(super) fn live_fingerprint(mut identity: Value) -> Result<String> {
     // GUI and mux builds may enable different serde_json map ordering.
     identity.sort_all_objects();
@@ -201,6 +239,7 @@ fn preview_text(text: &str, limit: usize) -> Option<String> {
     (!result.is_empty()).then_some(result)
 }
 
+#[cfg(unix)]
 pub(super) fn live_projects(
     workspaces: &[Value],
     tabs: &[Value],
@@ -291,9 +330,33 @@ pub(super) fn saved_projects(snapshot: &Snapshot) -> Vec<PreviewProject> {
 
 pub fn preview(context: &ImportContext, name: &str) -> Result<Preview> {
     let dir = session_dir(context, name)?;
-    let ping = request(&dir, "ping", json!({}), Duration::from_secs(3));
+    // Herdr's Windows server cannot hand its terminals over. Windows reads
+    // the layout it saves a few seconds after each change, running or not.
+    #[cfg(unix)]
+    if let Some(preview) = live_preview(&dir, name)? {
+        return Ok(preview);
+    }
+    let (snapshot, fingerprint) = saved_snapshot(&dir)?;
+    let unavailable = snapshot
+        .check_working_directories()
+        .err()
+        .map(|error| error.to_string());
+    Ok(Preview {
+        session: name.into(),
+        live: false,
+        version: None,
+        fingerprint,
+        projects: saved_projects(&snapshot),
+        unavailable,
+    })
+}
+
+/// The session as a running server reports it, or `None` when none answers.
+#[cfg(unix)]
+fn live_preview(dir: &Path, name: &str) -> Result<Option<Preview>> {
+    let ping = request(dir, "ping", json!({}), Duration::from_secs(3));
     let ping = match ping {
-        Ok(ping) => Some(ping),
+        Ok(ping) => ping,
         Err(error)
             if error
                 .chain()
@@ -305,62 +368,46 @@ pub fn preview(context: &ImportContext, name: &str) -> Result<Preview> {
                     )
                 }) =>
         {
-            None
+            return Ok(None)
         }
         Err(error) => return Err(error.context("Cannot inspect Herdr; no session was changed")),
     };
-    if let Some(ping) = ping {
-        let result = request(&dir, "session.snapshot", json!({}), Duration::from_secs(5))?;
-        let snapshot = result
-            .get("snapshot")
-            .context("Herdr did not return its session structure")?;
-        let workspaces = snapshot["workspaces"]
-            .as_array()
-            .context("Missing Herdr workspaces")?;
-        let tabs = snapshot["tabs"].as_array().context("Missing Herdr tabs")?;
-        let panes = snapshot["panes"]
-            .as_array()
-            .context("Missing Herdr panes")?;
-        ensure!(
-            panes.len() <= super::model::MAX_PANES,
-            "Herdr session has too many panes"
-        );
-        let identity = json!({
-            "workspaces": workspaces.iter().map(|w| json!([w["workspace_id"], w["label"]])).collect::<Vec<_>>(),
-            "tabs": tabs.iter().map(|t| json!([t["tab_id"], t["workspace_id"], t["label"]])).collect::<Vec<_>>(),
-            "panes": panes.iter().map(|p| json!([p["pane_id"], p["terminal_id"], p["tab_id"]])).collect::<Vec<_>>()
-        });
-        let projects = live_projects(workspaces, tabs, panes);
-        let available = ping["capabilities"]["live_handoff"]
-            .as_bool()
-            .unwrap_or(false);
-        Ok(Preview {
-            session: name.into(),
-            live: true,
-            version: ping["version"].as_str().map(str::to_string),
-            fingerprint: live_fingerprint(identity)?,
-            projects,
-            unavailable: if panes.is_empty() {
-                Some("Herdr session is empty".into())
-            } else if !available {
-                Some("This running Herdr server does not support live handoff".into())
-            } else {
-                None
-            },
-        })
-    } else {
-        let (snapshot, fingerprint) = saved_snapshot(&dir)?;
-        let unavailable = snapshot
-            .check_working_directories()
-            .err()
-            .map(|error| error.to_string());
-        Ok(Preview {
-            session: name.into(),
-            live: false,
-            version: None,
-            fingerprint,
-            projects: saved_projects(&snapshot),
-            unavailable,
-        })
-    }
+    let result = request(dir, "session.snapshot", json!({}), Duration::from_secs(5))?;
+    let snapshot = result
+        .get("snapshot")
+        .context("Herdr did not return its session structure")?;
+    let workspaces = snapshot["workspaces"]
+        .as_array()
+        .context("Missing Herdr workspaces")?;
+    let tabs = snapshot["tabs"].as_array().context("Missing Herdr tabs")?;
+    let panes = snapshot["panes"]
+        .as_array()
+        .context("Missing Herdr panes")?;
+    ensure!(
+        panes.len() <= super::model::MAX_PANES,
+        "Herdr session has too many panes"
+    );
+    let identity = json!({
+        "workspaces": workspaces.iter().map(|w| json!([w["workspace_id"], w["label"]])).collect::<Vec<_>>(),
+        "tabs": tabs.iter().map(|t| json!([t["tab_id"], t["workspace_id"], t["label"]])).collect::<Vec<_>>(),
+        "panes": panes.iter().map(|p| json!([p["pane_id"], p["terminal_id"], p["tab_id"]])).collect::<Vec<_>>()
+    });
+    let projects = live_projects(workspaces, tabs, panes);
+    let available = ping["capabilities"]["live_handoff"]
+        .as_bool()
+        .unwrap_or(false);
+    Ok(Some(Preview {
+        session: name.into(),
+        live: true,
+        version: ping["version"].as_str().map(str::to_string),
+        fingerprint: live_fingerprint(identity)?,
+        projects,
+        unavailable: if panes.is_empty() {
+            Some("Herdr session is empty".into())
+        } else if !available {
+            Some("This running Herdr server does not support live handoff".into())
+        } else {
+            None
+        },
+    }))
 }

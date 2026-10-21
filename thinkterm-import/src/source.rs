@@ -1,7 +1,6 @@
 use crate::{ImportMode, ImportPlan, ImportRequest, PaneId, Preview, Session, MAX_PANES};
 use anyhow::{ensure, Context, Result};
 use std::collections::HashSet;
-use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -32,10 +31,17 @@ pub struct TerminalSeed {
     pub ansi: String,
 }
 
+/// The terminal a live handoff passes over. No Windows source hands one over
+/// yet, so there it only keeps the plan's shape.
+#[cfg(unix)]
+pub type Pty = std::os::fd::OwnedFd;
+#[cfg(windows)]
+pub type Pty = std::os::windows::io::OwnedHandle;
+
 pub struct LiveTerminal {
     pub pane_id: PaneId,
     pub seed: TerminalSeed,
-    pub pty: OwnedFd,
+    pub pty: Pty,
 }
 
 /// The adapter keeps its source paused until the owner has prepared every

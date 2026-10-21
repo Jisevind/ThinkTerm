@@ -12,7 +12,6 @@ pub(super) enum ImportSource {
     WezTerm,
     /// The folders VS Code and the editors built from it have opened.
     Editors,
-    #[cfg(unix)]
     Session(&'static str),
 }
 
@@ -25,7 +24,6 @@ impl ImportSource {
         if !crate::editor_projects::installed().is_empty() {
             sources.push(Self::Editors);
         }
-        #[cfg(unix)]
         sources.extend(
             thinkterm_import::sources()
                 .into_iter()
@@ -40,18 +38,14 @@ impl ImportSource {
         match id {
             None => Some(Self::WezTerm),
             Some(EDITORS_SOURCE) => Some(Self::Editors),
-            #[cfg(unix)]
             Some(id) => thinkterm_import::sources()
                 .into_iter()
                 .find(|source| source.id == id)
                 .map(|source| Self::Session(source.id)),
-            #[cfg(not(unix))]
-            Some(_) => None,
         }
     }
 
     pub(super) fn initial() -> Self {
-        #[cfg(unix)]
         if let Some(source) = session_import::remembered_source() {
             return source;
         }
@@ -59,7 +53,6 @@ impl ImportSource {
         if selected.as_deref() == Some(EDITORS_SOURCE) {
             return Self::Editors;
         }
-        #[cfg(unix)]
         if let Some(selected) = selected {
             if let Some(source) = thinkterm_import::sources()
                 .into_iter()
@@ -76,7 +69,6 @@ impl ImportSource {
     fn is_beta(self) -> bool {
         match self {
             Self::WezTerm | Self::Editors => false,
-            #[cfg(unix)]
             Self::Session(_) => true,
         }
     }
@@ -85,7 +77,6 @@ impl ImportSource {
         match self {
             Self::WezTerm => "WezTerm".to_string(),
             Self::Editors => crate::i18n::tr("settings-import-editors"),
-            #[cfg(unix)]
             Self::Session(id) => thinkterm_import::source(id)
                 .map(|s| s.info().name)
                 .unwrap_or(id)
@@ -97,7 +88,6 @@ impl ImportSource {
         crate::i18n::tr(match self {
             Self::WezTerm => "settings-import-wezterm-description",
             Self::Editors => "settings-import-editors-description",
-            #[cfg(unix)]
             Self::Session(_) => "settings-import-session-description",
         })
     }
@@ -107,14 +97,12 @@ impl ImportSource {
             Self::WezTerm => Some(BrandIcon::WezTerm),
             // Drawn as its editors' marks, see `paint_editor_stack`.
             Self::Editors => None,
-            #[cfg(unix)]
             Self::Session(id) => {
                 BrandIcon::for_import_source(thinkterm_import::source(id).ok()?.info().icon)
             }
         }
     }
 
-    #[cfg(unix)]
     pub(super) fn provider(self) -> anyhow::Result<&'static dyn thinkterm_import::ImportSource> {
         match self {
             Self::Session(id) => thinkterm_import::source(id),
@@ -155,7 +143,6 @@ struct ImportSourceLayout {
 
 impl SettingsWindow {
     pub(super) fn import_busy(&self) -> bool {
-        #[cfg(unix)]
         if matches!(self.ui.import_source, ImportSource::Session(_)) {
             return self.ui.session_import.busy();
         }
@@ -190,14 +177,12 @@ impl SettingsWindow {
                         let space = OPENED_FROM_SPACE.with(|slot| slot.borrow().clone());
                         self.start_editor_import(space);
                     }
-                    #[cfg(unix)]
                     ImportSource::Session(_) => {
                         self.perform_session_import_action(SettingsAction::SessionImportDetect)
                     }
                 }
             }
             SettingsAction::ImportBack => {
-                #[cfg(unix)]
                 if matches!(self.ui.import_source, ImportSource::Session(_))
                     && self.ui.session_import.has_preview()
                 {
@@ -211,11 +196,8 @@ impl SettingsWindow {
                 self.ui.import_step = ImportStep::Source;
                 self.ui.import_result = None;
                 self.ui.editor_import.release();
-                #[cfg(unix)]
-                {
-                    self.ui.session_import.abandon();
-                    self.ui.session_import = session_import::ImportUi::default();
-                }
+                self.ui.session_import.abandon();
+                self.ui.session_import = session_import::ImportUi::default();
             }
             _ => {}
         }
@@ -276,7 +258,6 @@ impl SettingsWindow {
             ImportStep::Review => match self.ui.import_source {
                 ImportSource::WezTerm => self.paint_wezterm_import(layers, x, top, width)?,
                 ImportSource::Editors => self.paint_editor_import(layers, x, top, width)?,
-                #[cfg(unix)]
                 ImportSource::Session(_) => self.paint_session_import(layers, x, top, width)?,
             },
             ImportStep::Result => match self.ui.import_source {
@@ -304,7 +285,6 @@ impl SettingsWindow {
                     )?
                 }
                 ImportSource::Editors => self.paint_editor_result(layers, x, top, width)?,
-                #[cfg(unix)]
                 ImportSource::Session(_) => self.paint_session_result(layers, x, top, width)?,
             },
         };

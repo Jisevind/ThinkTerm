@@ -1,17 +1,26 @@
 //! Herdr's saved-layout and live-handoff adapter. No mux or GUI dependency.
-#![cfg(unix)]
+//! Herdr's Windows server cannot hand its terminals over, so Windows imports
+//! the saved layout only.
 
 mod model;
+#[cfg(unix)]
 mod seed;
 mod source;
+#[cfg(unix)]
 mod transport;
 
-use anyhow::{ensure, Context, Result};
-use model::{Runtime, Snapshot};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{ensure, Result};
+#[cfg(unix)]
+use model::Runtime;
+use model::Snapshot;
 use thinkterm_import::{
-    ImportContext, ImportMode, ImportPlan, ImportRequest, ImportSource, LiveTerminal,
-    PreparedImport, Preview, Project, Selection, Session, SourceInfo, TerminalSeed, Thread,
+    ImportContext, ImportMode, ImportPlan, ImportRequest, ImportSource, PreparedImport, Preview,
+    Project, Selection, Session, SourceInfo, Thread,
 };
+#[cfg(unix)]
+use thinkterm_import::{LiveTerminal, TerminalSeed};
 
 struct Herdr;
 static HERDR: Herdr = Herdr;
@@ -62,30 +71,14 @@ impl ImportSource for Herdr {
                 handoff: None,
             });
         }
-        let mut transfer =
-            transport::receive(&dir, &context.executable).context("Receive Herdr handoff")?;
-        let plan = into_plan(transfer.manifest.snapshot.clone(), request.mode);
-        let terminals = transfer
-            .manifest
-            .panes
-            .iter()
-            .zip(transfer.fds.drain(..))
-            .map(|(runtime, pty)| LiveTerminal {
-                pane_id: runtime.pane_id,
-                seed: terminal_seed(runtime),
-                pty,
-            })
-            .collect();
-        Ok(PreparedImport {
-            plan,
-            terminals,
-            handoff: Some(Box::new(transfer)),
-        })
+        receive_live(context, &dir, request.mode)
     }
 
     fn notes(&self, mode: Option<ImportMode>) -> Vec<&'static str> {
         let mut notes = vec![];
-        if mode != Some(ImportMode::Layout) {
+        #[cfg(windows)]
+        notes.push("herdr-windows-layout-only");
+        if cfg!(unix) && mode != Some(ImportMode::Layout) {
             notes.push("herdr-requirements-live");
             #[cfg(target_os = "linux")]
             notes.push("herdr-requirements-linux");
@@ -106,10 +99,46 @@ impl ImportSource for Herdr {
     }
 
     fn run_helper(&self) -> Option<Result<()>> {
-        transport::maybe_run_relay()
+        #[cfg(unix)]
+        return transport::maybe_run_relay();
+        #[cfg(windows)]
+        None
     }
 }
 
+#[cfg(unix)]
+fn receive_live(
+    context: &ImportContext,
+    dir: &std::path::Path,
+    mode: ImportMode,
+) -> Result<PreparedImport> {
+    let mut transfer =
+        transport::receive(dir, &context.executable).context("Receive Herdr handoff")?;
+    let plan = into_plan(transfer.manifest.snapshot.clone(), mode);
+    let terminals = transfer
+        .manifest
+        .panes
+        .iter()
+        .zip(transfer.fds.drain(..))
+        .map(|(runtime, pty)| LiveTerminal {
+            pane_id: runtime.pane_id,
+            seed: terminal_seed(runtime),
+            pty,
+        })
+        .collect();
+    Ok(PreparedImport {
+        plan,
+        terminals,
+        handoff: Some(Box::new(transfer)),
+    })
+}
+
+#[cfg(windows)]
+fn receive_live(_: &ImportContext, _: &std::path::Path, _: ImportMode) -> Result<PreparedImport> {
+    anyhow::bail!("Herdr on Windows cannot hand over running terminals")
+}
+
+#[cfg(unix)]
 impl thinkterm_import::Handoff for transport::Transfer {
     fn commit(&mut self) -> Result<()> {
         transport::Transfer::commit(self)
@@ -119,6 +148,7 @@ impl thinkterm_import::Handoff for transport::Transfer {
     }
 }
 
+#[cfg(unix)]
 fn terminal_seed(runtime: &Runtime) -> TerminalSeed {
     TerminalSeed {
         child_pid: runtime.child_pid,
@@ -269,5 +299,5 @@ fn error_key(message: &str) -> Option<&'static str> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

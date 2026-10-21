@@ -11,7 +11,6 @@ pub mod dispatch;
 pub mod handoff;
 #[cfg(target_os = "macos")]
 pub mod hold;
-#[cfg(unix)]
 pub mod session_import;
 pub mod local;
 pub mod pki;

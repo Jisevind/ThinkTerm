@@ -2281,7 +2281,6 @@ impl SessionHandler {
                     )));
                     return;
                 }
-                #[cfg(unix)]
                 smol::spawn(async move {
                     let result = promise::spawn::spawn_into_new_thread(move || {
                         crate::session_import::discover(request)
@@ -2290,11 +2289,6 @@ impl SessionHandler {
                     send_response(result.map(Pdu::ListImportSessionsResponse));
                 })
                 .detach();
-                #[cfg(not(unix))]
-                {
-                    let _ = request;
-                    send_response(Err(anyhow!("Session import is supported on macOS and Linux")));
-                }
             }
 
             Pdu::PreviewImportSession(request) => {
@@ -2304,7 +2298,6 @@ impl SessionHandler {
                     )));
                     return;
                 }
-                #[cfg(unix)]
                 smol::spawn(async move {
                     let result = promise::spawn::spawn_into_new_thread(move || {
                         crate::session_import::preview(request)
@@ -2313,11 +2306,6 @@ impl SessionHandler {
                     send_response(result.map(Pdu::PreviewImportSessionResponse));
                 })
                 .detach();
-                #[cfg(not(unix))]
-                {
-                    let _ = request;
-                    send_response(Err(anyhow!("Session import is supported on macOS and Linux")));
-                }
             }
 
             Pdu::GetImportSessionStatus(request) => {
@@ -2325,17 +2313,11 @@ impl SessionHandler {
                     send_response(Err(anyhow!("Session import requires an authenticated desktop connection")));
                     return;
                 }
-                #[cfg(unix)]
                 spawn_into_main_thread(async move {
                     send_response(crate::session_import::status(request.request_id).await.map(|status| {
                         Pdu::GetImportSessionStatusResponse(codec::GetImportSessionStatusResponse { status })
                     }));
                 }).detach();
-                #[cfg(not(unix))]
-                {
-                    let _ = request;
-                    send_response(Err(anyhow!("Session import is supported on macOS and Linux")));
-                }
             }
 
             Pdu::ImportSessionRequest(request) => {
@@ -2345,7 +2327,6 @@ impl SessionHandler {
                     )));
                     return;
                 }
-                #[cfg(unix)]
                 spawn_into_main_thread(async move {
                     promise::spawn::spawn(async move {
                         let result = crate::session_import::execute(request, |tree, add, _layouts| {
@@ -2358,11 +2339,6 @@ impl SessionHandler {
                     .detach();
                 })
                 .detach();
-                #[cfg(not(unix))]
-                {
-                    let _ = request;
-                    send_response(Err(anyhow!("Session import is supported on macOS and Linux")));
-                }
             }
 
             Pdu::MutateThinkTermTree(MutateThinkTermTree { ops }) => {
@@ -3071,7 +3047,6 @@ async fn ensure_thinkterm_thread(request: EnsureThinkTermThread) -> anyhow::Resu
     // awaits below would leak the requesting identity to unrelated
     // main-thread work. See `Mux::with_identity`.
     let landing = crate::thinkterm_tree::ensure_landing(request.preferred_thread_id.as_deref())?;
-    #[cfg(unix)]
     crate::session_import::wait_for_workspace(&landing.workspace).await?;
     let _materialize = THINKTERM_MATERIALIZE.lock().await;
 
@@ -3286,7 +3261,6 @@ async fn split_pane(split: SplitPane) -> anyhow::Result<Pdu> {
 }
 
 async fn domain_spawn_v2(spawn: SpawnV2) -> anyhow::Result<Pdu> {
-    #[cfg(unix)]
     crate::session_import::ensure_not_pending(&spawn.workspace)?;
     let mux = Mux::get();
     // No identity: `spawn.workspace` is an explicit non-optional string on

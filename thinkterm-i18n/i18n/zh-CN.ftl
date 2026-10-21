@@ -1302,6 +1302,7 @@ settings-import-reload = 重新读取
 session-import-requirements-local = 仅支持本机同一用户的会话，需能访问会话目录。
 herdr-requirements-live = 实时迁移需 Herdr 支持 live_handoff，且两端能访问相同的临时目录、socket 和 ThinkTerm 程序。
 herdr-requirements-linux = Linux 的 /tmp 必须允许执行脚本（不能以 noexec 挂载）。
+herdr-windows-layout-only = Windows 上的 Herdr 无法交出运行中的会话，只能导入它保存的布局：标签、分屏和目录，每个窗格新开一个 shell。Herdr 开着也能导入，它里面正在运行的会话不受影响。
 session-import-requirements-layout = 未运行会话的布局导入无需实时交接能力；工作目录必须存在，布局格式须受当前 ThinkTerm 支持。
 session-import-requirements-refresh = 预览后会话结构或布局有变动，请重新预览。
 session-import-refresh-preview = 重新预览

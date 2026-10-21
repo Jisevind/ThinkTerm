@@ -1,4 +1,6 @@
-use anyhow::{bail, ensure, Context, Result};
+#[cfg(unix)]
+use anyhow::bail;
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -73,6 +75,7 @@ pub enum Direction {
     Vertical,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub version: u32,
@@ -81,6 +84,7 @@ pub struct Manifest {
     pub panes: Vec<Runtime>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Deserialize)]
 pub struct Runtime {
     pub pane_id: u32,
@@ -103,6 +107,7 @@ pub struct Runtime {
     pub initial_history_ansi: Option<String>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct InputState {
@@ -232,7 +237,7 @@ impl Snapshot {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn pane_count(&self) -> usize {
         self.workspaces
             .iter()
@@ -242,6 +247,7 @@ impl Snapshot {
     }
 }
 
+#[cfg(unix)]
 impl Manifest {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.version == 1, "Unsupported Herdr handoff version");

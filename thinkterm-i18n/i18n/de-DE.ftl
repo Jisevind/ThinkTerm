@@ -1348,6 +1348,7 @@ settings-import-reload = Quelle neu laden
 session-import-requirements-local = Erforderlich ist eine lokale Sitzung desselben Benutzers mit zugänglichem Sitzungsverzeichnis.
 herdr-requirements-live = Die Live-Übertragung benötigt Herdrs live_handoff-Funktion und gemeinsamen Zugriff auf temporäre Dateien, Sockets und die ThinkTerm-Datei.
 herdr-requirements-linux = Unter Linux muss /tmp die Skriptausführung erlauben; noexec wird nicht unterstützt.
+herdr-windows-layout-only = Unter Windows kann Herdr laufende Sitzungen nicht übergeben. Übernommen wird nur das von Herdr gespeicherte Layout: Tabs, Teilungen und Verzeichnisse, jeweils mit einer neuen Shell. Herdr kann geöffnet bleiben; die darin laufenden Sitzungen bleiben unberührt.
 session-import-requirements-layout = Gespeicherte Layouts beendeter Sitzungen benötigen keine Live-Übergabe. Arbeitsverzeichnisse müssen existieren und ThinkTerm muss das Layoutformat unterstützen.
 session-import-requirements-refresh = Aktualisieren Sie die Vorschau, wenn sich Sitzungsstruktur oder Layout ändern.
 session-import-refresh-preview = Vorschau aktualisieren

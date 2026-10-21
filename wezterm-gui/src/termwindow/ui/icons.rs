@@ -602,7 +602,6 @@ const MIN_BRAND_LUMA: f32 = 40.0;
 
 impl BrandIcon {
     /// The mark an import source names in its `SourceInfo::icon`.
-    #[cfg(unix)]
     pub fn for_import_source(icon: &str) -> Option<Self> {
         match icon {
             "herdr" => Some(Self::Herdr),

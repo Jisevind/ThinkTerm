@@ -2,9 +2,10 @@
 //! register outside this crate and retain their own discovery and protocols.
 mod layout;
 mod pending;
+#[cfg(unix)]
 mod pty;
 mod receipt;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 use anyhow::{ensure, Context, Result};
@@ -17,6 +18,8 @@ use mux::window::Window;
 use mux::Mux;
 pub(crate) use pending::ensure_not_pending;
 pub use pending::wait_for_workspace;
+#[cfg(unix)]
+use portable_pty::adopted_child;
 use portable_pty::{CommandBuilder, MasterPty};
 use promise::spawn::spawn_into_new_thread;
 use std::collections::HashMap;
@@ -31,7 +34,7 @@ struct LivePane {
     id: PaneId,
     pid: u32,
     terminal: Terminal,
-    master: pty::ImportedPty,
+    master: Box<dyn MasterPty>,
 }
 
 struct Prepared {
@@ -96,6 +99,24 @@ pub fn preview(
     })
 }
 
+#[cfg(unix)]
+fn prepare_pty(pty: thinkterm_import::Pty) -> Result<Box<dyn MasterPty>> {
+    Ok(Box::new(pty::ImportedPty::prepare(pty)?))
+}
+
+/// No Windows source hands its terminals over; see `thinkterm_import::Pty`.
+#[cfg(windows)]
+fn prepare_pty(_: thinkterm_import::Pty) -> Result<Box<dyn MasterPty>> {
+    anyhow::bail!("Live session import needs macOS or Linux")
+}
+
+/// `prepare_pty` turns down every Windows terminal, so no live pane gets
+/// this far there.
+#[cfg(windows)]
+fn adopted_child(_: u32) -> Box<dyn portable_pty::Child + Send + Sync> {
+    unreachable!("Windows prepares no live terminals")
+}
+
 fn initial_size(seed: &TerminalSeed) -> TerminalSize {
     TerminalSize {
         rows: seed.rows as usize,
@@ -121,7 +142,7 @@ fn prepare(request: &thinkterm_import::ImportRequest) -> Result<Prepared> {
         .collect();
     let mut panes = HashMap::new();
     for live in imported.terminals {
-        let master = pty::ImportedPty::prepare(live.pty).context("Prepare imported PTY")?;
+        let master = prepare_pty(live.pty).context("Prepare imported PTY")?;
         let size = initial_size(&live.seed);
         // Restoring saved output cannot send a reply to a process still owned
         // by the source. Only the final terminal receives the live writer.
@@ -244,6 +265,66 @@ fn make_tree(plan: &ImportPlan, name: &str) -> ThinkTermTree {
     tree
 }
 
+/// default_prog may be an agent or other saved command. A layout import
+/// only starts a login shell at the saved cwd.
+#[cfg(unix)]
+fn layout_shell() -> CommandBuilder {
+    let shell = CommandBuilder::new_default_prog().get_shell();
+    let mut command = CommandBuilder::new(&shell);
+    command.arg("-l");
+    command.env("SHELL", &shell);
+    command
+}
+
+/// Windows has no login shell to ask for. The shell chosen in Settings, when
+/// this is the app's own process; where that is not known, as in the session
+/// server, the configured default_prog when it names a shell, and else the
+/// system's command processor.
+#[cfg(windows)]
+fn layout_shell() -> CommandBuilder {
+    let argv = mux::default_prog::preferred_argv().or_else(|| {
+        config::configuration()
+            .default_prog
+            .clone()
+            .filter(|argv| names_a_shell(argv))
+    });
+    match argv {
+        Some(argv) => CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect()),
+        None => CommandBuilder::new(CommandBuilder::new_default_prog().get_shell()),
+    }
+}
+
+/// Whether `argv` runs a shell, by its program's name.
+#[cfg(any(windows, test))]
+fn names_a_shell(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    // By hand rather than with `Path`, which on unix would not split a
+    // Windows path at its backslashes.
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    matches!(
+        name,
+        "cmd"
+            | "powershell"
+            | "pwsh"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "nu"
+            | "wsl"
+            | "elvish"
+            | "xonsh"
+            | "dash"
+            | "ksh"
+            | "tcsh"
+            | "csh"
+    )
+}
+
 /// Receipts take a file lock, so the lookup runs on a blocking thread.
 pub async fn status(request_id: String) -> Result<codec::ImportSessionStatus> {
     smol::unblock(move || receipt::Store::owner().status(&request_id)).await
@@ -326,12 +407,7 @@ where
     if prepared.transfer.is_none() {
         for tab in prepared.plan.tabs() {
             for (id, saved) in &tab.panes {
-                // default_prog may be an agent or other saved command. A
-                // layout import only starts a login shell at the saved cwd.
-                let shell = CommandBuilder::new_default_prog().get_shell();
-                let mut command = CommandBuilder::new(&shell);
-                command.arg("-l");
-                command.env("SHELL", &shell);
+                let mut command = layout_shell();
                 command.set_require_cwd(true);
                 command.cwd(&saved.cwd);
                 match domain
@@ -484,8 +560,8 @@ where
             let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
                 live.id,
                 live.terminal,
-                portable_pty::adopted_child(live.pid),
-                Box::new(live.master),
+                adopted_child(live.pid),
+                live.master,
                 writer,
                 domain.domain_id(),
                 "Imported terminal".into(),

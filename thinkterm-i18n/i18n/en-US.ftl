@@ -1348,6 +1348,7 @@ settings-import-reload = Reload source
 session-import-requirements-local = Use a local session owned by the same user, with an accessible session directory.
 herdr-requirements-live = Live migration requires Herdr’s live_handoff capability and shared access to temporary files, sockets, and the ThinkTerm executable.
 herdr-requirements-linux = On Linux, /tmp must allow script execution; noexec mounts are unsupported.
+herdr-windows-layout-only = On Windows, Herdr cannot hand over running sessions, so only the layout it saved comes over: tabs, splits and folders, each with a fresh shell. Herdr can stay open; the sessions running in it are left alone.
 session-import-requirements-layout = Saved layouts from stopped sessions need no live handoff. Working directories must exist and ThinkTerm must support the layout format.
 session-import-requirements-refresh = Refresh the preview if the session structure or layout changes.
 session-import-refresh-preview = Refresh preview

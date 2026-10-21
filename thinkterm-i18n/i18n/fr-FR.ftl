@@ -1342,6 +1342,7 @@ settings-import-reload = Recharger la source
 session-import-requirements-local = La session doit être locale, appartenir au même utilisateur et avoir un répertoire accessible.
 herdr-requirements-live = Le transfert à chaud nécessite live_handoff dans Herdr et un accès partagé aux fichiers temporaires, aux sockets et à l’exécutable ThinkTerm.
 herdr-requirements-linux = Sous Linux, /tmp doit autoriser les scripts ; les montages noexec ne sont pas pris en charge.
+herdr-windows-layout-only = Sous Windows, Herdr ne peut pas transférer les sessions en cours : seule la disposition qu’il a enregistrée est reprise (onglets, divisions et répertoires), chacun avec un nouveau shell. Herdr peut rester ouvert ; les sessions qui y tournent ne sont pas touchées.
 session-import-requirements-layout = Les dispositions de sessions arrêtées ne nécessitent pas de transfert à chaud. Les répertoires doivent exister et ThinkTerm doit prendre en charge le format.
 session-import-requirements-refresh = Actualisez l’aperçu si la structure de la session ou la disposition change.
 session-import-refresh-preview = Actualiser l’aperçu

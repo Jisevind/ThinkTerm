@@ -3,9 +3,9 @@
 mod model;
 pub use model::*;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod source;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use source::*;
 
 #[cfg(test)]

@@ -302,3 +302,28 @@ fn preserves_split_direction_ratio_focus_and_zoom() {
         panic!("missing split");
     }
 }
+
+/// A Windows layout import starts default_prog only when it is a shell: it
+/// may as well be an agent.
+#[test]
+fn a_shell_is_known_by_its_program_name() {
+    let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    for shell in [
+        argv(&["pwsh.exe", "-NoLogo"]),
+        argv(&[r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"]),
+        argv(&["cmd"]),
+        argv(&[r"C:\Program Files\Git\bin\bash.exe", "--login"]),
+        argv(&["wsl.exe", "-d", "Ubuntu"]),
+        argv(&["/usr/bin/fish"]),
+    ] {
+        assert!(names_a_shell(&shell), "{:?}", shell);
+    }
+    for program in [
+        argv(&["claude"]),
+        argv(&[r"C:\Tools\codex.exe"]),
+        argv(&["htop"]),
+        argv(&[]),
+    ] {
+        assert!(!names_a_shell(&program), "{:?}", program);
+    }
+}
