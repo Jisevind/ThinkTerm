@@ -68,7 +68,7 @@ La persistance des sessions dépend de la disponibilité du serveur mux et de so
 
 Lorsque plusieurs agents travaillent sur différents projets, la barre d'onglets ne suffit plus : quelle session travaille encore, laquelle attend une réponse et où la compilation vient-elle de se terminer ? ThinkTerm place la structure des projets et leur état à côté du terminal, pour suivre le travail local et distant au même endroit.
 
-Rust est au cœur du terminal, du serveur mux, du client de bureau et de la TUI de ThinkTerm. L’application de bureau utilise le GPU pour le rendu, sans Electron ni WebView intégrée. Sur les fondations natives de WezTerm, ThinkTerm ajoute l’organisation en espaces de travail, les sessions distantes persistantes et des outils pour travailler avec des agents.
+Rust est au cœur du terminal, du serveur mux, du client de bureau et de la TUI de ThinkTerm. L’application de bureau utilise le GPU pour le rendu, sans Electron ni WebView intégrée. GPUI, le framework d’interface de Zed, ne répond pas aux exigences de performance de ThinkTerm pour le rendu du terminal. Sur les fondations natives de WezTerm, ThinkTerm ajoute l’organisation en espaces de travail, les sessions distantes persistantes et des outils pour travailler avec des agents.
 
 ## Des espaces adaptés à votre travail
 

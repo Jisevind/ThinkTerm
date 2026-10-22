@@ -68,7 +68,7 @@ ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**
 
 同时在多个项目中运行 Agent 时，标签栏很快就会让人分不清：哪个还在工作，哪个需要输入，刚才的构建又在哪里结束了？ThinkTerm 把项目结构和工作状态放在终端旁边，让本地与远程工作一目了然。
 
-Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TUI。桌面端通过 GPU 渲染，不依赖 Electron 或内嵌 WebView。在 WezTerm 的原生基础之上，ThinkTerm 提供工作空间组织、持久远程会话和辅助 Agent 工作的工具。
+Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TUI。桌面端通过 GPU 渲染，不依赖 Electron 或内嵌 WebView。Zed 的 UI 框架 GPUI 无法满足 ThinkTerm 在终端渲染上的性能要求。在 WezTerm 的原生基础之上，ThinkTerm 提供工作空间组织、持久远程会话和辅助 Agent 工作的工具。
 
 ## 围绕工作组织会话
 

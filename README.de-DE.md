@@ -68,7 +68,7 @@ Die Sitzungen bleiben nur bestehen, solange mux-Server und Host verfügbar sind.
 
 Wenn mehrere Agenten in unterschiedlichen Projekten laufen, wird die Tab-Leiste schnell unübersichtlich: Welche Sitzung arbeitet noch, welche wartet auf eine Eingabe, und wo ist gerade der Build fertig geworden? ThinkTerm zeigt die Projektstruktur und den Arbeitsstatus direkt neben dem Terminal und bringt lokale und entfernte Arbeit zusammen.
 
-Rust bildet die Grundlage für den Terminalkern, den mux-Server, den Desktop-Client und die TUI von ThinkTerm. Die Desktop-Anwendung rendert über die GPU, ohne Electron oder eingebettete WebView. Auf der nativen Basis von WezTerm ergänzt ThinkTerm Arbeitsbereiche, dauerhafte Remote-Sitzungen und Werkzeuge für die Arbeit mit Agenten.
+Rust bildet die Grundlage für den Terminalkern, den mux-Server, den Desktop-Client und die TUI von ThinkTerm. Die Desktop-Anwendung rendert über die GPU, ohne Electron oder eingebettete WebView. GPUI, das UI-Framework von Zed, erfüllt die Leistungsanforderungen von ThinkTerm an das Terminal-Rendering nicht. Auf der nativen Basis von WezTerm ergänzt ThinkTerm Arbeitsbereiche, dauerhafte Remote-Sitzungen und Werkzeuge für die Arbeit mit Agenten.
 
 ## Arbeitsbereiche passend zu deiner Arbeit
 

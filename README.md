@@ -70,7 +70,7 @@ Session persistence depends on the mux server and its host remaining available; 
 
 Running several agents across different projects quickly turns a tab bar into a guessing game: which session is working, which needs input, and where did that build finish? ThinkTerm puts the project structure and work status beside the terminal, with local and remote work visible together.
 
-Rust powers ThinkTerm's terminal core, mux server, desktop client, and TUI. The desktop renders through the GPU without Electron or an embedded web view. Built on WezTerm, this native foundation supports workspace organization, persistent remote sessions, and tools for working alongside agents.
+Rust powers ThinkTerm's terminal core, mux server, desktop client, and TUI. The desktop renders through the GPU without Electron or an embedded web view. GPUI, Zed's UI framework, does not meet ThinkTerm's performance requirements for terminal rendering. Built on WezTerm, this native foundation supports workspace organization, persistent remote sessions, and tools for working alongside agents.
 
 ## Workspaces that follow your work
 
