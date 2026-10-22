@@ -4,6 +4,7 @@ settings-window-title = ThinkTerm 设置
 settings-window-open-error = 无法打开设置：{ $error }
 settings-language = 语言
 settings-language-description = 立即更改 ThinkTerm 界面的显示语言。
+settings-language-font-missing = 这台 Mac 上没有苹方字体，中文暂用冬青黑体显示。想用苹方，可以在“字体册”里下载“PingFang SC”，然后重启 ThinkTerm。
 settings-language-changed = 界面语言已切换为{ $language }。
 settings-language-save-error = 无法保存语言设置：{ $error }
 common-on = 开

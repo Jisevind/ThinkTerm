@@ -16930,9 +16930,22 @@ impl SettingsWindow {
         note: &str,
         width: f32,
     ) -> anyhow::Result<f32> {
+        self.draw_row_note_in_lines(layers, x, y, note, width, self.ui.row_description_lines)
+    }
+
+    /// `draw_row_note` in at most `most` lines.
+    fn draw_row_note_in_lines(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        note: &str,
+        width: f32,
+        most: usize,
+    ) -> anyhow::Result<f32> {
         let palette = self.palette();
         let body_font = Rc::clone(&self.body_font);
-        let lines = self.description_lines(&body_font, note, width);
+        let lines = self.capped_lines(&body_font, note, width, most);
         self.draw_text_lines(layers, &body_font, x, y, &lines, palette.muted_text, width)
     }
 
@@ -18703,13 +18716,32 @@ impl SettingsWindow {
             palette.text,
             text_width,
         )?;
-        let extra = self.draw_row_description(
+        let mut extra = self.draw_row_description(
             layers,
             x,
             y,
             &crate::i18n::tr("settings-language-description"),
             text_width,
         )?;
+        // Chinese drawn in Hiragino Sans GB for want of PingFang: where to
+        // get it, under the row that chooses the language.
+        if wezterm_font::simplified_chinese_font_missing() {
+            let note_y =
+                self.settings_row_description_y(y) + self.description_line_step() + extra;
+            // Three lines, where a card's descriptions get two: it says
+            // what is wrong and what to do about it.
+            let last_note_y = note_y
+                + self.draw_row_note_in_lines(
+                    layers,
+                    x,
+                    note_y,
+                    &crate::i18n::tr("settings-language-font-missing"),
+                    text_width,
+                    3,
+                )?;
+            let bottom = last_note_y + self.metrics.cell_size.height as f32 + self.ui_px(6.0);
+            extra = extra.max(bottom - (y + self.settings_row_visual_height()));
+        }
         self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)?;
         Ok(extra)
     }

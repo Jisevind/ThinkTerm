@@ -4,6 +4,7 @@ settings-window-title = Réglages de ThinkTerm
 settings-window-open-error = Impossible d’ouvrir les réglages : { $error }
 settings-language = Langue
 settings-language-description = Change immédiatement la langue de l’interface de ThinkTerm.
+settings-language-font-missing = PingFang n’est pas installée sur ce Mac : le chinois s’affiche donc en Hiragino Sans GB. Pour utiliser PingFang, téléchargez « PingFang SC » dans Livre des polices, puis redémarrez ThinkTerm.
 settings-language-changed = La langue de l’interface est maintenant { $language }.
 settings-language-save-error = Impossible d’enregistrer la langue : { $error }
 common-on = Activé
