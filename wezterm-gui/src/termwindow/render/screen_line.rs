@@ -1,8 +1,8 @@
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::render::{
-    cell_fg_bg, resolve_fg_color_attr, same_hyperlink, update_next_frame_time, ClusterStyleCache,
-    ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams, LineToElementShape,
-    RenderScreenLineParams, RenderScreenLineResult,
+    cell_fg_bg, faint_color, resolve_fg_color_attr, same_hyperlink, update_next_frame_time,
+    ClusterStyleCache, ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams,
+    LineToElementShape, RenderScreenLineParams, RenderScreenLineResult,
 };
 use crate::termwindow::LineToElementShapeItem;
 use ::window::DeadKeyStatus;
@@ -16,7 +16,7 @@ use termwiz::color::LinearRgba;
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
 use wezterm_term::color::ColorAttribute;
-use wezterm_term::CellAttributes;
+use wezterm_term::{CellAttributes, Intensity};
 
 impl crate::TermWindow {
     /// "Render" a line of the terminal screen into the vertex buffer.
@@ -341,7 +341,7 @@ impl crate::TermWindow {
             .min(grid_cols)
             .saturating_sub(cursor_range.start);
         if cursor_cells > 0 {
-            let (fg_color, bg_color) = if let Some(c) = &cursor_cell {
+            let (fg_color, bg_color, faint) = if let Some(c) = &cursor_cell {
                 let attrs = c.attrs();
 
                 let bg_color = params.palette.resolve_bg(attrs.background()).to_linear();
@@ -354,9 +354,16 @@ impl crate::TermWindow {
                     &Default::default(),
                 );
 
-                (fg_color, bg_color)
+                (fg_color, bg_color, attrs.intensity() == Intensity::Half)
             } else {
-                (params.foreground, params.default_bg)
+                (params.foreground, params.default_bg, false)
+            };
+            // A bar or underline cursor still shows the cell's glyph, so
+            // faint text has to stay faint under it too.
+            let fg_color = if faint {
+                faint_color(fg_color.to_srgb(), bg_color.to_srgb()).to_linear()
+            } else {
+                fg_color
             };
 
             let ComputeCellFgBgResult {
