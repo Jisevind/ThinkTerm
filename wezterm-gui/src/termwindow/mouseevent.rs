@@ -8471,16 +8471,104 @@ impl super::TermWindow {
     }
 
     fn mouse_event_local_new_tab_button(&mut self, event: MouseEvent, context: &dyn WindowOps) {
-        if event.kind == WMEK::Press(MousePress::Left) {
-            self.spawn_command(
-                &SpawnCommand {
-                    domain: crate::local_sessions::local_spawn_domain(),
-                    ..SpawnCommand::default()
-                },
-                crate::spawn::SpawnWhere::NewTab,
-            );
+        match event.kind {
+            WMEK::Press(MousePress::Left) => {
+                self.spawn_command(
+                    &SpawnCommand {
+                        domain: crate::local_sessions::local_spawn_domain(),
+                        ..SpawnCommand::default()
+                    },
+                    crate::spawn::SpawnWhere::NewTab,
+                );
+            }
+            // What the menu picks runs as a key assignment, which needs a
+            // pane: a window with none would drop the choice.
+            WMEK::Press(MousePress::Right) if self.get_active_pane_or_overlay().is_some() => {
+                self.show_term_context_menu(context, event.coords, self.new_tab_shell_menu_items());
+            }
+            _ => {}
         }
         context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    /// Whether the window's terminal runs on this machine, in process or in
+    /// the local session server, so that the shells found here are the ones
+    /// a new tab beside it would run. Not without a terminal: what the menu
+    /// picks runs as a key assignment, which needs a pane.
+    fn active_pane_is_on_this_machine(&self) -> bool {
+        let Some(pane) = self.get_active_pane_or_overlay() else {
+            return false;
+        };
+        Mux::get().get_domain(pane.domain_id()).is_some_and(|domain| {
+            domain.downcast_ref::<mux::domain::LocalDomain>().is_some()
+                || crate::local_sessions::is_host_domain_id(domain.domain_id())
+        })
+    }
+
+    /// What a right click on the new tab button offers: a new tab in each
+    /// shell found on this machine, the one chosen in Settings ticked, then
+    /// the configuration's own launch_menu, then the launcher this click
+    /// used to open, for its domains.
+    fn new_tab_shell_menu_items(&self) -> Vec<ContextMenuItem> {
+        let domain = crate::local_sessions::local_spawn_domain();
+        let chosen = crate::native_settings::load_shared()
+            .terminal
+            .default_shell
+            .clone();
+        let mut items = vec![ContextMenuItem::section_header(crate::i18n::tr(
+            "menu-new-tab-with",
+        ))];
+        for shell in crate::shell_catalog::discover() {
+            let checked = chosen.as_ref() == Some(&shell.argv);
+            items.push(
+                ContextMenuItem::item_with_icon(
+                    shell.label,
+                    ContextMenuIcon::Terminal,
+                    KeyAssignment::SpawnCommandInNewTab(SpawnCommand {
+                        args: Some(shell.argv),
+                        domain: domain.clone(),
+                        ..SpawnCommand::default()
+                    }),
+                )
+                .checked(checked),
+            );
+        }
+        let launch_menu: Vec<_> = self
+            .config
+            .launch_menu
+            .iter()
+            .filter_map(|command| {
+                let label = command
+                    .label
+                    .clone()
+                    .or_else(|| {
+                        command
+                            .args
+                            .as_ref()
+                            .filter(|args| !args.is_empty())
+                            .map(|args| args.join(" "))
+                    })
+                    .or_else(|| match &command.domain {
+                        SpawnTabDomain::DomainName(name) => Some(name.clone()),
+                        _ => None,
+                    })?;
+                Some(ContextMenuItem::item_with_icon(
+                    label,
+                    ContextMenuIcon::Terminal,
+                    KeyAssignment::SpawnCommandInNewTab(command.clone()),
+                ))
+            })
+            .collect();
+        if !launch_menu.is_empty() {
+            items.push(ContextMenuItem::Separator);
+            items.extend(launch_menu);
+        }
+        items.push(ContextMenuItem::Separator);
+        items.push(ContextMenuItem::item(
+            crate::i18n::tr("menu-new-tab-more"),
+            KeyAssignment::ShowLauncher,
+        ));
+        items
     }
 
     fn do_new_tab_button_click(&mut self, button: MousePress) {
@@ -8736,7 +8824,15 @@ impl super::TermWindow {
                     );
                 }
                 TabBarItem::NewTabButton { .. } => {
-                    self.do_new_tab_button_click(MousePress::Right);
+                    if self.active_pane_is_on_this_machine() {
+                        self.show_term_context_menu(
+                            context,
+                            event.coords,
+                            self.new_tab_shell_menu_items(),
+                        );
+                    } else {
+                        self.do_new_tab_button_click(MousePress::Right);
+                    }
                 }
                 TabBarItem::None
                 | TabBarItem::LeftStatus
