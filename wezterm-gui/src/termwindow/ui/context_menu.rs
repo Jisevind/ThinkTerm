@@ -17,21 +17,25 @@ use wezterm_font::LoadedFont;
 // Design pixels (2x macOS backing), scaled via ui_px/ui_f32 like the rest
 // of the chrome. The fallback menu only shows on non-mac (and behind a
 // debug flag on mac).
-const MENU_MIN_WIDTH: usize = 400;
+const MENU_MIN_WIDTH: usize = 240;
 const MENU_MAX_WIDTH: usize = 1000;
 const MENU_WINDOW_MARGIN: usize = 24;
-const MENU_PADDING_X: usize = 22;
-const MENU_PADDING_Y: usize = 12;
-const MENU_LABEL_GAP: usize = 16;
-const MENU_ICON_SIZE: usize = 32;
-const MENU_ICON_SLOT: usize = 48;
-const MENU_CHECK_SLOT: usize = 40;
-const MENU_ARROW_SLOT: usize = 44;
-const MENU_ROW_EXTRA_HEIGHT: usize = 24;
+const MENU_PADDING_X: usize = 20;
+const MENU_PADDING_Y: usize = 10;
+const MENU_LABEL_GAP: usize = 14;
+const MENU_ICON_SIZE: usize = 28;
+const MENU_ICON_SLOT: usize = 40;
+const MENU_CHECK_SLOT: usize = 36;
+const MENU_ARROW_SLOT: usize = 40;
+const MENU_ROW_EXTRA_HEIGHT: usize = 16;
+/// The menu's text against the sidebar's, whose size it follows: 15 points
+/// there (the macOS default) is 13 here, as the system's own menus have it.
+const MENU_FONT_SCALE: f64 = 13.0 / 15.0;
+const MENU_FONT_WEIGHT: u16 = 400;
 const MENU_SEPARATOR_HEIGHT: usize = 14;
 const MENU_BORDER_WIDTH: f32 = 2.0;
 const MENU_RADIUS: f32 = 28.0;
-const MENU_ROW_RADIUS: f32 = 18.0;
+const MENU_ROW_RADIUS: f32 = 24.0;
 const MENU_ROW_HOVER_INSET_X: usize = 10;
 const MENU_ROW_HOVER_INSET_Y: usize = 4;
 
@@ -685,14 +689,15 @@ impl crate::TermWindow {
         let active_path = menu.active_path.clone();
 
         let native_settings = crate::native_settings::load();
-        let menu_font_size = crate::native_settings::home_font_size(&native_settings);
+        let menu_font_size =
+            crate::native_settings::home_font_size(&native_settings) * MENU_FONT_SCALE;
         let ui_font = self
             .fonts
-            .title_font_with_size(menu_font_size)
+            .title_font_with_size_and_weight(menu_font_size, MENU_FONT_WEIGHT)
             .context("context menu ui font")?;
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let row_height = (ui_metrics.cell_size.height as usize + self.ui_px(MENU_ROW_EXTRA_HEIGHT))
-            .max(self.ui_px(44));
+            .max(self.ui_px(40));
         let mut palette = context_menu_palette(self.chrome());
         // Last word to the user: the menu tuning above overwrites slots the
         // chrome already resolved, `ui_colors` among them.
@@ -870,6 +875,7 @@ fn compute_menu_metrics(
     let mut height = term.ui_px(MENU_PADDING_Y) * 2;
     let mut any_checked = false;
     let mut any_icon = false;
+    let mut any_submenu = false;
 
     for row in rows {
         match row {
@@ -878,6 +884,7 @@ fn compute_menu_metrics(
                     label,
                     checked,
                     icon,
+                    submenu,
                     ..
                 } = item
                 {
@@ -885,6 +892,7 @@ fn compute_menu_metrics(
                         label_width.max(term.sidebar_text_width(font, label)?.ceil() as usize);
                     any_checked |= *checked;
                     any_icon |= icon.as_ref().and_then(menu_icon).is_some();
+                    any_submenu |= ContextMenuState::has_renderable_items(submenu);
                 }
                 height = height.saturating_add(row_height);
             }
@@ -903,7 +911,10 @@ fn compute_menu_metrics(
     // Rows are laid out inside the border, not across it, so the width owed to
     // the widest label has to include the border it sits between; without this
     // that one label is the only one that ends up ellipsized.
-    let check_slot = if any_checked {
+    // Where rows have icons, a tick takes its row's icon's place instead of
+    // a column of its own: two columns before every label pushed the text
+    // far from the menu's edge for the one row that is ticked.
+    let check_slot = if any_checked && !any_icon {
         term.ui_px(MENU_CHECK_SLOT)
     } else {
         0
@@ -919,7 +930,13 @@ fn compute_menu_metrics(
         + icon_slot
         + term.ui_px(MENU_LABEL_GAP)
         + label_width
-        + term.ui_px(MENU_ARROW_SLOT);
+        // The arrow's room only where a row has one: kept always, it left
+        // every menu with an empty strip down its right side.
+        + if any_submenu {
+            term.ui_px(MENU_ARROW_SLOT)
+        } else {
+            0
+        };
     let max_width = term
         .ui_px(MENU_MAX_WIDTH)
         .min(window_width.saturating_sub(term.ui_px(MENU_WINDOW_MARGIN) * 2))
@@ -1052,7 +1069,9 @@ fn paint_menu_rows(
             // A caption, not a command: muted, never highlighted, and left out
             // of `ui_items`/`layout` so the mouse cannot land on it at all.
             MenuRow::SectionHeader { label } => {
-                let label_x = x + term.ui_f32(MENU_BORDER_WIDTH) as usize + metrics.label_offset(term);
+                // From the menu's edge, over the columns of the rows below
+                // it, as a heading over them rather than one more row.
+                let label_x = x + term.ui_f32(MENU_BORDER_WIDTH) as usize + term.ui_px(MENU_PADDING_X);
                 let text_y = cursor_y
                     + (metrics
                         .row_height
@@ -1096,6 +1115,14 @@ fn paint_menu_rows(
                 });
 
                 if hovered {
+                    let highlight_height = item_rect
+                        .height
+                        .saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_Y) * 2)
+                        as f32;
+                    // Opaque, a step of the card towards its text as the eye
+                    // sees it: the card's hover grey is a translucent white,
+                    // which blends in linear light and so came out several
+                    // times brighter than it reads in sRGB.
                     term.fill_rounded_rectangle(
                         layers,
                         2,
@@ -1112,13 +1139,10 @@ fn paint_menu_rows(
                                 .width
                                 .saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_X) * 2)
                                 as f32,
-                            item_rect
-                                .height
-                                .saturating_sub(term.ui_px(MENU_ROW_HOVER_INSET_Y) * 2)
-                                as f32,
+                            highlight_height,
                         ),
-                        palette.control_hover_bg,
-                        term.ui_f32(MENU_ROW_RADIUS),
+                        crate::ui::color::mix(palette.control_bg, palette.text, 0.08),
+                        term.ui_f32(MENU_ROW_RADIUS).min(highlight_height / 2.0),
                     )?;
                 }
 
@@ -1142,17 +1166,24 @@ fn paint_menu_rows(
                         + (item_rect.height.saturating_sub(term.ui_px(MENU_ICON_SIZE))) / 2;
                     let check_x = item_rect.x + term.ui_px(MENU_PADDING_X);
                     let icon_x = check_x + metrics.check_slot;
+                    // The tick sits in the icon's place where there is no
+                    // column of its own (see `compute_menu_metrics`).
+                    let tick_in_icon_slot = metrics.check_slot == 0 && metrics.icon_slot > 0;
                     if *checked {
                         term.paint_sidebar_icon(
                             layers,
                             SvgIcon::Check,
-                            check_x,
+                            if tick_in_icon_slot { icon_x } else { check_x },
                             icon_y,
                             term.ui_px(MENU_ICON_SIZE),
                             foreground,
                         )?;
                     }
-                    if let Some(icon) = icon.as_ref().and_then(|icon| menu_icon(icon)) {
+                    if let Some(icon) = icon
+                        .as_ref()
+                        .filter(|_| !(*checked && tick_in_icon_slot))
+                        .and_then(|icon| menu_icon(icon))
+                    {
                         term.paint_sidebar_icon(
                             layers,
                             icon,
@@ -1231,7 +1262,13 @@ fn paint_menu_rows(
 /// Takes the window's palette rather than an appearance so the caller pays for
 /// resolving it once per configuration instead of once per menu paint.
 fn context_menu_palette(palette: UiPalette) -> UiPalette {
-    palette.as_menu_card()
+    let mut card = palette.as_menu_card();
+    // Solid whatever the palette: one derived from the terminal's scheme
+    // keeps its see-through control fill, and what the menu covered showed
+    // through it.
+    let fill = card.control_bg;
+    card.control_bg = LinearRgba::with_components(fill.0, fill.1, fill.2, 1.0);
+    card
 }
 
 fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
