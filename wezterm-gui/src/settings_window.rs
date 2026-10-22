@@ -8777,6 +8777,7 @@ impl SettingsWindow {
                         SvgIcon::ArchiveRestore,
                         TileColor::Slate,
                     )?;
+                    this.paint_separator(layers, tx, end, tw)?;
                     this.paint_toggle_setting_row_with_hint(
                         layers,
                         tx,
