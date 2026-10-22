@@ -215,6 +215,7 @@ pub fn display_name(agent_id: &str) -> String {
 
 /// The mark the page draws for an agent, as the desktop picks it
 /// (`agent_status::brand_icon`, lobe-icons); `bot` for one with no logo.
+/// OMP, a fork of Pi with no logo of its own, borrows Pi's.
 pub fn icon(agent_id: &str) -> &'static str {
     match agent_id {
         "claude" => "brand-claude",
@@ -224,7 +225,7 @@ pub fn icon(agent_id: &str) -> &'static str {
         "codex" => "brand-codex",
         "cursor" => "brand-cursor",
         "opencode" => "brand-opencode",
-        "pi" => "brand-pi",
+        "pi" | "omp" => "brand-pi",
         _ => "bot",
     }
 }
@@ -377,6 +378,7 @@ mod tests {
         assert_eq!(icon("codebuddy"), "brand-codebuddy");
         assert_eq!(icon("codex"), "brand-codex");
         assert_eq!(icon("kimi"), "brand-kimi");
+        assert_eq!(icon("omp"), "brand-pi");
         assert_eq!(icon("gemini"), "bot");
     }
 

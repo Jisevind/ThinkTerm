@@ -473,8 +473,9 @@ pub(crate) enum AgentIcon {
 ///
 /// `agent_id` is not a closed set — a native contract or a user manifest
 /// can name any agent — so callers must have a fallback glyph rather than
-/// assuming a mark exists. OMP and Soul are known ids with no upstream
-/// logo and land in the same fallback.
+/// assuming a mark exists. Soul is a known id with no upstream logo and
+/// lands in the same fallback. OMP has none either; a fork of Pi, it
+/// borrows Pi's.
 ///
 /// Colored marks are only used where they read on both themes. Kimi's
 /// colored mark is a white glyph with a blue dot: fine on dark chrome,
@@ -495,7 +496,7 @@ pub(crate) fn brand_icon(agent_id: &str, appearance: Appearance) -> Option<Agent
         "codex" => AgentIcon::Mono(SvgIcon::AgentCodex),
         "cursor" => AgentIcon::Mono(SvgIcon::AgentCursor),
         "opencode" => AgentIcon::Mono(SvgIcon::AgentOpenCode),
-        "pi" => AgentIcon::Mono(SvgIcon::AgentPi),
+        "pi" | "omp" => AgentIcon::Mono(SvgIcon::AgentPi),
         _ => return None,
     })
 }
@@ -872,14 +873,15 @@ mod tests {
         use super::{brand_icon, AgentIcon, Appearance};
         for appearance in [Appearance::Dark, Appearance::Light] {
             for id in [
-                "claude", "codebuddy", "codex", "copilot", "cursor", "kimi", "opencode", "pi",
+                "claude", "codebuddy", "codex", "copilot", "cursor", "kimi", "omp", "opencode",
+                "pi",
             ] {
                 assert!(
                     brand_icon(id, appearance).is_some(),
                     "{id} should have a brand mark in {appearance:?}"
                 );
             }
-            for id in ["omp", "soul", "some-custom-agent", ""] {
+            for id in ["soul", "some-custom-agent", ""] {
                 assert!(
                     brand_icon(id, appearance).is_none(),
                     "{id} should fall back in {appearance:?}"
