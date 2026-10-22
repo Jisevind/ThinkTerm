@@ -647,6 +647,9 @@ pub(crate) enum ContextMenuApplicationAction {
         host_id: String,
         command: crate::termwindow::content_view::RemoteHostCommand,
     },
+    /// The new tab menu's remote host: open it as its card's Connect does,
+    /// whether or not the Remote Hosts page is open.
+    OpenRemoteHost(String),
     SetFrontendAccessMode(codec::FrontendAccessMode),
     /// Notification bell entry: jump to a thread, switching Space first when
     /// it lives elsewhere, and acknowledge its unseen work.

@@ -278,6 +278,12 @@ impl crate::TermWindow {
             return;
         };
         match action {
+            crate::termwindow::ContextMenuApplicationAction::OpenRemoteHost(host_id) => {
+                let Some(window) = self.window.clone() else {
+                    return;
+                };
+                self.open_ssh_host_thread_without_connecting(host_id, &window);
+            }
             crate::termwindow::ContextMenuApplicationAction::EditRecordingOverlay => {
                 self.start_recording_overlay_edit();
             }

@@ -47,6 +47,9 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
+/// How many remote hosts the new tab menu lists in place; more go into a
+/// submenu of their own.
+const NEW_TAB_MENU_HOSTS_INLINE: usize = 6;
 
 /// The update capsule floats over the terminal's corner: a wheel turned over
 /// it scrolls the terminal underneath.
@@ -8484,7 +8487,7 @@ impl super::TermWindow {
             // What the menu picks runs as a key assignment, which needs a
             // pane: a window with none would drop the choice.
             WMEK::Press(MousePress::Right) if self.get_active_pane_or_overlay().is_some() => {
-                self.show_term_context_menu(context, event.coords, self.new_tab_shell_menu_items());
+                self.show_new_tab_menu(event.coords);
             }
             _ => {}
         }
@@ -8505,11 +8508,22 @@ impl super::TermWindow {
         })
     }
 
+    /// The new tab button's menu, at `coords`.
+    pub(crate) fn show_new_tab_menu(&mut self, coords: ::window::Point) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        self.begin_context_menu_application_actions();
+        let items = self.new_tab_shell_menu_items();
+        self.show_term_context_menu(&window, coords, items);
+    }
+
     /// What a right click on the new tab button offers: a new tab in each
-    /// shell found on this machine, the one chosen in Settings ticked, then
-    /// the configuration's own launch_menu, then the launcher this click
-    /// used to open, for its domains.
-    fn new_tab_shell_menu_items(&self) -> Vec<ContextMenuItem> {
+    /// shell found on this machine, the one chosen in Settings ticked; the
+    /// saved remote hosts, as their page connects them -- the launcher's domains,
+    /// by the names people gave them; the configuration's own launch_menu;
+    /// then the launcher this click used to open, for what else it lists.
+    fn new_tab_shell_menu_items(&mut self) -> Vec<ContextMenuItem> {
         let domain = crate::local_sessions::local_spawn_domain();
         let chosen = crate::native_settings::load_shared()
             .terminal
@@ -8532,6 +8546,37 @@ impl super::TermWindow {
                 )
                 .checked(checked),
             );
+        }
+        // The hosts saved on the Remote Hosts page, not every alias in
+        // ~/.ssh/config: those the page keeps folded away, and they would
+        // crowd the saved ones into the submenu.
+        let hosts: Vec<ContextMenuItem> = crate::ssh_hosts::list_hosts()
+            .into_iter()
+            .map(|(host_id, spec)| {
+                let label = spec.label.trim();
+                let label = if label.is_empty() {
+                    crate::ssh_hosts::endpoint(&spec)
+                } else {
+                    label.to_string()
+                };
+                self.context_menu_application_item_with_icon(
+                    label,
+                    ContextMenuIcon::Server,
+                    crate::termwindow::ContextMenuApplicationAction::OpenRemoteHost(host_id),
+                    true,
+                )
+            })
+            .collect();
+        if !hosts.is_empty() {
+            items.push(ContextMenuItem::Separator);
+            let title = crate::i18n::tr("ssh-hosts-title");
+            // A long list goes one level down, so the shells stay in reach.
+            if hosts.len() > NEW_TAB_MENU_HOSTS_INLINE {
+                items.push(ContextMenuItem::submenu(title, hosts));
+            } else {
+                items.push(ContextMenuItem::section_header(title));
+                items.extend(hosts);
+            }
         }
         let launch_menu: Vec<_> = self
             .config
@@ -8571,7 +8616,11 @@ impl super::TermWindow {
         items
     }
 
-    fn do_new_tab_button_click(&mut self, button: MousePress) {
+    /// A click on the new tab button, offered first to the configuration's
+    /// `new-tab-button-click` handler. Unless that handles it, the click does
+    /// what the button does by default: with `menu_at`, the right button
+    /// opens the new tab menu there rather than the launcher.
+    fn do_new_tab_button_click(&mut self, button: MousePress, menu_at: Option<::window::Point>) {
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -8588,6 +8637,7 @@ impl super::TermWindow {
             pane: MuxPane,
             button: MousePress,
             action: Option<KeyAssignment>,
+            menu_at: Option<::window::Point>,
         ) -> anyhow::Result<()> {
             let default_action = match lua {
                 Some(lua) => {
@@ -8606,7 +8656,16 @@ impl super::TermWindow {
                 }
                 None => true,
             };
-            if let (true, Some(assignment)) = (default_action, action) {
+            if !default_action {
+                return Ok(());
+            }
+            if let Some(coords) = menu_at {
+                window
+                    .window
+                    .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        term_window.show_new_tab_menu(coords);
+                    })));
+            } else if let Some(assignment) = action {
                 window.window.notify(TermWindowNotif::PerformAssignment {
                     pane_id: pane.0,
                     assignment,
@@ -8618,7 +8677,7 @@ impl super::TermWindow {
         let window = GuiWin::new(self);
         let pane = MuxPane(pane.pane_id());
         promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-            dispatch_new_tab_button(lua, window, pane, button, action)
+            dispatch_new_tab_button(lua, window, pane, button, action, menu_at)
         }))
         .detach();
     }
@@ -8777,7 +8836,7 @@ impl super::TermWindow {
                     self.activate_content_view(id);
                 }
                 TabBarItem::NewTabButton { .. } => {
-                    self.do_new_tab_button_click(MousePress::Left);
+                    self.do_new_tab_button_click(MousePress::Left, None);
                 }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
                     self.mouse_event_window_header_blank(event.clone(), context);
@@ -8807,7 +8866,7 @@ impl super::TermWindow {
                     self.close_specific_tab(tab_idx, true);
                 }
                 TabBarItem::NewTabButton { .. } => {
-                    self.do_new_tab_button_click(MousePress::Middle);
+                    self.do_new_tab_button_click(MousePress::Middle, None);
                 }
                 TabBarItem::None
                 | TabBarItem::LeftStatus
@@ -8824,15 +8883,10 @@ impl super::TermWindow {
                     );
                 }
                 TabBarItem::NewTabButton { .. } => {
-                    if self.active_pane_is_on_this_machine() {
-                        self.show_term_context_menu(
-                            context,
-                            event.coords,
-                            self.new_tab_shell_menu_items(),
-                        );
-                    } else {
-                        self.do_new_tab_button_click(MousePress::Right);
-                    }
+                    let menu_at = self
+                        .active_pane_is_on_this_machine()
+                        .then_some(event.coords);
+                    self.do_new_tab_button_click(MousePress::Right, menu_at);
                 }
                 TabBarItem::None
                 | TabBarItem::LeftStatus
