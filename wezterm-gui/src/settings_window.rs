@@ -1408,6 +1408,18 @@ mod settings_search_tests {
     use super::*;
 
     #[test]
+    fn wrap_atoms_break_between_cjk_characters_but_not_inside_words() {
+        let atoms = |word: &str| wrap_atoms(word);
+        assert_eq!(atoms("ThinkTerm。"), ["ThinkTerm。"]);
+        assert_eq!(atoms("里下载“PingFang"), ["里", "下", "载", "“PingFang"]);
+        assert_eq!(atoms("SC”，然后重启"), ["SC”，", "然", "后", "重", "启"]);
+        assert_eq!(atoms("显示。想用"), ["显", "示。", "想", "用"]);
+        assert_eq!(atoms("「PingFang"), ["「PingFang"]);
+        assert_eq!(atoms("settings.json"), ["settings.json"]);
+        assert_eq!(atoms("n’est"), ["n’est"]);
+    }
+
+    #[test]
     fn the_settings_font_weight_steps_through_450() {
         assert_eq!(next_settings_font_weight(400, true), 450);
         assert_eq!(next_settings_font_weight(450, true), 500);
@@ -1501,6 +1513,62 @@ fn cap_height(metrics: FontMetrics) -> f32 {
         .cap_height
         .map(|cap| cap.get() as f32)
         .unwrap_or(metrics.cell_height.get() as f32 * 0.58)
+}
+
+/// Whether a line may break before or after `c`, with no space there: the
+/// characters of Chinese, Japanese and Korean, and their punctuation.
+fn breaks_anywhere(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x323AF
+    )
+}
+
+/// Punctuation a line must not start with: it stays with what it closes.
+fn closes(c: char) -> bool {
+    matches!(
+        c,
+        '，' | '。' | '、' | '；' | '：' | '！' | '？' | '）' | '」' | '』' | '”' | '’' | '》'
+            | '〉' | '】' | '〕' | '］' | '｝' | '…' | '・'
+    )
+}
+
+/// Punctuation a line must not end with: it stays with what it opens.
+fn opens(c: char) -> bool {
+    matches!(c, '（' | '「' | '『' | '“' | '‘' | '《' | '〈' | '【' | '〔' | '［' | '｛')
+}
+
+/// `word` (no whitespace in it) in the pieces a line may break between: each
+/// Chinese, Japanese or Korean character alone, a run of anything else whole
+/// ("ThinkTerm", "PingFang"), closing punctuation joined to the piece before
+/// it and opening punctuation to the piece after.
+fn wrap_atoms(word: &str) -> Vec<String> {
+    let mut atoms: Vec<String> = Vec::new();
+    // Whether the next character joins the last piece: it follows opening
+    // punctuation, or continues a run that is not CJK.
+    let mut join = false;
+    let mut run = false;
+    for ch in word.chars() {
+        if closes(ch) {
+            match atoms.last_mut() {
+                Some(last) => last.push(ch),
+                None => atoms.push(ch.to_string()),
+            }
+            join = false;
+            // A word goes on past an apostrophe ("n’est"); not past a
+            // full-width comma or stop.
+            run = run && !breaks_anywhere(ch);
+            continue;
+        }
+        let cjk = breaks_anywhere(ch);
+        match atoms.last_mut() {
+            Some(last) if join || (run && !cjk) => last.push(ch),
+            _ => atoms.push(ch.to_string()),
+        }
+        join = opens(ch);
+        run = !cjk && !join;
+    }
+    atoms
 }
 
 /// How often Settings offers to look for a new release, in seconds: the
@@ -16933,15 +17001,29 @@ impl SettingsWindow {
         }
         let mut lines = self.wrap_settings_text(font, text, width);
         if lines.len() > most {
-            // Words were split at spaces, which the join puts back; text
-            // without spaces (CJK) was split between characters.
-            let joiner = if text.contains(char::is_whitespace) {
-                " "
-            } else {
-                ""
-            };
-            let rest = lines.split_off(most - 1).join(joiner);
-            lines.push(self.text_with_ellipsis(font, &rest, width));
+            // What the last line holds is the text from where it starts --
+            // found by counting past what the lines before it hold, as the
+            // wrap drops only whitespace -- not those lines joined again,
+            // which put back spaces the text never had.
+            let mut skip: usize = lines[..most - 1]
+                .iter()
+                .map(|line| line.chars().filter(|c| !c.is_whitespace()).count())
+                .sum();
+            let start = text
+                .char_indices()
+                .find(|(_, c)| {
+                    if c.is_whitespace() {
+                        return false;
+                    }
+                    if skip == 0 {
+                        return true;
+                    }
+                    skip -= 1;
+                    false
+                })
+                .map_or(text.len(), |(index, _)| index);
+            lines.truncate(most - 1);
+            lines.push(self.text_with_ellipsis(font, &text[start..], width));
         }
         let mut cache = self.wrapped_text.borrow_mut();
         // As the shape cache does: no recency to evict by, and the page
@@ -20213,41 +20295,36 @@ impl SettingsWindow {
         self.wrapped_text.borrow_mut().clear();
     }
 
-    /// Greedy word wrap against the shaped width; falls back to char-level
-    /// breaking for unspaced (CJK) text or overlong tokens.
+    /// Greedy wrap against the shaped width, breaking between words and
+    /// between Chinese, Japanese or Korean characters (`wrap_atoms`); a
+    /// piece too long for a line on its own is cut a character at a time.
     fn wrap_settings_text(&self, font: &Rc<LoadedFont>, text: &str, max_width: f32) -> Vec<String> {
         let mut lines = Vec::new();
         let mut current = String::new();
-        let push_wrapped_word = |word: &str, current: &mut String, lines: &mut Vec<String>| {
-            let mut piece = String::new();
-            for ch in word.chars() {
-                let mut candidate = piece.clone();
-                candidate.push(ch);
-                if !piece.is_empty() && self.measure_text_width(font, &candidate) > max_width {
-                    lines.push(std::mem::take(&mut piece));
-                    piece.push(ch);
-                } else {
-                    piece = candidate;
-                }
-            }
-            *current = piece;
-        };
         for word in text.split_whitespace() {
-            let candidate = if current.is_empty() {
-                word.to_string()
-            } else {
-                format!("{current} {word}")
-            };
-            if self.measure_text_width(font, &candidate) <= max_width {
-                current = candidate;
-            } else if current.is_empty() {
-                push_wrapped_word(word, &mut current, &mut lines);
-            } else {
-                lines.push(std::mem::take(&mut current));
-                if self.measure_text_width(font, word) <= max_width {
-                    current = word.to_string();
+            for (index, atom) in wrap_atoms(word).iter().enumerate() {
+                // The space between words; none inside one.
+                let separator = if index == 0 && !current.is_empty() { " " } else { "" };
+                let candidate = format!("{current}{separator}{atom}");
+                if current.is_empty() || self.measure_text_width(font, &candidate) <= max_width {
+                    current = candidate;
                 } else {
-                    push_wrapped_word(word, &mut current, &mut lines);
+                    lines.push(std::mem::take(&mut current));
+                    current = atom.clone();
+                }
+                if self.measure_text_width(font, &current) > max_width {
+                    let mut piece = String::new();
+                    for ch in current.chars() {
+                        let mut candidate = piece.clone();
+                        candidate.push(ch);
+                        if !piece.is_empty() && self.measure_text_width(font, &candidate) > max_width
+                        {
+                            lines.push(std::mem::replace(&mut piece, ch.to_string()));
+                        } else {
+                            piece = candidate;
+                        }
+                    }
+                    current = piece;
                 }
             }
         }
