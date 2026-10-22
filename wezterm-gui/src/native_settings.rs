@@ -1378,6 +1378,12 @@ pub(crate) struct NativeWorkspaceSettings {
     /// "direct" (GitHub only) or a mirror's host. An unknown name is the
     /// default. The CLI and the mux server read it from this file.
     pub(crate) update_download_source: String,
+    /// Whether the app looks for a new release by itself. `None` follows
+    /// `check_for_updates` in the configuration.
+    pub(crate) check_for_updates: Option<bool>,
+    /// How often it looks again while it runs, in seconds. `None` follows
+    /// `check_for_updates_interval_seconds` in the configuration.
+    pub(crate) update_check_interval_seconds: Option<u64>,
     /// Local terminals run in a background mux server (the default unix
     /// domain) instead of inside the GUI process, so they survive the GUI
     /// quitting, crashing or updating. Read once at launch.
@@ -1394,6 +1400,8 @@ impl Default for NativeWorkspaceSettings {
             system_notifications_enabled: true,
             remote_update_keeps_sessions: true,
             update_download_source: thinkterm_update::DownloadSource::Auto.name().to_string(),
+            check_for_updates: None,
+            update_check_interval_seconds: None,
             // Preserve the behavior of older settings files without this field.
             // Fresh installs enable it in ThinkTermNativeSettings::for_new_install.
             local_sessions_via_mux: false,
@@ -3017,6 +3025,23 @@ pub(crate) fn update_download_source(
     settings: &ThinkTermNativeSettings,
 ) -> thinkterm_update::DownloadSource {
     thinkterm_update::DownloadSource::from_name(&settings.workspaces.update_download_source)
+}
+
+/// Whether the app looks for a new release by itself: Settings' switch, or
+/// while that is untouched, the configuration.
+pub(crate) fn checks_for_updates(settings: &ThinkTermNativeSettings) -> bool {
+    settings
+        .workspaces
+        .check_for_updates
+        .unwrap_or_else(|| config::configuration().check_for_updates)
+}
+
+/// How often, in seconds, the app looks for a new release while it runs.
+pub(crate) fn update_check_interval_seconds(settings: &ThinkTermNativeSettings) -> u64 {
+    settings
+        .workspaces
+        .update_check_interval_seconds
+        .unwrap_or_else(|| config::configuration().check_for_updates_interval_seconds)
 }
 
 pub(crate) fn local_sessions_via_mux() -> bool {

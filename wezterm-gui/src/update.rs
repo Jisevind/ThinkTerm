@@ -1,4 +1,3 @@
-use config::configuration;
 use mux::connui::ConnectionUI;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -97,7 +96,7 @@ fn set_update_available(available: bool, new_build: bool, latest: &Release) {
 /// first frame rather than after the checker's first delay. Called before
 /// any window exists, so it only stores: the first paint reads it.
 pub fn load_last_release_info() {
-    if !configuration().check_for_updates {
+    if !crate::native_settings::checks_for_updates(&crate::native_settings::load_shared()) {
         return;
     }
     let status = cached_update_status();
@@ -157,10 +156,15 @@ fn cached_release() -> Option<Release> {
         .and_then(|data| serde_json::from_slice::<Release>(&data).ok())
 }
 
+/// When the last check on record was made: when its answer was written.
+fn last_checked() -> Option<SystemTime> {
+    let path = config::DATA_DIR.join("check_update");
+    path.metadata().and_then(|meta| meta.modified()).ok()
+}
+
 pub fn cached_update_status() -> CachedUpdateStatus {
     let current_version = running_release_version();
-    let path = config::DATA_DIR.join("check_update");
-    let last_checked = path.metadata().and_then(|meta| meta.modified()).ok();
+    let last_checked = last_checked();
     let latest = cached_release();
     let update_available = latest.as_ref().is_some_and(|latest| {
         is_newer_build(
@@ -269,9 +273,15 @@ fn record_latest_release(latest: &Release) -> anyhow::Result<()> {
 
 /// Returns true if the provided socket path is dead.
 fn update_checker() {
-    // Every launch checks, a few seconds in so the check does not compete
-    // with starting up; after that, once every interval while it runs.
+    // A check is due an interval after the last one, a few seconds in at the
+    // earliest so it does not compete with starting up. The last one is the
+    // record on disk -- whichever process made it, a "Check for Updates"
+    // included -- so a weekly check stays weekly across launches; or this
+    // process's last attempt, so a failing one is not retried every minute.
+    // The switch and the interval are read again every minute, so a change
+    // in Settings applies without first waiting out the interval it replaced.
     let initial_interval = Duration::from_secs(10);
+    let poll = Duration::from_secs(60);
 
     let force_ui = always_show_update_ui();
 
@@ -279,7 +289,23 @@ fn update_checker() {
 
     let my_sock = config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
 
+    // Wall-clock time, so a night the machine slept through counts.
+    let mut last_attempt: Option<SystemTime> = None;
     loop {
+        let settings = crate::native_settings::load_shared();
+        let interval =
+            Duration::from_secs(crate::native_settings::update_check_interval_seconds(&settings));
+        let last_check = last_checked().max(last_attempt);
+        let due = crate::native_settings::checks_for_updates(&settings)
+            && last_check.map_or(true, |at| {
+                at.elapsed().map_or(true, |elapsed| elapsed >= interval)
+            });
+        if !due {
+            std::thread::sleep(poll);
+            continue;
+        }
+        last_attempt = Some(SystemTime::now());
+
         // Figure out which other wezterm-guis are running.
         // We have a little "consensus protocol" to decide which
         // of us will show the toast notification or show the update
@@ -288,45 +314,41 @@ fn update_checker() {
         // running, we don't spam the user with a lot of notifications.
         let socks = wezterm_client::discovery::discover_gui_socks();
 
-        if configuration().check_for_updates {
-            if let Ok(mut latest) = get_latest_release_info() {
-                let current = running_release_version();
-                // A package made by hand with this release's version is told
-                // about the release once its code is the later one.
-                let verdict = judge_release(&mut latest, &current, cached_release().as_ref());
-                let newer = verdict.newer;
-                set_update_available(newer || force_ui, verdict.new_build, &latest);
-                if newer || force_ui {
-                    log::info!(
-                        "latest release {} is newer than current build {}",
-                        latest.tag_name,
-                        current
+        if let Ok(mut latest) = get_latest_release_info() {
+            let current = running_release_version();
+            // A package made by hand with this release's version is told
+            // about the release once its code is the later one.
+            let verdict = judge_release(&mut latest, &current, cached_release().as_ref());
+            let newer = verdict.newer;
+            set_update_available(newer || force_ui, verdict.new_build, &latest);
+            if newer || force_ui {
+                log::info!(
+                    "latest release {} is newer than current build {}",
+                    latest.tag_name,
+                    current
+                );
+
+                let url = release_tag_url(&latest.tag_name);
+
+                if force_ui || socks.is_empty() || socks[0] == my_sock {
+                    persistent_toast_notification_with_click_to_open_url(
+                        &crate::i18n::tr(if verdict.new_build {
+                            "update-toast-new-build-title"
+                        } else {
+                            "update-toast-title"
+                        }),
+                        &crate::i18n::tr("update-toast-body"),
+                        &url,
                     );
-
-                    let url = release_tag_url(&latest.tag_name);
-
-                    if force_ui || socks.is_empty() || socks[0] == my_sock {
-                        persistent_toast_notification_with_click_to_open_url(
-                            &crate::i18n::tr(if verdict.new_build {
-                                "update-toast-new-build-title"
-                            } else {
-                                "update-toast-title"
-                            }),
-                            &crate::i18n::tr("update-toast-body"),
-                            &url,
-                        );
-                    }
                 }
+            }
 
-                if let Err(err) = record_latest_release(&latest) {
-                    log::warn!("{err:#}");
-                }
+            if let Err(err) = record_latest_release(&latest) {
+                log::warn!("{err:#}");
             }
         }
 
-        std::thread::sleep(Duration::from_secs(
-            configuration().check_for_updates_interval_seconds,
-        ));
+        std::thread::sleep(poll);
     }
 }
 
