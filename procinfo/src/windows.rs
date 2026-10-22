@@ -2,8 +2,8 @@
 use super::*;
 use ntapi::ntpebteb::PEB;
 use ntapi::ntpsapi::{
-    NtQueryInformationProcess, ProcessBasicInformation, ProcessWow64Information,
-    PROCESS_BASIC_INFORMATION,
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessSequenceNumber,
+    ProcessWow64Information, PROCESS_BASIC_INFORMATION,
 };
 use ntapi::ntrtl::RTL_USER_PROCESS_PARAMETERS;
 use ntapi::ntwow64::RTL_USER_PROCESS_PARAMETERS32;
@@ -18,7 +18,9 @@ use winapi::um::processthreadsapi::{GetCurrentProcessId, GetProcessTimes, OpenPr
 use winapi::um::shellapi::CommandLineToArgvW;
 use winapi::um::tlhelp32::*;
 use winapi::um::winbase::{LocalFree, QueryFullProcessImageNameW};
-use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use winapi::um::winnt::{
+    HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+};
 
 /// Manages a Toolhelp32 snapshot handle
 struct Snapshot(HANDLE);
@@ -114,6 +116,17 @@ impl ProcHandle {
         log::trace!("ProcHandle::new({}): OpenProcess", pid);
         let handle = unsafe { OpenProcess(options, FALSE as _, pid) };
         log::trace!("ProcHandle::new({}): OpenProcess -> {:?}", pid, handle);
+        if handle.is_null() {
+            return None;
+        }
+        Some(Self { pid, proc: handle })
+    }
+
+    /// A handle that can only be queried, which Windows grants for elevated
+    /// and protected processes as well. It reads nothing from the process,
+    /// so our own pid is fine here.
+    fn query_only(pid: u32) -> Option<Self> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE as _, pid) };
         if handle.is_null() {
             return None;
         }
@@ -314,6 +327,164 @@ impl ProcHandle {
 
         Some((start.dwHighDateTime as u64) << 32 | start.dwLowDateTime as u64)
     }
+
+    /// Where the process stands in creation order. Both answers need only a
+    /// `query_only` handle.
+    fn birth(&self) -> Birth {
+        Birth {
+            sequence: self.query_proc(ProcessSequenceNumber),
+            time: self.start_time(),
+        }
+    }
+}
+
+/// Where a process stands in creation order, which tells a real parent from
+/// a younger process that was handed the parent's pid after it exited.
+#[derive(Clone, Copy, Default)]
+struct Birth {
+    /// Counts the processes created since boot. Unlike the creation time it
+    /// does not run backwards when the system clock is stepped back.
+    sequence: Option<u64>,
+    /// Creation time in FILETIME units, for when there is no sequence number.
+    time: Option<u64>,
+}
+
+impl Birth {
+    fn read(pid: u32) -> Self {
+        ProcHandle::query_only(pid)
+            .map(|proc| proc.birth())
+            .unwrap_or_default()
+    }
+
+    /// Whether this process is known to have started before `other`.
+    fn before(&self, other: &Birth) -> bool {
+        match (self.sequence, other.sequence) {
+            (Some(mine), Some(theirs)) => mine < theirs,
+            _ => matches!((self.time, other.time), (Some(mine), Some(theirs)) if mine < theirs),
+        }
+    }
+
+    /// What this process's children are measured against: this process
+    /// where it is known, the nearest ancestor that is known otherwise, as a
+    /// process starts after every one of its ancestors.
+    fn or(self, ancestor: Birth) -> Birth {
+        Birth {
+            sequence: self.sequence.or(ancestor.sequence),
+            time: self.time.or(ancestor.time),
+        }
+    }
+}
+
+/// What `with_root_pid` records about one process besides its table entry
+/// and its birth.
+#[derive(Default)]
+struct ProcFacts {
+    executable: Option<PathBuf>,
+    cwd: PathBuf,
+    argv: Vec<String>,
+    console: u64,
+}
+
+impl ProcFacts {
+    fn read(pid: u32) -> Self {
+        let mut facts = Self::default();
+        if let Some(proc) = ProcHandle::new(pid) {
+            facts.executable = proc.executable();
+            if let Some(params) = proc.get_params() {
+                facts.cwd = params.cwd;
+                facts.argv = params.argv;
+                facts.console = params.console as _;
+            }
+        }
+        facts
+    }
+}
+
+/// Where `build_tree` learns about a process beyond its table entry; the
+/// tests stand in for the live system here.
+trait ProcSource {
+    fn birth(&mut self, pid: u32) -> Birth;
+    fn facts(&mut self, pid: u32) -> ProcFacts;
+}
+
+struct LiveProcs;
+
+impl ProcSource for LiveProcs {
+    fn birth(&mut self, pid: u32) -> Birth {
+        Birth::read(pid)
+    }
+
+    fn facts(&mut self, pid: u32) -> ProcFacts {
+        ProcFacts::read(pid)
+    }
+}
+
+/// Deeper than any real process tree. A runaway chain, a script that keeps
+/// starting itself, is cut here instead of being walked until the stack
+/// runs out: the mux server walks pane trees on its 1 MiB main thread.
+const MAX_DEPTH: usize = 64;
+
+/// The tree below `info`, which must not have started before `bound`: its
+/// nearest known ancestor.
+///
+/// Windows records the pid of a process's creator once and hands the pid
+/// out again after that process exits, so the parent a snapshot names can
+/// be a younger, unrelated process -- even one of the child's own
+/// descendants. A daemon whose launcher has exited, as the mux server's
+/// has, becomes the child of whichever program in one of its own panes is
+/// given the launcher's pid, and following children then goes round and
+/// round until the stack overflows. A process that started before its
+/// ancestor is not below it; `visited` ends any loop the births cannot rule
+/// out.
+fn build_tree(
+    info: &PROCESSENTRY32W,
+    procs: &[PROCESSENTRY32W],
+    bound: Birth,
+    depth: usize,
+    visited: &mut HashSet<u32>,
+    source: &mut dyn ProcSource,
+) -> Option<LocalProcessInfo> {
+    if !visited.insert(info.th32ProcessID) {
+        return None;
+    }
+    let birth = source.birth(info.th32ProcessID);
+    if birth.before(&bound) {
+        return None;
+    }
+    let facts = source.facts(info.th32ProcessID);
+
+    let mut children = HashMap::new();
+    if depth < MAX_DEPTH {
+        let bound = birth.or(bound);
+        for kid in procs {
+            if kid.th32ParentProcessID == info.th32ProcessID {
+                if let Some(child) = build_tree(kid, procs, bound, depth + 1, visited, source) {
+                    children.insert(kid.th32ProcessID, child);
+                }
+            }
+        }
+    }
+
+    let executable = facts
+        .executable
+        .unwrap_or_else(|| wstr_to_path(&info.szExeFile));
+    let name = match executable.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => String::new(),
+    };
+
+    Some(LocalProcessInfo {
+        pid: info.th32ProcessID,
+        ppid: info.th32ParentProcessID,
+        name,
+        executable,
+        cwd: facts.cwd,
+        argv: facts.argv,
+        start_time: birth.time.unwrap_or(0),
+        status: LocalProcessStatus::Run,
+        children,
+        console: facts.console,
+    })
 }
 
 /// Parse a command line string into an argv array
@@ -398,59 +569,163 @@ impl LocalProcessInfo {
         let procs = Snapshot::entries();
         log::trace!("Got snapshot");
 
-        fn build_proc(info: &PROCESSENTRY32W, procs: &[PROCESSENTRY32W]) -> LocalProcessInfo {
-            let mut children = HashMap::new();
+        let info = procs.iter().find(|info| info.th32ProcessID == pid)?;
+        build_tree(
+            info,
+            &procs,
+            Birth::default(),
+            0,
+            &mut HashSet::new(),
+            &mut LiveProcs,
+        )
+    }
+}
 
-            for kid in procs {
-                if kid.th32ParentProcessID == info.th32ProcessID {
-                    children.insert(kid.th32ProcessID, build_proc(kid, procs));
-                }
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            let mut executable = None;
-            let mut start_time = 0;
-            let mut cwd = PathBuf::new();
-            let mut argv = vec![];
-            let mut console = 0;
+    fn entry(pid: u32, ppid: u32) -> PROCESSENTRY32W {
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as _;
+        entry.th32ProcessID = pid;
+        entry.th32ParentProcessID = ppid;
+        entry
+    }
 
-            if let Some(proc) = ProcHandle::new(info.th32ProcessID) {
-                if let Some(exe) = proc.executable() {
-                    executable.replace(exe);
-                }
-                if let Some(params) = proc.get_params() {
-                    cwd = params.cwd;
-                    argv = params.argv;
-                    console = params.console as _;
-                }
-                if let Some(start) = proc.start_time() {
-                    start_time = start;
-                }
-            }
+    /// Births by pid; a pid without one is a process that could not be
+    /// opened or has exited since the snapshot.
+    struct Births(HashMap<u32, Birth>);
 
-            let executable = executable.unwrap_or_else(|| wstr_to_path(&info.szExeFile));
-            let name = match executable.file_name() {
-                Some(name) => name.to_string_lossy().into_owned(),
-                None => String::new(),
-            };
-
-            LocalProcessInfo {
-                pid: info.th32ProcessID,
-                ppid: info.th32ParentProcessID,
-                name,
-                executable,
-                cwd,
-                argv,
-                start_time,
-                status: LocalProcessStatus::Run,
-                children,
-                console,
-            }
+    impl ProcSource for Births {
+        fn birth(&mut self, pid: u32) -> Birth {
+            self.0.get(&pid).copied().unwrap_or_default()
         }
 
-        if let Some(info) = procs.iter().find(|info| info.th32ProcessID == pid) {
-            Some(build_proc(info, &procs))
-        } else {
-            None
+        fn facts(&mut self, _pid: u32) -> ProcFacts {
+            ProcFacts::default()
         }
+    }
+
+    fn seq(sequence: u64) -> Birth {
+        Birth {
+            sequence: Some(sequence),
+            time: None,
+        }
+    }
+
+    fn time(time: u64) -> Birth {
+        Birth {
+            sequence: None,
+            time: Some(time),
+        }
+    }
+
+    fn both(sequence: u64, time: u64) -> Birth {
+        Birth {
+            sequence: Some(sequence),
+            time: Some(time),
+        }
+    }
+
+    fn tree(root: u32, procs: &[PROCESSENTRY32W], births: &[(u32, Birth)]) -> LocalProcessInfo {
+        let info = procs
+            .iter()
+            .find(|info| info.th32ProcessID == root)
+            .unwrap();
+        let mut births = Births(births.iter().copied().collect());
+        build_tree(
+            info,
+            procs,
+            Birth::default(),
+            0,
+            &mut HashSet::new(),
+            &mut births,
+        )
+        .unwrap()
+    }
+
+    fn pids(info: &LocalProcessInfo) -> Vec<u32> {
+        fn walk(info: &LocalProcessInfo, out: &mut Vec<u32>) {
+            out.push(info.pid);
+            for child in info.children.values() {
+                walk(child, out);
+            }
+        }
+        let mut out = vec![];
+        walk(info, &mut out);
+        out.sort_unstable();
+        out
+    }
+
+    fn depth(info: &LocalProcessInfo) -> usize {
+        info.children
+            .values()
+            .map(|c| depth(c) + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The launcher (8) started the server (12) and exited; a program in
+    /// the server's pane was then given pid 8, so the table makes the
+    /// server a child of its own pane.
+    fn server_below_its_own_pane() -> Vec<PROCESSENTRY32W> {
+        vec![
+            entry(12, 8),  // server, its launcher gone
+            entry(16, 12), // pane shell
+            entry(20, 16), // agent in the pane
+            entry(8, 20),  // a program the agent ran, given the launcher's pid
+        ]
+    }
+
+    #[test]
+    fn a_reused_parent_pid_does_not_put_the_server_below_its_pane() {
+        let births = [(12, seq(1)), (16, seq(2)), (20, seq(3)), (8, seq(4))];
+        let pane = tree(16, &server_below_its_own_pane(), &births);
+        assert_eq!(pids(&pane), vec![8, 16, 20]);
+    }
+
+    #[test]
+    fn the_server_stays_out_when_the_reused_pid_has_exited() {
+        // Pid 8 is gone by the time it is read: the server is measured
+        // against the agent above it instead.
+        let births = [(12, seq(1)), (16, seq(2)), (20, seq(3))];
+        let pane = tree(16, &server_below_its_own_pane(), &births);
+        assert_eq!(pids(&pane), vec![8, 16, 20]);
+    }
+
+    #[test]
+    fn a_parent_loop_ends_when_no_birth_is_known() {
+        // Nothing tells the server apart without births; the loop through
+        // the pane's own shell still ends.
+        let pane = tree(16, &server_below_its_own_pane(), &[]);
+        assert_eq!(pids(&pane), vec![8, 12, 16, 20]);
+    }
+
+    #[test]
+    fn a_clock_stepped_back_does_not_drop_a_child() {
+        let procs = [entry(4, 0), entry(8, 4)];
+        // The child is later in sequence but earlier on the clock.
+        let births = [(4, both(10, 500)), (8, both(11, 400))];
+        assert_eq!(pids(&tree(4, &procs, &births)), vec![4, 8]);
+    }
+
+    #[test]
+    fn creation_times_decide_without_sequence_numbers() {
+        let procs = [entry(4, 0), entry(8, 4), entry(12, 4)];
+        let births = [(4, time(100)), (8, time(100)), (12, time(99))];
+        assert_eq!(pids(&tree(4, &procs, &births)), vec![4, 8]);
+    }
+
+    #[test]
+    fn the_idle_process_is_not_its_own_child() {
+        let procs = [entry(0, 0), entry(4, 0)];
+        assert_eq!(pids(&tree(0, &procs, &[])), vec![0, 4]);
+    }
+
+    #[test]
+    fn a_runaway_chain_stops_at_the_depth_limit() {
+        let procs: Vec<_> = (1..1000).map(|n| entry(4 * (n + 1), 4 * n)).collect();
+        assert_eq!(depth(&tree(8, &procs, &[])), MAX_DEPTH);
     }
 }
