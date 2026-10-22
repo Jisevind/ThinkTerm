@@ -5,7 +5,7 @@ use crate::locator::{FontDataSource, FontLocator, FontOrigin};
 use crate::parser::ParsedFont;
 use cocoa::base::id;
 use config::{FontAttributes, FontStretch, FontStyle, FontWeight};
-use core_foundation::array::CFArray;
+use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFRange, TCFType};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::{CFString, CFStringRef};
@@ -18,6 +18,16 @@ use std::collections::HashSet;
 
 lazy_static::lazy_static! {
     static ref FALLBACK: Vec<ParsedFont> = build_fallback_list();
+    static ref SIMPLIFIED_CHINESE: Vec<ParsedFont> = simplified_chinese_fonts();
+    static ref PINGFANG_MISSING: bool = pingfang_missing();
+}
+
+/// Whether this Mac has no PingFang to draw Chinese with while Chinese is
+/// what it reads (`prefers_simplified_chinese`): Han characters then come
+/// from Hiragino Sans GB, and the user may want to download PingFang.
+/// Found out once.
+pub fn simplified_chinese_font_missing() -> bool {
+    *PINGFANG_MISSING
 }
 
 #[link(name = "CoreText", kind = "framework")]
@@ -204,9 +214,11 @@ impl FontLocator for CoreTextFontLocator {
         for &c in codepoints {
             wanted.add(c as u32);
         }
+        let mut uncovered = wanted.clone();
         for (cov_len, font) in &mut matches {
             if let Ok(cov) = font.coverage_intersection(&wanted) {
                 *cov_len = cov.len();
+                uncovered = uncovered.difference(&cov);
             }
         }
 
@@ -219,6 +231,43 @@ impl FontLocator for CoreTextFontLocator {
             }
         });
         matches.dedup();
+
+        // Han characters: from Hiragino Sans GB where PingFang is missing
+        // and Chinese is what this Mac reads -- all of them and first, with
+        // the punctuation and kana around them, or a line would mix it with
+        // the Japanese or Korean font the system offers for what those
+        // share (a run of only punctuation loads that font for the Han
+        // characters that follow). Otherwise only Han characters no font
+        // above covers, and last, so that it changes nothing where PingFang
+        // is installed and takes no character another font draws.
+        let all_han = *PINGFANG_MISSING;
+        let mut han = RangeSet::new();
+        for &c in codepoints {
+            let c = c as u32;
+            let wanted = if all_han {
+                is_han(c) || is_chinese_punctuation_or_kana(c)
+            } else {
+                is_han(c) && uncovered.contains(c)
+            };
+            if wanted {
+                han.add(c);
+            }
+        }
+        if !han.is_empty() {
+            let found: Vec<(u32, ParsedFont)> = SIMPLIFIED_CHINESE
+                .iter()
+                .filter_map(|font| {
+                    let cov = font.coverage_intersection(&han).ok()?;
+                    (!cov.is_empty()).then(|| (cov.len(), font.clone()))
+                })
+                .collect();
+            matches.retain(|(_, font)| !found.iter().any(|(_, han_font)| han_font == font));
+            if all_han {
+                matches.splice(0..0, found);
+            } else {
+                matches.extend(found);
+            }
+        }
 
         log::trace!("fallback candidates for {codepoints:?} is {matches:#?}");
 
@@ -241,6 +290,100 @@ impl FontLocator for CoreTextFontLocator {
     }
 }
 
+/// Simplified Chinese where the system's own choice cannot be had. PingFang,
+/// which CoreText answers Chinese with, is a font asset macOS downloads on
+/// demand; until it has, every font left in the cascade is Japanese or
+/// Korean, whose Han characters lack the simplified-only forms, and those
+/// drew as boxes. Hiragino Sans GB ships in /System/Library/Fonts and has
+/// them all; its text face, W3, says it weighs 300, which is why it is not
+/// in the regular-weight list `build_fallback_list` makes.
+fn simplified_chinese_fonts() -> Vec<ParsedFont> {
+    let attributes = FontAttributes::new_fallback("Hiragino Sans GB");
+    let Ok(descriptors) = descriptor_from_attr(&attributes) else {
+        return vec![];
+    };
+    let mut fonts: Vec<ParsedFont> = descriptors
+        .iter()
+        .flat_map(|descriptor| handles_from_descriptor(&descriptor))
+        .filter(|font| font.names().full_name == "Hiragino Sans GB W3")
+        .collect();
+    fonts.sort();
+    fonts.dedup();
+    fonts
+}
+
+/// Whether `c` is a CJK unified or compatibility ideograph.
+fn is_han(c: u32) -> bool {
+    matches!(
+        c,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x323AF
+    )
+}
+
+/// CJK symbols and punctuation, kana, and full-width forms.
+fn is_chinese_punctuation_or_kana(c: u32) -> bool {
+    matches!(c, 0x3000..=0x30FF | 0xFF00..=0xFFEF)
+}
+
+/// The languages this Mac's user reads, most preferred first; none when the
+/// defaults name none.
+fn preferred_languages() -> anyhow::Result<CFArray<CFString>> {
+    let user_defaults: id = unsafe { msg_send![class!(NSUserDefaults), standardUserDefaults] };
+
+    let apple_lang = "AppleLanguages"
+        .parse::<CFString>()
+        .map_err(|_| anyhow::anyhow!("failed to parse lang name en as CFString"))?;
+
+    // The defaults keep the array: it is borrowed, not handed over, so it
+    // is wrapped without taking a reference that dropping it would give
+    // back -- that released what was not ours, once per caller.
+    let langs: id = unsafe { msg_send![user_defaults, stringArrayForKey:apple_lang] };
+    if langs.is_null() {
+        return Ok(CFArray::from_CFTypes(&[]));
+    }
+    Ok(unsafe { CFArray::wrap_under_get_rule(langs as CFArrayRef) })
+}
+
+/// See `simplified_chinese_font_missing`. PingFang is a font asset macOS
+/// downloads on demand: until it has, its family names no file.
+fn pingfang_missing() -> bool {
+    let languages: Vec<String> = preferred_languages()
+        .map(|languages| languages.iter().map(|language| language.to_string()).collect())
+        .unwrap_or_default();
+    if !prefers_simplified_chinese(&languages) {
+        return false;
+    }
+    let installed = descriptor_from_attr(&FontAttributes::new_fallback("PingFang SC"))
+        .is_ok_and(|descriptors| {
+            descriptors.iter().any(|descriptor| {
+                handles_from_descriptor(&descriptor)
+                    .iter()
+                    .any(|font| font.names().family == "PingFang SC")
+            })
+        });
+    !installed
+}
+
+/// Whether the first of `languages` (BCP 47 tags, as macOS lists them) that
+/// is Chinese, Japanese or Korean is Simplified Chinese. Japanese and Korean
+/// readers want the Han characters their own fonts draw, Traditional Chinese
+/// readers theirs; someone who lists none of them is told nothing about a
+/// Chinese font.
+fn prefers_simplified_chinese(languages: &[String]) -> bool {
+    for language in languages {
+        let language = language.to_ascii_lowercase();
+        let mut subtags = language.split(|c| c == '-' || c == '_');
+        match subtags.next() {
+            Some("zh") => {
+                return !subtags.any(|subtag| matches!(subtag, "hant" | "tw" | "hk" | "mo"));
+            }
+            Some("ja" | "ko") => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn build_fallback_list() -> Vec<ParsedFont> {
     build_fallback_list_impl().unwrap_or_else(|err| {
         log::error!("Error getting system fallback fonts: {:#}", err);
@@ -252,15 +395,7 @@ fn build_fallback_list_impl() -> anyhow::Result<Vec<ParsedFont>> {
     let menlo =
         new_from_name("Menlo", 0.0).map_err(|_| anyhow::anyhow!("failed to get Menlo font"))?;
 
-    let user_defaults: id = unsafe { msg_send![class!(NSUserDefaults), standardUserDefaults] };
-
-    let apple_lang = "AppleLanguages"
-        .parse::<CFString>()
-        .map_err(|_| anyhow::anyhow!("failed to parse lang name en as CFString"))?;
-
-    let langs: CFArray<CFString> =
-        unsafe { msg_send![user_defaults, stringArrayForKey:apple_lang] };
-
+    let langs = preferred_languages()?;
     let cascade = cascade_list_for_languages(&menlo, &langs);
     let mut fonts = vec![];
     // Explicitly include Menlo itself, as it appears to be the only
@@ -323,4 +458,27 @@ fn build_fallback_list_impl() -> anyhow::Result<Vec<ParsedFont>> {
     }
 
     Ok(fonts)
+}
+
+#[cfg(test)]
+mod test {
+    use super::prefers_simplified_chinese;
+
+    fn prefers(languages: &[&str]) -> bool {
+        let languages: Vec<String> = languages.iter().map(|l| l.to_string()).collect();
+        prefers_simplified_chinese(&languages)
+    }
+
+    #[test]
+    fn simplified_chinese_is_preferred_only_when_it_is_the_first_han_reader() {
+        assert!(prefers(&["zh-Hans-CN", "en-US"]));
+        assert!(prefers(&["en-US", "zh-Hans-CN", "ja-JP"]));
+        assert!(!prefers(&["en-AU"]));
+        assert!(!prefers(&[]));
+        assert!(prefers(&["zh-CN"]));
+        assert!(!prefers(&["ja-JP", "zh-Hans-CN"]));
+        assert!(!prefers(&["en-US", "ko-KR", "zh-Hans"]));
+        assert!(!prefers(&["zh-Hant-TW", "zh-Hans-CN"]));
+        assert!(!prefers(&["zh-HK"]));
+    }
 }

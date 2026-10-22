@@ -48,6 +48,16 @@ pub fn alloc_font_id() -> LoadedFontId {
     FONT_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether this Mac has no PingFang to draw Chinese with while Chinese is
+/// what it reads, so Han characters come from Hiragino Sans GB. Always false
+/// elsewhere.
+pub fn simplified_chinese_font_missing() -> bool {
+    #[cfg(target_os = "macos")]
+    return locator::core_text::simplified_chinese_font_missing();
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
 lazy_static::lazy_static! {
     static ref LAST_WARNING: Mutex<Option<(Instant, usize)>> = Mutex::new(None);
     /// Fallback resolution results, process-wide, keyed by the sorted missing
