@@ -1780,6 +1780,14 @@ fn localized_text_contrast_label(mode: crate::native_settings::NativeTextContras
     })
 }
 
+fn localized_cursor_blink_label(mode: crate::native_settings::NativeCursorBlink) -> String {
+    use crate::native_settings::NativeCursorBlink;
+    crate::i18n::tr(match mode {
+        NativeCursorBlink::Hard => "settings-cursor-blink-hard",
+        NativeCursorBlink::Smooth => "settings-cursor-blink-smooth",
+    })
+}
+
 /// The groove and the selected segment of a segmented control, which have to
 /// be told apart.
 ///
@@ -2084,6 +2092,7 @@ enum SettingsAction {
     /// has the search and the live preview a thousand entries need.
     OpenColorSchemePicker,
     SetTextContrast(crate::native_settings::NativeTextContrast),
+    SetCursorBlink(crate::native_settings::NativeCursorBlink),
     ToggleOverlayScrollbar,
     ToggleSplitAnimation,
     SetBottomQuoteMode(NativeBottomQuoteMode),
@@ -5598,6 +5607,44 @@ impl SettingsWindow {
         }
     }
 
+    fn apply_cursor_blink(&mut self, mode: crate::native_settings::NativeCursorBlink) {
+        self.ui.open_dropdown = None;
+        // Merge into the freshest settings for the reason `apply_text_contrast`
+        // gives: another row may have written the file while this window was
+        // open.
+        let mut merged = crate::native_settings::load();
+        merged.terminal.cursor_blink = mode;
+        self.set_native_settings(merged);
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                // The blink state carries the easing pair, so each window has
+                // to rebuild it rather than just repaint.
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    for gui_window in front_end.gui_windows() {
+                        gui_window.window.notify(
+                            crate::termwindow::TermWindowNotif::Apply(Box::new(|term_window| {
+                                term_window.refresh_cursor_blink();
+                            })),
+                        );
+                    }
+                }
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", crate::i18n::tr("settings-cursor-blink")),
+                        ("value", localized_cursor_blink_label(mode)),
+                    ],
+                );
+            }
+            Err(err) => {
+                self.status = settings_tr(
+                    "settings-status-terminal-error",
+                    &[("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     fn apply_remote_pane_resize_mode(&mut self, mode: NativeRemotePaneResizeMode) {
         self.ui.open_dropdown = None;
         self.native_settings.terminal.remote_pane_resize_mode = mode;
@@ -6666,6 +6713,7 @@ impl SettingsWindow {
             // Handled as a drag, on press and release.
             SettingsAction::WindowOpacitySlider => {}
             SettingsAction::SetTextContrast(mode) => self.apply_text_contrast(mode),
+            SettingsAction::SetCursorBlink(mode) => self.apply_cursor_blink(mode),
             SettingsAction::SetRemotePaneResizeMode(mode) => {
                 self.apply_remote_pane_resize_mode(mode)
             }
@@ -13588,7 +13636,9 @@ impl SettingsWindow {
             &crate::i18n::tr("settings-terminal-display-heading"),
         )?;
         let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
-            use crate::native_settings::{NativeScrollMode, NativeTextContrast};
+            use crate::native_settings::{
+                NativeCursorBlink, NativeScrollMode, NativeTextContrast,
+            };
             let mut rows = RowCursor::new(top, this);
 
             let options: Vec<(String, SettingsAction)> = NativeScrollMode::ALL
@@ -13692,6 +13742,39 @@ impl SettingsWindow {
                 tw,
                 &crate::i18n::tr("settings-text-contrast"),
                 &crate::i18n::tr("settings-text-contrast-description"),
+                &options,
+                selected,
+                rows.rule(),
+            )?);
+
+            let options: Vec<(String, SettingsAction)> = NativeCursorBlink::ALL
+                .iter()
+                .map(|mode| {
+                    (
+                        localized_cursor_blink_label(*mode),
+                        SettingsAction::SetCursorBlink(*mode),
+                    )
+                })
+                .collect();
+            let selected = NativeCursorBlink::ALL
+                .iter()
+                .position(|mode| *mode == this.native_settings.terminal.cursor_blink)
+                .unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Eye,
+                TileColor::Purple,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-cursor-blink"),
+                &crate::i18n::tr("settings-cursor-blink-description"),
                 &options,
                 selected,
                 rows.rule(),
