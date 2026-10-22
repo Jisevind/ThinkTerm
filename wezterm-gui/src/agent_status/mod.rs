@@ -516,17 +516,17 @@ pub(crate) enum IntegrationKind {
 /// display order: (agent id, PATH probe names, coverage).
 pub(crate) const SUPPORTED_AGENTS: &[(&str, &[&str], IntegrationKind)] = &[
     ("claude", &["claude"], IntegrationKind::ScreenRules),
-    (
-        "codebuddy",
-        &["codebuddy", "codebuddy-code", "cbc"],
-        IntegrationKind::ScreenRules,
-    ),
     ("codex", &["codex"], IntegrationKind::ScreenRules),
     ("copilot", &["copilot"], IntegrationKind::ScreenRules),
     ("cursor", &["cursor-agent", "cursor"], IntegrationKind::ScreenRules),
     ("pi", &["pi"], IntegrationKind::ScreenRules),
     ("opencode", &["opencode"], IntegrationKind::ScreenRules),
     ("kimi", &["kimi"], IntegrationKind::ScreenRules),
+    (
+        "codebuddy",
+        &["codebuddy", "codebuddy-code", "cbc"],
+        IntegrationKind::ScreenRules,
+    ),
     ("omp", &["omp"], IntegrationKind::ScreenRules),
     ("soul", &["soul"], IntegrationKind::Native),
 ];
