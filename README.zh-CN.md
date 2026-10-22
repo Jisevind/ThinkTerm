@@ -70,6 +70,55 @@ ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**
 
 Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TUI。桌面端通过 GPU 渲染，不依赖 Electron 或内嵌 WebView。Zed 的 UI 框架 GPUI 无法满足 ThinkTerm 在终端渲染上的性能要求。在 WezTerm 的原生基础之上，ThinkTerm 提供工作空间组织、持久远程会话和辅助 Agent 工作的工具。
 
+## 性能
+
+与 WezTerm 的吞吐对比，在同一台 Mac 上用 kitty 的 `kitten __benchmark__` 测得（MB/s，越大越好）。
+
+ThinkTerm 测试时开着本地 mux：shell 跑在 mux 服务端里，输出要先经过 mux 再到窗口。
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-zh-CN-dark.svg">
+    <img src="assets/performance-zh-CN-light.svg" alt="ThinkTerm 与 WezTerm 在 6 项 kitten 跑分中的吞吐对比：ThinkTerm 有 5 项更快（1.1× 到 5.6×），图片一项略慢（0.95×）" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>表格数据</summary>
+
+| 测试项 | ThinkTerm 0.3.0<br>2026-10-21 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍数 |
+| --- | ---: | ---: | ---: |
+| 纯 ASCII 字符 | **133.0** | 23.6 | 5.6× |
+| Unicode 字符 | **104.5** | 46.7 | 2.2× |
+| 多码点 Unicode 字符 | **197.5** | 49.3 | 4.0× |
+| CSI 序列夹少量字符 | **49.5** | 15.6 | 3.2× |
+| 长转义序列 | **213.8** | 194.9 | 1.1× |
+| 图片 | 257.2 | **270.5** | 0.95× |
+
+</details>
+
+Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-256color`，在 Xvfb 虚拟显示里用 CPU 软件渲染。ThinkTerm 同样走本地 mux。
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-zh-CN-dark.svg">
+    <img src="assets/performance-linux-zh-CN-light.svg" alt="Linux 上 ThinkTerm 与 kitty 在 5 项 kitten 跑分中的吞吐对比：ThinkTerm 全部更快（1.1× 到 2.2×）" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>表格数据</summary>
+
+| 测试项 | ThinkTerm 143b60a2<br>2026-10-02 | kitty 0.47.4<br>2026-10-02 | 倍数 |
+| --- | ---: | ---: | ---: |
+| 纯 ASCII 字符 | **147.4** | 79.4 | 1.9× |
+| Unicode 字符 | **85.6** | 78.7 | 1.1× |
+| CSI 序列夹少量字符 | **50.0** | 44.0 | 1.1× |
+| 长转义序列 | **533.5** | 238.1 | 2.2× |
+| 图片 | **391.8** | 181.0 | 2.2× |
+
+</details>
+
 ## 围绕工作组织会话
 
 | 层级 | 用途 |

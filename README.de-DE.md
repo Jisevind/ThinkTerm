@@ -70,6 +70,55 @@ Wenn mehrere Agenten in unterschiedlichen Projekten laufen, wird die Tab-Leiste 
 
 Rust bildet die Grundlage für den Terminalkern, den mux-Server, den Desktop-Client und die TUI von ThinkTerm. Die Desktop-Anwendung rendert über die GPU, ohne Electron oder eingebettete WebView. GPUI, das UI-Framework von Zed, erfüllt die Leistungsanforderungen von ThinkTerm an das Terminal-Rendering nicht. Auf der nativen Basis von WezTerm ergänzt ThinkTerm Arbeitsbereiche, dauerhafte Remote-Sitzungen und Werkzeuge für die Arbeit mit Agenten.
 
+## Leistung
+
+Durchsatz im Vergleich zu WezTerm, gemessen mit `kitten __benchmark__` aus kitty auf demselben Mac (MB/s, höher ist besser).
+
+ThinkTerm wurde mit lokalem mux gemessen: Die Shell läuft im mux-Server, und ihre Ausgabe geht über den mux, bevor sie das Fenster erreicht.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-de-DE-dark.svg">
+    <img src="assets/performance-de-DE-light.svg" alt="Durchsatz von ThinkTerm im Vergleich zu WezTerm in sechs kitten-Benchmarks: ThinkTerm ist in fünf schneller (1,1× bis 5,6×) und bei Bildern etwas langsamer (0,95×)" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>Daten als Tabelle</summary>
+
+| Test | ThinkTerm 0.3.0<br>2026-10-21 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Faktor |
+| --- | ---: | ---: | ---: |
+| Nur ASCII-Zeichen | **133,0** | 23,6 | 5,6× |
+| Unicode-Zeichen | **104,5** | 46,7 | 2,2× |
+| Unicode-Zellen aus mehreren Codepoints | **197,5** | 49,3 | 4,0× |
+| CSI-Sequenzen mit wenigen Zeichen | **49,5** | 15,6 | 3,2× |
+| Lange Escape-Sequenzen | **213,8** | 194,9 | 1,1× |
+| Bilder | 257,2 | **270,5** | 0,95× |
+
+</details>
+
+Unter Linux im Vergleich zu kitty auf Ubuntu 20.04 (i9-12900K), bei 180×50 mit `TERM=xterm-256color`, in Xvfb mit CPU-Software-Rendering. ThinkTerm lief auch hier über den lokalen mux.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-de-DE-dark.svg">
+    <img src="assets/performance-linux-de-DE-light.svg" alt="Durchsatz von ThinkTerm im Vergleich zu kitty unter Linux in fünf kitten-Benchmarks: ThinkTerm ist in allen fünf schneller (1,1× bis 2,2×)" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>Daten als Tabelle</summary>
+
+| Test | ThinkTerm 143b60a2<br>2026-10-02 | kitty 0.47.4<br>2026-10-02 | Faktor |
+| --- | ---: | ---: | ---: |
+| Nur ASCII-Zeichen | **147,4** | 79,4 | 1,9× |
+| Unicode-Zeichen | **85,6** | 78,7 | 1,1× |
+| CSI-Sequenzen mit wenigen Zeichen | **50,0** | 44,0 | 1,1× |
+| Lange Escape-Sequenzen | **533,5** | 238,1 | 2,2× |
+| Bilder | **391,8** | 181,0 | 2,2× |
+
+</details>
+
 ## Arbeitsbereiche passend zu deiner Arbeit
 
 | Ebene | Zweck |

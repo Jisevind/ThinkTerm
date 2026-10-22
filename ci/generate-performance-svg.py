@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Generate the README benchmark charts in assets/.
+
+Each chart writes <prefix>-{light,dark}.svg for English and
+<prefix>-<lang>-{light,dark}.svg for the other languages. After a new kitten
+run, update that chart in CHARTS, run this script, and keep the README tables
+in step.
+"""
+
+import sys
+from html import escape
+from pathlib import Path
+
+CHARTS = [
+    dict(
+        prefix="performance",
+        rival="WezTerm",
+        legend=("ThinkTerm 0.3.0 · 2026-10-21", "WezTerm 20260117 · 2026-09-23"),
+        machine="Mac · M1 Pro",
+        caption="mac",
+        scale_max=300,
+        # workload: (ThinkTerm MB/s, rival MB/s)
+        results={
+            "ascii": (133.0, 23.6),
+            "unicode": (104.5, 46.7),
+            "multi": (197.5, 49.3),
+            "csi": (49.5, 15.6),
+            "long": (213.8, 194.9),
+            "images": (257.2, 270.5),
+        },
+    ),
+    dict(
+        prefix="performance-linux",
+        rival="kitty",
+        legend=("ThinkTerm 143b60a2 · 2026-10-02", "kitty 0.47.4 · 2026-10-02"),
+        machine="Ubuntu 20.04 · i9-12900K",
+        caption="linux",
+        scale_max=600,
+        results={
+            "ascii": (147.4, 79.4),
+            "unicode": (85.6, 78.7),
+            "csi": (50.0, 44.0),
+            "long": (533.5, 238.1),
+            "images": (391.8, 181.0),
+        },
+    ),
+]
+
+LATIN_FONTS = "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial"
+
+LANGS = {
+    "en": dict(
+        fonts=LATIN_FONTS,
+        decimal=".",
+        subhead="kitten __benchmark__ · {machine} · MB/s, higher is better",
+        ratio="Ratio",
+        labels=dict(
+            ascii="Only ASCII chars",
+            unicode="Unicode chars",
+            multi="Unique multi-codepoint Unicode cells",
+            csi="CSI codes with few chars",
+            long="Long escape codes",
+            images="Images",
+        ),
+        captions=dict(
+            mac="ThinkTerm measured through its local mux: the shell runs in the mux server and output passes through it before reaching the window.",
+            linux="ThinkTerm measured through its local mux · 180×50 · Xvfb with CPU software rendering",
+        ),
+    ),
+    "zh-CN": dict(
+        fonts=LATIN_FONTS + ", 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC'",
+        decimal=".",
+        subhead="kitten __benchmark__ · {machine} · MB/s，越大越好",
+        ratio="倍数",
+        labels=dict(
+            ascii="纯 ASCII 字符",
+            unicode="Unicode 字符",
+            multi="多码点 Unicode 字符",
+            csi="CSI 序列夹少量字符",
+            long="长转义序列",
+            images="图片",
+        ),
+        captions=dict(
+            mac="ThinkTerm 测试时开着本地 mux：shell 跑在 mux 服务端里，输出要先经过 mux 再到窗口。",
+            linux="ThinkTerm 走本地 mux · 180×50 · Xvfb 虚拟显示，CPU 软件渲染",
+        ),
+    ),
+    "ja-JP": dict(
+        fonts=LATIN_FONTS + ", 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', 'Meiryo', 'Noto Sans CJK JP'",
+        decimal=".",
+        subhead="kitten __benchmark__ · {machine} · MB/s、大きいほど高速",
+        ratio="倍率",
+        labels=dict(
+            ascii="ASCII 文字のみ",
+            unicode="Unicode 文字",
+            multi="複数コードポイントの Unicode セル",
+            csi="文字の少ない CSI シーケンス",
+            long="長いエスケープシーケンス",
+            images="画像",
+        ),
+        captions=dict(
+            mac="ThinkTerm はローカル mux を有効にして計測：シェルは mux サーバーで動き、出力は mux を経由してウィンドウに届きます。",
+            linux="ThinkTerm はローカル mux 経由 · 180×50 · Xvfb、CPU ソフトウェアレンダリング",
+        ),
+    ),
+    "de-DE": dict(
+        fonts=LATIN_FONTS,
+        decimal=",",
+        subhead="kitten __benchmark__ · {machine} · MB/s, höher ist besser",
+        ratio="Faktor",
+        labels=dict(
+            ascii="Nur ASCII-Zeichen",
+            unicode="Unicode-Zeichen",
+            multi="Unicode-Zellen aus mehreren Codepoints",
+            csi="CSI-Sequenzen mit wenigen Zeichen",
+            long="Lange Escape-Sequenzen",
+            images="Bilder",
+        ),
+        captions=dict(
+            mac="ThinkTerm mit lokalem mux gemessen: Die Shell läuft im mux-Server, und ihre Ausgabe geht über den mux ins Fenster.",
+            linux="ThinkTerm über lokalen mux gemessen · 180×50 · Xvfb mit CPU-Software-Rendering",
+        ),
+    ),
+    "fr-FR": dict(
+        fonts=LATIN_FONTS,
+        decimal=",",
+        subhead="kitten __benchmark__ · {machine} · Mo/s, plus c’est élevé, mieux c’est",
+        ratio="Rapport",
+        labels=dict(
+            ascii="Caractères ASCII uniquement",
+            unicode="Caractères Unicode",
+            multi="Cellules Unicode à plusieurs points de code",
+            csi="Séquences CSI avec peu de caractères",
+            long="Longues séquences d’échappement",
+            images="Images",
+        ),
+        captions=dict(
+            mac="ThinkTerm mesuré avec son mux local : le shell tourne dans le serveur mux, et sa sortie passe par le mux avant la fenêtre.",
+            linux="ThinkTerm mesuré via son mux local · 180×50 · Xvfb avec rendu logiciel sur CPU",
+        ),
+    ),
+}
+
+THEMES = {
+    "light": dict(
+        card="#ffffff", card_edge="#d2d2d7", ink="#1d1d1f", sub="#6e6e73", faint="#86868b",
+        grid="#ececf0", axis="#d2d2d7", ours_a="#2b8cff", ours_b="#0071e3", theirs="#c7c7cc",
+        win_fill="#e8f1ff", win_edge="#c4d7f6", win_ink="#0071e3",
+        even_fill="#f5f5f7", even_edge="#e3e3e8", even_ink="#6e6e73", glow=0.28,
+    ),
+    "dark": dict(
+        card="#000000", card_edge="#2c2c2e", ink="#f5f5f7", sub="#a1a1a6", faint="#8e8e93",
+        grid="#1c1c1e", axis="#3a3a3c", ours_a="#5fb0ff", ours_b="#2f8cff", theirs="#48484a",
+        win_fill="#0b1f3d", win_edge="#1f4a85", win_ink="#4da3ff",
+        even_fill="#1c1c1e", even_edge="#3a3a3c", even_ink="#a1a1a6", glow=0.5,
+    ),
+}
+
+W = 1000
+MIN_X0 = 372      # bar origin, pushed right when a label is too wide
+BAR_END = 842     # where the scale maximum lands
+TOP = 178
+ROW_H = 66
+BAR_H = 16
+GAP = 5
+PILL_CX = 912
+LEGEND_X = 372
+
+
+def label_width(s):
+    """Rough width of a 15px semibold label; CJK glyphs are full width."""
+    return sum(15.0 if ord(ch) >= 0x2E80 else 7.6 for ch in s)
+
+
+def build(chart, lang, t):
+    L = LANGS[lang]
+    c = THEMES[t]
+    rows = [(L["labels"][k], a, b) for k, (a, b) in chart["results"].items()]
+    scale_max = chart["scale_max"]
+    x0 = max(MIN_X0, round(max(label_width(n) for n, _, _ in rows)) + 70)
+    scale_w = BAR_END - x0
+    subhead = L["subhead"].format(machine=chart["machine"])
+    title = f'ThinkTerm vs {chart["rival"]}'
+
+    def x_of(v):
+        return x0 + v / scale_max * scale_w
+
+    def num(v, digits=1):
+        return f"{v:.{digits}f}".replace(".", L["decimal"])
+
+    def ratio(a, b):
+        r = a / b
+        return num(r, 2 if r < 1 else 1) + "×"
+
+    h = TOP + ROW_H * len(rows) + 96
+    o = []
+    o.append(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {h}" width="{W}" height="{h}" role="img" aria-labelledby="t d">')
+    o.append(f'<title id="t">{title}</title>')
+    o.append(f'<desc id="d">{escape(subhead)}. '
+             + escape("; ".join(f'{n}: ThinkTerm {num(a)}, {chart["rival"]} {num(b)} ({ratio(a, b)})' for n, a, b in rows))
+             + '.</desc>')
+    o.append('<defs>')
+    o.append(f'<linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="{c["ours_b"]}"/><stop offset="1" stop-color="{c["ours_a"]}"/></linearGradient>')
+    o.append(f'<filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="{c["ours_b"]}" flood-opacity="{c["glow"]}"/></filter>')
+    o.append('</defs>')
+    o.append('<style>')
+    o.append(f"text {{ font-family: {L['fonts']}, sans-serif; fill: {c['ink']}; }}")
+    o.append('.headline { font-size: 32px; font-weight: 700; letter-spacing: -0.6px; }')
+    o.append(f'.subhead {{ font-size: 16px; fill: {c["sub"]}; }}')
+    o.append('.label { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; }')
+    o.append(f'.legend {{ font-size: 13.5px; font-weight: 500; fill: {c["sub"]}; }}')
+    o.append('.val-ours { font-size: 13px; font-weight: 700; }')
+    o.append(f'.val-theirs {{ font-size: 12.5px; font-weight: 500; fill: {c["sub"]}; }}')
+    o.append(f'.tick {{ font-size: 11.5px; fill: {c["faint"]}; }}')
+    o.append(f'.caption {{ font-size: 13px; font-weight: 500; fill: {c["faint"]}; }}')
+    o.append(f'.grid {{ stroke: {c["grid"]}; stroke-width: 1; }}')
+    o.append(f'.axis {{ stroke: {c["axis"]}; stroke-width: 1.2; }}')
+    o.append('.ours { fill: url(#ours); }')
+    o.append('.ours-bar { fill: url(#ours); filter: url(#glow); }')
+    o.append(f'.theirs {{ fill: {c["theirs"]}; }}')
+    o.append(f'.win {{ fill: {c["win_fill"]}; stroke: {c["win_edge"]}; }}')
+    o.append(f'.win-t {{ font-size: 14px; font-weight: 700; fill: {c["win_ink"]}; }}')
+    o.append(f'.even {{ fill: {c["even_fill"]}; stroke: {c["even_edge"]}; }}')
+    o.append(f'.even-t {{ font-size: 14px; font-weight: 700; fill: {c["even_ink"]}; }}')
+    o.append('</style>')
+    o.append(f'<rect x="0.5" y="0.5" width="{W - 1}" height="{h - 1}" rx="28" fill="{c["card"]}" stroke="{c["card_edge"]}"/>')
+    o.append(f'<text x="500" y="62" class="headline" text-anchor="middle">{title}</text>')
+    o.append(f'<text x="500" y="92" class="subhead" text-anchor="middle">{escape(subhead)}</text>')
+
+    # legend
+    ly = 132
+    ours, theirs = chart["legend"]
+    o.append(f'<rect x="{LEGEND_X}" y="{ly - 10}" width="22" height="12" rx="6" class="ours"/>')
+    o.append(f'<text x="{LEGEND_X + 30}" y="{ly}" class="legend">{ours}</text>')
+    lx = LEGEND_X + 30 + round(len(ours) * 7.0) + 30
+    o.append(f'<rect x="{lx}" y="{ly - 10}" width="22" height="12" rx="6" class="theirs"/>')
+    o.append(f'<text x="{lx + 30}" y="{ly}" class="legend">{theirs}</text>')
+    o.append(f'<text x="{PILL_CX}" y="{ly}" class="legend" text-anchor="middle">{escape(L["ratio"])}</text>')
+
+    # grid, six steps whatever the scale
+    gy0 = TOP - 14
+    gy1 = TOP + ROW_H * len(rows) - 10
+    step = scale_max // 6
+    for v in range(step, scale_max + 1, step):
+        x = x_of(v)
+        o.append(f'<line x1="{x:.1f}" y1="{gy0}" x2="{x:.1f}" y2="{gy1}" class="grid"/>')
+        o.append(f'<text x="{x:.1f}" y="{gy1 + 20}" class="tick" text-anchor="middle">{v}</text>')
+    o.append(f'<line x1="{x0}" y1="{gy0}" x2="{x0}" y2="{gy1}" class="axis"/>')
+    o.append(f'<text x="{x0}" y="{gy1 + 20}" class="tick" text-anchor="middle">0</text>')
+
+    r = BAR_H / 2
+    for i, (name, a, b) in enumerate(rows):
+        y = TOP + i * ROW_H
+        mid = y + BAR_H + GAP / 2
+        o.append(f'<text x="{x0 - 22}" y="{mid + 5:.1f}" class="label" text-anchor="end">{escape(name)}</text>')
+        wa = x_of(a) - x0
+        wb = x_of(b) - x0
+        o.append(f'<rect x="{x0}" y="{y}" width="{wa:.1f}" height="{BAR_H}" rx="{r}" class="ours-bar"/>')
+        o.append(f'<text x="{x0 + wa + 8:.1f}" y="{y + 12.5}" class="val-ours">{num(a)}</text>')
+        yb = y + BAR_H + GAP
+        o.append(f'<rect x="{x0}" y="{yb}" width="{wb:.1f}" height="{BAR_H}" rx="{r}" class="theirs"/>')
+        o.append(f'<text x="{x0 + wb + 8:.1f}" y="{yb + 12.5}" class="val-theirs">{num(b)}</text>')
+        cls = "win" if a > b else "even"
+        o.append(f'<rect x="{PILL_CX - 34}" y="{mid - 14:.1f}" width="68" height="28" rx="14" class="{cls}"/>')
+        o.append(f'<text x="{PILL_CX}" y="{mid + 5:.1f}" class="{cls}-t" text-anchor="middle">{ratio(a, b)}</text>')
+
+    o.append(f'<text x="500" y="{h - 34}" class="caption" text-anchor="middle">{escape(L["captions"][chart["caption"]])}</text>')
+    o.append('</svg>')
+    return "\n".join(o) + "\n"
+
+
+def main():
+    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "assets"
+    for chart in CHARTS:
+        for lang in LANGS:
+            prefix = chart["prefix"] if lang == "en" else f'{chart["prefix"]}-{lang}'
+            for t in THEMES:
+                (out / f"{prefix}-{t}.svg").write_text(build(chart, lang, t))
+
+
+if __name__ == "__main__":
+    main()
