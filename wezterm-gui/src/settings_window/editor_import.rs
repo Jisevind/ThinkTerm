@@ -573,13 +573,7 @@ impl SettingsWindow {
         Ok(y + self.settings_row_visual_height() + extra)
     }
 
-    pub(super) fn paint_editor_space_menu(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        x: f32,
-        y: f32,
-        width: f32,
-    ) -> anyhow::Result<()> {
+    pub(super) fn editor_space_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
         let chosen = self.ui.editor_import.space.clone();
         let options: Vec<_> = self
             .ui
@@ -595,7 +589,7 @@ impl SettingsWindow {
                 )
             })
             .collect();
-        self.paint_dropdown_menu(layers, x, y, width, &options)
+        options
     }
 
     pub(super) fn paint_editor_result(

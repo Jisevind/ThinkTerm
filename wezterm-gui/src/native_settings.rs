@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_SETTINGS_FONT_SIZE: f64 = if cfg!(target_os = "macos") 
     10.5
 };
 pub(crate) const DEFAULT_SETTINGS_FONT_WEIGHT: u16 =
-    if cfg!(target_os = "macos") { 600 } else { 500 };
+    if cfg!(target_os = "macos") { 450 } else { 500 };
 pub(crate) const DEFAULT_HOME_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
     15.0
 } else {

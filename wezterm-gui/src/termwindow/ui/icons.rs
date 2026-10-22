@@ -22,6 +22,7 @@ pub enum SvgIcon {
     Check,
     ChevronDown,
     ChevronRight,
+    ChevronsUpDown,
     Cloud,
     CodeXml,
     ClipboardCopy,
@@ -233,6 +234,9 @@ impl SvgIcon {
             }
             Self::ChevronRight => {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-right.svg")
+            }
+            Self::ChevronsUpDown => {
+                include_bytes!("../../../../third_party/lucide/icons/chevrons-up-down.svg")
             }
             Self::Cloud => include_bytes!("../../../../third_party/lucide/icons/cloud.svg"),
             Self::CodeXml => include_bytes!("../../../../third_party/lucide/icons/code-xml.svg"),
@@ -880,6 +884,7 @@ mod tests {
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,
             SvgIcon::ChevronRight,
+            SvgIcon::ChevronsUpDown,
             SvgIcon::Cloud,
             SvgIcon::CodeXml,
             SvgIcon::Copy,

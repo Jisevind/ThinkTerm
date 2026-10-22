@@ -140,7 +140,20 @@ const ROW_TILE_GLYPH: f32 = 0.58;
 const ROW_BADGE_SIDE: f32 = 44.0;
 const DIAGRAM_BADGE_SIDE: f32 = 38.0;
 /// The ⓘ after a label whose explanation shows on hover, and its gap.
-const HINT_ICON_SIDE: f32 = 20.0;
+const HINT_ICON_SIDE: f32 = 24.0;
+// A dropdown's card, shaped as the right-click menu Windows and Linux show
+// (termwindow::ui::context_menu), on the top layer so the icons of the rows
+// it covers do not show through.
+const DROPDOWN_LAYER: usize = 2;
+const DROPDOWN_RADIUS: f32 = 28.0;
+const DROPDOWN_PADDING_X: f32 = 22.0;
+const DROPDOWN_PADDING_Y: f32 = 12.0;
+const DROPDOWN_ROW_EXTRA_HEIGHT: f32 = 24.0;
+const DROPDOWN_ROW_RADIUS: f32 = 24.0;
+const DROPDOWN_HOVER_INSET_X: f32 = 10.0;
+const DROPDOWN_HOVER_INSET_Y: f32 = 4.0;
+const DROPDOWN_CHECK_SLOT: f32 = 40.0;
+const DROPDOWN_CHECK_SIZE: f32 = 28.0;
 const HINT_ICON_GAP: f32 = 8.0;
 /// How a row's square is lit: more gently than a tab icon, with a faint
 /// light rim and a plain dark shadow, as System Settings draws its own.
@@ -781,6 +794,40 @@ fn settings_body_font_weight(label_weight: u16) -> u16 {
     ((label_weight as f32 * 0.875) as u16).max(350)
 }
 
+/// The weights the Settings text steps through: the hundreds, and 450, the
+/// macOS default, between regular and medium.
+const SETTINGS_FONT_WEIGHTS: &[u16] = &[300, 400, 450, 500, 600, 700, 800];
+
+/// The next weight up (or down) from `current`, which a hand edit may have
+/// left between two steps; the ends stay where they are.
+fn next_settings_font_weight(current: u16, up: bool) -> u16 {
+    let next = if up {
+        SETTINGS_FONT_WEIGHTS.iter().find(|weight| **weight > current)
+    } else {
+        SETTINGS_FONT_WEIGHTS.iter().rev().find(|weight| **weight < current)
+    };
+    next.copied().unwrap_or(current)
+}
+
+/// The weight of the pages' titles: semibold at least, so a title still
+/// stands over its rows when their labels are set lighter (macOS's 450 by
+/// default).
+fn settings_title_font_weight(label_weight: u16) -> u16 {
+    label_weight.max(600)
+}
+
+/// The weight of the Import page's body text: two thirds of the labels',
+/// but never below medium, where it read as thin.
+fn settings_import_body_font_weight(label_weight: u16) -> u16 {
+    ((label_weight as f32 * 0.67).round() as u16).max(500)
+}
+
+/// The weight of a dropdown's value and choices: regular, or the labels'
+/// weight where that is lighter still.
+fn settings_control_font_weight(label_weight: u16) -> u16 {
+    label_weight.min(400)
+}
+
 /// Names the background check interval the way someone would say it out
 /// loud, falling back to whole hours or minutes for a hand-edited value.
 fn format_check_interval(seconds: u64) -> String {
@@ -1361,6 +1408,16 @@ mod settings_search_tests {
     use super::*;
 
     #[test]
+    fn the_settings_font_weight_steps_through_450() {
+        assert_eq!(next_settings_font_weight(400, true), 450);
+        assert_eq!(next_settings_font_weight(450, true), 500);
+        assert_eq!(next_settings_font_weight(500, false), 450);
+        assert_eq!(next_settings_font_weight(620, false), 600);
+        assert_eq!(next_settings_font_weight(800, true), 800);
+        assert_eq!(next_settings_font_weight(300, false), 300);
+    }
+
+    #[test]
     fn general_is_searchable_by_the_language_row_label() {
         assert!(SettingsSection::General.matches_search("language"));
         let localized_label = crate::i18n::tr("settings-language").to_lowercase();
@@ -1437,6 +1494,18 @@ fn window_opacity_label(choice: Option<u8>) -> String {
         Some(percent) => format!("{percent}%"),
     }
 }
+
+/// How tall a font's capitals are, or a fair guess when it does not say.
+fn cap_height(metrics: FontMetrics) -> f32 {
+    metrics
+        .cap_height
+        .map(|cap| cap.get() as f32)
+        .unwrap_or(metrics.cell_height.get() as f32 * 0.58)
+}
+
+/// How often Settings offers to look for a new release, in seconds: the
+/// configuration's default of twelve hours, then less often.
+const UPDATE_FREQUENCY_CHOICES: &[u64] = &[12 * 60 * 60, 24 * 60 * 60, 7 * 24 * 60 * 60];
 
 /// What the expiry dropdown offers, shortest first.
 ///
@@ -1914,6 +1983,9 @@ enum SettingsAction {
     SetAgentStatus(crate::native_settings::NativeThreadStatus),
     ToggleDownloadSourceMenu,
     SetDownloadSource(thinkterm_update::DownloadSource),
+    ToggleCheckForUpdates,
+    ToggleUpdateFrequencyMenu,
+    SetUpdateFrequency(u64),
     /// Swallows clicks that land in an open dropdown's padding or row
     /// gaps instead of letting them reach the controls underneath.
     DropdownMenuBackdrop,
@@ -2048,6 +2120,8 @@ enum SettingsDropdown {
     MacGlass,
     /// Where updates download the release from, on the Updates page.
     DownloadSource,
+    /// How often the app looks for a new release, on the Updates page.
+    UpdateFrequency,
     DefaultShell,
     CommandPaletteHotkey,
     WebLinkTtl,
@@ -2584,6 +2658,9 @@ struct SettingsUiState {
     /// `(x, y, width)` its open menu hangs from. Recorded by the rows, so a
     /// menu follows its row wherever the page put it.
     dropdown_anchors: Vec<(SettingsDropdown, (f32, f32, f32))>,
+    /// What each choice of the system menu a dropdown opened as does, by
+    /// its place: the menu answers with the place.
+    native_menu: Vec<SettingsAction>,
     /// The fonts the Terminal page previews in, at most one of each kind,
     /// and let go when another page is shown. `None` remembers a face that
     /// would not load, so it is not retried every frame.
@@ -2682,6 +2759,7 @@ impl SettingsUiState {
             content_scrollbar_visible_until: None,
             row_description_lines: 1,
             dropdown_anchors: Vec::new(),
+            native_menu: Vec::new(),
             preview_fonts: Vec::new(),
             stale_glyphs: false,
             terminal_colors: Vec::new(),
@@ -3543,6 +3621,11 @@ struct SettingsWindow {
     /// weight for labels and explanations made the two read as equally
     /// important; macOS separates them by weight, not only by color.
     body_font: Rc<LoadedFont>,
+    /// The value a dropdown shows and its choices, in a plain weight as the
+    /// system's pop-up buttons and menus have it: in the labels' weight a
+    /// value read as a second label, and Chinese and Japanese names, whose
+    /// fallback fonts lack the heavier weights, drew lighter than the rest.
+    control_font: Rc<LoadedFont>,
     import_body_font: Rc<LoadedFont>,
     import_title_font: Rc<LoadedFont>,
     title_font: Rc<LoadedFont>,
@@ -3623,7 +3706,10 @@ impl SettingsWindow {
         let settings_font_size = crate::native_settings::settings_font_size(&native_settings);
         let settings_font_weight = crate::native_settings::settings_font_weight(&native_settings);
         let title_font = fonts
-            .title_font_with_size_and_weight(settings_font_size + 4.0, settings_font_weight)?;
+            .title_font_with_size_and_weight(
+                settings_font_size + 4.0,
+                settings_title_font_weight(settings_font_weight),
+            )?;
         let sidebar_title_font = fonts.title_font_with_size_and_weight(
             Self::sidebar_brand_font_size_for_config(&config),
             SIDEBAR_BRAND_FONT_WEIGHT,
@@ -3634,13 +3720,17 @@ impl SettingsWindow {
             settings_font_size,
             settings_body_font_weight(settings_font_weight),
         )?;
+        let control_font = fonts.command_palette_font_with_size_and_weight(
+            settings_font_size,
+            settings_control_font_weight(settings_font_weight),
+        )?;
         let import_body_font = fonts.command_palette_font_with_size_and_weight(
             (settings_font_size - 1.0).max(10.0),
-            (settings_font_weight as f32 * 0.67).round().max(350.0) as u16,
+            settings_import_body_font_weight(settings_font_weight),
         )?;
         let import_title_font = fonts.title_font_with_size_and_weight(
             settings_font_size + 10.0,
-            settings_font_weight,
+            settings_title_font_weight(settings_font_weight),
         )?;
         let logo_caption_font = fonts.command_palette_font_with_size_and_weight(
             LOGO_CAPTION_FONT_SIZE,
@@ -3713,6 +3803,7 @@ impl SettingsWindow {
             fonts: Rc::clone(&fonts),
             ui_font,
             body_font,
+            control_font,
             import_body_font,
             import_title_font,
             title_font,
@@ -3952,6 +4043,19 @@ impl SettingsWindow {
                 Ok(true)
             }
             WindowEvent::NeedRepaint => Ok(self.do_paint(window)),
+            WindowEvent::PerformContextMenuAction(index) => {
+                let picked = self.ui.native_menu.get(index as usize).copied();
+                self.ui.native_menu.clear();
+                if let Some(action) = picked {
+                    self.perform_action(action, window);
+                }
+                window.invalidate();
+                Ok(true)
+            }
+            WindowEvent::ContextMenuDismissed => {
+                self.ui.native_menu.clear();
+                Ok(true)
+            }
             WindowEvent::MouseEvent(event) => {
                 self.mouse_event(event, window);
                 Ok(true)
@@ -4123,6 +4227,8 @@ impl SettingsWindow {
                         | SettingsAction::SetMacGlass(_)
                         | SettingsAction::ToggleDownloadSourceMenu
                         | SettingsAction::SetDownloadSource(_)
+                        | SettingsAction::ToggleUpdateFrequencyMenu
+                        | SettingsAction::SetUpdateFrequency(_)
                         | SettingsAction::ToggleDefaultShellMenu
                         | SettingsAction::SetDefaultShell(_)
                         | SettingsAction::ToggleCommandPaletteHotkeyMenu
@@ -4163,6 +4269,7 @@ impl SettingsWindow {
                 self.ui.interaction.hovered = action;
                 if pressed.is_some() && pressed == action {
                     self.perform_action(action.unwrap(), window);
+                    self.open_dropdown_natively(window, hit.map(|target| target.rect));
                 }
                 window.invalidate();
             }
@@ -5127,8 +5234,8 @@ impl SettingsWindow {
     }
 
     fn step_settings_font_weight(&mut self, delta: i16) {
-        let current = crate::native_settings::settings_font_weight(&self.native_settings) as i16;
-        let value = (current + delta).clamp(300, 800) as u16;
+        let current = crate::native_settings::settings_font_weight(&self.native_settings);
+        let value = next_settings_font_weight(current, delta > 0);
         self.native_settings.chrome.settings_font_weight = Some(value);
         self.save_native_chrome_settings(ChromeFontArea::Settings);
     }
@@ -5193,7 +5300,10 @@ impl SettingsWindow {
             .command_palette_font_with_size_and_weight(settings_font_size, settings_font_weight)?;
         self.title_font = self
             .fonts
-            .title_font_with_size_and_weight(settings_font_size + 4.0, settings_font_weight)?;
+            .title_font_with_size_and_weight(
+                settings_font_size + 4.0,
+                settings_title_font_weight(settings_font_weight),
+            )?;
         self.sidebar_title_font = self.fonts.title_font_with_size_and_weight(
             Self::sidebar_brand_font_size_for_config(&configuration()),
             SIDEBAR_BRAND_FONT_WEIGHT,
@@ -5202,13 +5312,17 @@ impl SettingsWindow {
             settings_font_size,
             settings_body_font_weight(settings_font_weight),
         )?;
+        self.control_font = self.fonts.command_palette_font_with_size_and_weight(
+            settings_font_size,
+            settings_control_font_weight(settings_font_weight),
+        )?;
         self.import_body_font = self.fonts.command_palette_font_with_size_and_weight(
             (settings_font_size - 1.0).max(10.0),
-            (settings_font_weight as f32 * 0.67).round().max(350.0) as u16,
+            settings_import_body_font_weight(settings_font_weight),
         )?;
         self.import_title_font = self.fonts.title_font_with_size_and_weight(
             settings_font_size + 10.0,
-            settings_font_weight,
+            settings_title_font_weight(settings_font_weight),
         )?;
         self.logo_caption_font = self.fonts.command_palette_font_with_size_and_weight(
             LOGO_CAPTION_FONT_SIZE,
@@ -6227,6 +6341,51 @@ impl SettingsWindow {
                     ),
                 };
             }
+            SettingsAction::ToggleCheckForUpdates => {
+                self.ui.open_dropdown = None;
+                let enabled = !crate::native_settings::checks_for_updates(&self.native_settings);
+                self.native_settings.workspaces.check_for_updates = Some(enabled);
+                let setting = crate::i18n::tr("settings-update-automatic");
+                self.status = match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => settings_tr(
+                        "settings-status-value-now",
+                        &[
+                            ("setting", setting),
+                            (
+                                "value",
+                                crate::i18n::tr(if enabled { "common-on" } else { "common-off" }),
+                            ),
+                        ],
+                    ),
+                    Err(err) => settings_tr(
+                        "settings-status-save-error",
+                        &[("setting", setting), ("error", format!("{err:#}"))],
+                    ),
+                };
+            }
+            SettingsAction::ToggleUpdateFrequencyMenu => {
+                self.ui.open_dropdown =
+                    if self.ui.open_dropdown == Some(SettingsDropdown::UpdateFrequency) {
+                        None
+                    } else {
+                        Some(SettingsDropdown::UpdateFrequency)
+                    };
+            }
+            SettingsAction::SetUpdateFrequency(seconds) => {
+                self.ui.open_dropdown = None;
+                self.native_settings.workspaces.update_check_interval_seconds = Some(seconds);
+                let setting = crate::i18n::tr("settings-update-frequency");
+                self.status = match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => settings_tr(
+                        "settings-status-value-now",
+                        &[("setting", setting), ("value", format_check_interval(seconds))],
+                    ),
+                    Err(err) => settings_tr(
+                        "settings-status-save-error",
+                        &[("setting", setting), ("error", format!("{err:#}"))],
+                    ),
+                };
+            }
             SettingsAction::DropdownMenuBackdrop => {
                 // Deliberately inert: the click was inside the open menu
                 // but not on an option, so it selects nothing and the menu
@@ -6600,7 +6759,7 @@ impl SettingsWindow {
                     Ok(()) => {
                         self.status = if self.native_settings.developer.force_fallback_context_menu
                         {
-                            "macOS fallback context menu enabled for future right-click menus."
+                            "macOS fallback menus enabled for future right-click menus and dropdowns."
                                 .to_string()
                         } else if std::env::var_os("THINKTERM_FORCE_FALLBACK_CONTEXT_MENU")
                             .is_some()
@@ -6608,7 +6767,7 @@ impl SettingsWindow {
                             "Fallback context menu setting disabled, but the environment variable still forces fallback."
                                 .to_string()
                         } else {
-                            "macOS native context menu restored for future right-click menus."
+                            "macOS native menus restored for future right-click menus and dropdowns."
                                 .to_string()
                         };
                     }
@@ -8196,8 +8355,7 @@ impl SettingsWindow {
         let Some((key, icon_x, icon_y, icon_size)) = self.ui.hint.take() else {
             return Ok(());
         };
-        let mut card = self.chrome_palette.as_menu_card();
-        crate::native_settings::apply_ui_colors(&mut card, configuration().ui_colors.as_ref());
+        let card = self.floating_card_palette();
         let font = self.fonts.command_palette_font_with_size_and_weight(
             crate::native_settings::settings_font_size(&self.native_settings),
             400,
@@ -15953,8 +16111,10 @@ impl SettingsWindow {
                 .push((key, plugin.id.clone(), plugin.background_default));
             let chosen = crate::plugins::choosing(&plugin.id).unwrap_or(plugin.background);
             let label = crate::i18n::tr(background_label(chosen));
-            let pill_width = (self.measure_text_width(&ui_font, &label) + self.ui_px(68.0))
-                .max(self.ui_px(120.0));
+            // As `dropdown_pill_rect` sizes the others.
+            let pill_width = (self.measure_text_width(&self.control_font, &label)
+                + self.ui_px(88.0))
+            .max(self.ui_px(120.0));
             let pill = rect(
                 switch_x - self.ui_px(16.0) - pill_width,
                 control_y,
@@ -16056,26 +16216,19 @@ impl SettingsWindow {
         pill: window::RectF,
         options: &[(String, String, SettingsAction, bool)],
     ) -> anyhow::Result<()> {
-        const LAYER: usize = 2;
-        let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
-        let body_font = Rc::clone(&self.body_font);
+        let control_font = Rc::clone(&self.control_font);
         let line = self.metrics.cell_size.height as f32;
-        let row_height = line * 2.0 + self.ui_px(20.0);
-        let row_gap = self.ui_px(6.0);
-        let menu_padding = self.ui_px(8.0);
-        let menu_height = menu_padding * 2.0
-            + row_height * options.len() as f32
-            + row_gap * options.len().saturating_sub(1) as f32;
+        let row_height = line * 2.0 + self.ui_px(DROPDOWN_ROW_EXTRA_HEIGHT);
+        let menu_height = self.dropdown_menu_height(options.len(), row_height);
         let widest = options
             .iter()
             .map(|(label, meaning, _, _)| {
-                self.measure_text_width(&ui_font, label)
-                    .max(self.measure_text_width(&body_font, meaning))
+                self.measure_text_width(&control_font, label)
+                    .max(self.measure_text_width(&control_font, meaning))
             })
             .fold(0.0, f32::max);
         let right = pill.origin.x + pill.size.width;
-        let width = (widest + self.ui_px(48.0))
+        let width = (widest + self.dropdown_label_inset() + self.ui_px(DROPDOWN_PADDING_X))
             .max(pill.size.width)
             .min(right - self.ui_px(8.0));
         let x = right - width;
@@ -16085,90 +16238,41 @@ impl SettingsWindow {
         } else {
             (pill.origin.y - self.ui_px(8.0) - menu_height).max(self.content_scroll_area_top())
         };
-        let menu_bg = match self.effective_appearance() {
-            Appearance::Light | Appearance::LightHighContrast => rgba(248, 248, 250, 1.0),
-            Appearance::Dark | Appearance::DarkHighContrast => rgba(34, 34, 36, 1.0),
-        };
-        // As in `paint_dropdown_menu`: the whole menu is claimed, so a click
-        // between its rows does not reach what it is painted over.
-        self.ui_context.push(
-            rect(x, y, width, menu_height),
-            WidgetKind::Button,
-            SettingsAction::DropdownMenuBackdrop,
-        );
-        self.draw_rounded_frame(
-            layers,
-            LAYER,
-            x,
-            y,
-            width,
-            menu_height,
-            menu_bg,
-            palette.control_border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        let mut row_y = y + menu_padding;
+        let card = self.paint_dropdown_card(layers, rect(x, y, width, menu_height))?;
+        let text_x = x + self.dropdown_label_inset();
+        let text_width = x + width - self.ui_px(DROPDOWN_PADDING_X) - text_x;
+        let mut row_y = y + self.ui_px(DROPDOWN_PADDING_Y);
         for (label, meaning, action, selected) in options {
-            let (action, selected) = (*action, *selected);
-            let row_rect = rect(
-                x + self.ui_px(8.0),
-                row_y,
-                width - self.ui_px(16.0),
-                row_height,
-            );
-            self.ui_context.push(row_rect, WidgetKind::Button, action);
-            let hovered = self.ui.interaction.hovered == Some(action);
-            let pressed = self.ui.interaction.pressed == Some(action);
-            let row_bg = if selected {
-                Some(palette.nav_selected_bg)
-            } else if pressed {
-                Some(palette.control_pressed_bg)
-            } else if hovered {
-                Some(palette.control_hover_bg)
-            } else {
-                None
-            };
-            if let Some(row_bg) = row_bg {
-                self.draw_rounded_rect(
-                    layers,
-                    LAYER,
-                    row_rect.origin.x,
-                    row_rect.origin.y,
-                    row_rect.size.width,
-                    row_rect.size.height,
-                    row_bg,
-                    self.ui_px(9.0),
-                )?;
-            }
-            let text_x = row_rect.origin.x + self.ui_px(14.0);
-            let text_width = row_rect.size.width - self.ui_px(28.0);
-            let top = row_rect.origin.y + self.ui_px(10.0);
-            let (label_color, meaning_color) = if selected {
-                (palette.selected_text, palette.selected_text)
-            } else {
-                (palette.text, palette.secondary_text)
-            };
+            let top = row_y + self.ui_px(DROPDOWN_ROW_EXTRA_HEIGHT) / 2.0;
+            self.paint_dropdown_row(
+                layers,
+                &card,
+                rect(x, row_y, width, row_height),
+                top,
+                *action,
+                *selected,
+            )?;
             self.draw_text_on_layer(
                 layers,
-                LAYER,
-                &ui_font,
+                DROPDOWN_LAYER,
+                &control_font,
                 text_x,
                 top,
                 label,
-                label_color,
+                card.text,
                 text_width,
             )?;
             self.draw_text_on_layer(
                 layers,
-                LAYER,
-                &body_font,
+                DROPDOWN_LAYER,
+                &control_font,
                 text_x,
                 top + line,
                 meaning,
-                meaning_color,
+                card.secondary_text,
                 text_width,
             )?;
-            row_y += row_height + row_gap;
+            row_y += row_height;
         }
         Ok(())
     }
@@ -16361,49 +16465,83 @@ impl SettingsWindow {
             hero_buttons,
         )?;
 
-        // Three plain facts, one line each: the labels say what they are, and
-        // an explanation under every one of them was noise.
-        let config = configuration();
-        let rows = [
-            (
-                SvgIcon::RefreshCw,
-                TileColor::Green,
-                crate::i18n::tr("settings-update-automatic"),
-                if config.check_for_updates {
-                    crate::i18n::tr("common-on")
-                } else {
-                    crate::i18n::tr("common-off")
-                },
-            ),
-            (
-                SvgIcon::Calendar,
-                TileColor::Orange,
-                crate::i18n::tr("settings-update-frequency"),
-                format_check_interval(config.check_for_updates_interval_seconds),
-            ),
-            (
-                SvgIcon::Timer,
-                TileColor::Blue,
-                crate::i18n::tr("settings-update-last-checked"),
-                self.ui
-                    .update_status
-                    .as_ref()
-                    .and_then(|status| status.last_checked)
-                    .map(format_last_checked)
-                    .unwrap_or_else(|| crate::i18n::tr("settings-update-never")),
-            ),
-        ];
+        // One line each: whether and how often the app looks by itself,
+        // then when it last did.
         let card_y = hero_y + hero_height + gap;
-        let card_height = self.compact_card_height(rows.len());
+        let card_height = self.compact_card_height(3);
         let row_step = self.compact_row_step();
         let first_row_y = card_y + self.ui_px(12.0);
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
-        for (index, (icon, color, label, value)) in rows.iter().enumerate() {
-            let row_y = first_row_y + row_step * index as f32;
-            let (tx, tw) =
-                self.paint_band_tile(layers, row_x, row_y, row_step, row_width, *icon, *color)?;
-            self.paint_compact_row(layers, tx, row_y, tw, label, value, index > 0)?;
-        }
+        let (tx, tw) = self.paint_band_tile(
+            layers,
+            row_x,
+            first_row_y,
+            row_step,
+            row_width,
+            SvgIcon::RefreshCw,
+            TileColor::Green,
+        )?;
+        self.paint_toggle_setting_row_with_hint(
+            layers,
+            tx,
+            first_row_y,
+            tw,
+            row_step,
+            &crate::i18n::tr("settings-update-automatic"),
+            "settings-update-automatic-description",
+            crate::native_settings::checks_for_updates(&self.native_settings),
+            SettingsAction::ToggleCheckForUpdates,
+        )?;
+        let frequency_row_y = first_row_y + row_step;
+        self.paint_separator(layers, tx, frequency_row_y, tw)?;
+        let (tx, tw) = self.paint_band_tile(
+            layers,
+            row_x,
+            frequency_row_y,
+            row_step,
+            row_width,
+            SvgIcon::Calendar,
+            TileColor::Orange,
+        )?;
+        let frequency = format_check_interval(
+            crate::native_settings::update_check_interval_seconds(&self.native_settings),
+        );
+        self.paint_band_dropdown_row(
+            layers,
+            (tx, frequency_row_y, tw, row_step),
+            SettingsDropdown::UpdateFrequency,
+            SettingsAction::ToggleUpdateFrequencyMenu,
+            &crate::i18n::tr("settings-update-frequency"),
+            "settings-update-frequency-description",
+            &frequency,
+            crate::native_settings::checks_for_updates(&self.native_settings),
+        )?;
+        let checked_row_y = frequency_row_y + row_step;
+        let (tx, tw) = self.paint_band_tile(
+            layers,
+            row_x,
+            checked_row_y,
+            row_step,
+            row_width,
+            SvgIcon::Timer,
+            TileColor::Blue,
+        )?;
+        let last_checked = self
+            .ui
+            .update_status
+            .as_ref()
+            .and_then(|status| status.last_checked)
+            .map(format_last_checked)
+            .unwrap_or_else(|| crate::i18n::tr("settings-update-never"));
+        self.paint_compact_row(
+            layers,
+            tx,
+            checked_row_y,
+            tw,
+            &crate::i18n::tr("settings-update-last-checked"),
+            &last_checked,
+            true,
+        )?;
 
         // Two choices: where updates download from, and what updating a
         // remote server does to its sessions.
@@ -17095,17 +17233,32 @@ impl SettingsWindow {
         label: &str,
         hint_key: &'static str,
     ) -> anyhow::Result<()> {
+        let text = self.palette().text;
+        self.paint_hinted_label_in(layers, x, label_y, text_width, label, hint_key, text)
+    }
+
+    /// `paint_hinted_label` with the label in `color`.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_hinted_label_in(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        label_y: f32,
+        text_width: f32,
+        label: &str,
+        hint_key: &'static str,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
-        let cell_height = self.metrics.cell_size.height as f32;
         let icon_size = self.ui_px(HINT_ICON_SIDE);
         let icon_gap = self.ui_px(HINT_ICON_GAP);
-        self.draw_text(layers, &ui_font, x, label_y, label, palette.text, text_width)?;
+        self.draw_text(layers, &ui_font, x, label_y, label, color, text_width)?;
         let shown = self.text_with_ellipsis(&ui_font, label, text_width);
         let label_width = self.measure_text_width(&ui_font, &shown);
 
         let icon_x = x + label_width + icon_gap;
-        let icon_y = label_y + (cell_height - icon_size) / 2.0;
+        let icon_y = self.ui_text_center_y(label_y) - icon_size / 2.0;
         let hint = SettingsAction::Hint(hint_key);
         let reach = self.ui_px(6.0);
         self.ui_context.push(
@@ -17549,6 +17702,16 @@ impl SettingsWindow {
         (self.measure_text_width(&self.logo_caption_font, label) + self.ui_px(12.0) * 2.0).round()
     }
 
+    /// The middle of a line of UI text drawn at `y`, as it looks: half its
+    /// capitals above the baseline. The line box's middle sits lower.
+    fn ui_text_center_y(&self, y: f32) -> f32 {
+        // `draw_text` puts the baseline this far below the y it is given,
+        // whatever the font.
+        let baseline_offset =
+            self.metrics.cell_size.height as f32 + self.metrics.descender.get() as f32;
+        y + baseline_offset - cap_height(self.ui_font.metrics()) / 2.0
+    }
+
     /// The capsule `paint_beta_badge` draws, with any label and color.
     fn paint_badge(
         &self,
@@ -17565,17 +17728,9 @@ impl SettingsWindow {
         if x + width > right_edge {
             return Ok(());
         }
-        let cap_height = |metrics: FontMetrics| {
-            metrics
-                .cap_height
-                .map(|cap| cap.get() as f32)
-                .unwrap_or(metrics.cell_height.get() as f32 * 0.58)
-        };
-        // `draw_text` puts the baseline this far below the y it is given,
-        // whatever the font.
         let baseline_offset =
             self.metrics.cell_size.height as f32 + self.metrics.descender.get() as f32;
-        let center_y = title_y + baseline_offset - cap_height(self.ui_font.metrics()) / 2.0;
+        let center_y = self.ui_text_center_y(title_y);
         let label_cap = cap_height(font.metrics());
         let height = (label_cap + self.ui_px(16.0)).round();
         self.draw_rounded_rect(
@@ -17609,12 +17764,12 @@ impl SettingsWindow {
         column_width: f32,
         label: &str,
     ) -> window::RectF {
-        // The 60 is what `paint_dropdown_pill` takes back out of the width for
-        // the inset and the chevron, so a label sized to exactly `text + 60`
-        // is handed a budget of exactly its own width -- which lands on the
-        // truncation boundary and loses its last character. "Dark" drew as
-        // "Dar". The slack is for that boundary, not for looks.
-        let natural = self.measure_text_width(&self.ui_font, label) + self.ui_px(68.0);
+        // `paint_dropdown_pill_in` takes 68 back out of the width for the
+        // round button and the gaps beside it; 16 more is the left inset the
+        // box shows under the pointer. A label handed exactly its own width
+        // lands on the truncation boundary and loses its last character --
+        // "Dark" drew as "Dar" -- so the budget keeps a little slack too.
+        let natural = self.measure_text_width(&self.control_font, label) + self.ui_px(88.0);
         let pill_width = natural.max(self.ui_px(120.0)).min(column_width);
         rect(
             control_x + column_width - pill_width,
@@ -17632,35 +17787,77 @@ impl SettingsWindow {
         bg: LinearRgba,
         border: LinearRgba,
     ) -> anyhow::Result<()> {
+        let text = self.palette().text;
+        self.paint_dropdown_pill_in(layers, pill, label, bg, border, text)
+    }
+
+    /// `paint_dropdown_pill` with its value and arrows in `text`. Shaped as
+    /// the system settings' pop-up buttons: no box, the value in a plain
+    /// weight, then up-and-down arrows in a round button. Under the pointer
+    /// or with its menu open (`bg` the hover fill, or `border` the open
+    /// edge, as every caller passes them) the whole control is boxed instead.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_dropdown_pill_in(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        pill: window::RectF,
+        label: &str,
+        bg: LinearRgba,
+        border: LinearRgba,
+        text: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let control_font = Rc::clone(&self.control_font);
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
-        self.draw_rounded_frame(
-            layers,
-            0,
-            pill.origin.x,
-            pill.origin.y,
-            pill.size.width,
-            pill.size.height,
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            pill.origin.x + self.ui_px(16.0),
-            self.control_text_y(pill.origin.y, pill.size.height),
-            label,
-            palette.text,
-            pill.size.width - self.ui_px(60.0),
-        )?;
+        let lit = bg != palette.control_bg || border == palette.nav_selected_bg;
+        let circle = self.ui_px(40.0);
+        let circle_x = pill.origin.x + pill.size.width - circle - self.ui_px(8.0);
+        let circle_y = pill.origin.y + (pill.size.height - circle) / 2.0;
+        if lit {
+            self.draw_rounded_frame(
+                layers,
+                0,
+                pill.origin.x,
+                pill.origin.y,
+                pill.size.width,
+                pill.size.height,
+                bg,
+                border,
+                self.ui_px(CONTROL_RADIUS),
+            )?;
+        } else {
+            self.draw_rounded_frame(
+                layers,
+                0,
+                circle_x,
+                circle_y,
+                circle,
+                circle,
+                bg,
+                border,
+                circle / 2.0,
+            )?;
+        }
+        let arrows = self.ui_px(24.0);
         self.draw_svg_icon(
             layers,
-            SvgIcon::ChevronDown,
-            pill.origin.x + pill.size.width - self.ui_px(38.0),
-            pill.origin.y + (pill.size.height - self.ui_px(22.0)) / 2.0,
-            self.ui_px(22.0),
-            palette.secondary_text,
+            SvgIcon::ChevronsUpDown,
+            circle_x + (circle - arrows) / 2.0,
+            circle_y + (circle - arrows) / 2.0,
+            arrows,
+            text,
+        )?;
+        // The value sits against the button, as the system's does.
+        let budget = pill.size.width - circle - self.ui_px(28.0);
+        let shown = self.text_with_ellipsis(&control_font, label, budget);
+        let width = self.measure_text_width(&control_font, &shown);
+        self.draw_text(
+            layers,
+            &control_font,
+            circle_x - self.ui_px(12.0) - width,
+            self.control_text_y(pill.origin.y, pill.size.height),
+            &shown,
+            text,
+            budget,
         )?;
         Ok(())
     }
@@ -18258,13 +18455,7 @@ impl SettingsWindow {
         Ok(extra)
     }
 
-    fn paint_web_link_ttl_menu(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        x: f32,
-        y: f32,
-        width: f32,
-    ) -> anyhow::Result<()> {
+    fn web_link_ttl_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
         let current = self.native_settings.web.link_ttl_secs;
         let options: Vec<(String, SettingsAction, bool)> = WEB_LINK_TTL_CHOICES
             .iter()
@@ -18277,7 +18468,7 @@ impl SettingsWindow {
                 )
             })
             .collect();
-        self.paint_dropdown_menu(layers, x, y, width, &options)
+        options
     }
 
     fn paint_command_palette_hotkey_row(
@@ -18350,13 +18541,7 @@ impl SettingsWindow {
         Ok(())
     }
 
-    fn paint_command_palette_hotkey_menu(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        x: f32,
-        y: f32,
-        width: f32,
-    ) -> anyhow::Result<()> {
+    fn command_palette_hotkey_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
         use crate::native_settings::NativeCommandPaletteHotkey as Hotkey;
         let current = crate::native_settings::palette_hotkey_choice(&self.native_settings);
         let options: Vec<(String, SettingsAction, bool)> = [
@@ -18375,7 +18560,7 @@ impl SettingsWindow {
             )
         })
         .collect();
-        self.paint_dropdown_menu(layers, x, y, width, &options)
+        options
     }
 
     fn paint_language_row(
@@ -18399,7 +18584,14 @@ impl SettingsWindow {
         );
         let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleLanguageMenu;
-        let dropdown_label = (&crate::i18n::configured_language_label(&self.native_settings)).to_string();
+        // "Follow System" alone: which language that comes to is said in
+        // the menu, where there is room for it, rather than cut short here.
+        let configured = crate::i18n::configured_preference(&self.native_settings);
+        let dropdown_label = if configured.eq_ignore_ascii_case(thinkterm_i18n::SYSTEM_PREFERENCE) {
+            crate::i18n::tr("language-system")
+        } else {
+            crate::i18n::configured_language_label(&self.native_settings)
+        };
         let control_rect =
             self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::Language);
@@ -18544,13 +18736,7 @@ impl SettingsWindow {
         Ok(extra)
     }
 
-    fn paint_default_shell_menu(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        x: f32,
-        y: f32,
-        width: f32,
-    ) -> anyhow::Result<()> {
+    fn default_shell_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
         let chosen = self.native_settings.terminal.default_shell.clone();
         let mut options = vec![(
             self.no_override_label(),
@@ -18564,7 +18750,7 @@ impl SettingsWindow {
                 chosen.as_ref() == Some(&shell.argv),
             ));
         }
-        self.paint_dropdown_menu(layers, x, y, width, &options)
+        options
     }
 
     /// A row whose control opens `dropdown`, showing `current`: the title
@@ -18639,24 +18825,20 @@ impl SettingsWindow {
         (control_x, control_y, control_width): (f32, f32, f32),
         options: &[(String, SettingsAction, bool)],
     ) -> anyhow::Result<()> {
-        // The height `paint_dropdown_menu` gives it.
-        let rows = options.len() as f32;
-        let menu_height = self.ui_px(8.0) * 2.0
-            + self.ui_px(46.0) * rows
-            + self.ui_px(6.0) * (rows - 1.0).max(0.0);
+        let menu_height = self.dropdown_menu_height(options.len(), self.dropdown_row_height());
         let below = control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0);
         let y = if below + menu_height <= self.content_bottom() - self.ui_px(8.0) {
             below
         } else {
             (control_y - self.ui_px(8.0) - menu_height).max(self.content_scroll_area_top())
         };
-        let ui_font = Rc::clone(&self.ui_font);
+        let control_font = Rc::clone(&self.control_font);
         let widest = options
             .iter()
-            .map(|(label, ..)| self.measure_text_width(&ui_font, label))
+            .map(|(label, ..)| self.measure_text_width(&control_font, label))
             .fold(0.0, f32::max);
         let right = control_x + control_width;
-        let width = (widest + self.ui_px(48.0))
+        let width = (widest + self.dropdown_label_inset() + self.ui_px(DROPDOWN_PADDING_X))
             .max(control_width)
             .min(right - self.ui_px(8.0));
         self.paint_dropdown_menu(layers, right - width, y, width, options)
@@ -18891,90 +19073,90 @@ impl SettingsWindow {
         else {
             return Ok(());
         };
+        let options = self.dropdown_menu_options(dropdown);
+        self.paint_fitted_dropdown_menu(layers, (control_x, control_y, control_width), &options)
+    }
+
+    /// On macOS the dropdown just opened shows as the system's own menu,
+    /// under its control, rather than as the card painted here. The plugins'
+    /// menus stay painted: their choices each say what they mean, a second
+    /// line the system menu has no room for.
+    fn open_dropdown_natively(&mut self, window: &Window, clicked: Option<window::RectF>) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let Some(dropdown) = self
+            .ui
+            .open_dropdown
+            .filter(|dropdown| !matches!(dropdown, SettingsDropdown::PluginBackground(_)))
+        else {
+            return;
+        };
+        if crate::native_settings::force_fallback_context_menu() {
+            return;
+        }
+        self.ui.open_dropdown = None;
+        // Under the button that was clicked: it sits at the right of its
+        // column, and only as wide as its value.
+        let Some(button) = clicked else {
+            return;
+        };
+        let options = self.dropdown_menu_options(dropdown);
+        let items = options
+            .iter()
+            .enumerate()
+            .map(|(index, (label, _, selected))| {
+                window::ContextMenuItem::application_item(label.clone(), index as u64)
+                    .checked(*selected)
+            })
+            .collect();
+        self.ui.native_menu = options.into_iter().map(|(_, action, _)| action).collect();
+        let below = button.max_y() + self.ui_px(8.0);
+        window.show_context_menu(
+            window::Point::new(button.min_x().round() as isize, below.round() as isize),
+            items,
+        );
+    }
+
+    /// What `dropdown` offers: each choice's label, what picking it does,
+    /// and whether it is the current one.
+    fn dropdown_menu_options(&self, dropdown: SettingsDropdown) -> Vec<(String, SettingsAction, bool)> {
         match dropdown {
-            SettingsDropdown::Language => self.paint_language_menu(
-                layers,
-                control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
-                control_width,
-            ),
-            SettingsDropdown::MacGlass => {
-                let options = self.mac_glass_menu_options();
-                self.paint_fitted_dropdown_menu(
-                    layers,
-                    (control_x, control_y, control_width),
-                    &options,
-                )
-            }
-            SettingsDropdown::MainRenderer => self.paint_main_renderer_menu(
-                layers,
-                control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
-                control_width,
-            ),
-            SettingsDropdown::DownloadSource => self.paint_download_source_menu(
-                layers,
-                control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
-                control_width,
-            ),
-            SettingsDropdown::DefaultShell => self.paint_default_shell_menu(
-                layers,
-                control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
-                control_width,
-            ),
-            SettingsDropdown::CommandPaletteHotkey => self.paint_command_palette_hotkey_menu(
-                layers,
-                control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
-                control_width,
-            ),
-            SettingsDropdown::WebLinkTtl => self.paint_web_link_ttl_menu(
-                layers,
-                control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
-                control_width,
-            ),
-            SettingsDropdown::EditorImportSpace => self.paint_editor_space_menu(
-                layers,
-                control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
-                control_width,
-            ),
-            // Painted under its pill, above.
-            SettingsDropdown::PluginBackground(_) => Ok(()),
+            SettingsDropdown::Language => self.language_menu_options(),
+            SettingsDropdown::MacGlass => self.mac_glass_menu_options(),
+            SettingsDropdown::MainRenderer => self.main_renderer_menu_options(),
+            SettingsDropdown::DownloadSource => self.download_source_menu_options(),
+            SettingsDropdown::UpdateFrequency => self.update_frequency_menu_options(),
+            SettingsDropdown::DefaultShell => self.default_shell_menu_options(),
+            SettingsDropdown::CommandPaletteHotkey => self.command_palette_hotkey_menu_options(),
+            SettingsDropdown::WebLinkTtl => self.web_link_ttl_menu_options(),
+            SettingsDropdown::EditorImportSpace => self.editor_space_menu_options(),
+            // Each choice comes with what it means: its own menu, under its
+            // pill (`paint_plugin_background_menu`).
+            SettingsDropdown::PluginBackground(_) => vec![],
         }
     }
 
-    fn paint_language_menu(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        x: f32,
-        y: f32,
-        width: f32,
-    ) -> anyhow::Result<()> {
+    fn language_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
         let configured = crate::i18n::configured_preference(&self.native_settings);
         let options: Vec<(String, SettingsAction, bool)> = crate::i18n::LANGUAGE_OPTIONS
             .iter()
             .map(|option| {
                 (
-                    crate::i18n::language_option_label(*option),
+                    if option.preference == thinkterm_i18n::SYSTEM_PREFERENCE {
+                        crate::i18n::system_language_label()
+                    } else {
+                        crate::i18n::language_option_label(*option)
+                    },
                     SettingsAction::SetLanguage(option.preference),
                     configured.eq_ignore_ascii_case(option.preference),
                 )
             })
             .collect();
-        self.paint_dropdown_menu(layers, x, y, width, &options)
+        options
     }
 
-    fn paint_download_source_menu(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        x: f32,
-        y: f32,
-        width: f32,
-    ) -> anyhow::Result<()> {
+    fn download_source_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
         let current = crate::native_settings::update_download_source(&self.native_settings);
         let options: Vec<(String, SettingsAction, bool)> = thinkterm_update::DownloadSource::all()
             .map(|source| {
@@ -18985,7 +19167,7 @@ impl SettingsWindow {
                 )
             })
             .collect();
-        self.paint_dropdown_menu(layers, x, y, width, &options)
+        options
     }
 
     /// The Updates page's download source: a hinted label and a dropdown,
@@ -18998,23 +19180,59 @@ impl SettingsWindow {
         width: f32,
         band_height: f32,
     ) -> anyhow::Result<()> {
+        let value = download_source_label(crate::native_settings::update_download_source(
+            &self.native_settings,
+        ));
+        self.paint_band_dropdown_row(
+            layers,
+            (x, y, width, band_height),
+            SettingsDropdown::DownloadSource,
+            SettingsAction::ToggleDownloadSourceMenu,
+            &crate::i18n::tr("settings-update-download-source"),
+            "settings-update-download-source-description",
+            &value,
+            true,
+        )
+    }
+
+    fn update_frequency_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
+        let current = crate::native_settings::update_check_interval_seconds(&self.native_settings);
+        let options: Vec<(String, SettingsAction, bool)> = UPDATE_FREQUENCY_CHOICES
+            .iter()
+            .map(|&seconds| {
+                (
+                    format_check_interval(seconds),
+                    SettingsAction::SetUpdateFrequency(seconds),
+                    seconds == current,
+                )
+            })
+            .collect();
+        options
+    }
+
+    /// A hinted label and a dropdown showing `value`, both centred in a
+    /// single-line band `(x, y, width, band_height)`.
+    fn paint_band_dropdown_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        (x, y, width, band_height): (f32, f32, f32, f32),
+        dropdown: SettingsDropdown,
+        action: SettingsAction,
+        label: &str,
+        hint_key: &'static str,
+        value: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
         let palette = self.palette();
         let control_width = self.settings_control_width(width);
         let control_x = x + width - control_width;
         let control_height = self.ui_px(CONTROL_HEIGHT);
         let control_y = y + ((band_height - control_height) / 2.0).max(0.0);
-        self.note_dropdown_anchor(
-            SettingsDropdown::DownloadSource,
-            (control_x, control_y, control_width),
-        );
-        let action = SettingsAction::ToggleDownloadSourceMenu;
-        let label = download_source_label(crate::native_settings::update_download_source(
-            &self.native_settings,
-        ));
-        let control_rect = self.dropdown_pill_rect(control_x, control_y, control_width, &label);
-        let open = self.ui.open_dropdown == Some(SettingsDropdown::DownloadSource);
-        let hovered = self.ui.interaction.hovered == Some(action);
-        let pressed = self.ui.interaction.pressed == Some(action);
+        self.note_dropdown_anchor(dropdown, (control_x, control_y, control_width));
+        let control_rect = self.dropdown_pill_rect(control_x, control_y, control_width, value);
+        let open = enabled && self.ui.open_dropdown == Some(dropdown);
+        let hovered = enabled && self.ui.interaction.hovered == Some(action);
+        let pressed = enabled && self.ui.interaction.pressed == Some(action);
         let bg = if pressed || hovered {
             palette.control_hover_bg
         } else {
@@ -19027,8 +19245,16 @@ impl SettingsWindow {
         } else {
             palette.control_border
         };
-        self.ui_context
-            .push(control_rect, WidgetKind::Button, action);
+        // Greyed out, a row takes no clicks: what it sets does nothing now.
+        if enabled {
+            self.ui_context
+                .push(control_rect, WidgetKind::Button, action);
+        }
+        let text = if enabled {
+            palette.text
+        } else {
+            palette.muted_text
+        };
 
         let cell_height = self.metrics.cell_size.height as f32;
         let icon_size = self.ui_px(HINT_ICON_SIDE);
@@ -19036,25 +19262,12 @@ impl SettingsWindow {
         let text_width =
             (control_rect.min_x() - x - icon_size - icon_gap - 24.0).max(width * 0.3);
         let label_y = control_y + (control_height - cell_height) / 2.0;
-        self.paint_hinted_label(
-            layers,
-            x,
-            label_y,
-            text_width,
-            &crate::i18n::tr("settings-update-download-source"),
-            "settings-update-download-source-description",
-        )?;
-        self.paint_dropdown_pill(layers, control_rect, &label, bg, border)?;
+        self.paint_hinted_label_in(layers, x, label_y, text_width, label, hint_key, text)?;
+        self.paint_dropdown_pill_in(layers, control_rect, value, bg, border, text)?;
         Ok(())
     }
 
-    fn paint_main_renderer_menu(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        x: f32,
-        y: f32,
-        width: f32,
-    ) -> anyhow::Result<()> {
+    fn main_renderer_menu_options(&self) -> Vec<(String, SettingsAction, bool)> {
         let current = self.current_main_renderer();
         let options = [
             (
@@ -19068,9 +19281,12 @@ impl SettingsWindow {
                 current == NativeRendererBackend::WebGpu,
             ),
         ];
-        self.paint_dropdown_menu(layers, x, y, width, &options)
+        options.to_vec()
     }
 
+    /// A dropdown's choices, floating under its control in the card
+    /// Windows and Linux show a right-click menu in: rows that light up
+    /// under the pointer, a tick before the current one.
     fn paint_dropdown_menu(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -19079,93 +19295,155 @@ impl SettingsWindow {
         width: f32,
         options: &[(String, SettingsAction, bool)],
     ) -> anyhow::Result<()> {
-        let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
-        let row_height = self.ui_px(46.0);
-        let row_gap = self.ui_px(6.0);
-        let menu_padding = self.ui_px(8.0);
-        let menu_height = menu_padding * 2.0
-            + row_height * options.len() as f32
-            + row_gap * options.len().saturating_sub(1) as f32;
-        let menu_bg = match self.effective_appearance() {
-            Appearance::Light | Appearance::LightHighContrast => rgba(248, 248, 250, 1.0),
-            Appearance::Dark | Appearance::DarkHighContrast => rgba(34, 34, 36, 1.0),
-        };
+        let control_font = Rc::clone(&self.control_font);
+        let row_height = self.dropdown_row_height();
+        let menu_height = self.dropdown_menu_height(options.len(), row_height);
+        let card = self.paint_dropdown_card(layers, rect(x, y, width, menu_height))?;
+        let label_x = x + self.dropdown_label_inset();
+        let label_width = x + width - self.ui_px(DROPDOWN_PADDING_X) - label_x;
+        let mut row_y = y + self.ui_px(DROPDOWN_PADDING_Y);
+        for (label, action, selected) in options {
+            let label_y = self.control_text_y(row_y, row_height);
+            let color = self.paint_dropdown_row(
+                layers,
+                &card,
+                rect(x, row_y, width, row_height),
+                label_y,
+                *action,
+                *selected,
+            )?;
+            self.draw_text_on_layer(
+                layers,
+                DROPDOWN_LAYER,
+                &control_font,
+                label_x,
+                label_y,
+                label,
+                color,
+                label_width,
+            )?;
+            row_y += row_height;
+        }
+        Ok(())
+    }
 
-        // Claim the whole menu area before the rows do. Hit testing takes
-        // the last matching rect, so the rows still win where they cover;
-        // this only catches the padding and the gaps between them, which
-        // would otherwise pass the click through to whatever control the
-        // open menu is painted over.
+    /// How tall a dropdown's row of one line is.
+    fn dropdown_row_height(&self) -> f32 {
+        self.metrics.cell_size.height as f32 + self.ui_px(DROPDOWN_ROW_EXTRA_HEIGHT)
+    }
+
+    /// How tall a dropdown of `rows` rows `row_height` tall is.
+    fn dropdown_menu_height(&self, rows: usize, row_height: f32) -> f32 {
+        self.ui_px(DROPDOWN_PADDING_Y) * 2.0 + row_height * rows as f32
+    }
+
+    /// How far into a dropdown its labels start: past the tick's slot.
+    fn dropdown_label_inset(&self) -> f32 {
+        self.ui_px(DROPDOWN_PADDING_X) + self.ui_px(DROPDOWN_CHECK_SLOT)
+    }
+
+    /// The colours of a card floating over the page -- a dropdown's choices,
+    /// an ⓘ's explanation: the menu card's, solid whatever the palette. One
+    /// derived from the terminal's scheme keeps its see-through control
+    /// fill, and the rows a card covered showed through it.
+    fn floating_card_palette(&self) -> crate::ui::UiPalette {
+        let mut card = self.chrome_palette.as_menu_card();
+        crate::native_settings::apply_ui_colors(&mut card, configuration().ui_colors.as_ref());
+        let fill = card.control_bg;
+        card.control_bg = LinearRgba::with_components(fill.0, fill.1, fill.2, 1.0);
+        card
+    }
+
+    /// The floating card a dropdown's rows sit on, at `bounds`, with its
+    /// shadow. Claims all of it first: hit testing takes the last matching
+    /// rect, so the rows still win where they cover, and a click in the
+    /// card's padding does not pass through to the control it covers.
+    /// Returns the colours its rows paint in.
+    fn paint_dropdown_card(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        bounds: window::RectF,
+    ) -> anyhow::Result<crate::ui::UiPalette> {
+        let card = self.floating_card_palette();
         self.ui_context.push(
-            rect(x, y, width, menu_height),
+            bounds,
             WidgetKind::Button,
             SettingsAction::DropdownMenuBackdrop,
         );
-
-        self.draw_rounded_frame(
+        let ctx = crate::ui::draw::DrawContext::new(
+            self.render_state
+                .as_ref()
+                .context("settings render state")?,
+            self.dimensions,
+            &self.metrics,
+        );
+        let shadow = if card.is_dark() { 0.58 } else { 0.43 };
+        ctx.draw_elevated_surface(
             layers,
-            1,
-            x,
-            y,
-            width,
-            menu_height,
-            menu_bg,
-            palette.control_border,
-            self.ui_px(CONTROL_RADIUS),
+            DROPDOWN_LAYER,
+            bounds,
+            card.control_bg,
+            card.control_border,
+            LinearRgba::with_components(0.0, 0.0, 0.0, shadow),
+            self.ui_px(DROPDOWN_RADIUS),
         )?;
+        Ok(card)
+    }
 
-        let mut row_y = y + menu_padding;
-        for (label, action, selected) in options {
-            let action = *action;
-            let selected = *selected;
-            let row_rect = rect(
-                x + self.ui_px(8.0),
-                row_y,
-                width - self.ui_px(16.0),
-                row_height,
-            );
-            self.ui_context.push(row_rect, WidgetKind::Button, action);
-            let hovered = self.ui.interaction.hovered == Some(action);
-            let pressed = self.ui.interaction.pressed == Some(action);
-            let row_bg = if selected {
-                Some(palette.nav_selected_bg)
-            } else if pressed {
-                Some(palette.control_pressed_bg)
-            } else if hovered {
-                Some(palette.control_hover_bg)
-            } else {
-                None
-            };
-            if let Some(row_bg) = row_bg {
-                self.draw_rounded_rect(
-                    layers,
-                    1,
-                    row_rect.origin.x,
-                    row_rect.origin.y,
-                    row_rect.size.width,
-                    row_rect.size.height,
-                    row_bg,
-                    self.ui_px(9.0),
-                )?;
-            }
-            self.draw_text(
+    /// One choice's row in a dropdown card, `row` being all of it, whose
+    /// label is drawn at `label_y`: the highlight under the pointer, inset
+    /// from the card's edges, and the tick before the current choice.
+    /// Returns the colour its label goes in.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_dropdown_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        card: &crate::ui::UiPalette,
+        row: window::RectF,
+        label_y: f32,
+        action: SettingsAction,
+        selected: bool,
+    ) -> anyhow::Result<LinearRgba> {
+        self.ui_context.push(row, WidgetKind::Button, action);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        if hovered || pressed {
+            let inset_x = self.ui_px(DROPDOWN_HOVER_INSET_X);
+            let inset_y = self.ui_px(DROPDOWN_HOVER_INSET_Y);
+            // Opaque, a step of the card towards its text as the eye sees
+            // it, as the update capsule's button: the card's own hover grey
+            // is a translucent white, which blends in linear light and so
+            // comes out several times brighter than it reads in sRGB.
+            let step = if pressed { 0.14 } else { 0.08 };
+            let height = row.size.height - inset_y * 2.0;
+            self.draw_rounded_rect(
                 layers,
-                &ui_font,
-                row_rect.origin.x + self.ui_px(14.0),
-                self.control_text_y(row_rect.origin.y, row_height),
-                label,
-                if selected {
-                    palette.selected_text
-                } else {
-                    palette.text
-                },
-                row_rect.size.width - self.ui_px(28.0),
+                DROPDOWN_LAYER,
+                row.origin.x + inset_x,
+                row.origin.y + inset_y,
+                row.size.width - inset_x * 2.0,
+                height,
+                crate::ui::color::mix(card.control_bg, card.text, step),
+                self.ui_px(DROPDOWN_ROW_RADIUS).min(height / 2.0),
             )?;
-            row_y += row_height + row_gap;
         }
-
-        Ok(())
+        let color = if hovered || pressed || selected {
+            card.text
+        } else {
+            card.secondary_text
+        };
+        if selected {
+            let size = self.ui_px(DROPDOWN_CHECK_SIZE);
+            self.draw_svg_icon(
+                layers,
+                SvgIcon::Check,
+                row.origin.x + self.ui_px(DROPDOWN_PADDING_X),
+                self.ui_text_center_y(label_y) - size / 2.0,
+                size,
+                color,
+            )?;
+        }
+        Ok(color)
     }
 
     fn content_bottom(&self) -> f32 {

@@ -49,12 +49,19 @@ pub(crate) fn activate_from_settings(settings: &ThinkTermNativeSettings) -> &'st
     activate_preference(configured_preference(settings))
 }
 
+/// "Follow System (English)": following the system, and what that comes to
+/// -- the system's language, whichever one is chosen now.
+pub(crate) fn system_language_label() -> String {
+    let resolved = thinkterm_i18n::resolve_preference(SYSTEM_PREFERENCE, &system_locales());
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("language", thinkterm_i18n::native_name_for_locale(resolved));
+    tr_args("language-system-resolved", &args)
+}
+
 pub(crate) fn configured_language_label(settings: &ThinkTermNativeSettings) -> String {
     let preference = configured_preference(settings);
     if preference.eq_ignore_ascii_case(SYSTEM_PREFERENCE) {
-        let mut args = fluent_bundle::FluentArgs::new();
-        args.set("language", thinkterm_i18n::native_name_for_locale(current_locale()));
-        tr_args("language-system-resolved", &args)
+        system_language_label()
     } else {
         let resolved = thinkterm_i18n::resolve_preference(preference, &system_locales());
         thinkterm_i18n::native_name_for_locale(resolved).to_string()
