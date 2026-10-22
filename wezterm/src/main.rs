@@ -932,7 +932,9 @@ impl UpdateCommand {
             anyhow::bail!("update failed");
         }
         println!();
-        println!("Installed {target_version}. A running thinkterm-mux-server or GUI keeps the old build until it is restarted.");
+        // The installer has said what still runs the old build, and on a
+        // server moved the mux server over itself.
+        println!("Installed {target_version}. What still runs the old build is listed above.");
         Ok(())
     }
 }

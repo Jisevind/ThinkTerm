@@ -1043,6 +1043,61 @@ else
   [ "$variant" != desktop ] || note "app launcher $arrow $(pretty "$sharedir/applications")"
 fi
 
+# The binaries were swapped under it, so a mux server that is still running
+# is the old build. Client and server refuse to talk across a protocol
+# change, so the next `thinkterm connect` would fail with a version error
+# unless it is replaced.
+# Matched on the command line: Linux truncates process names to 15
+# characters, so -x with the full binary name never matches there.
+server_running=""
+if have pgrep && pgrep -u "$(id -u)" -f '[t]hinkterm-mux-server' >/dev/null 2>&1; then
+  server_running=1
+fi
+
+# On a server, the new build takes the running one's sessions over
+# (--takeover) and carries on in its place, so nothing running in it ends.
+# A server that cannot hand over -- a build from before the handoff -- says
+# so and keeps running as it was. Only for someone at a terminal: `thinkterm
+# update` on another machine runs this script over ssh without one and takes
+# the server over itself, as its settings say. The desktop app moves its
+# own session server over the next time it starts; swapping it under the
+# app still open would cut that off.
+take_over_server() {
+  if have timeout; then
+    timeout 120 "$bindir/thinkterm-mux-server" --daemonize --takeover
+  else
+    "$bindir/thinkterm-mux-server" --daemonize --takeover
+  fi
+}
+takeover=""
+if [ -n "$server_running" ] && [ "$variant" = server ] && [ -t 1 ]; then
+  new_build=$version
+  [ "$version" != unknown ] || new_build="the new version"
+  attempt=1
+  while :; do
+    if with_spinner "moving the mux server's sessions to $new_build" take_over_server; then
+      takeover=done
+      break
+    else
+      code=$?
+    fi
+    # Tried again as the app's own takeover is: a failure part-way leaves
+    # the running server as it was and need not recur. Not a server that
+    # cannot hand over at all (3), nor one that timed out (124).
+    if [ "$code" -eq 3 ] || [ "$code" -eq 124 ] || [ "$attempt" -ge 3 ]; then
+      takeover=failed
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  if [ "$takeover" = done ]; then
+    ok "moved the mux server to $new_build ${ui_dim}its sessions carry on$ui_reset"
+  else
+    warn "the mux server could not hand its sessions over; it keeps running the old version"
+  fi
+fi
+
 # What is left for the user, most pressing first: "!" for what stops
 # ThinkTerm working until it is done, "." for what is worth knowing.
 next_shown=""
@@ -1089,13 +1144,8 @@ if [ -n "$missing_libs" ]; then
   done
 fi
 
-# The binaries were swapped under it, so a mux server that is still running
-# is the old build. Client and server refuse to talk across a protocol
-# change, so the next `thinkterm connect` would fail with a version error
-# unless it is restarted.
-# Matched on the command line: Linux truncates process names to 15
-# characters, so -x with the full binary name never matches there.
-if have pgrep && pgrep -u "$(id -u)" -f '[t]hinkterm-mux-server' >/dev/null 2>&1; then
+# The server variant's is dealt with below.
+if [ -n "$server_running" ] && [ "$variant" != server ]; then
   next . "the mux server still running is the old version; restart it to update it."
 fi
 gui_running=""
@@ -1105,11 +1155,24 @@ if have pgrep && pgrep -u "$(id -u)" -f '[t]hinkterm-gui' >/dev/null 2>&1; then
 fi
 
 if [ "$variant" = server ]; then
-  next . "start the mux server (no root, no service file):"
-  cmd "thinkterm-mux-server --daemonize"
-  if [ "$os" = linux ]; then
-    next . "it usually keeps running after you log out of SSH; if it does not:"
-    cmd "loginctl enable-linger \$USER   # some servers need an admin for this"
+  if [ "$takeover" = done ]; then
+    :
+  elif [ "$takeover" = failed ]; then
+    next ! "the mux server still runs the old version; to switch, stop it and start this one (its sessions end):"
+    cmd "thinkterm cli stop-server"
+    cmd "thinkterm-mux-server --daemonize"
+  elif [ -n "$server_running" ]; then
+    # Not tried without a terminal. Starting another one beside it would
+    # change nothing: --takeover hands its sessions to the new build.
+    next . "the mux server still running is the old version; move its sessions to this one:"
+    cmd "thinkterm-mux-server --daemonize --takeover"
+  else
+    next . "start the mux server (no root, no service file):"
+    cmd "thinkterm-mux-server --daemonize"
+    if [ "$os" = linux ]; then
+      next . "it usually keeps running after you log out of SSH; if it does not:"
+      cmd "loginctl enable-linger \$USER   # some servers need an admin for this"
+    fi
   fi
 fi
 
