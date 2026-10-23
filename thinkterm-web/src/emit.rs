@@ -244,13 +244,23 @@ pub fn emit_line(
     for cluster in &clusters {
         let attrs = &cluster.attrs;
         let bg_is_default = attrs.background() == ColorAttribute::Default;
-        let bg = p.palette.resolve_bg(attrs.background()).to_linear();
-        let fg = resolve_fg(attrs, attrs.foreground(), p.palette).to_linear();
+        let bg = p.palette.resolve_bg(attrs.background());
+        let fg = resolve_fg(attrs, attrs.foreground(), p.palette);
         let (fg, bg, bg_is_default) = if attrs.reverse() == !p.reverse_video {
             (bg, fg, false)
         } else {
             (fg, bg, bg_is_default)
         };
+        // SGR 2 carries no alpha of its own: mix half way to the cell's own
+        // background, as the desktop renderer does, so the same sequence
+        // reads as a dim grey on either side of a light/dark scheme.
+        let fg = if attrs.intensity() == Intensity::Half {
+            fg.interpolate(bg, 0.5)
+        } else {
+            fg
+        };
+        let bg = bg.to_linear();
+        let fg = fg.to_linear();
         // The floor lifts dim text off its ground, as the desktop's
         // minimum contrast does; the ground of a default cell is the
         // palette's.

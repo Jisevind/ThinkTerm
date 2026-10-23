@@ -4856,6 +4856,8 @@ impl TermWindow {
                 &config,
                 None,
             );
+        let (cursor_blink_ease_in, cursor_blink_ease_out) =
+            crate::native_settings::cursor_blink_eases(&config);
         let myself = Self {
             frontend_geometry_phases: HashMap::new(),
             remote_open_intent: remote_open_domain
@@ -5009,9 +5011,9 @@ impl TermWindow {
             last_gpu_allocator_log: Cell::new(None),
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
-                config.cursor_blink_ease_in,
+                cursor_blink_ease_in,
                 config.cursor_blink_rate,
-                config.cursor_blink_ease_out,
+                cursor_blink_ease_out,
                 None,
             )),
             blink_state: RefCell::new(ColorEase::new(
@@ -7762,6 +7764,22 @@ impl TermWindow {
         self.invalidate_window();
     }
 
+    /// Rebuild the cursor's blink state from the style chosen in Settings.
+    /// `config_was_reloaded` does this too; this is the direct route, for the
+    /// settings window, which writes the choice to its own file and never
+    /// touches the configuration.
+    pub(crate) fn refresh_cursor_blink(&mut self) {
+        let (ease_in, ease_out) = crate::native_settings::cursor_blink_eases(&self.config);
+        *self.cursor_blink_state.borrow_mut() = ColorEase::new(
+            self.config.cursor_blink_rate,
+            ease_in,
+            self.config.cursor_blink_rate,
+            ease_out,
+            None,
+        );
+        self.invalidate_window();
+    }
+
     /// Re-resolve the cached chrome colours. `config_was_reloaded` does this
     /// too; this is the direct route, for when the appearance moved without a
     /// configuration reload behind it.
@@ -8031,11 +8049,13 @@ impl TermWindow {
             _ => return,
         };
         self.terminal_bar_kind = self.wanted_terminal_bar_kind(&config, window.len());
+        let (cursor_blink_ease_in, cursor_blink_ease_out) =
+            crate::native_settings::cursor_blink_eases(&config);
         *self.cursor_blink_state.borrow_mut() = ColorEase::new(
             config.cursor_blink_rate,
-            config.cursor_blink_ease_in,
+            cursor_blink_ease_in,
             config.cursor_blink_rate,
-            config.cursor_blink_ease_out,
+            cursor_blink_ease_out,
             None,
         );
         *self.blink_state.borrow_mut() = ColorEase::new(

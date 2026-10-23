@@ -853,6 +853,40 @@ impl crate::TermWindow {
         adjusted
     }
 
+    /// The colour of the text under a block cursor.
+    ///
+    /// A block cursor is expected to be readable on its own background. A
+    /// colour scheme sets `cursor_fg` for the scheme's own cursor colour, but
+    /// an application can change that colour with OSC 12 -- OpenCode asks for
+    /// `#eeeeee` -- and then a white `cursor_fg` disappears into it. Keep the
+    /// configured colour when it reads; otherwise fall back to the cell's own
+    /// background, the inversion a block cursor normally is, and to black or
+    /// white when even that does not clear the bar.
+    fn block_cursor_text_color(
+        configured: LinearRgba,
+        cell_background: LinearRgba,
+        cursor_background: LinearRgba,
+    ) -> LinearRgba {
+        // WCAG AA for body text. A cursor covers one cell, but that cell is
+        // exactly where the user is looking.
+        const MIN_CONTRAST: f32 = 4.5;
+
+        if configured.contrast_ratio(&cursor_background) >= MIN_CONTRAST {
+            return configured;
+        }
+        if cell_background.contrast_ratio(&cursor_background) >= MIN_CONTRAST {
+            return cell_background;
+        }
+
+        let black = LinearRgba::with_components(0., 0., 0., 1.);
+        let white = LinearRgba::with_components(1., 1., 1., 1.);
+        if black.contrast_ratio(&cursor_background) >= white.contrast_ratio(&cursor_background) {
+            black
+        } else {
+            white
+        }
+    }
+
     pub fn compute_cell_fg_bg(&self, params: ComputeCellFgBgParams) -> ComputeCellFgBgResult {
         let focused_and_active =
             self.focused.is_some() && params.is_active_pane && !self.right_sidebar_has_text_focus();
@@ -901,7 +935,14 @@ impl crate::TermWindow {
                 let (fg_color, bg_color) = if self.use_reverse_video_cursor(&params) {
                     (params.bg_color, params.fg_color)
                 } else {
-                    (params.cursor_fg, params.cursor_bg)
+                    (
+                        Self::block_cursor_text_color(
+                            params.cursor_fg.when_fully_transparent(params.fg_color),
+                            params.bg_color,
+                            params.cursor_bg,
+                        ),
+                        params.cursor_bg,
+                    )
                 };
 
                 let fg_color = self.ensure_min_contrast(fg_color, bg_color);
@@ -962,7 +1003,11 @@ impl crate::TermWindow {
                     (params.bg_color, params.fg_color, params.fg_color)
                 } else {
                     (
-                        params.cursor_fg.when_fully_transparent(params.fg_color),
+                        Self::block_cursor_text_color(
+                            params.cursor_fg.when_fully_transparent(params.fg_color),
+                            params.bg_color,
+                            params.cursor_bg,
+                        ),
                         params.cursor_bg,
                         params.cursor_bg,
                     )
@@ -1412,6 +1457,17 @@ fn resolve_fg_color_attr(
 /// -- and the two swapped where the cell's reverse attribute and the
 /// screen's reverse video disagree. The flag says the background is the
 /// pane's own ground.
+/// The colour SGR 2 (faint) is drawn in: half way from the foreground to
+/// the cell's own background, which is what a 50% overlay looks like on an
+/// opaque cell. Faint carries no alpha of its own, so mixing is the only way
+/// to honour it without changing the glyph pipeline.
+pub(crate) fn faint_color(
+    fg: wezterm_term::color::SrgbaTuple,
+    bg: wezterm_term::color::SrgbaTuple,
+) -> wezterm_term::color::SrgbaTuple {
+    fg.interpolate(bg, 0.5)
+}
+
 pub(crate) fn cell_fg_bg(
     attrs: &CellAttributes,
     palette: &ColorPalette,
@@ -1427,11 +1483,19 @@ pub(crate) fn cell_fg_bg(
     let bg = palette.resolve_bg(attrs.background());
     let fg = resolve_fg_color_attr_srgb(attrs, attrs.foreground(), palette, config, style);
     // Check the line reverse_video flag and flip.
-    if attrs.reverse() == !reverse_video {
+    let (fg, bg, bg_is_default) = if attrs.reverse() == !reverse_video {
         (bg, fg, false)
     } else {
         (fg, bg, bg_is_default)
-    }
+    };
+    // Faint is resolved after the flip, against the background the glyph is
+    // actually drawn on.
+    let fg = if attrs.intensity() == wezterm_term::Intensity::Half {
+        faint_color(fg, bg)
+    } else {
+        fg
+    };
+    (fg, bg, bg_is_default)
 }
 
 fn resolve_fg_color_attr_srgb(
@@ -1589,6 +1653,75 @@ mod line_quad_cache_tests {
                 + std::mem::size_of::<LineQuadCacheValue>()
                 + vectors
                 + boxes
+        );
+    }
+}
+
+#[cfg(test)]
+mod cursor_colour_tests {
+    use super::*;
+    use crate::TermWindow;
+    use wezterm_term::color::SrgbaTuple;
+
+    fn rgb(r: u8, g: u8, b: u8) -> LinearRgba {
+        LinearRgba::with_srgba(r, g, b, 0xff)
+    }
+
+    /// OpenCode sets the cursor to `#eeeeee` with OSC 12. The scheme's white
+    /// `cursor_fg` has nowhere near enough contrast, so the cursor has to
+    /// fall back to the cell's own background -- the inversion a block
+    /// cursor is normally understood to be.
+    #[test]
+    fn a_white_cursor_fg_on_a_near_white_cursor_inverts_the_cell() {
+        let dark = rgb(0x1e, 0x1e, 0x1e);
+        let near_white = rgb(0xee, 0xee, 0xee);
+        let white = rgb(0xff, 0xff, 0xff);
+
+        let picked = TermWindow::block_cursor_text_color(white, dark, near_white);
+        assert_eq!(picked, dark, "the cell background is the readable fallback");
+    }
+
+    /// A cursor that already reads keeps the colour the scheme asked for.
+    #[test]
+    fn a_readable_cursor_fg_is_left_alone() {
+        let white = rgb(0xff, 0xff, 0xff);
+        let near_black = rgb(0x10, 0x10, 0x10);
+
+        let picked = TermWindow::block_cursor_text_color(white, rgb(0x80, 0x80, 0x80), near_black);
+        assert_eq!(picked, white);
+    }
+
+    /// When neither the scheme's foreground nor the cell's background has
+    /// enough contrast, black or white takes over rather than leaving the
+    /// glyph invisible.
+    #[test]
+    fn a_mid_grey_cursor_gets_black_or_white() {
+        let mid = rgb(0x80, 0x80, 0x80);
+        let picked = TermWindow::block_cursor_text_color(
+            rgb(0x90, 0x90, 0x90),
+            rgb(0x70, 0x70, 0x70),
+            mid,
+        );
+        assert!(
+            picked.contrast_ratio(&mid) >= 4.5,
+            "the fallback has to read, got {:?}",
+            picked
+        );
+    }
+
+    /// SGR 2 has no alpha of its own: it is mixed half way to the cell's
+    /// background, so the same sequence reads as a dim grey on either side
+    /// of a light/dark scheme.
+    #[test]
+    fn faint_text_is_mixed_half_way_to_its_background() {
+        let white = SrgbaTuple(1., 1., 1., 1.);
+        let dark = SrgbaTuple(0.1, 0.1, 0.1, 1.);
+        let faint = faint_color(white, dark);
+
+        assert!(faint.3 == 1.0, "dimming must not make the glyph transparent");
+        assert!(
+            faint.to_linear().relative_luminance() < white.to_linear().relative_luminance(),
+            "faint text has to be darker than normal text"
         );
     }
 }

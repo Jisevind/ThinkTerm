@@ -360,6 +360,31 @@ impl NativeTextContrast {
     }
 }
 
+/// How the cursor blinks.
+///
+/// `Hard` switches it between fully on and fully off, as Apple's Terminal
+/// does; `Smooth` eases it in and out, as the Lua
+/// `cursor_blink_ease_in`/`cursor_blink_ease_out` settings describe. Smooth
+/// stays the default so the configuration keeps deciding; Hard is there for
+/// the classic on/off cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCursorBlink {
+    Hard,
+    Smooth,
+}
+
+impl Default for NativeCursorBlink {
+    fn default() -> Self {
+        Self::Smooth
+    }
+}
+
+impl NativeCursorBlink {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 2] = [Self::Smooth, Self::Hard];
+}
+
 /// A value this build does not know about must not cost the user the rest of
 /// their settings, so an unreadable choice reads as the default rather than
 /// failing the whole file. Same reasoning as `theme_mode_or_default`.
@@ -874,6 +899,10 @@ pub(crate) struct NativeTerminalSettings {
     /// `text_min_contrast_ratio`, which is itself off unless set.
     #[serde(deserialize_with = "text_contrast_or_default")]
     pub(crate) text_contrast: NativeTextContrast,
+    /// See [`NativeCursorBlink`]. Smooth is the default, preserving the
+    /// eased cursor the Lua settings describe.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) cursor_blink: NativeCursorBlink,
     pub(crate) bottom_quote_enabled: bool,
     pub(crate) bottom_quote_mode: NativeBottomQuoteMode,
     pub(crate) bottom_quote_interval_minutes: Option<u32>,
@@ -898,6 +927,7 @@ impl Default for NativeTerminalSettings {
             copy_effect: NativeCopyEffect::default(),
             focus_follows_mouse: false,
             text_contrast: NativeTextContrast::default(),
+            cursor_blink: NativeCursorBlink::default(),
             bottom_quote_enabled: false,
             bottom_quote_mode: NativeBottomQuoteMode::default(),
             bottom_quote_interval_minutes: None,
@@ -959,6 +989,24 @@ pub(crate) fn text_min_contrast_ratio(config: &ConfigHandle) -> Option<f32> {
         .text_contrast
         .ratio()
         .or(config.text_min_contrast_ratio)
+}
+
+/// The easing pair the cursor's `ColorEase` should use.
+///
+/// `Hard` overrides the Lua easing entirely; `Smooth` leaves it in charge,
+/// so a configuration that named `EaseIn`, `EaseInOut` or `Linear` keeps the
+/// function it asked for. Read when the state is built and when the setting
+/// changes, not per frame.
+pub(crate) fn cursor_blink_eases(
+    config: &ConfigHandle,
+) -> (config::EasingFunction, config::EasingFunction) {
+    match load_shared().terminal.cursor_blink {
+        NativeCursorBlink::Hard => (
+            config::EasingFunction::Constant,
+            config::EasingFunction::Constant,
+        ),
+        NativeCursorBlink::Smooth => (config.cursor_blink_ease_in, config.cursor_blink_ease_out),
+    }
 }
 
 /// Read once per painted pane, through the shared handle.
@@ -2220,6 +2268,7 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
     let font_size = (before.terminal.font_size != after.terminal.font_size)
         .then_some(after.terminal.font_size);
     let contrast = before.terminal.text_contrast != after.terminal.text_contrast;
+    let cursor_blink = before.terminal.cursor_blink != after.terminal.cursor_blink;
     let before_chrome = &before.chrome;
     let after_chrome = &after.chrome;
     let panels = before_chrome.right_sidebar_files_enabled != after_chrome.right_sidebar_files_enabled
@@ -2252,6 +2301,9 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
                         }
                         if contrast {
                             term_window.refresh_text_min_contrast();
+                        }
+                        if cursor_blink {
+                            term_window.refresh_cursor_blink();
                         }
                         if panels {
                             term_window.right_sidebar_panels_changed();
@@ -3388,6 +3440,38 @@ mod tests {
             let out = serde_json::to_string(&settings).expect("serialises");
             assert!(
                 out.contains(&format!("\"text_contrast\":\"{written}\"")),
+                "{written} has to survive a save: {out}"
+            );
+        }
+    }
+
+    /// A file written before this setting existed keeps the eased cursor the
+    /// Lua defaults describe rather than silently changing its blink.
+    #[test]
+    fn a_settings_file_without_a_blink_choice_reads_as_smooth() {
+        let json = r#"{
+            "version": 1,
+            "terminal": { "scroll_mode": "smooth" }
+        }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.terminal.cursor_blink, NativeCursorBlink::Smooth);
+    }
+
+    #[test]
+    fn a_blink_choice_round_trips_through_the_file() {
+        for (written, expected) in [
+            ("hard", NativeCursorBlink::Hard),
+            ("smooth", NativeCursorBlink::Smooth),
+        ] {
+            let json = format!(r#"{{"terminal": {{"cursor_blink": "{written}"}}}}"#);
+            let settings: ThinkTermNativeSettings =
+                serde_json::from_str(&json).expect("the file has to survive");
+            assert_eq!(settings.terminal.cursor_blink, expected, "{written}");
+
+            let out = serde_json::to_string(&settings).expect("serialises");
+            assert!(
+                out.contains(&format!("\"cursor_blink\":\"{written}\"")),
                 "{written} has to survive a save: {out}"
             );
         }
