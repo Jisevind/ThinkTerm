@@ -57,7 +57,10 @@ fn frontend_gate_with_geometry(
 /// the terminal is taken by a click like any other.
 const REMOTE_OPEN_ARM_TIMEOUT: Duration = Duration::from_secs(75);
 
-fn remote_open_intent_expired(intent: &super::RemoteOpenIntent, now: std::time::Instant) -> bool {
+pub(super) fn remote_open_intent_expired(
+    intent: &super::RemoteOpenIntent,
+    now: std::time::Instant,
+) -> bool {
     !intent.ready && now.saturating_duration_since(intent.armed) > REMOTE_OPEN_ARM_TIMEOUT
 }
 

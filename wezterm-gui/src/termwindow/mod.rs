@@ -2792,6 +2792,9 @@ pub struct TermWindow {
     /// one per grace period even if something keeps repainting the
     /// hidden window (snapshot and capture contexts can draw it).
     occlusion_last_release: Option<Instant>,
+    /// A frame was held back while the window was hidden
+    /// (`hidden_paint_can_wait`); it is drawn when the window shows.
+    hidden_paint_owed: bool,
     fonts: Rc<FontConfiguration>,
     /// Window dimensions and dpi
     pub dimensions: Dimensions,
@@ -4135,6 +4138,70 @@ impl TermWindow {
         }
     }
 
+    /// Whether this window's next frame can wait until it is seen again:
+    /// it has been out of sight for the grace period, is not the window in
+    /// use, and nothing it is in the middle of needs frames to finish.
+    fn hidden_paint_can_wait(&self) -> bool {
+        // Frame dumps are taken on the paint path; a dumping window keeps
+        // drawing so its frames can be looked at wherever it is.
+        if crate::framedump::enabled() {
+            return false;
+        }
+        hidden_paint_wait_due(
+            self.occluded.map(|since| since.elapsed()),
+            self.focused.is_some(),
+            || self.owes_frames_while_hidden(),
+        )
+    }
+
+    /// What has to keep going even where nobody can see it, because its end
+    /// changes more than this window's picture: a transition whose last
+    /// frame tidies up after it, the update notice's dismissal (every
+    /// window hides it then), a takeover or recovery waiting for this
+    /// window to confirm its geometry (the whole connection waits with it),
+    /// and a remote thread being opened (claimed on a frame).
+    ///
+    /// The last two advance only on a frame of the active tab with the
+    /// terminal shown; one owed to a tab switched away from or closed, or
+    /// held up behind a page, would keep the window drawing for good.
+    fn owes_frames_while_hidden(&self) -> bool {
+        if self.content_view_fade.is_some() || self.update_capsule.owes_frames_while_hidden() {
+            return true;
+        }
+        if self.content_view_foreground() {
+            return false;
+        }
+        let opening_remote = self.remote_open_intent.is_some_and(|intent| {
+            !resize::remote_open_intent_expired(&intent, Instant::now())
+        });
+        opening_remote
+            || Mux::get()
+                .get_active_tab_for_window(self.mux_window_id)
+                .is_some_and(|tab| {
+                    self.frontend_geometry_confirmations
+                        .contains_key(&tab.tab_id())
+                })
+    }
+
+    /// Paint, or hold the frame back while the window cannot be seen
+    /// (`hidden_paint_can_wait`), keeping current what painting would also
+    /// have kept current: the pane sizes the programs see. A held frame is
+    /// drawn on the reveal (`occlusion_changed`).
+    fn paint_or_hold(&mut self, window: &Window) -> anyhow::Result<bool> {
+        if self.hidden_paint_can_wait() {
+            self.hidden_paint_owed = true;
+            self.reconcile_active_mux_tab_size_before_paint();
+            self.sync_pane_font_sizes();
+            return Ok(true);
+        }
+        self.hidden_paint_owed = false;
+        if self.webgpu.is_some() {
+            self.do_paint_webgpu()
+        } else {
+            Ok(self.do_paint(window))
+        }
+    }
+
     /// A menu, modal or rename over the window.
     pub(crate) fn menu_or_overlay_open(&self) -> bool {
         self.modal.borrow().is_some()
@@ -4225,12 +4292,24 @@ impl TermWindow {
     }
 
     /// Tracks whether the user can see this window at all. macOS reports
-    /// the transition via WindowEvent::OcclusionChanged; other platforms
-    /// never emit it and the window simply counts as always visible.
-    fn occlusion_changed(&mut self, visible: bool, _window: &Window) {
+    /// the transition via WindowEvent::OcclusionChanged, and Windows when
+    /// the window is minimised or hidden; elsewhere it is never emitted and
+    /// the window simply counts as always visible.
+    fn occlusion_changed(&mut self, visible: bool, window: &Window) {
         log::trace!("Setting occlusion visible={visible:?}");
         if visible {
+            let held_back = self
+                .occluded
+                .is_some_and(|since| since.elapsed() >= HIDDEN_PAINT_GRACE);
             self.occluded = None;
+            // The system shows the last frame presented until a new one
+            // arrives. Draw one now for a frame held back while hidden, and
+            // after any hide long enough to hold frames back: one that never
+            // got as far as being held (a timer display sleep swallowed, a
+            // paint that failed) would otherwise leave the old picture up.
+            if std::mem::take(&mut self.hidden_paint_owed) || held_back {
+                window.invalidate();
+            }
         } else if self.occluded.is_none() {
             self.occluded = Some(Instant::now());
             self.occlusion_released = false;
@@ -4804,6 +4883,7 @@ impl TermWindow {
             occluded: None,
             occlusion_released: false,
             occlusion_last_release: None,
+            hidden_paint_owed: false,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
             pane_subscription_dead: RefCell::new(None),
@@ -5601,11 +5681,7 @@ impl TermWindow {
                 self.resizes_pending -= 1;
                 if self.is_repaint_pending {
                     self.is_repaint_pending = false;
-                    if self.webgpu.is_some() {
-                        self.do_paint_webgpu()?;
-                    } else {
-                        self.do_paint(window);
-                    }
+                    self.paint_or_hold(window)?;
                 }
                 self.apply_pending_scale_changes();
                 Ok(true)
@@ -5687,10 +5763,8 @@ impl TermWindow {
                 if self.resizes_pending > 0 {
                     self.is_repaint_pending = true;
                     Ok(true)
-                } else if self.webgpu.is_some() {
-                    self.do_paint_webgpu()
                 } else {
-                    Ok(self.do_paint(window))
+                    self.paint_or_hold(window)
                 }
             }
             WindowEvent::Notification(item) => {
@@ -6756,6 +6830,13 @@ impl TermWindow {
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
+
+        // A window holding its frames until it is seen again would only
+        // have the repaint swallowed (paint_or_hold); it draws on the reveal.
+        if self.hidden_paint_can_wait() {
+            self.hidden_paint_owed = true;
+            return;
+        }
 
         // An armed trailing-edge timer means this window already owes
         // itself a repaint that will cover this output; nothing new to
@@ -9455,6 +9536,11 @@ impl TermWindow {
     /// pane type. ClientPane gets an additional state watchdog for work that
     /// has not yet become a renderable line.
     fn terminal_render_watchdog(&mut self) {
+        // A window holding its frames back while hidden is behind on
+        // purpose; forcing repaints there would only be swallowed again.
+        if self.hidden_paint_can_wait() {
+            return;
+        }
         let mux = Mux::get();
         let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
             return;
@@ -12600,6 +12686,64 @@ mod content_view_output_tests {
             content_view_output_repaint(true, now, next_allowed, INTERVAL),
             ContentViewOutputRepaint::Defer { due: next_allowed }
         );
+    }
+}
+
+/// How long a window must have been out of sight before its frames are held
+/// back: a quick look away -- an app switch, a Space flicked past -- keeps
+/// it current for the moment it shows again.
+const HIDDEN_PAINT_GRACE: Duration = Duration::from_secs(2);
+
+/// Whether a window's frames can wait until it is seen again; see
+/// `TermWindow::hidden_paint_can_wait`. The window in use always draws,
+/// whatever the system says about its visibility. `owes_frames` is asked
+/// last: it looks things up, and this runs for every chunk of pane output.
+fn hidden_paint_wait_due(
+    hidden_for: Option<Duration>,
+    focused: bool,
+    owes_frames: impl FnOnce() -> bool,
+) -> bool {
+    !focused && hidden_for.is_some_and(|hidden| hidden >= HIDDEN_PAINT_GRACE) && !owes_frames()
+}
+
+#[cfg(test)]
+mod hidden_paint_tests {
+    use super::{hidden_paint_wait_due, HIDDEN_PAINT_GRACE};
+    use std::time::Duration;
+
+    #[test]
+    fn a_window_in_sight_draws() {
+        assert!(!hidden_paint_wait_due(None, false, || false));
+    }
+
+    #[test]
+    fn a_window_hidden_past_the_grace_waits() {
+        assert!(hidden_paint_wait_due(Some(HIDDEN_PAINT_GRACE), false, || false));
+    }
+
+    #[test]
+    fn a_quick_look_away_keeps_drawing() {
+        assert!(!hidden_paint_wait_due(
+            Some(HIDDEN_PAINT_GRACE - Duration::from_millis(1)),
+            false,
+            || false
+        ));
+    }
+
+    #[test]
+    fn the_window_in_use_always_draws() {
+        assert!(!hidden_paint_wait_due(Some(Duration::from_secs(60)), true, || false));
+    }
+
+    #[test]
+    fn work_in_flight_keeps_a_hidden_window_drawing() {
+        assert!(!hidden_paint_wait_due(Some(Duration::from_secs(60)), false, || true));
+    }
+
+    #[test]
+    fn a_window_in_sight_never_asks_what_it_owes() {
+        assert!(!hidden_paint_wait_due(None, false, || unreachable!()));
+        assert!(!hidden_paint_wait_due(Some(Duration::from_secs(60)), true, || unreachable!()));
     }
 }
 

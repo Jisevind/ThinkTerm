@@ -1950,6 +1950,11 @@ impl WindowInner {
             self.window.makeKeyAndOrderFront_(nil);
             self.update_titlebar_background();
         }
+        // A window that opens out of sight -- on another Space, behind a
+        // full-screen app -- never changes occlusion state, so no
+        // notification would ever tell the app layer it is hidden. Read the
+        // state it starts in once it is on screen.
+        WindowView::perform_in_common_modes(*self.view, sel!(thinktermRecheckOcclusion));
     }
 
     fn close(&mut self) {
@@ -3731,6 +3736,11 @@ impl WindowView {
 
     extern "C" fn did_become_key(this: &mut Object, _sel: Sel, _id: id) {
         let view_ptr: id = this as *mut Object;
+        // A window can become key while still out of sight (another of its
+        // windows closed on a different Space, Cmd-Tab without switching
+        // Spaces), and the app layer takes focus to mean visible. Re-read
+        // the real state so it is not left believing so.
+        Self::perform_in_common_modes(view_ptr, sel!(thinktermRecheckOcclusion));
         if let Some(this) = Self::get_this(this) {
             if let Ok(mut inner) = this.inner.try_borrow_mut() {
                 inner.events.dispatch(WindowEvent::FocusChanged(true));
@@ -3749,6 +3759,9 @@ impl WindowView {
 
     extern "C" fn did_resign_key(this: &mut Object, _sel: Sel, _id: id) {
         let view_ptr: id = this as *mut Object;
+        // See did_become_key: losing focus is where a window that was only
+        // taken for visible because it had focus starts to count as hidden.
+        Self::perform_in_common_modes(view_ptr, sel!(thinktermRecheckOcclusion));
         if let Some(this) = Self::get_this(this) {
             if let Ok(mut inner) = this.inner.try_borrow_mut() {
                 inner.events.dispatch(WindowEvent::FocusChanged(false));

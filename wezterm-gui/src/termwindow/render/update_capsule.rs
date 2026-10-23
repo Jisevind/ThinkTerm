@@ -126,7 +126,13 @@ impl UpdateCapsule {
     /// on screen like that: they finish in an unfocused window too. The
     /// turning ring is not one of them; it keeps the spinners' clock.
     pub(crate) fn owes_frames(&self) -> bool {
-        self.animating || self.flight.is_some()
+        self.animating || self.owes_frames_while_hidden()
+    }
+
+    /// The dismissal's flight lands on a change every window shows, so it
+    /// has to finish even in a window nobody can see.
+    pub(crate) fn owes_frames_while_hidden(&self) -> bool {
+        self.flight.is_some()
     }
 }
 
