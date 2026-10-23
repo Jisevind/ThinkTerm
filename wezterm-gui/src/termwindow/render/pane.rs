@@ -1912,8 +1912,21 @@ impl crate::TermWindow {
         };
         */
 
-        let global_cursor_fg = self.palette().cursor_fg;
-        let global_cursor_bg = self.palette().cursor_bg;
+        // The cursor colours this window's configuration gives its panes.
+        // Settings applies its scheme -- light mode's included -- as a window
+        // override, so the global palette is not the one to compare with.
+        let resolved = &self.config.resolved_palette;
+        let (configured_cursor_fg, configured_cursor_bg) =
+            match (resolved.cursor_fg, resolved.cursor_bg) {
+                (Some(fg), Some(bg)) => (fg.into(), bg.into()),
+                (fg, bg) => {
+                    let fallback = ColorPalette::default();
+                    (
+                        fg.map_or(fallback.cursor_fg, Into::into),
+                        bg.map_or(fallback.cursor_bg, Into::into),
+                    )
+                }
+            };
         let config = self.config.clone();
         let palette = pos.pane.palette();
 
@@ -2166,12 +2179,11 @@ impl crate::TermWindow {
         let selection_bg = palette.selection_bg.to_linear();
         let cursor_fg = palette.cursor_fg.to_linear();
         let cursor_bg = palette.cursor_bg.to_linear();
-        // Settings applies its scheme -- the light one included -- to this
-        // window rather than to the global palette compared here, so a pane
-        // can differ from it with no program involved. Only a palette the
-        // program set itself (OSC 12 and friends) means it chose the cursor.
-        let cursor_is_default_color = (palette.cursor_fg == global_cursor_fg
-            && palette.cursor_bg == global_cursor_bg)
+        // The cursor is the scheme's own unless the program set a palette
+        // (OSC 12 and friends) and that palette moved the cursor itself: one
+        // that only recolours text leaves the scheme's cursor alone.
+        let cursor_is_default_color = (palette.cursor_fg == configured_cursor_fg
+            && palette.cursor_bg == configured_cursor_bg)
             || pos.pane.palette_override().is_none();
 
         {
