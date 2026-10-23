@@ -1915,8 +1915,9 @@ fn default_ratelimit_line_prefetches_per_second() -> u32 {
     50
 }
 
+/// 600ms each way, about what desktops use: GTK's 600ms, Windows' 530ms.
 fn default_cursor_blink_rate() -> u64 {
-    800
+    600
 }
 
 fn default_text_blink_rate() -> u64 {
