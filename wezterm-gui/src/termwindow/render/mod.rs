@@ -1458,15 +1458,11 @@ fn resolve_fg_color_attr(
     resolve_fg_color_attr_srgb(attrs, fg, palette, config, style).to_linear()
 }
 
-/// A cell's colours as the line renderer draws them, before blinking: its
-/// foreground resolved as text is -- bold brightening, a font rule's colour
-/// -- and the two swapped where the cell's reverse attribute and the
-/// screen's reverse video disagree. The flag says the background is the
-/// pane's own ground.
 /// The colour SGR 2 (faint) is drawn in: half way from the foreground to
 /// the cell's own background, which is what a 50% overlay looks like on an
 /// opaque cell. Faint carries no alpha of its own, so mixing is the only way
-/// to honour it without changing the glyph pipeline.
+/// to honour it without changing the glyph pipeline. The default font rules
+/// keep faint text in the regular face, so this is all the dimming it gets.
 pub(crate) fn faint_color(
     fg: wezterm_term::color::SrgbaTuple,
     bg: wezterm_term::color::SrgbaTuple,
@@ -1474,6 +1470,11 @@ pub(crate) fn faint_color(
     fg.interpolate(bg, 0.5)
 }
 
+/// A cell's colours as the line renderer draws them, before blinking: its
+/// foreground resolved as text is -- bold brightening, a font rule's colour
+/// -- and the two swapped where the cell's reverse attribute and the
+/// screen's reverse video disagree, then dimmed if the cell is faint. The
+/// flag says the background is the pane's own ground.
 pub(crate) fn cell_fg_bg(
     attrs: &CellAttributes,
     palette: &ColorPalette,

@@ -1578,20 +1578,17 @@ impl Config {
         let bold = reduced.make_bold();
         let bold_italic = bold.make_italic();
 
-        let half_bright = reduced.make_half_bright();
-        let half_bright_italic = half_bright.make_italic();
-
+        // Faint (SGR 2) keeps the regular face. The renderer draws it in a
+        // dimmer colour, as other terminals do; a lighter weight on top would
+        // make it thin as well as grey, and where the font has no lighter
+        // face the synthesized one would halve its brightness again. Only
+        // faint italic needs a rule, because the italic rule below is for
+        // normal intensity; plain faint falls through to `font` like normal
+        // text.
         cfg.font_rules.push(StyleRule {
             italic: Some(true),
             intensity: Some(wezterm_term::Intensity::Half),
-            font: half_bright_italic,
-            ..Default::default()
-        });
-
-        cfg.font_rules.push(StyleRule {
-            italic: Some(false),
-            intensity: Some(wezterm_term::Intensity::Half),
-            font: half_bright,
+            font: italic.clone(),
             ..Default::default()
         });
 
@@ -2887,6 +2884,25 @@ return config
             std::os::unix::fs::symlink("/tmp/target", &from).unwrap();
             copy_legacy_data_item(&from, &to).unwrap();
             assert!(!to.exists());
+        }
+    }
+
+    /// The renderer dims faint text by colour, so the default rules must not
+    /// also ask for a lighter face: that would make it thin as well as grey,
+    /// or dim it twice where the font has no lighter weight.
+    #[test]
+    fn faint_text_keeps_the_regular_weight() {
+        let config = Config::default_config();
+        let faint_rules: Vec<_> = config
+            .font_rules
+            .iter()
+            .filter(|rule| rule.intensity == Some(wezterm_term::Intensity::Half))
+            .collect();
+        assert!(!faint_rules.is_empty(), "faint italic still needs its rule");
+        for rule in faint_rules {
+            for attr in &rule.font.font {
+                assert!(attr.weight >= crate::FontWeight::REGULAR, "{:?}", attr);
+            }
         }
     }
 }

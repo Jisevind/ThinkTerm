@@ -358,8 +358,8 @@ impl crate::TermWindow {
             } else {
                 (params.foreground, params.default_bg, false)
             };
-            // A bar or underline cursor still shows the cell's glyph, so
-            // faint text has to stay faint under it too.
+            // A reverse-video cursor is drawn in the cell's foreground, so a
+            // faint cell's cursor takes the faint colour too.
             let fg_color = if faint {
                 faint_color(fg_color.to_srgb(), bg_color.to_srgb()).to_linear()
             } else {
