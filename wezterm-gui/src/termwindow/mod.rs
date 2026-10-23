@@ -3084,6 +3084,9 @@ pub struct TermWindow {
     /// Throttle for `log_gpu_allocator_throttled`; runtime-only diagnostics.
     last_gpu_allocator_log: Cell<Option<Instant>>,
     cursor_blink_state: RefCell<ColorEase>,
+    /// Settings' cursor blink is Smooth or Hard, so a cursor in the default
+    /// style blinks. Rebuilt with `cursor_blink_state`.
+    cursor_blinks_by_default: bool,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
 
@@ -5016,6 +5019,7 @@ impl TermWindow {
                 cursor_blink_ease_out,
                 None,
             )),
+            cursor_blinks_by_default: crate::native_settings::cursor_blinks_by_default(),
             blink_state: RefCell::new(ColorEase::new(
                 config.text_blink_rate,
                 config.text_blink_ease_in,
@@ -7777,6 +7781,7 @@ impl TermWindow {
             ease_out,
             None,
         );
+        self.cursor_blinks_by_default = crate::native_settings::cursor_blinks_by_default();
         self.invalidate_window();
     }
 
@@ -8058,6 +8063,7 @@ impl TermWindow {
             cursor_blink_ease_out,
             None,
         );
+        self.cursor_blinks_by_default = crate::native_settings::cursor_blinks_by_default();
         *self.blink_state.borrow_mut() = ColorEase::new(
             config.text_blink_rate,
             config.text_blink_ease_in,

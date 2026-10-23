@@ -891,6 +891,25 @@ impl crate::TermWindow {
         }
     }
 
+    /// The shape a cursor is drawn with. A program that set its own style
+    /// keeps it; the default style blinks when Settings asks for a blink.
+    fn effective_cursor_shape(
+        default_style: config::DefaultCursorStyle,
+        shape: CursorShape,
+        blinks_by_default: bool,
+    ) -> CursorShape {
+        let effective = default_style.effective_shape(shape);
+        if shape != CursorShape::Default || !blinks_by_default {
+            return effective;
+        }
+        match effective {
+            CursorShape::SteadyBlock => CursorShape::BlinkingBlock,
+            CursorShape::SteadyUnderline => CursorShape::BlinkingUnderline,
+            CursorShape::SteadyBar => CursorShape::BlinkingBar,
+            other => other,
+        }
+    }
+
     pub fn compute_cell_fg_bg(&self, params: ComputeCellFgBgParams) -> ComputeCellFgBgResult {
         let focused_and_active =
             self.focused.is_some() && params.is_active_pane && !self.right_sidebar_has_text_focus();
@@ -976,10 +995,11 @@ impl crate::TermWindow {
 
         let (cursor_shape, visibility) = match params.cursor {
             Some(cursor) => (
-                params
-                    .config
-                    .default_cursor_style
-                    .effective_shape(cursor.shape),
+                Self::effective_cursor_shape(
+                    params.config.default_cursor_style,
+                    cursor.shape,
+                    self.cursor_blinks_by_default,
+                ),
                 cursor.visibility,
             ),
             _ => (CursorShape::default(), CursorVisibility::Hidden),
@@ -1746,6 +1766,52 @@ mod cursor_colour_tests {
         assert!(
             faint.to_linear().relative_luminance() < white.to_linear().relative_luminance(),
             "faint text has to be darker than normal text"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cursor_blink_tests {
+    use crate::TermWindow;
+    use config::DefaultCursorStyle;
+    use termwiz::surface::CursorShape;
+
+    fn shape(style: DefaultCursorStyle, asked: CursorShape, blinks: bool) -> CursorShape {
+        TermWindow::effective_cursor_shape(style, asked, blinks)
+    }
+
+    /// With the setting off the cursor is exactly what the configuration
+    /// says, including a blink it asked for itself.
+    #[test]
+    fn off_leaves_the_configured_cursor_alone() {
+        assert_eq!(
+            shape(DefaultCursorStyle::SteadyBlock, CursorShape::Default, false),
+            CursorShape::SteadyBlock
+        );
+        assert_eq!(
+            shape(DefaultCursorStyle::BlinkingBar, CursorShape::Default, false),
+            CursorShape::BlinkingBar
+        );
+    }
+
+    #[test]
+    fn the_default_cursor_blinks_when_settings_ask() {
+        assert_eq!(
+            shape(DefaultCursorStyle::SteadyBlock, CursorShape::Default, true),
+            CursorShape::BlinkingBlock
+        );
+        assert_eq!(
+            shape(DefaultCursorStyle::SteadyBar, CursorShape::Default, true),
+            CursorShape::BlinkingBar
+        );
+    }
+
+    /// A program that chose a steady cursor keeps it.
+    #[test]
+    fn a_program_s_own_cursor_style_wins() {
+        assert_eq!(
+            shape(DefaultCursorStyle::SteadyBlock, CursorShape::SteadyBar, true),
+            CursorShape::SteadyBar
         );
     }
 }

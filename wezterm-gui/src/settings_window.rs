@@ -1783,6 +1783,7 @@ fn localized_text_contrast_label(mode: crate::native_settings::NativeTextContras
 fn localized_cursor_blink_label(mode: crate::native_settings::NativeCursorBlink) -> String {
     use crate::native_settings::NativeCursorBlink;
     crate::i18n::tr(match mode {
+        NativeCursorBlink::Off => "settings-cursor-blink-off",
         NativeCursorBlink::Hard => "settings-cursor-blink-hard",
         NativeCursorBlink::Smooth => "settings-cursor-blink-smooth",
     })
