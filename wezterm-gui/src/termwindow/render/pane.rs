@@ -2166,8 +2166,13 @@ impl crate::TermWindow {
         let selection_bg = palette.selection_bg.to_linear();
         let cursor_fg = palette.cursor_fg.to_linear();
         let cursor_bg = palette.cursor_bg.to_linear();
-        let cursor_is_default_color =
-            palette.cursor_fg == global_cursor_fg && palette.cursor_bg == global_cursor_bg;
+        // Settings applies its scheme -- the light one included -- to this
+        // window rather than to the global palette compared here, so a pane
+        // can differ from it with no program involved. Only a palette the
+        // program set itself (OSC 12 and friends) means it chose the cursor.
+        let cursor_is_default_color = (palette.cursor_fg == global_cursor_fg
+            && palette.cursor_bg == global_cursor_bg)
+            || pos.pane.palette_override().is_none();
 
         {
             // A smooth scroll cuts the top row off by `scroll_px`, which

@@ -878,6 +878,10 @@ impl crate::TermWindow {
         {
             return configured;
         }
+        // A cell on the default background has no alpha in a see-through
+        // window; text drawn in its colour must still be opaque.
+        let (r, g, b, _) = cell_background.tuple();
+        let cell_background = LinearRgba::with_components(r, g, b, 1.);
         if cell_background.contrast_ratio(&cursor_background) >= MIN_CONTRAST {
             return cell_background;
         }
@@ -1706,6 +1710,22 @@ mod cursor_colour_tests {
 
         let picked = TermWindow::block_cursor_text_color(white, dark, near_white, false);
         assert_eq!(picked, dark, "the cell background is the readable fallback");
+    }
+
+    /// In a see-through window the default background reaches this with no
+    /// alpha. Inverting into it must not draw the text fully transparent.
+    #[test]
+    fn the_inverted_text_stays_opaque_in_a_see_through_window() {
+        let (r, g, b, _) = rgb(0x1e, 0x1e, 0x1e).tuple();
+        let clear_dark = LinearRgba::with_components(r, g, b, 0.);
+
+        let picked = TermWindow::block_cursor_text_color(
+            rgb(0xff, 0xff, 0xff),
+            clear_dark,
+            rgb(0xee, 0xee, 0xee),
+            false,
+        );
+        assert_eq!(picked, rgb(0x1e, 0x1e, 0x1e));
     }
 
     /// A cursor that already reads keeps the colour the scheme asked for.
