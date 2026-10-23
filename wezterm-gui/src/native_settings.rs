@@ -388,6 +388,32 @@ impl NativeCursorBlink {
     pub(crate) const ALL: [Self; 3] = [Self::Off, Self::Smooth, Self::Hard];
 }
 
+/// The cursor's usual shape.
+///
+/// `Block` is the default and leaves the shape to the Lua
+/// `default_cursor_style`, which is a block unless it says otherwise. `Bar`
+/// and `Underline` replace the configured shape and keep its blink. A
+/// program that sets its own cursor style still decides, as with
+/// [`NativeCursorBlink`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCursorShape {
+    Block,
+    Bar,
+    Underline,
+}
+
+impl Default for NativeCursorShape {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+impl NativeCursorShape {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 3] = [Self::Block, Self::Bar, Self::Underline];
+}
+
 /// A value this build does not know about must not cost the user the rest of
 /// their settings, so an unreadable choice reads as the default rather than
 /// failing the whole file. Same reasoning as `theme_mode_or_default`.
@@ -906,6 +932,10 @@ pub(crate) struct NativeTerminalSettings {
     /// cursor the configuration describes.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) cursor_blink: NativeCursorBlink,
+    /// See [`NativeCursorShape`]. Block is the default, keeping the shape
+    /// the configuration describes.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) cursor_shape: NativeCursorShape,
     pub(crate) bottom_quote_enabled: bool,
     pub(crate) bottom_quote_mode: NativeBottomQuoteMode,
     pub(crate) bottom_quote_interval_minutes: Option<u32>,
@@ -931,6 +961,7 @@ impl Default for NativeTerminalSettings {
             focus_follows_mouse: false,
             text_contrast: NativeTextContrast::default(),
             cursor_blink: NativeCursorBlink::default(),
+            cursor_shape: NativeCursorShape::default(),
             bottom_quote_enabled: false,
             bottom_quote_mode: NativeBottomQuoteMode::default(),
             bottom_quote_interval_minutes: None,
@@ -1019,6 +1050,12 @@ pub(crate) fn cursor_blink_eases(
 /// alongside `cursor_blink_eases`, not per frame.
 pub(crate) fn cursor_blinks_by_default() -> bool {
     load_shared().terminal.cursor_blink != NativeCursorBlink::Off
+}
+
+/// The cursor shape chosen in Settings. Read alongside `cursor_blink_eases`,
+/// not per frame.
+pub(crate) fn cursor_shape_choice() -> NativeCursorShape {
+    load_shared().terminal.cursor_shape
 }
 
 /// Read once per painted pane, through the shared handle.
@@ -2280,7 +2317,8 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
     let font_size = (before.terminal.font_size != after.terminal.font_size)
         .then_some(after.terminal.font_size);
     let contrast = before.terminal.text_contrast != after.terminal.text_contrast;
-    let cursor_blink = before.terminal.cursor_blink != after.terminal.cursor_blink;
+    let cursor_style = before.terminal.cursor_blink != after.terminal.cursor_blink
+        || before.terminal.cursor_shape != after.terminal.cursor_shape;
     let before_chrome = &before.chrome;
     let after_chrome = &after.chrome;
     let panels = before_chrome.right_sidebar_files_enabled != after_chrome.right_sidebar_files_enabled
@@ -2314,8 +2352,8 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
                         if contrast {
                             term_window.refresh_text_min_contrast();
                         }
-                        if cursor_blink {
-                            term_window.refresh_cursor_blink();
+                        if cursor_style {
+                            term_window.refresh_cursor_style();
                         }
                         if panels {
                             term_window.right_sidebar_panels_changed();
@@ -3468,6 +3506,29 @@ mod tests {
         let settings: ThinkTermNativeSettings =
             serde_json::from_str(json).expect("the file has to survive");
         assert_eq!(settings.terminal.cursor_blink, NativeCursorBlink::Off);
+        assert_eq!(settings.terminal.cursor_shape, NativeCursorShape::Block);
+    }
+
+    #[test]
+    fn a_cursor_shape_choice_round_trips_through_the_file() {
+        for (written, expected) in [
+            ("block", NativeCursorShape::Block),
+            ("bar", NativeCursorShape::Bar),
+            ("underline", NativeCursorShape::Underline),
+        ] {
+            let json = format!(r#"{{"terminal": {{"cursor_shape": "{written}"}}}}"#);
+            let settings: ThinkTermNativeSettings =
+                serde_json::from_str(&json).expect("the file has to survive");
+            assert_eq!(settings.terminal.cursor_shape, expected, "{written}");
+
+            let out = serde_json::to_string(&settings).expect("serialises");
+            assert!(
+                out.contains(&format!("\"cursor_shape\":\"{written}\"")),
+                "{} has to survive a save: {}",
+                written,
+                out
+            );
+        }
     }
 
     #[test]

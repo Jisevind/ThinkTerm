@@ -3087,6 +3087,9 @@ pub struct TermWindow {
     /// Settings' cursor blink is Smooth or Hard, so a cursor in the default
     /// style blinks. Rebuilt with `cursor_blink_state`.
     cursor_blinks_by_default: bool,
+    /// The cursor shape chosen in Settings, for a cursor in the default
+    /// style. Rebuilt with `cursor_blink_state`.
+    cursor_shape_choice: crate::native_settings::NativeCursorShape,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
 
@@ -5020,6 +5023,7 @@ impl TermWindow {
                 None,
             )),
             cursor_blinks_by_default: crate::native_settings::cursor_blinks_by_default(),
+            cursor_shape_choice: crate::native_settings::cursor_shape_choice(),
             blink_state: RefCell::new(ColorEase::new(
                 config.text_blink_rate,
                 config.text_blink_ease_in,
@@ -7768,11 +7772,11 @@ impl TermWindow {
         self.invalidate_window();
     }
 
-    /// Rebuild the cursor's blink state from the style chosen in Settings.
-    /// `config_was_reloaded` does this too; this is the direct route, for the
-    /// settings window, which writes the choice to its own file and never
-    /// touches the configuration.
-    pub(crate) fn refresh_cursor_blink(&mut self) {
+    /// Rebuild the cursor's blink state and shape from the style chosen in
+    /// Settings. `config_was_reloaded` does this too; this is the direct
+    /// route, for the settings window, which writes the choice to its own
+    /// file and never touches the configuration.
+    pub(crate) fn refresh_cursor_style(&mut self) {
         let (ease_in, ease_out) = crate::native_settings::cursor_blink_eases(&self.config);
         *self.cursor_blink_state.borrow_mut() = ColorEase::new(
             self.config.cursor_blink_rate,
@@ -7782,6 +7786,7 @@ impl TermWindow {
             None,
         );
         self.cursor_blinks_by_default = crate::native_settings::cursor_blinks_by_default();
+        self.cursor_shape_choice = crate::native_settings::cursor_shape_choice();
         self.invalidate_window();
     }
 
@@ -8064,6 +8069,7 @@ impl TermWindow {
             None,
         );
         self.cursor_blinks_by_default = crate::native_settings::cursor_blinks_by_default();
+        self.cursor_shape_choice = crate::native_settings::cursor_shape_choice();
         *self.blink_state.borrow_mut() = ColorEase::new(
             config.text_blink_rate,
             config.text_blink_ease_in,

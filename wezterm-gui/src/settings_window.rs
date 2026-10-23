@@ -1213,6 +1213,10 @@ impl SettingsSection {
                 "Selection",
                 "Split Animation",
                 "Animation",
+                "Cursor",
+                "Cursor Shape",
+                "Cursor Blink",
+                "Blink",
                 "Terminal",
             ],
             Self::Workspaces => &[
@@ -1397,6 +1401,8 @@ impl SettingsSection {
                     "settings-copy-effect",
                     "settings-focus-follows-mouse",
                     "settings-split-animation",
+                    "settings-cursor-shape",
+                    "settings-cursor-blink",
                 ]
                 .iter()
                 .any(|id| crate::i18n::tr(id).to_lowercase().contains(query)))
@@ -1780,6 +1786,15 @@ fn localized_text_contrast_label(mode: crate::native_settings::NativeTextContras
     })
 }
 
+fn localized_cursor_shape_label(shape: crate::native_settings::NativeCursorShape) -> String {
+    use crate::native_settings::NativeCursorShape;
+    crate::i18n::tr(match shape {
+        NativeCursorShape::Block => "settings-cursor-shape-block",
+        NativeCursorShape::Bar => "settings-cursor-shape-bar",
+        NativeCursorShape::Underline => "settings-cursor-shape-underline",
+    })
+}
+
 fn localized_cursor_blink_label(mode: crate::native_settings::NativeCursorBlink) -> String {
     use crate::native_settings::NativeCursorBlink;
     crate::i18n::tr(match mode {
@@ -2094,6 +2109,7 @@ enum SettingsAction {
     OpenColorSchemePicker,
     SetTextContrast(crate::native_settings::NativeTextContrast),
     SetCursorBlink(crate::native_settings::NativeCursorBlink),
+    SetCursorShape(crate::native_settings::NativeCursorShape),
     ToggleOverlayScrollbar,
     ToggleSplitAnimation,
     SetBottomQuoteMode(NativeBottomQuoteMode),
@@ -5609,12 +5625,31 @@ impl SettingsWindow {
     }
 
     fn apply_cursor_blink(&mut self, mode: crate::native_settings::NativeCursorBlink) {
-        self.ui.open_dropdown = None;
-        // Merge into the freshest settings for the reason `apply_text_contrast`
-        // gives: another row may have written the file while this window was
-        // open.
         let mut merged = crate::native_settings::load();
         merged.terminal.cursor_blink = mode;
+        self.save_cursor_style(merged, "settings-cursor-blink", localized_cursor_blink_label(mode));
+    }
+
+    fn apply_cursor_shape(&mut self, shape: crate::native_settings::NativeCursorShape) {
+        let mut merged = crate::native_settings::load();
+        merged.terminal.cursor_shape = shape;
+        self.save_cursor_style(
+            merged,
+            "settings-cursor-shape",
+            localized_cursor_shape_label(shape),
+        );
+    }
+
+    /// Save a cursor blink or shape choice, made on settings merged from the
+    /// freshest file for the reason `apply_text_contrast` gives: another row
+    /// may have written it while this window was open.
+    fn save_cursor_style(
+        &mut self,
+        merged: crate::native_settings::ThinkTermNativeSettings,
+        setting: &str,
+        value: String,
+    ) {
+        self.ui.open_dropdown = None;
         self.set_native_settings(merged);
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
@@ -5624,17 +5659,14 @@ impl SettingsWindow {
                     for gui_window in front_end.gui_windows() {
                         gui_window.window.notify(
                             crate::termwindow::TermWindowNotif::Apply(Box::new(|term_window| {
-                                term_window.refresh_cursor_blink();
+                                term_window.refresh_cursor_style();
                             })),
                         );
                     }
                 }
                 self.status = settings_tr(
                     "settings-status-value-now",
-                    &[
-                        ("setting", crate::i18n::tr("settings-cursor-blink")),
-                        ("value", localized_cursor_blink_label(mode)),
-                    ],
+                    &[("setting", crate::i18n::tr(setting)), ("value", value)],
                 );
             }
             Err(err) => {
@@ -6715,6 +6747,7 @@ impl SettingsWindow {
             SettingsAction::WindowOpacitySlider => {}
             SettingsAction::SetTextContrast(mode) => self.apply_text_contrast(mode),
             SettingsAction::SetCursorBlink(mode) => self.apply_cursor_blink(mode),
+            SettingsAction::SetCursorShape(shape) => self.apply_cursor_shape(shape),
             SettingsAction::SetRemotePaneResizeMode(mode) => {
                 self.apply_remote_pane_resize_mode(mode)
             }
@@ -13638,7 +13671,7 @@ impl SettingsWindow {
         )?;
         let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
             use crate::native_settings::{
-                NativeCursorBlink, NativeScrollMode, NativeTextContrast,
+                NativeCursorBlink, NativeCursorShape, NativeScrollMode, NativeTextContrast,
             };
             let mut rows = RowCursor::new(top, this);
 
@@ -13743,6 +13776,39 @@ impl SettingsWindow {
                 tw,
                 &crate::i18n::tr("settings-text-contrast"),
                 &crate::i18n::tr("settings-text-contrast-description"),
+                &options,
+                selected,
+                rows.rule(),
+            )?);
+
+            let options: Vec<(String, SettingsAction)> = NativeCursorShape::ALL
+                .iter()
+                .map(|shape| {
+                    (
+                        localized_cursor_shape_label(*shape),
+                        SettingsAction::SetCursorShape(*shape),
+                    )
+                })
+                .collect();
+            let selected = NativeCursorShape::ALL
+                .iter()
+                .position(|shape| *shape == this.native_settings.terminal.cursor_shape)
+                .unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Square,
+                TileColor::Indigo,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-cursor-shape"),
+                &crate::i18n::tr("settings-cursor-shape-description"),
                 &options,
                 selected,
                 rows.rule(),
