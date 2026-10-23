@@ -263,6 +263,7 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #agents .ag.elsewhere { opacity: .62; }
 #agents .ic { display: inline-flex; width: 20px; height: 20px; flex: none; align-items: center; justify-content: center; color: var(--text2); }
 #agents .ic svg { width: 20px; height: 20px; }
+#agents .ic .ticon { height: 100%; margin-left: 0; }
 /* Kimi's mark per theme (icons.ts): coloured on dark, single-colour on light. */
 #agents .ic .dark-only, #agents .ic .light-only { display: inline-flex; }
 [data-theme=light] #agents .ic .dark-only, :root:not([data-theme=light]) #agents .ic .light-only { display: none; }

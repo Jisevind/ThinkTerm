@@ -580,7 +580,7 @@ impl TermWindow {
             let brand = brand_of(agent);
             self.paint_agent_mark(
                 &mut layers,
-                brand,
+                agent,
                 (x + pad_x).round() as usize,
                 cy.round() as usize,
                 mark.round() as usize,
@@ -780,7 +780,7 @@ impl TermWindow {
         let mut cy = y + pad_y;
         self.paint_agent_mark(
             &mut layers,
-            brand_of(agent),
+            agent,
             left.round() as usize,
             cy.round() as usize,
             mark.round() as usize,

@@ -5,13 +5,16 @@
 //! probes.
 
 use crate::agent_status::{self, AgentIcon, AgentPanelAction, ProgramReport, ProgramReportState};
+use crate::tab_icons::RgbExt as _;
 use crate::native_settings::NativeThreadStatus;
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{
     right_sidebar_file_row_metrics, sidebar_row_element_visible, FILE_SCROLL_FADE_HEIGHT,
 };
-use crate::termwindow::ui::tokens::{SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_ROW_RADIUS};
+use crate::termwindow::ui::tokens::{
+    SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_ROW_RADIUS, TAB_ICON_GLYPH_RATIO,
+};
 use crate::termwindow::{TermWindow, TermWindowNotif, UIItem, UIItemType};
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
@@ -522,7 +525,7 @@ impl TermWindow {
             let icon_y = title_mid.saturating_sub(icon_size / 2);
             let brand = brand_of(agent);
             if visible(icon_y, icon_size) {
-                self.paint_agent_mark(layers, brand, icon_x, icon_y, icon_size, muted_fg)?;
+                self.paint_agent_mark(layers, agent, icon_x, icon_y, icon_size, muted_fg)?;
             }
 
             let shown = agent.shown_state();
@@ -1100,23 +1103,66 @@ impl TermWindow {
         Ok(fitted)
     }
 
-    /// An agent's mark: its brand's when it has one, a robot when not.
+    /// A program's mark: its brand's when it has one, otherwise the card its
+    /// pane's tab shows, so a program reporting its status without a logo of
+    /// its own -- a build, a download -- looks the same in both places.
     pub(crate) fn paint_agent_mark(
         &self,
         layers: &mut TripleLayerQuadAllocator,
-        brand: Option<AgentIcon>,
+        agent: &agent_status::AgentPaneStatus,
         x: usize,
         y: usize,
         size: usize,
         mono: LinearRgba,
     ) -> anyhow::Result<()> {
-        match brand {
+        match brand_of(agent) {
             Some(AgentIcon::Color(brand)) => {
                 self.paint_sidebar_brand_icon(layers, brand, x, y, size)
             }
             Some(AgentIcon::Mono(icon)) => self.paint_sidebar_icon(layers, icon, x, y, size, mono),
-            None => self.paint_sidebar_icon(layers, SvgIcon::Bot, x, y, size, mono),
+            None => self.paint_pane_card(layers, agent.pane_id, x, y, size),
         }
+    }
+
+    /// The card `pane_id`'s tab shows, `size` pixels square: the terminal's
+    /// when the pane is not in this process.
+    fn paint_pane_card(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        pane_id: PaneId,
+        x: usize,
+        y: usize,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        let icon = Mux::get()
+            .get_pane(pane_id)
+            .map(|pane| crate::tab_icons::resolve(pane.as_ref()))
+            .unwrap_or_else(|| crate::tab_icons::catalog().terminal_card().resolved());
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        crate::tab_icons::draw_plate(
+            &ctx,
+            layers,
+            1,
+            x as f32,
+            y as f32,
+            size as f32,
+            icon.circle,
+            self.chrome().is_dark(),
+        )
+        .context("program card")?;
+        let glyph = ((size as f32 * TAB_ICON_GLYPH_RATIO).round() as usize).clamp(1, size.max(1));
+        crate::tab_icons::draw_glyph(
+            &ctx,
+            layers,
+            2,
+            &icon.glyph,
+            (x + (size - glyph) / 2) as f32,
+            (y + (size - glyph) / 2) as f32,
+            glyph as f32,
+            icon.glyph_color.linear(),
+        )
+        .context("program card glyph")
     }
 
     /// A progress bar: its track, and the share done over it once that is

@@ -192,6 +192,8 @@ export type AgentRow = {
   place: string;
   /** `brand-<agent>` for an agent with a logo (agents.rs `icon`), else `bot`. */
   icon: string;
+  /** For a program with no logo: the card its tab shows, drawn instead of `bot`. */
+  card: string | null;
   /** What the program said about itself (OSC 7501), when it did. */
   kind: string | null;
   said: string | null;

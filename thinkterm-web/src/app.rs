@@ -4648,11 +4648,13 @@ impl<P: Platform, L: Link> App<P, L> {
         inner
             .open_subtasks
             .retain(|pane| tree.agent_report(*pane).is_some_and(|r| !r.children.is_empty()));
+        let shared: &Inner<P, L> = inner;
         let rows = crate::agents::rows(
-            &inner.tree,
-            inner.window_id,
-            |pane| inner.panes.get(&pane).map(|c| crate::navbar::display_title(&c.title).0),
-            |pane| inner.open_subtasks.contains(&pane),
+            &shared.tree,
+            shared.window_id,
+            |pane| shared.panes.get(&pane).map(|c| crate::navbar::display_title(&c.title).0),
+            |pane| Self::pane_icon(shared, pane),
+            |pane| shared.open_subtasks.contains(&pane),
         );
         let summary = crate::agents::summary(&rows);
         let tabs = Self::panel_tabs(&inner);

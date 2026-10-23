@@ -24,6 +24,9 @@ pub struct AgentRow {
     pub place: String,
     /// The brand or fallback icon the page draws.
     pub icon: &'static str,
+    /// For a program with no logo: the card its tab shows, which the page
+    /// draws instead of the fallback, as the desktop does.
+    pub card: Option<String>,
     /// What the program said about itself (OSC 7501): what it waits for,
     /// what it is doing or why it stopped, how far it got, its sub-tasks.
     pub kind: Option<String>,
@@ -226,9 +229,12 @@ pub fn icon(agent_id: &str) -> &'static str {
         "cursor" => "brand-cursor",
         "opencode" => "brand-opencode",
         "pi" | "omp" => "brand-pi",
-        _ => "bot",
+        _ => FALLBACK_ICON,
     }
 }
+
+/// What `icon` gives a program with no logo of its own.
+const FALLBACK_ICON: &str = "bot";
 
 fn state_key(state: AgentState) -> (&'static str, &'static str) {
     match state {
@@ -247,6 +253,7 @@ pub fn rows(
     tree: &TreeModel,
     current_window: WindowId,
     title_of: impl Fn(PaneId) -> Option<String>,
+    card_of: impl Fn(PaneId) -> Option<String>,
     open: impl Fn(PaneId) -> bool,
 ) -> Vec<AgentRow> {
     let mut rows: Vec<AgentRow> = tree
@@ -272,6 +279,7 @@ pub fn rows(
                 state_label: tr(state_label),
                 place,
                 icon: icon(agent_id),
+                card: if icon(agent_id) == FALLBACK_ICON { card_of(pane) } else { None },
                 agent_id: agent_id.to_string(),
                 kind: report.and_then(|r| r.kind).map(kind_label),
                 said: report.and_then(|r| r.msg.clone()),
@@ -359,6 +367,7 @@ mod tests {
             state_label: String::new(),
             place: place.into(),
             icon: icon(agent),
+            card: None,
             kind: None,
             said: None,
             progress: None,
@@ -419,16 +428,43 @@ mod tests {
             }),
         );
 
-        let folded = rows(&tree, 1, |_| None, |_| false).remove(0);
+        let folded = rows(&tree, 1, |_| None, |_| None, |_| false).remove(0);
         assert!(!folded.subtasks_open);
         assert!(folded.subtasks.is_empty() && folded.more_subtasks == 0);
         let line = &folded.subtasks_summary;
         assert!(line.contains('7') && line.contains('5'), "{line}");
 
-        let open = rows(&tree, 1, |_| None, |pane| pane == 5).remove(0);
+        let open = rows(&tree, 1, |_| None, |_| None, |pane| pane == 5).remove(0);
         assert!(open.subtasks_open);
         assert_eq!((open.subtasks.len(), open.more_subtasks), (5, 2));
         assert_eq!(open.subtasks_summary, folded.subtasks_summary);
+    }
+
+    /// A program with no logo is drawn with its tab's card; one with a
+    /// logo keeps it.
+    #[test]
+    fn a_program_without_a_logo_takes_its_tab_s_card() {
+        use thinkterm_proto::{AgentEvidence, AgentStatus};
+        let mut tree = TreeModel::default();
+        for (pane, agent) in [(5, "claude"), (7, "terraform")] {
+            tree.apply_agent(
+                pane,
+                Some(&AgentStatus {
+                    agent_id: agent.into(),
+                    state: AgentState::Working,
+                    evidence: AgentEvidence::Report,
+                    session_id: None,
+                    since_unix: 0,
+                    ended: false,
+                    report: None,
+                }),
+            );
+        }
+
+        let rows = rows(&tree, 1, |_| None, |pane| Some(format!("card-{pane}")), |_| false);
+        let card = |agent: &str| rows.iter().find(|r| r.agent_id == agent).unwrap().card.clone();
+        assert_eq!(card("claude"), None);
+        assert_eq!(card("terraform").as_deref(), Some("card-7"));
     }
 
     #[test]
