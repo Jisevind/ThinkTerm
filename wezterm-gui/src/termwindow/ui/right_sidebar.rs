@@ -2090,7 +2090,7 @@ impl RightSidebarMode {
             Self::Chat => SvgIcon::FolderTree,
             Self::Tasks => SvgIcon::NotebookTabs,
             Self::Snippets => SvgIcon::CodeXml,
-            Self::Agents => SvgIcon::Bot,
+            Self::Agents => SvgIcon::Eye,
             Self::Plugin(_) => self
                 .plugin_panel()
                 .map_or(SvgIcon::Puzzle, |panel| SvgIcon::for_panel(&panel.icon)),

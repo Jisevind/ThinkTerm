@@ -16085,7 +16085,7 @@ impl SettingsWindow {
             Panel::Chat => (SvgIcon::FolderOpen, TileColor::Blue),
             Panel::Tasks => (SvgIcon::NotebookTabs, TileColor::Yellow),
             Panel::Snippets => (SvgIcon::Braces, TileColor::Purple),
-            Panel::Agents => (SvgIcon::Bot, TileColor::Orange),
+            Panel::Agents => (SvgIcon::Eye, TileColor::Orange),
             Panel::Plugin(_) => (SvgIcon::Puzzle, TileColor::Green),
         }
     }

@@ -147,7 +147,7 @@ pub fn plugin_tab(id: &str) -> String {
 pub fn panel_tabs(snippets: bool, plugins: &[PluginPanel]) -> Vec<PanelTab> {
     let own = [
         ("snippets", "code-xml", "right-mode-snippets"),
-        ("agents", "bot", "right-mode-agents"),
+        ("agents", "eye", "right-mode-agents"),
     ]
         .into_iter()
         .filter(|(id, _, _)| snippets || *id != "snippets")
