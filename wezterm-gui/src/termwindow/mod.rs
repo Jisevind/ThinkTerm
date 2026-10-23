@@ -4361,6 +4361,19 @@ impl TermWindow {
         };
     }
 
+    /// Drop the card render buffers: the flattened vertices and the GPU
+    /// vertex and index buffers they are uploaded into, which overview cards
+    /// and pictures composited from their own textures share. They grow to
+    /// fit the busiest frame and keep that size while in use -- the point
+    /// while the overview is up, tens of megabytes of nothing once it has
+    /// gone. The next frame that needs them rebuilds them, once. Returns
+    /// whether anything was held.
+    fn release_card_frame_buffers(&self) -> bool {
+        let verts = std::mem::take(&mut *self.card_frame_verts.borrow_mut());
+        let scratch = self.card_scratch.borrow_mut().take();
+        verts.capacity() > 0 || scratch.is_some()
+    }
+
     /// The card previews outlive the overview on purpose: reopening it
     /// replays them instead of rebuilding every card in the revealing
     /// frame. But an overview closed for good keeps its quads and card
@@ -4379,15 +4392,17 @@ impl TermWindow {
         }
         self.preview_cache_last_wanted = None;
         let footprint = self.preview_cache_footprint();
-        if footprint.cards == 0 && footprint.quad_bytes == 0 {
+        let had_card_buffers = self.release_card_frame_buffers();
+        if footprint.cards == 0 && footprint.quad_bytes == 0 && !had_card_buffers {
             return;
         }
         log::debug!(
             "overview idle for {PREVIEW_CACHE_RELEASE_SECS}s; releasing {} card previews \
-             ({} bytes of quads, {} bytes of card textures)",
+             ({} bytes of quads, {} bytes of card textures, card render buffers: {})",
             footprint.cards,
             footprint.quad_bytes,
-            footprint.texture_bytes
+            footprint.texture_bytes,
+            if had_card_buffers { "released" } else { "none" }
         );
         self.preview_quad_cache.borrow_mut().clear();
         *self.preview_rebuild_partial.borrow_mut() = None;
@@ -4449,6 +4464,8 @@ impl TermWindow {
         self.line_quad_cache.borrow_mut().clear();
         // Likewise the scratch recorder: a hidden window records no lines.
         *self.line_quad_scratch.borrow_mut() = HeapQuadAllocator::default();
+        // Nor renders cards.
+        self.release_card_frame_buffers();
         // And the panes last painted, which would keep one closed since
         // alive until the next frame.
         self.split_slides.release();
