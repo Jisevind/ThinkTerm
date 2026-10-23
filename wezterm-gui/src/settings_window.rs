@@ -17654,15 +17654,20 @@ impl SettingsWindow {
                 (self.measure_text_width(&ui_font, text) + self.ui_px(28.0)).max(self.ui_px(72.0))
             })
             .collect();
-        let natural_total: f32 = natural.iter().sum::<f32>() + inset * 2.0;
+        // Neighbouring segments keep the edge's margin between them, so a
+        // hovered segment next to the selected one does not run into it.
+        let gap = inset;
+        let gaps = gap * options.len().saturating_sub(1) as f32;
+        let natural_segments: f32 = natural.iter().sum();
+        let natural_total = natural_segments + gaps + inset * 2.0;
         // The column is the target width, but three labels can need more
         // than it offers (fonts scale with the point size, the column with
         // the UI scale, and the two diverge at 96 dpi). Let the control
         // borrow from the label side before ellipsising its options.
         let max_width = column_width.max(width * 0.45);
         let control_width = natural_total.min(max_width);
-        let shrink = if natural_total > inset * 2.0 {
-            (control_width - inset * 2.0) / (natural_total - inset * 2.0)
+        let shrink = if natural_segments > 0.0 {
+            ((control_width - inset * 2.0 - gaps) / natural_segments).max(0.0)
         } else {
             1.0
         };
@@ -17691,7 +17696,15 @@ impl SettingsWindow {
             options.iter().zip(natural.iter()).enumerate()
         {
             let segment_width = natural_width * shrink;
-            let segment_rect = rect(segment_x, segment_y, segment_width, segment_height);
+            // Clicks in a gap go to the nearer segment.
+            let reach_left = if index > 0 { gap / 2.0 } else { 0.0 };
+            let reach_right = if index + 1 < options.len() { gap / 2.0 } else { 0.0 };
+            let segment_rect = rect(
+                segment_x - reach_left,
+                segment_y,
+                segment_width + reach_left + reach_right,
+                segment_height,
+            );
             self.ui_context
                 .push(segment_rect, WidgetKind::Button, *action);
             let is_selected = index == selected;
@@ -17735,7 +17748,7 @@ impl SettingsWindow {
                 },
                 available,
             )?;
-            segment_x += segment_width;
+            segment_x += segment_width + gap;
         }
         Ok(extra)
     }
