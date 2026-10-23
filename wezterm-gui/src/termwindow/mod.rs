@@ -2936,6 +2936,13 @@ pub struct TermWindow {
     /// When a paint last asked for card previews; None once the caches
     /// have been released. Drives the idle release of `preview_quad_cache`.
     preview_cache_last_wanted: Option<Instant>,
+    /// When a key, the pointer or an input method last reached this window,
+    /// or it came into focus: what `maybe_warm_overview_fonts` waits to see
+    /// a pause in.
+    last_user_input: Instant,
+    /// How far the Live Overview's fonts have been loaded ahead of its
+    /// first open since the font caches were last emptied.
+    overview_font_warmup: OverviewFontWarmup,
     /// When each card's terminal first showed visible content, keyed like
     /// `preview_quad_cache`. Drives the blank->content fade-in; survives
     /// overview closes and atlas repacks so neither replays the fade.
@@ -4128,6 +4135,14 @@ impl TermWindow {
         }
     }
 
+    /// A menu, modal or rename over the window.
+    pub(crate) fn menu_or_overlay_open(&self) -> bool {
+        self.modal.borrow().is_some()
+            || self.context_menu.is_some()
+            || self.native_context_menu_open
+            || self.inline_tab_rename.is_some()
+    }
+
     pub(crate) fn owes_frames_regardless_of_focus(&self) -> bool {
         self.content_view_fade.is_some()
             || self.active_content_view_index().is_some()
@@ -4223,6 +4238,48 @@ impl TermWindow {
             // slide when it is seen again, nor a closed pane held till then.
             self.split_slides.release();
         }
+    }
+
+    /// Load the Live Overview's fonts before it is opened, once input has
+    /// paused. Loading them was most of what opening the overview cost --
+    /// measured, 64ms of a 90ms frame on a first open and 232ms of 240ms
+    /// after a configuration reload, which empties the font caches -- and
+    /// that frame holds the window still before the opening animation can
+    /// start. A font takes 16-58ms, so they go one at a time, a second
+    /// apart, and only in the focused window with nothing over its
+    /// terminal and nothing animating (the onboarding intro among them):
+    /// not on someone typing or using a menu, nor on another window in use.
+    /// Starts over wherever the caches are emptied: a reload, or a move to
+    /// a screen of another density.
+    fn maybe_warm_overview_fonts(&mut self) {
+        let next = self.overview_font_warmup.loaded;
+        let Some(font) = crate::termwindow::render::paint::OverviewFont::ALL.get(next).copied()
+        else {
+            return;
+        };
+        // A menu or modal open takes no pointer or key events while it is
+        // used, and the palette sits untouched while its list is read; a
+        // stall would freeze either just the same.
+        let busy = self.focused.is_none()
+            || self.content_view_foreground()
+            || self.owes_frames_regardless_of_focus()
+            || self.menu_or_overlay_open()
+            || self.command_palette.is_some();
+        if !overview_font_warmup_due(
+            self.last_user_input.elapsed(),
+            self.overview_font_warmup.last_load.map(|at| at.elapsed()),
+            busy,
+        ) {
+            return;
+        }
+        let settings = crate::native_settings::load_shared();
+        if let Err(err) = self.overview_font(&settings, font) {
+            log::debug!("loading the overview's {font:?} font ahead of time: {err:#}");
+        }
+        self.overview_font_warmup = OverviewFontWarmup {
+            loaded: next + 1,
+            last_load: Some(Instant::now()),
+        };
     }
 
     /// The card previews outlive the overview on purpose: reopening it
@@ -4795,6 +4852,8 @@ impl TermWindow {
             preview_quad_cache: RefCell::new(HashMap::new()),
             preview_rebuild_partial: RefCell::new(None),
             preview_cache_last_wanted: None,
+            last_user_input: Instant::now(),
+            overview_font_warmup: OverviewFontWarmup::default(),
             preview_content_fade: RefCell::new(HashMap::new()),
             pending_card_renders: RefCell::new(Vec::new()),
             card_frame_verts: RefCell::new(Vec::new()),
@@ -5357,6 +5416,37 @@ impl TermWindow {
         window: &Window,
     ) -> anyhow::Result<bool> {
         log::debug!("{event:?}");
+        // Anything the user does to the window: what
+        // `maybe_warm_overview_fonts` waits to see a pause in. Some input
+        // arrives only in another shape -- an input method composing as
+        // dead-key status, a menu shortcut as a key assignment, an edge
+        // drag as live resizes -- and coming back to a window starts using
+        // it before the first key does.
+        if matches!(
+            event,
+            WindowEvent::MouseEvent(_)
+                | WindowEvent::MouseLeave
+                | WindowEvent::RawKeyEvent(_)
+                | WindowEvent::KeyEvent(_)
+                | WindowEvent::AdviseDeadKeyStatus(_)
+                | WindowEvent::NativeTextInputReplace { .. }
+                | WindowEvent::FocusChanged(true)
+                | WindowEvent::PerformKeyAssignment(_)
+                | WindowEvent::PerformContextMenuAction(_)
+                | WindowEvent::ContextMenuDismissed
+                | WindowEvent::ToggleWorkspaceSidebar
+                | WindowEvent::WorkspaceSidebarButtonHover(_)
+                | WindowEvent::DraggedFile { .. }
+                | WindowEvent::DroppedFile { .. }
+                | WindowEvent::DroppedUrl(_)
+                | WindowEvent::DroppedString(_)
+                | WindowEvent::Resized {
+                    live_resizing: true,
+                    ..
+                }
+        ) {
+            self.last_user_input = Instant::now();
+        }
         match event {
             WindowEvent::Destroyed => {
                 crate::main_window_placement::window_closed(self.mux_window_id);
@@ -6270,6 +6360,7 @@ impl TermWindow {
                 self.terminal_render_watchdog();
                 self.maybe_release_occluded_memory();
                 self.maybe_release_idle_preview_cache();
+                self.maybe_warm_overview_fonts();
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
@@ -7900,6 +7991,8 @@ impl TermWindow {
         if let Err(err) = self.fonts.config_changed(&config) {
             log::error!("Failed to load font configuration: {:#}", err);
         }
+        // The overview's fonts went with the caches, failed reload or not.
+        self.overview_font_warmup = OverviewFontWarmup::default();
 
         if let Some(window) = mux.get_window(self.mux_window_id) {
             let term_config: Arc<dyn TerminalConfiguration> =
@@ -12507,6 +12600,89 @@ mod content_view_output_tests {
             content_view_output_repaint(true, now, next_allowed, INTERVAL),
             ContentViewOutputRepaint::Defer { due: next_allowed }
         );
+    }
+}
+
+/// How far the Live Overview's fonts have been loaded ahead of its first
+/// open; reset wherever the font caches are emptied.
+#[derive(Default)]
+struct OverviewFontWarmup {
+    /// How many of `OverviewFont::ALL` are loaded.
+    loaded: usize,
+    /// When the last of them was.
+    last_load: Option<Instant>,
+}
+
+/// How long input must have paused before one of the Live Overview's fonts
+/// is loaded ahead of time: past a burst of typing, not inside one.
+const OVERVIEW_FONT_WARMUP_IDLE: Duration = Duration::from_secs(2);
+
+/// The least time between two of those loads. The heartbeat that drives
+/// them also runs on every title change, which an agent can make several
+/// times a second.
+const OVERVIEW_FONT_WARMUP_SPACING: Duration = Duration::from_secs(1);
+
+/// Whether this heartbeat may load one of the overview's fonts: input has
+/// paused, the last load was a while ago, and the window is not busy --
+/// out of focus while another is used, or showing or fading a view, when a
+/// frame must not be held up.
+fn overview_font_warmup_due(
+    since_input: Duration,
+    since_last_load: Option<Duration>,
+    busy: bool,
+) -> bool {
+    !busy
+        && since_input >= OVERVIEW_FONT_WARMUP_IDLE
+        && since_last_load.map_or(true, |since| since >= OVERVIEW_FONT_WARMUP_SPACING)
+}
+
+#[cfg(test)]
+mod overview_font_warmup_tests {
+    use super::{
+        overview_font_warmup_due, OVERVIEW_FONT_WARMUP_IDLE, OVERVIEW_FONT_WARMUP_SPACING,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn a_pause_in_input_lets_a_font_load() {
+        assert!(overview_font_warmup_due(
+            OVERVIEW_FONT_WARMUP_IDLE,
+            None,
+            false
+        ));
+    }
+
+    #[test]
+    fn typing_holds_the_fonts_back() {
+        assert!(!overview_font_warmup_due(
+            OVERVIEW_FONT_WARMUP_IDLE - Duration::from_millis(1),
+            None,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_busy_window_holds_the_fonts_back() {
+        assert!(!overview_font_warmup_due(
+            Duration::from_secs(60),
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn loads_stay_spaced_however_often_the_heartbeat_runs() {
+        let idle = Duration::from_secs(60);
+        assert!(!overview_font_warmup_due(
+            idle,
+            Some(OVERVIEW_FONT_WARMUP_SPACING - Duration::from_millis(1)),
+            false
+        ));
+        assert!(overview_font_warmup_due(
+            idle,
+            Some(OVERVIEW_FONT_WARMUP_SPACING),
+            false
+        ));
     }
 }
 

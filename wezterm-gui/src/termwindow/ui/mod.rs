@@ -222,7 +222,9 @@ impl crate::TermWindow {
     pub(crate) fn pane_nav_bar_height(&self) -> usize {
         let metrics = self
             .fonts
-            .title_font_with_size(crate::native_settings::pane_header_font_size())
+            .title_font_with_size(crate::native_settings::pane_header_font_size(
+                &crate::native_settings::load_shared(),
+            ))
             .map(|font| RenderMetrics::with_font_metrics(&font.metrics()))
             .unwrap_or(self.render_metrics);
         pane_nav_bar_height_for_metrics(metrics)

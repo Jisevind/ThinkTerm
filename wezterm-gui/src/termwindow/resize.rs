@@ -2799,6 +2799,11 @@ impl super::TermWindow {
         }
 
         let (prior_font, prior_dpi) = self.fonts.change_scaling(font_scale, dimensions.dpi);
+        if prior_dpi != dimensions.dpi {
+            // A new density empties the caches the overview's fonts were
+            // loaded into.
+            self.overview_font_warmup = Default::default();
+        }
         match RenderMetrics::new(&self.fonts) {
             Ok(metrics) => {
                 self.render_metrics = metrics;

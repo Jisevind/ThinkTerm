@@ -68,6 +68,24 @@ const WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES: usize = 8 << 20;
 /// drains at one per frame.
 const MAX_PREVIEW_QUAD_REBUILDS_PER_FRAME: usize = 1;
 
+/// The fonts the Live Overview draws with, beyond the terminal's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverviewFont {
+    Controls,
+    GroupTitle,
+    CardName,
+    CardCaption,
+}
+
+impl OverviewFont {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Controls,
+        Self::GroupTitle,
+        Self::CardName,
+        Self::CardCaption,
+    ];
+}
+
 /// How long one frame may spend rebuilding a card before the rest of the work
 /// is carried over to the next frame.
 ///
@@ -2277,6 +2295,36 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// One of the fonts the Live Overview draws with. Also loaded ahead of
+    /// the overview's first open (`maybe_warm_overview_fonts`), so the two
+    /// have to ask for exactly the same fonts.
+    pub(crate) fn overview_font(
+        &self,
+        settings: &crate::native_settings::ThinkTermNativeSettings,
+        font: OverviewFont,
+    ) -> anyhow::Result<Rc<wezterm_font::LoadedFont>> {
+        match font {
+            OverviewFont::Controls => self.fonts.command_palette_font_with_size_and_weight(
+                crate::native_settings::settings_font_size(settings),
+                crate::native_settings::settings_font_weight(settings),
+            ),
+            OverviewFont::GroupTitle => self
+                .fonts
+                .title_font_with_size(crate::native_settings::sidebar_font_size(settings)),
+            // A card names a thread in a capsule the size of a control, not a
+            // heading: a shade under the pane header size, and a caption a
+            // step below that in the same family.
+            OverviewFont::CardName => self.fonts.title_font_with_size_and_weight(
+                (crate::native_settings::pane_header_font_size(settings) * 0.95).max(9.0),
+                600,
+            ),
+            OverviewFont::CardCaption => self.fonts.title_font_with_size_and_weight(
+                (crate::native_settings::pane_header_font_size(settings) * 0.78).max(8.0),
+                500,
+            ),
+        }
+    }
+
     pub fn paint_content_view(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -2310,23 +2358,10 @@ impl crate::TermWindow {
                 )
             }
             ContentViewTypography::Overview => (
-                self.fonts.command_palette_font_with_size_and_weight(
-                    crate::native_settings::settings_font_size(&settings),
-                    font_weight,
-                )?,
-                self.fonts
-                    .title_font_with_size(crate::native_settings::sidebar_font_size())?,
-                // A card names a thread in a capsule the size of a control,
-                // not a heading: a shade under the pane header size, and a
-                // caption a step below that in the same family.
-                self.fonts.title_font_with_size_and_weight(
-                    (crate::native_settings::pane_header_font_size() * 0.95).max(9.0),
-                    600,
-                )?,
-                self.fonts.title_font_with_size_and_weight(
-                    (crate::native_settings::pane_header_font_size() * 0.78).max(8.0),
-                    500,
-                )?,
+                self.overview_font(&settings, OverviewFont::Controls)?,
+                self.overview_font(&settings, OverviewFont::GroupTitle)?,
+                self.overview_font(&settings, OverviewFont::CardName)?,
+                self.overview_font(&settings, OverviewFont::CardCaption)?,
             ),
         };
         let render_metrics =

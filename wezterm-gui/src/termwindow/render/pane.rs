@@ -891,7 +891,9 @@ impl crate::TermWindow {
 
             let ui_font = self
                 .fonts
-                .title_font_with_size(crate::native_settings::pane_header_font_size())
+                .title_font_with_size(crate::native_settings::pane_header_font_size(
+                    &crate::native_settings::load_shared(),
+                ))
                 .context("collapsed pane nav title font")?;
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
             let text_x = icon_right + self.ui_px(PANE_NAV_ICON_GAP);
@@ -1391,7 +1393,9 @@ impl crate::TermWindow {
 
             let ui_font = self
                 .fonts
-                .title_font_with_size(crate::native_settings::pane_header_font_size())
+                .title_font_with_size(crate::native_settings::pane_header_font_size(
+                    &crate::native_settings::load_shared(),
+                ))
                 .context("pane nav title font")?;
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
             let text_x = icon_right + self.ui_px(PANE_NAV_ICON_GAP);

@@ -832,7 +832,8 @@ impl crate::TermWindow {
         let count_font = self
             .fonts
             .title_font_with_size_and_weight(
-                crate::native_settings::sidebar_font_size() * 0.55,
+                crate::native_settings::sidebar_font_size(&crate::native_settings::load_shared())
+                    * 0.55,
                 700,
             )
             .context("sidebar thread count font")?;
@@ -1166,7 +1167,9 @@ impl crate::TermWindow {
     /// whenever the sidebar font size was customized.
     fn workspace_sidebar_cell_height(&self) -> usize {
         self.fonts
-            .title_font_with_size(crate::native_settings::sidebar_font_size())
+            .title_font_with_size(crate::native_settings::sidebar_font_size(
+                &crate::native_settings::load_shared(),
+            ))
             .map(|font| {
                 RenderMetrics::with_font_metrics(&font.metrics())
                     .cell_size
@@ -1424,7 +1427,9 @@ impl crate::TermWindow {
         let muted_fg = chrome.secondary_text;
         let ui_font = self
             .fonts
-            .title_font_with_size(crate::native_settings::sidebar_font_size())
+            .title_font_with_size(crate::native_settings::sidebar_font_size(
+                &crate::native_settings::load_shared(),
+            ))
             .context("sidebar ui font")?;
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let row_marks = self.sidebar_thread_row_marks()?;

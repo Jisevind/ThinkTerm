@@ -2712,8 +2712,8 @@ pub(crate) fn home_font_size(settings: &ThinkTermNativeSettings) -> f64 {
         .clamp(10.0, 28.0)
 }
 
-pub(crate) fn sidebar_font_size() -> f64 {
-    load()
+pub(crate) fn sidebar_font_size(settings: &ThinkTermNativeSettings) -> f64 {
+    settings
         .chrome
         .sidebar_font_size
         .unwrap_or(DEFAULT_SIDEBAR_FONT_SIZE)
@@ -2955,8 +2955,8 @@ pub(crate) fn tab_font_size() -> f64 {
         .clamp(10.0, 28.0)
 }
 
-pub(crate) fn pane_header_font_size() -> f64 {
-    load()
+pub(crate) fn pane_header_font_size(settings: &ThinkTermNativeSettings) -> f64 {
+    settings
         .chrome
         .pane_header_font_size
         .unwrap_or(DEFAULT_PANE_HEADER_FONT_SIZE)

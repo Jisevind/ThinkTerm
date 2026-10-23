@@ -959,10 +959,7 @@ impl super::TermWindow {
         use crate::termwindow::sidebar_hover::{HoverInput, PointerZone};
         // A menu, modal or rename opened from the revealed panel holds it
         // out; one open while it is away keeps it from revealing.
-        let overlay_open = self.modal.borrow().is_some()
-            || self.context_menu.is_some()
-            || self.native_context_menu_open
-            || self.inline_tab_rename.is_some();
+        let overlay_open = self.menu_or_overlay_open();
         let eligible = crate::native_settings::workspace_sidebar_hover_reveal_enabled()
             && self.workspace_sidebar_collapsed
             && !self.content_view_foreground()
