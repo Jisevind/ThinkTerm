@@ -855,23 +855,27 @@ impl crate::TermWindow {
 
     /// The colour of the text under a block cursor.
     ///
-    /// A block cursor is expected to be readable on its own background. A
-    /// colour scheme sets `cursor_fg` for the scheme's own cursor colour, but
-    /// an application can change that colour with OSC 12 -- OpenCode asks for
-    /// `#eeeeee` -- and then a white `cursor_fg` disappears into it. Keep the
-    /// configured colour when it reads; otherwise fall back to the cell's own
-    /// background, the inversion a block cursor normally is, and to black or
-    /// white when even that does not clear the bar.
+    /// A colour scheme sets `cursor_fg` for the scheme's own cursor colour,
+    /// and that pair is drawn as the scheme has it. An application can change
+    /// the cursor colour with OSC 12 -- OpenCode asks for `#eeeeee` -- and
+    /// then a white `cursor_fg` disappears into it. Only then is the text
+    /// checked: keep the configured colour when it reads; otherwise fall back
+    /// to the cell's own background, the inversion a block cursor normally
+    /// is, and to black or white when even that does not clear the bar.
     fn block_cursor_text_color(
         configured: LinearRgba,
         cell_background: LinearRgba,
         cursor_background: LinearRgba,
+        cursor_is_default_color: bool,
     ) -> LinearRgba {
         // WCAG AA for body text. A cursor covers one cell, but that cell is
         // exactly where the user is looking.
         const MIN_CONTRAST: f32 = 4.5;
 
-        if configured.contrast_ratio(&cursor_background) >= MIN_CONTRAST {
+        // The default macOS scheme puts white text on a grey block at under
+        // 3:1; that is the look it ships with, not one to correct.
+        if cursor_is_default_color || configured.contrast_ratio(&cursor_background) >= MIN_CONTRAST
+        {
             return configured;
         }
         if cell_background.contrast_ratio(&cursor_background) >= MIN_CONTRAST {
@@ -940,6 +944,7 @@ impl crate::TermWindow {
                             params.cursor_fg.when_fully_transparent(params.fg_color),
                             params.bg_color,
                             params.cursor_bg,
+                            params.cursor_is_default_color,
                         ),
                         params.cursor_bg,
                     )
@@ -1007,6 +1012,7 @@ impl crate::TermWindow {
                             params.cursor_fg.when_fully_transparent(params.fg_color),
                             params.bg_color,
                             params.cursor_bg,
+                            params.cursor_is_default_color,
                         ),
                         params.cursor_bg,
                         params.cursor_bg,
@@ -1677,7 +1683,7 @@ mod cursor_colour_tests {
         let near_white = rgb(0xee, 0xee, 0xee);
         let white = rgb(0xff, 0xff, 0xff);
 
-        let picked = TermWindow::block_cursor_text_color(white, dark, near_white);
+        let picked = TermWindow::block_cursor_text_color(white, dark, near_white, false);
         assert_eq!(picked, dark, "the cell background is the readable fallback");
     }
 
@@ -1687,7 +1693,23 @@ mod cursor_colour_tests {
         let white = rgb(0xff, 0xff, 0xff);
         let near_black = rgb(0x10, 0x10, 0x10);
 
-        let picked = TermWindow::block_cursor_text_color(white, rgb(0x80, 0x80, 0x80), near_black);
+        let picked =
+            TermWindow::block_cursor_text_color(white, rgb(0x80, 0x80, 0x80), near_black, false);
+        assert_eq!(picked, white);
+    }
+
+    /// The scheme's own cursor is drawn as it ships, readable or not: the
+    /// default macOS scheme puts white text on a `#98989d` block.
+    #[test]
+    fn the_scheme_s_own_cursor_keeps_its_text_colour() {
+        let white = rgb(0xff, 0xff, 0xff);
+
+        let picked = TermWindow::block_cursor_text_color(
+            white,
+            rgb(0x1e, 0x1e, 0x1e),
+            rgb(0x98, 0x98, 0x9d),
+            true,
+        );
         assert_eq!(picked, white);
     }
 
@@ -1701,6 +1723,7 @@ mod cursor_colour_tests {
             rgb(0x90, 0x90, 0x90),
             rgb(0x70, 0x70, 0x70),
             mid,
+            false,
         );
         assert!(
             picked.contrast_ratio(&mid) >= 4.5,
