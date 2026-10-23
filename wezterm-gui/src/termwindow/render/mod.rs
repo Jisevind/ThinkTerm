@@ -1065,7 +1065,10 @@ impl crate::TermWindow {
                 | CursorShape::SteadyBar,
                 CursorVisibility::Visible,
             ) => {
-                if self.use_reverse_video_cursor(&params) {
+                // A line this thin in the scheme's cursor colour -- a mid grey
+                // in the macOS default -- all but disappears, so it takes the
+                // text's colour unless the program chose the cursor's.
+                if self.use_reverse_video_cursor(&params) || params.cursor_is_default_color {
                     (params.fg_color, params.bg_color, params.fg_color)
                 } else {
                     (params.fg_color, params.bg_color, params.cursor_bg)
