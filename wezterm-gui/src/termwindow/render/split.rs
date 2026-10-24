@@ -41,7 +41,9 @@ impl crate::TermWindow {
             // Never above the terminal area: with no top padding (tabline.wez
             // zeroes it) the half-cell overhang reached into the window tab
             // row.
-            let area_top = border.top.get() as f32 + self.tab_bar_pixel_height().unwrap_or(0.);
+            let area_top = border.top.get() as f32
+                + self.window_tab_row_layout_height()
+                + self.window_tab_reveal_offset();
             top = (top - lift).max(area_top);
             self.filled_rectangle(
                 layers,

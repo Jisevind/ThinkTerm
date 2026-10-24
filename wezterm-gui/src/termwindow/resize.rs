@@ -2289,7 +2289,7 @@ impl super::TermWindow {
         // Everything above and below the pane tree: the window tab row and
         // the terminal bar.
         let tab_bar_height = {
-            let (top, bottom) = self.pane_area_insets();
+            let (top, bottom) = self.pane_area_layout_insets();
             top + bottom
         };
 
@@ -3164,7 +3164,7 @@ impl super::TermWindow {
             dpi: size.dpi,
         };
 
-        let tab_bar_height = self.tab_bar_pixel_height()? as usize
+        let tab_bar_height = self.window_tab_row_layout_height() as usize
             + crate::termwindow::render::tab_bar::terminal_bar_height(
                 self.terminal_bar_kind,
                 &render_metrics,

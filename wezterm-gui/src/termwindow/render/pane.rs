@@ -266,7 +266,8 @@ impl crate::TermWindow {
         let Ok((pane_x, pane_width)) = self.pane_chrome_span(pos) else {
             return 0.0;
         };
-        let tab_start = pane_x.max(0.0) as usize + self.pane_nav_tab_left_inset(pos.left);
+        let tab_start =
+            pane_x.max(0.0) as usize + self.pane_nav_tab_left_inset(pos.left, pos.top);
         let max_tab_right = ((pane_x + pane_width).max(0.0) as usize)
             .saturating_sub(self.pane_nav_action_reserved_width(pos, nav_height));
         max_tab_right.saturating_sub(tab_start) as f32
@@ -1117,7 +1118,7 @@ impl crate::TermWindow {
         }
 
         let tabs = self.pane_nav_tabs(pos);
-        let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos.left);
+        let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos.left, pos.top);
         let tab_gap = self.ui_px(PANE_NAV_TAB_GAP);
         let viewport_width = self.pane_nav_tab_viewport_width(pos) as usize;
         let max_tab_right = tab_start.saturating_add(viewport_width);

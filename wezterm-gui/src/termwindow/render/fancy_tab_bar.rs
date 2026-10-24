@@ -45,7 +45,7 @@ impl crate::TermWindow {
     ) -> anyhow::Result<Vec<UIItem>> {
         let chrome = self.chrome();
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
-        if row_height == 0 {
+        if row_height == 0 || !self.window_tab_row_drawn() {
             return Ok(vec![]);
         }
 
@@ -286,7 +286,7 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<Vec<UIItem>> {
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
-        if row_height == 0 {
+        if row_height == 0 || !self.window_tab_row_drawn() {
             return Ok(Vec::new());
         }
         let border = self.get_os_border();
@@ -310,19 +310,13 @@ impl crate::TermWindow {
         let muted_fg = chrome.secondary_text;
         let mut ui_items = Vec::new();
         let mut action_right = row_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
-        if self.fancy_tab_bar_shows_window_buttons() {
-            let window_button_right = if self.right_sidebar_width() > 0 {
-                self.dimensions
-                    .pixel_width
-                    .saturating_sub(border.right.get() as usize)
-                    .saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2)
-            } else {
-                action_right
-            };
-            let window_button_left = self.paint_window_tab_window_buttons(
+        // Over an open right sidebar the window's buttons are the sidebar's:
+        // see `paint_right_sidebar_window_buttons`.
+        if self.fancy_tab_bar_shows_window_buttons() && self.right_sidebar_width() == 0 {
+            action_right = self.paint_window_tab_window_buttons(
                 layers,
                 &mut ui_items,
-                window_button_right,
+                action_right,
                 content_row_y,
                 content_row_height,
                 button_size,
@@ -330,30 +324,27 @@ impl crate::TermWindow {
                 foreground,
                 muted_fg,
             )?;
-            if self.right_sidebar_width() == 0 {
-                action_right = window_button_left;
-            }
         }
 
+        // An auto-hiding row's pin takes the new-tab button's slot, just
+        // right of it, and moves the button one slot left.
+        let pin_then_new_tab = |slot: usize| {
+            if self.window_tab_reveal.shows_pin() {
+                (
+                    Some(slot),
+                    slot.saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size),
+                )
+            } else {
+                (None, slot)
+            }
+        };
+        let pin_x;
         if self.right_sidebar_width() > 0 {
             let action_button_x = action_right.saturating_sub(button_size);
             if cfg!(target_os = "macos") {
-                self.paint_window_tab_new_button(
-                    layers,
-                    &mut ui_items,
-                    action_button_x,
-                    content_row_y,
-                    content_row_height,
-                    button_size,
-                    icon_size,
-                    foreground,
-                    muted_fg,
-                )?;
-            } else {
-                let right_sidebar_toggle_x = action_button_x;
-                let new_button_x = right_sidebar_toggle_x
-                    .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size);
-                self.paint_window_tab_new_button(
+                let (pin, new_button_x) = pin_then_new_tab(action_button_x);
+                pin_x = pin;
+                self.paint_window_tab_icon_button(
                     layers,
                     &mut ui_items,
                     new_button_x,
@@ -363,6 +354,30 @@ impl crate::TermWindow {
                     icon_size,
                     foreground,
                     muted_fg,
+                    SvgIcon::Plus,
+                    UIItemType::TabBar(TabBarItem::NewTabButton),
+                    false,
+                )?;
+            } else {
+                let right_sidebar_toggle_x = action_button_x;
+                let (pin, new_button_x) = pin_then_new_tab(
+                    right_sidebar_toggle_x
+                        .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size),
+                );
+                pin_x = pin;
+                self.paint_window_tab_icon_button(
+                    layers,
+                    &mut ui_items,
+                    new_button_x,
+                    content_row_y,
+                    content_row_height,
+                    button_size,
+                    icon_size,
+                    foreground,
+                    muted_fg,
+                    SvgIcon::Plus,
+                    UIItemType::TabBar(TabBarItem::NewTabButton),
+                    false,
                 )?;
                 self.paint_window_tab_right_sidebar_toggle_button(
                     layers,
@@ -383,13 +398,14 @@ impl crate::TermWindow {
             // slot to match. The new button has to take that slot, or it
             // lands one button to the left -- inside the width the tab strip
             // was just given -- and overlaps the last tab.
-            let new_button_x = if self.right_sidebar_has_panels() {
+            let (pin, new_button_x) = pin_then_new_tab(if self.right_sidebar_has_panels() {
                 right_sidebar_toggle_x
                     .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size)
             } else {
                 right_sidebar_toggle_x
-            };
-            self.paint_window_tab_new_button(
+            });
+            pin_x = pin;
+            self.paint_window_tab_icon_button(
                 layers,
                 &mut ui_items,
                 new_button_x,
@@ -399,6 +415,9 @@ impl crate::TermWindow {
                 icon_size,
                 foreground,
                 muted_fg,
+                SvgIcon::Plus,
+                UIItemType::TabBar(TabBarItem::NewTabButton),
+                false,
             )?;
             self.paint_window_tab_right_sidebar_toggle_button(
                 layers,
@@ -413,6 +432,70 @@ impl crate::TermWindow {
             )?;
         }
 
+        if let Some(pin_x) = pin_x {
+            // In, the row stays out and keeps its place, and the pin is drawn
+            // in the text's colour; out, the row comes and goes with the
+            // pointer.
+            self.paint_window_tab_icon_button(
+                layers,
+                &mut ui_items,
+                pin_x,
+                content_row_y,
+                content_row_height,
+                button_size,
+                icon_size,
+                foreground,
+                muted_fg,
+                SvgIcon::Pin,
+                UIItemType::WindowTabsPin,
+                self.window_tab_reveal.pinned(),
+            )?;
+        }
+
+        Ok(ui_items)
+    }
+
+    /// The window's own buttons while an open right sidebar holds them at its
+    /// top rather than the row at its end. They stay there whether the row
+    /// is shown, hidden or on its way: hidden with the row, a window that
+    /// draws its own frame could not be closed.
+    pub(crate) fn paint_right_sidebar_window_buttons(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<Vec<UIItem>> {
+        let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
+        if row_height == 0
+            || self.right_sidebar_width() == 0
+            || !self.fancy_tab_bar_shows_window_buttons()
+        {
+            return Ok(Vec::new());
+        }
+        let border = self.get_os_border();
+        let content_top_spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height);
+        let content_row_y = border.top.get() as usize + content_top_spacer;
+        let content_row_height = row_height.saturating_sub(content_top_spacer);
+        let icon_size = self.ui_px(TAB_ICON_SIZE).min(content_row_height);
+        let button_size = content_row_height
+            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
+            .max(icon_size);
+        let right = self
+            .dimensions
+            .pixel_width
+            .saturating_sub(border.right.get() as usize)
+            .saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
+        let chrome = self.chrome();
+        let mut ui_items = Vec::new();
+        self.paint_window_tab_window_buttons(
+            layers,
+            &mut ui_items,
+            right,
+            content_row_y,
+            content_row_height,
+            button_size,
+            icon_size,
+            chrome.text,
+            chrome.secondary_text,
+        )?;
         Ok(ui_items)
     }
 
@@ -475,7 +558,7 @@ impl crate::TermWindow {
         Ok(ui_items)
     }
 
-    fn fancy_tab_bar_shows_window_buttons(&self) -> bool {
+    pub(crate) fn fancy_tab_bar_shows_window_buttons(&self) -> bool {
         uses_integrated_window_buttons(self.config.window_decorations, self.window_state)
             && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
             && !self.config.integrated_title_buttons.is_empty()
@@ -1148,8 +1231,10 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// A square icon button at the row's end: the new-tab button, the pin.
+    /// `lit` draws the icon in the text's colour without the pointer on it.
     #[allow(clippy::too_many_arguments)]
-    fn paint_window_tab_new_button(
+    fn paint_window_tab_icon_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_items: &mut Vec<UIItem>,
@@ -1160,6 +1245,9 @@ impl crate::TermWindow {
         icon_size: usize,
         foreground: LinearRgba,
         muted_fg: LinearRgba,
+        icon: SvgIcon,
+        item_type: UIItemType,
+        lit: bool,
     ) -> anyhow::Result<()> {
         let button_y = row_y + (row_height.saturating_sub(button_size) / 2);
         let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
@@ -1190,7 +1278,7 @@ impl crate::TermWindow {
                 WINDOW_TAB_ADD_BUTTON_RADIUS,
                 ICON_BUTTON_BORDER_WIDTH,
             )
-            .context("window tab new button hover")?;
+            .context("window tab button hover")?;
         }
 
         ui_items.push(UIItem {
@@ -1198,7 +1286,7 @@ impl crate::TermWindow {
             y: button_y,
             width: button_size,
             height: button_size,
-            item_type: UIItemType::TabBar(TabBarItem::NewTabButton),
+            item_type,
         });
 
         let icon_size = if pressed {
@@ -1208,11 +1296,11 @@ impl crate::TermWindow {
         };
         self.paint_fancy_tab_icon(
             layers,
-            SvgIcon::Plus,
+            icon,
             button_x + press_inset + (visual_size.saturating_sub(icon_size) / 2),
             button_y + press_inset + (visual_size.saturating_sub(icon_size) / 2),
             icon_size,
-            if hovered { foreground } else { muted_fg },
+            if hovered || lit { foreground } else { muted_fg },
         )
     }
 

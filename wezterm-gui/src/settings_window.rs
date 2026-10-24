@@ -1161,6 +1161,10 @@ impl SettingsSection {
             ],
             Self::Appearance => &[
                 "Theme Mode",
+                "Tab Bar",
+                "Top Tab Bar",
+                "Auto-hide",
+                "Hide Tabs",
                 "Effective Color Scheme",
                 "App Icon",
                 "Window Opacity",
@@ -1380,6 +1384,7 @@ impl SettingsSection {
             || (self == Self::Appearance
                 && [
                     "settings-window-opacity",
+                    "settings-window-tabs",
                     "settings-thread-icons",
                     "settings-thread-status",
                     "settings-agents-status",
@@ -1786,6 +1791,15 @@ fn localized_text_contrast_label(mode: crate::native_settings::NativeTextContras
     })
 }
 
+fn localized_window_tabs_label(mode: crate::native_settings::NativeWindowTabs) -> String {
+    use crate::native_settings::NativeWindowTabs;
+    crate::i18n::tr(match mode {
+        NativeWindowTabs::Show => "settings-window-tabs-show",
+        NativeWindowTabs::AutoHide => "settings-window-tabs-auto-hide",
+        NativeWindowTabs::Hide => "settings-window-tabs-hide",
+    })
+}
+
 fn localized_cursor_shape_label(shape: crate::native_settings::NativeCursorShape) -> String {
     use crate::native_settings::NativeCursorShape;
     crate::i18n::tr(match shape {
@@ -2069,6 +2083,7 @@ enum SettingsAction {
     SetMacGlass(crate::native_settings::NativeMacGlass),
     SetSidebarShade(crate::native_settings::NativeShade),
     SetTabBarShade(crate::native_settings::NativeShade),
+    SetWindowTabs(crate::native_settings::NativeWindowTabs),
     SetTerminalShade(crate::native_settings::NativeShade),
     SetThreadIcons(crate::native_settings::NativeThreadIcons),
     SetThreadStatus(crate::native_settings::NativeThreadStatus),
@@ -6419,6 +6434,7 @@ impl SettingsWindow {
                 localized_shade_label(shade),
                 |appearance| appearance.tab_bar_shade = shade,
             ),
+            SettingsAction::SetWindowTabs(mode) => self.apply_window_tabs(mode),
             SettingsAction::SetTerminalShade(shade) => self.apply_window_areas(
                 "settings-terminal-shade",
                 localized_shade_label(shade),
@@ -9107,6 +9123,41 @@ impl SettingsWindow {
                         rows.rule(),
                     )?);
                 }
+            }
+            {
+                use crate::native_settings::NativeWindowTabs;
+                let options: Vec<(String, SettingsAction)> = NativeWindowTabs::ALL
+                    .iter()
+                    .map(|mode| {
+                        (
+                            localized_window_tabs_label(*mode),
+                            SettingsAction::SetWindowTabs(*mode),
+                        )
+                    })
+                    .collect();
+                let selected = NativeWindowTabs::ALL
+                    .iter()
+                    .position(|mode| *mode == this.native_settings.appearance.window_tabs)
+                    .unwrap_or(0);
+                let (tx, tw) = this.paint_row_tile(
+                    layers,
+                    row_x,
+                    rows.y,
+                    row_width,
+                    SvgIcon::AppWindow,
+                    TileColor::Blue,
+                )?;
+                rows.add(this.paint_segmented_setting_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr("settings-window-tabs"),
+                    &crate::i18n::tr("settings-window-tabs-description"),
+                    &options,
+                    selected,
+                    rows.rule(),
+                )?);
             }
             Ok(rows.bottom)
         })?;
@@ -19156,6 +19207,45 @@ impl SettingsWindow {
                 self.status = settings_tr(
                     "settings-status-value-now",
                     &[("setting", setting), ("value", value)],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    /// Show, auto-hide or hide the window tab row, in every window. Choosing
+    /// auto-hide here starts with the pin out: it is what was asked for.
+    fn apply_window_tabs(&mut self, mode: crate::native_settings::NativeWindowTabs) {
+        self.ui.open_dropdown = None;
+        // The chosen segment pressed again: nothing changes, the pin included.
+        if crate::native_settings::load_shared().appearance.window_tabs == mode {
+            return;
+        }
+        let mut merged = crate::native_settings::load();
+        merged.appearance.window_tabs = mode;
+        merged.appearance.window_tabs_pinned = false;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-window-tabs");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    for gui_window in front_end.gui_windows() {
+                        gui_window.window.notify(
+                            crate::termwindow::TermWindowNotif::Apply(Box::new(|term_window| {
+                                term_window.refresh_window_tabs();
+                            })),
+                        );
+                    }
+                }
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[("setting", setting), ("value", localized_window_tabs_label(mode))],
                 );
             }
             Err(err) => {

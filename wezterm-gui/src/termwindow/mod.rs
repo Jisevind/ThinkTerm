@@ -167,6 +167,7 @@ pub mod resize;
 mod selection;
 mod sidebar_hover;
 mod space_swipe;
+mod window_tab_reveal;
 pub mod spawn;
 pub mod ssh_hosts_view;
 pub(crate) mod transfer_walk;
@@ -814,6 +815,10 @@ pub enum UIItemType {
     UpdateCapsule,
     UpdateCapsuleDismiss,
     RightSidebarToggle,
+    /// The pin of an auto-hiding window tab row.
+    WindowTabsPin,
+    /// A window tab row on its way down or back up: takes no click.
+    WindowTabsTravelling,
     RightSidebarMode(RightSidebarMode),
     RightSidebarBackground,
     RightSidebarResize,
@@ -3236,6 +3241,9 @@ pub struct TermWindow {
     /// touches `workspace_sidebar_collapsed` or `workspace_sidebar_width`:
     /// the terminal must not reflow for a hover.
     workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal,
+    /// The window tab row hidden or brought down from the top edge, as
+    /// Settings asks; see `window_tab_reveal`.
+    window_tab_reveal: window_tab_reveal::WindowTabReveal,
     /// Hover-reveal of the collapsed right sidebar: the same machine as the
     /// left one's, mirrored onto the right edge.
     right_sidebar_hover: sidebar_hover::SidebarHoverReveal,
@@ -4221,6 +4229,7 @@ impl TermWindow {
             || self.active_content_view_index().is_some()
             || self.workspace_sidebar_hover.needs_frames()
             || self.right_sidebar_hover.needs_frames()
+            || self.window_tab_reveal.needs_frames()
             || self.overlay_scrollbar_owes_frames()
             // A light still running, or a paste still to show up for one:
             // copying and then switching to the app to paste it in is the
@@ -4556,6 +4565,7 @@ impl TermWindow {
             self.workspace_sidebar_swipe.cancel_immediately();
             self.workspace_sidebar_hover.cancel_immediately();
             self.right_sidebar_hover.cancel_immediately();
+            self.window_tab_reveal.cancel();
             self.clear_workspace_space_swipe_frame_transition();
             self.right_sidebar_note.native_text_input_snapshot_key = None;
             window.set_native_text_input_snapshot(None);
@@ -4748,7 +4758,16 @@ impl TermWindow {
 
         // Initially we have only a single tab, and no status text yet.
         let terminal_bar_kind = crate::tabbar::terminal_bar_kind(&config, 1, false);
-        let tab_bar_height = Self::tab_bar_pixel_height_impl(&fontconfig)? as usize
+        // A window tab row that hides gives its height to the terminal: the
+        // window opens without it, and the shell starts at the size it asked
+        // for rather than being resized as the window appears.
+        let window_tab_reveal = window_tab_reveal::WindowTabReveal::new();
+        let window_tab_row_height = if window_tab_reveal.in_layout() {
+            Self::tab_bar_pixel_height_impl(&fontconfig)? as usize
+        } else {
+            0
+        };
+        let tab_bar_height = window_tab_row_height
             + crate::termwindow::render::tab_bar::terminal_bar_height(
                 terminal_bar_kind,
                 &render_metrics,
@@ -5114,6 +5133,7 @@ impl TermWindow {
             workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
             workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
+            window_tab_reveal,
             right_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
             right_sidebar_hover_was_presented: false,
             titlebar_sidebar_button_hovered: false,
@@ -8256,7 +8276,9 @@ impl TermWindow {
         // The terminal bar is part of the terminal, and the top panes' nav
         // bars rise into its band: only the window tab row is outside.
         let left = self.workspace_sidebar_width() as f32 + border.left.get() as f32;
-        let top = border.top.get() as f32 + self.tab_bar_pixel_height().unwrap_or(0.0);
+        let top = border.top.get() as f32
+            + self.window_tab_row_layout_height()
+            + self.window_tab_reveal_offset();
         let right = self.terminal_viewport_right();
         let bottom = (self.dimensions.pixel_height as f32 - border.bottom.get() as f32).max(top);
         euclid::rect(left, top, (right - left).max(0.0), (bottom - top).max(0.0))
@@ -9955,6 +9977,7 @@ impl TermWindow {
             InlineTabRenameTarget::WindowTab(tab_id),
             initial_title,
         ));
+        self.reveal_window_tab_row_for_rename();
         self.update_title_impl();
     }
 

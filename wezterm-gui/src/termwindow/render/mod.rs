@@ -522,7 +522,7 @@ impl crate::TermWindow {
             - padding_top
             - padding_bottom
             - {
-                let (top, bottom) = self.pane_area_insets();
+                let (top, bottom) = self.pane_area_layout_insets();
                 top + bottom
             };
         let left_gap = match self.config.window_content_alignment.horizontal {

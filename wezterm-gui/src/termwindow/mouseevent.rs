@@ -6,9 +6,10 @@ use crate::termwindow::space_swipe::{SidebarSpaceSwipeFinish, SidebarSpaceSwipeU
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::sidebar::SpaceConnectionState;
 use crate::termwindow::ui::tokens::{
-    PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH, TAB_ROW_START_PADDING, TAB_TARGET_WIDTH,
-    TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
-    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
+    MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH,
+    TAB_ROW_START_PADDING, TAB_TARGET_WIDTH, TAB_VERTICAL_PADDING,
+    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
+    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{
     pane_drop_action, pane_drop_zone, zone_split_request, GuiWin, MouseCapture, PaneDropKind,
@@ -569,7 +570,7 @@ impl super::TermWindow {
             1
         } else {
             2
-        };
+        } + usize::from(self.window_tab_reveal.shows_pin());
         let window_button_count = if self.right_sidebar_width() == 0
             && self
                 .window_tab_chrome_params()
@@ -593,7 +594,20 @@ impl super::TermWindow {
         )
     }
 
-    pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize) -> usize {
+    pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize, pane_top: usize) -> usize {
+        // A window tab row out of the layout leaves the traffic lights over
+        // the top-left pane's bar, which then starts clear of them. Nothing
+        // else of the row's stays behind to make room for.
+        if pane_left == 0
+            && pane_top == 0
+            && cfg!(target_os = "macos")
+            && !self.window_state.contains(WindowState::FULL_SCREEN)
+            && self.workspace_sidebar_width() == 0
+            && !self.window_tab_reveal.in_layout()
+        {
+            return self.ui_px(MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH)
+                + self.ui_px(TAB_ROW_START_PADDING);
+        }
         if pane_left == 0 && self.workspace_sidebar_width() > 0 {
             self.ui_px(TAB_ROW_START_PADDING)
         } else {
@@ -879,7 +893,11 @@ impl super::TermWindow {
             }
         }
 
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let tab_bar_height = if self.window_tab_row_in_place() {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.
+        };
         let tab_bar_y = border.top.get() as f32;
         if event.coords.x >= self.tab_bar_left_edge() as isize
             && (event.coords.x as f32) < self.terminal_viewport_right()
@@ -1651,6 +1669,8 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::RightSidebarToggle
+            | UIItemType::WindowTabsPin
+            | UIItemType::WindowTabsTravelling
             | UIItemType::RightSidebarMode(_)
             | UIItemType::RightSidebarBackground
             | UIItemType::RightSidebarResize
@@ -1825,6 +1845,8 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::RightSidebarToggle
+            | UIItemType::WindowTabsPin
+            | UIItemType::WindowTabsTravelling
             | UIItemType::RightSidebarMode(_)
             | UIItemType::RightSidebarBackground
             | UIItemType::RightSidebarResize
@@ -2109,6 +2131,15 @@ impl super::TermWindow {
                 self.cancel_remote_divider_resizes_except(None);
                 context.invalidate();
             }
+            // Chrome stays usable over a terminal held up here: the top edge
+            // still brings the window tab row down -- the way to another tab
+            // -- as the side edges do their sidebars where they may.
+            if self.command_palette.is_none() {
+                self.current_mouse_event.replace(event.clone());
+                self.update_workspace_sidebar_hover(context);
+                self.update_right_sidebar_hover(context);
+                self.update_window_tab_reveal(context);
+            }
             return;
         }
         if terminal_surface && takeover_gesture {
@@ -2124,6 +2155,7 @@ impl super::TermWindow {
         if self.command_palette.is_none() {
             self.update_workspace_sidebar_hover(context);
             self.update_right_sidebar_hover(context);
+            self.update_window_tab_reveal(context);
         }
 
         if self.consume_context_menu_suppressed_release(&event) {
@@ -2645,6 +2677,7 @@ impl super::TermWindow {
         // The machine reads `Away` now: cancels an Arming, starts a grace.
         self.update_workspace_sidebar_hover(context);
         self.update_right_sidebar_hover(context);
+        self.update_window_tab_reveal(context);
         self.update_title();
         if !preserve_cursor {
             context.set_cursor(Some(MouseCursor::Arrow));
@@ -4036,6 +4069,15 @@ impl super::TermWindow {
             UIItemType::RightSidebarToggle => {
                 self.mouse_event_right_sidebar_toggle(event, context);
             }
+            UIItemType::WindowTabsPin => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_window_tabs_pinned();
+                }
+            }
+            UIItemType::WindowTabsTravelling => {
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
             UIItemType::RightSidebarMode(mode) => {
                 self.mouse_event_right_sidebar_mode(mode, event, context);
             }
@@ -4647,6 +4689,15 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarToggle => {
                 self.mouse_event_right_sidebar_toggle(event, context);
+            }
+            UIItemType::WindowTabsPin => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_window_tabs_pinned();
+                }
+            }
+            UIItemType::WindowTabsTravelling => {
+                context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::RightSidebarMode(mode) => {
                 self.mouse_event_right_sidebar_mode(mode, event, context);

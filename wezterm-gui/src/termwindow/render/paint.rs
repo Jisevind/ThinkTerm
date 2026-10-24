@@ -4449,6 +4449,7 @@ impl crate::TermWindow {
         self.advance_workspace_space_swipe_push(frame_now);
         self.advance_workspace_sidebar_hover(frame_now);
         self.advance_right_sidebar_hover(frame_now);
+        self.advance_window_tab_reveal(frame_now);
         self.advance_content_view_fade(frame_now);
         // Card texture work is queued per pass; a retried pass re-queues it.
         self.pending_card_renders.borrow_mut().clear();
@@ -5126,10 +5127,21 @@ impl crate::TermWindow {
             }
 
             let defer_trailing_actions = !cfg!(target_os = "macos") && right_hover_overlay.is_some();
-            let tab_items = self
-                .paint_fancy_tab_bar(&mut chrome_layers, defer_trailing_actions)
-                .context("paint_tab_bar")?;
+            let tab_items = if let Some(shift) = self.window_tab_row_travel_shift() {
+                // On its way down from the top edge or back up: nothing on
+                // it takes a click until it lands.
+                self.paint_window_tab_row_travelling(&mut chrome_layers, shift)
+                    .context("paint travelling tab bar")?
+            } else {
+                self.paint_fancy_tab_bar(&mut chrome_layers, defer_trailing_actions)
+                    .context("paint_tab_bar")?
+            };
             self.ui_items.extend(tab_items);
+            // Over an open right sidebar, whatever the row is doing.
+            let window_buttons = self
+                .paint_right_sidebar_window_buttons(&mut chrome_layers)
+                .context("paint window buttons over the right sidebar")?;
+            self.ui_items.extend(window_buttons);
             drop(chrome_layers);
 
             if let Some((overlay, hidden, items)) = hover_overlay {
@@ -5167,7 +5179,7 @@ impl crate::TermWindow {
                 self.paint_right_sidebar_hover_overlay(&overlay, hidden)
                     .context("paint hover-revealed right sidebar")?;
                 self.ui_items.extend(items);
-                if !cfg!(target_os = "macos") {
+                if !cfg!(target_os = "macos") && self.window_tab_row_in_place() {
                     // Keep the full-height hover background, with the window
                     // and sidebar buttons above it. Flatten their sub-layers
                     // just like the panel so button fills remain visible too.

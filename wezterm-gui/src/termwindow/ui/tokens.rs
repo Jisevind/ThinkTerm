@@ -34,6 +34,17 @@ pub const SIDEBAR_HOVER_DWELL_MS: u64 = 180;
 /// Generous on purpose: it is the only defence against a native macOS menu,
 /// which sets no flag while open (see `ui/context_menu.rs`).
 pub const SIDEBAR_HOVER_GRACE_MS: u64 = 400;
+/// The window tab row's strip along the top, its counterpart of
+/// `SIDEBAR_HOVER_HOT_ZONE_WIDTH`. Deeper than that strip is wide: a window
+/// under the menu bar has nothing above it to stop the pointer, and an
+/// overshoot leaves the window.
+pub const WINDOW_TAB_REVEAL_HOT_ZONE_HEIGHT: usize = 16;
+/// The top strip's counterpart of `SIDEBAR_HOVER_STICKY_ZONE_WIDTH`.
+pub const WINDOW_TAB_REVEAL_STICKY_ZONE_HEIGHT: usize = 32;
+/// Off macOS, the top edge a window drawing its own frame leaves to the
+/// system for resizing, where the pointer never reaches the window: six
+/// logical pixels on X11 and Wayland, a little less on Windows.
+pub const WINDOW_RESIZE_EDGE_HEIGHT: usize = 12;
 pub const MACOS_TITLEBAR_CONTENT_TOP_INSET: usize = 52;
 pub const MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH: usize = 164;
 pub const MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS: usize = 1;

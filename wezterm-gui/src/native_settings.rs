@@ -459,6 +459,33 @@ impl NativeBottomQuoteMode {
     pub(crate) const ALL: [Self; 2] = [Self::Timed, Self::PseudoRandom];
 }
 
+/// The window tab row: the first of the two tab bars.
+///
+/// `Show` is the default and the row it has always been. `AutoHide` gives
+/// its height back to the terminal and brings it down over the top of the
+/// window while the pointer rests at the top edge, pushing the terminal
+/// area down rather than resizing it; its pin keeps it out
+/// (`window_tabs_pinned`). `Hide` leaves it out altogether, the tabs still
+/// there behind the keyboard and the command palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeWindowTabs {
+    Show,
+    AutoHide,
+    Hide,
+}
+
+impl Default for NativeWindowTabs {
+    fn default() -> Self {
+        Self::Show
+    }
+}
+
+impl NativeWindowTabs {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 3] = [Self::Show, Self::AutoHide, Self::Hide];
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAppearanceSettings {
@@ -497,6 +524,12 @@ pub(crate) struct NativeAppearanceSettings {
     /// hover cards.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) agents_status: NativeThreadStatus,
+    /// See [`NativeWindowTabs`].
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) window_tabs: NativeWindowTabs,
+    /// Under `AutoHide`, the row's pin is in: it stays out and takes its
+    /// height in the layout, as under `Show`.
+    pub(crate) window_tabs_pinned: bool,
 }
 
 /// How a sidebar thread row draws the programs its panes run. All but
@@ -1056,6 +1089,24 @@ pub(crate) fn cursor_blinks_by_default() -> bool {
 /// not per frame.
 pub(crate) fn cursor_shape_choice() -> NativeCursorShape {
     load_shared().terminal.cursor_shape
+}
+
+/// The window tab row's mode and, under `AutoHide`, whether it is pinned.
+/// Read when a window builds or refreshes its state, not per frame.
+pub(crate) fn window_tabs_choice() -> (NativeWindowTabs, bool) {
+    let settings = load_shared();
+    (
+        settings.appearance.window_tabs,
+        settings.appearance.window_tabs_pinned,
+    )
+}
+
+/// Pin or unpin the auto-hiding window tab row, from its pin button. Every
+/// window is told directly, so no reload is owed.
+pub(crate) fn save_window_tabs_pinned(pinned: bool) -> anyhow::Result<()> {
+    update_ui_state_and_settings_window(|settings| {
+        settings.appearance.window_tabs_pinned = pinned
+    })
 }
 
 /// Read once per painted pane, through the shared handle.
@@ -2319,6 +2370,8 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
     let contrast = before.terminal.text_contrast != after.terminal.text_contrast;
     let cursor_style = before.terminal.cursor_blink != after.terminal.cursor_blink
         || before.terminal.cursor_shape != after.terminal.cursor_shape;
+    let window_tabs = before.appearance.window_tabs != after.appearance.window_tabs
+        || before.appearance.window_tabs_pinned != after.appearance.window_tabs_pinned;
     let before_chrome = &before.chrome;
     let after_chrome = &after.chrome;
     let panels = before_chrome.right_sidebar_files_enabled != after_chrome.right_sidebar_files_enabled
@@ -2354,6 +2407,9 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
                         }
                         if cursor_style {
                             term_window.refresh_cursor_style();
+                        }
+                        if window_tabs {
+                            term_window.refresh_window_tabs();
                         }
                         if panels {
                             term_window.right_sidebar_panels_changed();
@@ -3507,6 +3563,38 @@ mod tests {
             serde_json::from_str(json).expect("the file has to survive");
         assert_eq!(settings.terminal.cursor_blink, NativeCursorBlink::Off);
         assert_eq!(settings.terminal.cursor_shape, NativeCursorShape::Block);
+    }
+
+    /// A file from before the window tab row could hide keeps it shown.
+    #[test]
+    fn a_settings_file_without_a_window_tabs_choice_shows_the_row() {
+        let json = r#"{ "version": 1, "appearance": { "theme_mode": "system" } }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.appearance.window_tabs, NativeWindowTabs::Show);
+        assert!(!settings.appearance.window_tabs_pinned);
+    }
+
+    #[test]
+    fn a_window_tabs_choice_round_trips_through_the_file() {
+        for (written, expected) in [
+            ("show", NativeWindowTabs::Show),
+            ("auto_hide", NativeWindowTabs::AutoHide),
+            ("hide", NativeWindowTabs::Hide),
+        ] {
+            let json = format!(r#"{{"appearance": {{"window_tabs": "{written}"}}}}"#);
+            let settings: ThinkTermNativeSettings =
+                serde_json::from_str(&json).expect("the file has to survive");
+            assert_eq!(settings.appearance.window_tabs, expected, "{written}");
+
+            let out = serde_json::to_string(&settings).expect("serialises");
+            assert!(
+                out.contains(&format!("\"window_tabs\":\"{written}\"")),
+                "{} has to survive a save: {}",
+                written,
+                out
+            );
+        }
     }
 
     #[test]
