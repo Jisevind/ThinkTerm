@@ -6,7 +6,7 @@ use crate::termwindow::space_swipe::{SidebarSpaceSwipeFinish, SidebarSpaceSwipeU
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::sidebar::SpaceConnectionState;
 use crate::termwindow::ui::tokens::{
-    MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH,
+    PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH,
     TAB_ROW_START_PADDING, TAB_TARGET_WIDTH, TAB_VERTICAL_PADDING,
     WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
     WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
@@ -595,9 +595,11 @@ impl super::TermWindow {
     }
 
     pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize, pane_top: usize) -> usize {
-        // A window tab row out of the layout leaves the traffic lights over
-        // the top-left pane's bar, which then starts clear of them. Nothing
-        // else of the row's stays behind to make room for.
+        // A window tab row out of the layout leaves the traffic lights and
+        // the sidebar button beside them over the top-left pane's bar, whose
+        // tabs then start where the row's do. Brought down, the row takes
+        // them back and pushes the bar below them: its tabs go back to the
+        // edge as the row comes.
         if pane_left == 0
             && pane_top == 0
             && cfg!(target_os = "macos")
@@ -605,8 +607,11 @@ impl super::TermWindow {
             && self.workspace_sidebar_width() == 0
             && !self.window_tab_reveal.in_layout()
         {
-            return self.ui_px(MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH)
-                + self.ui_px(TAB_ROW_START_PADDING);
+            let edge = self.ui_px(PANE_NAV_INSET) as f32;
+            let clear = self.window_tab_left_padding_pixels().ceil()
+                + self.ui_px(TAB_ROW_START_PADDING) as f32;
+            let away = 1.0 - self.window_tab_reveal.shown();
+            return (edge + (clear - edge).max(0.0) * away).round() as usize;
         }
         if pane_left == 0 && self.workspace_sidebar_width() > 0 {
             self.ui_px(TAB_ROW_START_PADDING)

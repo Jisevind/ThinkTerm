@@ -55,6 +55,11 @@ impl WindowTabReveal {
         self.pinned
     }
 
+    /// How far out the row is, 0 to 1.
+    pub(crate) fn shown(&self) -> f32 {
+        self.shown
+    }
+
     /// A dwell, a grace or a travel is under way.
     pub(crate) fn needs_frames(&self) -> bool {
         self.hover.needs_frames()
