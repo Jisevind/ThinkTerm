@@ -534,6 +534,9 @@ pub(crate) struct LiveOverviewView {
     /// eye is following, and a second copy waiting in the slot is what made
     /// the transition look like two layers.
     terminal_in_flight: Option<TabId>,
+    /// When that terminal set off. Its card keeps the first picture captured
+    /// after this until it lands; see the capture in `paint`.
+    terminal_in_flight_since: Option<Instant>,
     visible_panes: HashSet<PaneId>,
     live_resizing: bool,
     card_motion: HashMap<LiveThreadKey, CardMotion>,
@@ -600,6 +603,7 @@ impl LiveOverviewView {
             preview_chrome: Vec::new(),
             card_preview_rects: HashMap::new(),
             terminal_in_flight: None,
+            terminal_in_flight_since: None,
             visible_panes: HashSet::new(),
             live_resizing: false,
             card_motion: HashMap::new(),
@@ -1015,6 +1019,7 @@ impl LiveOverviewView {
                     // so a scroll does not reveal an uncaptured thumbnail. All
                     // other cards remain metadata-only.
                     let overscan = layout.grid.card_height + gap;
+                    let in_flight = self.terminal_in_flight == Some(card.tab_id);
                     let snapshot = if card_is_warm(rect, self.viewport, overscan) {
                         warm_tabs.insert(card.tab_id);
                         if self.defer_preview_captures {
@@ -1022,16 +1027,42 @@ impl LiveOverviewView {
                                 .get(&card.tab_id)
                                 .map(|cached| Arc::clone(&cached.snapshot))
                         } else {
-                            let fingerprint = terminal_preview_fingerprint(card.tab_id);
-                            let (snapshot, refresh_due) = resolve_snapshot(
-                                &mut self.snapshot_cache,
-                                &card.tab_id,
-                                fingerprint,
-                                now,
-                                refresh_interval,
-                                &mut capture_budget,
-                                || capture_terminal_snapshot(card.tab_id),
-                            );
+                            // The card the terminal is landing in captures on
+                            // an allowance of its own: its picture has to be
+                            // built by the time the terminal arrives, and the
+                            // shared budget is spent from the top of the grid
+                            // down, so a card further down could wait out the
+                            // flight for its turn. Once captured it keeps that
+                            // picture until it lands: a terminal that keeps
+                            // printing would otherwise hand it a new snapshot
+                            // every refresh, each one restarting a build that
+                            // might never finish in between.
+                            let landing_capture = self
+                                .terminal_in_flight_since
+                                .filter(|_| in_flight)
+                                .and_then(|since| {
+                                    self.snapshot_cache
+                                        .get(&card.tab_id)
+                                        .filter(|cached| cached.captured_at >= since)
+                                })
+                                .map(|cached| Arc::clone(&cached.snapshot));
+                            let mut landing_budget = 1;
+                            let (snapshot, refresh_due) = match landing_capture {
+                                Some(snapshot) => (Some(snapshot), None),
+                                None => resolve_snapshot(
+                                    &mut self.snapshot_cache,
+                                    &card.tab_id,
+                                    terminal_preview_fingerprint(card.tab_id),
+                                    now,
+                                    refresh_interval,
+                                    if in_flight {
+                                        &mut landing_budget
+                                    } else {
+                                        &mut capture_budget
+                                    },
+                                    || capture_terminal_snapshot(card.tab_id),
+                                ),
+                            };
                             if let Some(refresh_due) = refresh_due {
                                 // A `Some` here means the card's fingerprint no
                                 // longer matches what was captured. A future
@@ -1139,7 +1170,6 @@ impl LiveOverviewView {
                         preview_width,
                         preview_width / self.host_preview_aspect,
                     );
-                    let in_flight = self.terminal_in_flight == Some(tab_id);
                     // A card whose terminal is currently flying to it is left
                     // empty, but not neutral: the panel takes that terminal's
                     // own background so the arriving picture settles onto the
@@ -1167,7 +1197,27 @@ impl LiveOverviewView {
                                 preview_fill,
                                 ctx.px(PREVIEW_RADIUS),
                             )?;
-                            if !in_flight {
+                            if in_flight {
+                                // Built, not shown. The terminal arriving here
+                                // gives way to this picture as it lands
+                                // (`flight_lands_in_card`), so it has to be
+                                // recorded by then -- and the renderer keeps
+                                // only the pictures a frame asks for. Left out
+                                // of the requests, the card lost its picture on
+                                // every open and the landing revealed a bare
+                                // panel while it was rebuilt.
+                                if let Some(snapshot) = snapshot.as_ref() {
+                                    self.previews.push(TerminalPreviewRequest {
+                                        tab_id,
+                                        snapshot: Arc::clone(snapshot),
+                                        area: preview,
+                                        clip,
+                                        hold_scale: self.live_resizing,
+                                        opacity: 0.0,
+                                        prebuild: true,
+                                    });
+                                }
+                            } else {
                                 // A card that changed tab fades the old
                                 // picture out under the new one. The old
                                 // tab's snapshot is kept warm for the length
@@ -1184,6 +1234,7 @@ impl LiveOverviewView {
                                             clip,
                                             hold_scale: self.live_resizing,
                                             opacity: 1.0 - arrived,
+                                            prebuild: false,
                                         });
                                     }
                                 }
@@ -1195,6 +1246,7 @@ impl LiveOverviewView {
                                         clip,
                                         hold_scale: self.live_resizing,
                                         opacity: arrived,
+                                        prebuild: false,
                                     });
                                     self.visible_panes
                                         .extend(snapshot.panes.iter().map(|pane| pane.pane_id));
@@ -2383,6 +2435,11 @@ impl ContentView for LiveOverviewView {
     }
 
     fn set_terminal_in_flight(&mut self, tab_id: Option<TabId>) {
+        if tab_id.is_none() {
+            self.terminal_in_flight_since = None;
+        } else if tab_id != self.terminal_in_flight {
+            self.terminal_in_flight_since = Some(Instant::now());
+        }
         self.terminal_in_flight = tab_id;
     }
 

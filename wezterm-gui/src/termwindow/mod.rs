@@ -474,17 +474,15 @@ const CONTENT_VIEW_FADE: Duration = Duration::from_millis(140);
 /// registers as a jump rather than as travel.
 const CONTENT_VIEW_TRAVEL: Duration = Duration::from_millis(260);
 
-/// How long the travelling terminal takes to dissolve into the card's own
-/// thumbnail of it, once the two are close enough in size to overlap.
+/// How long the travelling terminal takes to dissolve away when the arriving
+/// view has no card for it to land in, once it is close to the size of its
+/// destination.
 ///
 /// Long enough to be seen, which is a lower bound with real teeth: a timeline
 /// does not start its clock until the frame after it is armed, so a dissolve
-/// budgeted at 45ms spent one frame arming and left two usable ones. That is a
-/// cut with extra steps, and it is what the first version of this shipped as.
+/// budgeted at 45ms spent one frame arming and left two usable ones.
 ///
-/// Deliberately outlasts the travel. The last stretch of it therefore runs
-/// after the terminal has settled into the card, where the two pictures are
-/// aligned exactly and the dissolve costs nothing at all.
+/// Landing in a card is a cut instead (`content_view::flight_lands_in_card`).
 const CONTENT_VIEW_LANDING_FADE: Duration = Duration::from_millis(140);
 
 /// How long the window frame takes to clear its own edges. Shorter than the

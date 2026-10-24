@@ -55,10 +55,12 @@ pub(crate) struct ContentViewFade {
     /// already gone by the time the flight is resolved -- so a close records
     /// the answer while it still can.
     pub(crate) pending_destination: Option<RectF>,
-    /// The travelling terminal dissolving into the card's own thumbnail of it,
-    /// started once the two are close enough in size to overlap. `None` until
+    /// The travelling terminal giving way to what it lands on: a cut to the
+    /// card's own thumbnail once it has arrived and that thumbnail is recorded
+    /// (`flight_lands_in_card`), or -- with no card to land in -- a dissolve
+    /// started once it is close to the size of its destination. `None` until
     /// then, and for the whole of a closing transition -- growing back out of
-    /// a card, there is nothing on the far side to dissolve into.
+    /// a card, there is nothing on the far side to give way to.
     pub(crate) landing: Option<crate::ui::anim::Timeline>,
     /// When this transition began, in wall-clock time.
     ///
@@ -84,6 +86,69 @@ const TRANSITION_INPUT_HOLD: Duration = Duration::from_millis(1000);
 /// Both look interactive and neither is.
 pub(crate) fn transition_holds_input(elapsed: Duration) -> bool {
     elapsed < TRANSITION_INPUT_HOLD
+}
+
+/// How long a terminal that has arrived at its card may wait there for the
+/// card's own picture before giving way to the card regardless.
+///
+/// Counted from the arrival, not from the start of the transition: the travel's
+/// clock only starts once the opening frame has been presented, and a slow
+/// opening frame would otherwise spend the wait before the terminal got
+/// anywhere. The picture is built while the terminal travels and is normally
+/// there before it arrives; running out means one that could not be captured,
+/// or a build still unfinished, which then appears as it completes.
+pub(crate) const FLIGHT_LANDING_WAIT: Duration = Duration::from_millis(300);
+
+/// Whether the terminal travelling into its card gives way to the card now.
+///
+/// Giving way is a cut, not a dissolve. The two are the same rows laid out
+/// twice -- the terminal as the window drew it, tab strip and pane headers
+/// included, and the card's own layout at its own scale -- so no glyph of one
+/// lands on its counterpart in the other. Dissolving them showed both at
+/// partial strength, and the thumbnail, still being built when the dissolve
+/// began, not at all: the card went dark for a few frames and came back on
+/// every open. A cut between two near pictures is a small shift the eye
+/// forgives.
+///
+/// Only once the terminal has arrived: cutting while it is still larger than
+/// the card would snap the picture down by the difference. And only once the
+/// card has its own picture recorded, so the cut lands on that picture rather
+/// than on an empty panel -- unless `waited` since the arrival has reached
+/// [`FLIGHT_LANDING_WAIT`].
+pub(crate) fn flight_lands_in_card(
+    travel_running: bool,
+    thumbnail_recorded: bool,
+    waited: Duration,
+) -> bool {
+    !travel_running && (thumbnail_recorded || waited >= FLIGHT_LANDING_WAIT)
+}
+
+#[cfg(test)]
+mod card_landing_tests {
+    use super::*;
+
+    #[test]
+    fn a_travelling_terminal_does_not_cut_even_to_a_ready_card() {
+        assert!(!flight_lands_in_card(true, true, Duration::ZERO));
+    }
+
+    #[test]
+    fn an_arrived_terminal_cuts_to_its_recorded_card() {
+        assert!(flight_lands_in_card(false, true, Duration::ZERO));
+    }
+
+    #[test]
+    fn an_arrived_terminal_waits_for_its_card_but_not_for_ever() {
+        assert!(!flight_lands_in_card(false, false, Duration::from_millis(100)));
+        assert!(flight_lands_in_card(false, false, FLIGHT_LANDING_WAIT));
+    }
+
+    #[test]
+    fn the_travel_and_the_wait_end_before_input_is_let_go() {
+        assert!(
+            crate::termwindow::CONTENT_VIEW_TRAVEL + FLIGHT_LANDING_WAIT < TRANSITION_INPUT_HOLD
+        );
+    }
 }
 
 #[cfg(test)]
@@ -266,26 +331,25 @@ pub(crate) struct ContentViewFlight {
     /// Which terminal is travelling, so the arriving view can be re-asked
     /// where it now keeps a place for it.
     pub(crate) tab_id: Option<TabId>,
+    /// Whether the view had a card for this terminal when it was recorded, so
+    /// the landing is a cut to that card rather than a dissolve. Decided once:
+    /// asked again on a pass that stopped partway through the view's paint,
+    /// the view could answer without the card and turn the cut into a
+    /// dissolve.
+    pub(crate) lands_in_card: bool,
 }
 
-/// How much larger than its card the travelling terminal may still be when the
-/// two are first allowed to overlap.
+/// How much larger than its destination a terminal with no card to land in
+/// may still be when it starts dissolving away. Landing in a card is a cut,
+/// made once the terminal has arrived (`flight_lands_in_card`).
 ///
-/// Loose, because the overlap itself is cheap: the eased opacity is still flat
-/// at 1.0 for the first quarter of the dissolve, and by the time the recording
-/// is visibly translucent the mismatch is already under 1%. What made the
-/// earlier attempt read as two pictures was not the mismatch on its own but
-/// the flat panel colour showing between them -- the card drew no thumbnail
-/// while its terminal was in flight, so there was nothing to dissolve into.
-/// With an aligned copy of the same picture underneath, a few percent of size
-/// difference is not what the eye is looking at.
-///
-/// Tightening this is what made the first version invisible: 3% left about two
-/// usable frames, which is a cut with extra steps.
+/// Loose, because a dissolve takes a while to show: the eased opacity is still
+/// flat at 1.0 for its first quarter. Tightened to 3%, it left about two
+/// usable frames -- a cut with extra steps.
 const FLIGHT_LANDING_OVERSIZE: f32 = 0.12;
 
-/// Whether the travelling terminal has closed to within touching distance of
-/// the card it is landing in.
+/// Whether a terminal with no card to land in has closed to within touching
+/// distance of its destination, where it starts dissolving away.
 ///
 /// Measured in size, not in time and not in distance already covered. The
 /// travel eases out, so a window written in either of those spends most of
@@ -441,6 +505,10 @@ pub(crate) struct TerminalPreviewRequest {
     /// How opaque to draw it, 0 to 1. A card changing tab draws the old
     /// picture fading out under the new one fading in.
     pub opacity: f32,
+    /// Build the picture but do not draw it: the card a terminal is flying
+    /// into, which has to be ready when the terminal lands on it and must not
+    /// show before then.
+    pub prebuild: bool,
 }
 
 /// Progress of an SSH connection that a content view kicked off, pushed by the

@@ -142,6 +142,13 @@ impl Timeline {
         Self::new(now, value, value, Duration::ZERO, Easing::Linear)
     }
 
+    /// When the value reaches its target, or reached it: `None` while the
+    /// clock has not started.
+    pub(crate) fn arrives_at(&self) -> Option<Instant> {
+        self.started_at
+            .map(|started_at| started_at + self.delay + self.duration)
+    }
+
     /// Advance to `now`; returns whether another frame is still wanted.
     ///
     /// Call this once per frame, before painting. The first call does not
@@ -296,6 +303,18 @@ mod tests {
         let mut timeline = Timeline::new(start, 12.0, 12.0, STANDARD, Easing::OutCubic);
         assert!(!timeline.advance(start));
         assert_eq!(timeline.value(at(start, 500)), 12.0);
+    }
+
+    #[test]
+    fn arrival_is_known_once_the_clock_runs() {
+        let start = Instant::now();
+        let mut timeline = armed(start);
+        timeline.advance(at(start, 0));
+        timeline.value(at(start, 0));
+        assert_eq!(timeline.arrives_at(), None);
+        // The clock starts on the frame after the first presented one.
+        timeline.advance(at(start, 100));
+        assert_eq!(timeline.arrives_at(), Some(at(start, 300)));
     }
 
     #[test]

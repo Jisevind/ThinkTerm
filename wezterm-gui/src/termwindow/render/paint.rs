@@ -129,6 +129,20 @@ fn snapshot_has_content(
         .any(|pane| pane.lines.iter().any(|line| !line.is_whitespace()))
 }
 
+/// When the fade-in of a card first seen with content starts: now, or -- for a
+/// card being built out of sight (`TerminalPreviewRequest::prebuild`), the one
+/// a terminal is flying into -- a whole ramp ago, so that it is settled when
+/// it is shown. The ramp softens a blank card filling in on screen; one
+/// started out of sight would still be running, at whatever point, when the
+/// landing reveals the card.
+fn preview_fade_start(now: Instant, prebuild: bool) -> Instant {
+    if prebuild {
+        now.checked_sub(PREVIEW_CONTENT_FADE).unwrap_or(now)
+    } else {
+        now
+    }
+}
+
 /// Everything a card's recorded quads depend on.
 ///
 /// Equal keys mean the recorded heap still draws the right picture and can be
@@ -1496,39 +1510,85 @@ impl crate::TermWindow {
     /// sidebar, below the tab bar).
     /// Advance a full-window view's arrival or departure.
     fn advance_content_view_fade(&mut self, now: Instant) {
+        // Read before the fade is borrowed for advancing: whether the
+        // travelling terminal lands in a card, and if so whether that card's
+        // own picture is recorded yet.
+        let card_recorded = self
+            .content_view_landing_tab()
+            .map(|tab_id| self.preview_thumbnail_recorded(tab_id));
         let Some(fade) = self.content_view_fade.as_mut() else {
             return;
         };
-        // Once the travelling terminal has closed to within touching distance
-        // of its card, hand the card back its own thumbnail and dissolve the
-        // recording into it. Both pictures are then on screen at the same
-        // rectangle, which is the only arrangement in which a dissolve reads as
-        // one thing settling rather than as two things overlapping.
+        // Hand the card back its own thumbnail as the travelling terminal
+        // reaches it. Into a card that is a cut, made once the terminal has
+        // arrived and the card's picture is recorded underneath it
+        // (`flight_lands_in_card`); until then the terminal holds at the card
+        // and the frames keep coming. With no card to land in, the recording
+        // dissolves away as it nears its destination.
         let mut landed = false;
+        let mut awaiting_card = false;
         if fade.landing.is_none() && fade.travel.target() >= 0.5 {
-            if let Some(flight) = fade.flight.as_ref() {
-                if crate::termwindow::content_view::flight_is_landing(
-                    flight.source,
-                    flight.destination,
-                    fade.travel.value(now),
-                ) {
-                    fade.landing = Some(crate::ui::anim::Timeline::new(
-                        now,
-                        1.0,
-                        0.0,
-                        crate::termwindow::CONTENT_VIEW_LANDING_FADE,
-                        crate::ui::anim::Easing::Smooth,
-                    ));
-                    landed = true;
+            // How long the terminal has been sitting where it was going:
+            // nothing while it is still on its way.
+            let waited = fade
+                .travel
+                .arrives_at()
+                .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+            match fade.flight.as_ref() {
+                Some(flight) => {
+                    let landing = match card_recorded {
+                        Some(recorded) => crate::termwindow::content_view::flight_lands_in_card(
+                            fade.travel.is_running(),
+                            recorded,
+                            waited,
+                        )
+                        // Already over: the terminal is not drawn from this
+                        // frame on. Even a millisecond-long timeline left a
+                        // frame with the terminal half transparent over the
+                        // thumbnail, its clock having started less than a
+                        // millisecond before the terminal was drawn.
+                        .then(|| crate::ui::anim::Timeline::settled(now, 0.0)),
+                        None => crate::termwindow::content_view::flight_is_landing(
+                            flight.source,
+                            flight.destination,
+                            fade.travel.value(now),
+                        )
+                        .then(|| {
+                            crate::ui::anim::Timeline::new(
+                                now,
+                                1.0,
+                                0.0,
+                                crate::termwindow::CONTENT_VIEW_LANDING_FADE,
+                                crate::ui::anim::Easing::Smooth,
+                            )
+                        }),
+                    };
+                    match landing {
+                        Some(landing) => {
+                            fade.landing = Some(landing);
+                            landed = true;
+                        }
+                        None => awaiting_card = card_recorded.is_some(),
+                    }
+                }
+                // Discarded with the atlas it was drawn from
+                // (`discard_content_view_captures_after_atlas_recreation`) and
+                // recorded again on this pass. The transition must not end
+                // underneath it meanwhile -- it had nothing left running and
+                // ended in that same pass, cutting to whatever the card had --
+                // but nor may it wait for ever.
+                None => {
+                    awaiting_card = waited < crate::termwindow::content_view::FLIGHT_LANDING_WAIT;
                 }
             }
         }
         let travelling = fade.travel.advance(now)
             | fade.chrome_travel.advance(now)
-            | fade.landing.as_mut().is_some_and(|fade| fade.advance(now));
+            | fade.landing.as_mut().is_some_and(|fade| fade.advance(now))
+            | awaiting_card;
         if landed {
             // Painted after this runs, so the thumbnail appears underneath the
-            // dissolve on this very frame rather than one frame late.
+            // landing terminal on this very frame rather than one frame late.
             if let Some(view) = self.active_content_view_mut() {
                 view.set_terminal_in_flight(None);
             }
@@ -1583,10 +1643,10 @@ impl crate::TermWindow {
     /// Replay the recorded terminal at the size its travel has reached.
     ///
     /// It rides above the view: the terminal is shrinking *into* the card, so
-    /// it has to be seen crossing the grid that is arriving underneath it. The
-    /// last stretch is spent fading, because what it lands on is the card's
-    /// own thumbnail of the same terminal drawn from the same snapshot -- near
-    /// enough to blend into, not near enough to cut to.
+    /// it has to be seen crossing the grid that is arriving underneath it.
+    /// Once it has arrived it gives way to the card's own thumbnail of the same
+    /// terminal in a cut (`content_view::flight_lands_in_card` says why not a
+    /// dissolve); with no card to land in, it dissolves away instead.
     fn paint_content_view_flight(&self, now: Instant) -> anyhow::Result<()> {
         let Some(fade) = self.content_view_fade.as_ref() else {
             return Ok(());
@@ -1597,20 +1657,11 @@ impl crate::TermWindow {
         let Some((source, target)) = self.content_view_flight_rects(now) else {
             return Ok(());
         };
-        // Opaque for all of the journey but the landing.
-        //
-        // An earlier version faded over the last tenth of the *distance*, and
-        // ease-out spends its time unevenly: that tenth is nearly half of the
-        // duration, so the fade ran translucent for seven frames at a size
-        // 3-18% off the card it was landing on. Worse, the card drew no
-        // thumbnail while its terminal was in flight, so there was nothing on
-        // the far side to dissolve into -- only the flat panel colour. Two
-        // misaligned pictures with a panel showing between them is exactly
-        // what "it looks like two layers" meant.
-        //
-        // Both of those are now addressed rather than avoided: the window is
-        // bounded by size instead of by distance, and the card is handed its
-        // thumbnail back as the window opens. See `flight_is_landing`.
+        // Opaque for all of the journey but the landing, which into a card is
+        // a cut over a thumbnail already recorded underneath it: the card's
+        // picture is built out of sight during the flight
+        // (`TerminalPreviewRequest::prebuild`) and the landing waits for it
+        // (`flight_lands_in_card`).
         let opacity = fade.landing.as_ref().map_or(1.0, |fade| fade.value(now));
 
         let gl_state = self.render_state.as_ref().unwrap();
@@ -2144,7 +2195,8 @@ impl crate::TermWindow {
             .unwrap_or_else(|| self.window_rect());
         // The view must not draw its own copy of a terminal that is currently
         // crossing the window towards it.
-        if destination != self.window_rect() {
+        let lands_in_card = destination != self.window_rect();
+        if lands_in_card {
             if let Some(view) = self.active_content_view_mut() {
                 view.set_terminal_in_flight(tab_id);
             }
@@ -2156,6 +2208,7 @@ impl crate::TermWindow {
                 source,
                 destination,
                 tab_id,
+                lands_in_card,
                 recording_revision:
                     crate::termwindow::ui::recording_overlay::recording_mask_revision(),
             });
@@ -2474,19 +2527,48 @@ impl crate::TermWindow {
         if !previews.is_empty() {
             self.preview_cache_last_wanted = Some(Instant::now());
             let live: HashSet<TabId> = previews.iter().map(|preview| preview.tab_id).collect();
+            // Nor is a card on screen that has not been captured yet. The view
+            // is made anew on every open and captures a few cards a frame, so
+            // on its first frames most cards ask for nothing -- and the
+            // picture each had last time is what it shows until it has been
+            // rebuilt.
+            let kept = |tab_id: &TabId| {
+                live.contains(tab_id)
+                    || self
+                        .active_content_view()
+                        .is_some_and(|view| view.terminal_landing_rect(*tab_id).is_some())
+            };
             self.preview_quad_cache
                 .borrow_mut()
-                .retain(|tab_id, _| live.contains(tab_id));
+                .retain(|tab_id, _| kept(tab_id));
             self.preview_content_fade
                 .borrow_mut()
-                .retain(|tab_id, _| live.contains(tab_id));
-            // Same policy for a rebuild sliced across frames: its card is gone.
-            let mut partial = self.preview_rebuild_partial.borrow_mut();
-            if partial
+                .retain(|tab_id, _| kept(tab_id));
+            // Same policy for a rebuild sliced across frames when its card is
+            // gone, or when the card no longer wants the picture being built --
+            // back at the size it already has a picture for, say. Nothing would
+            // continue such a build, and while it held the slot, `continuing`
+            // below kept every other card waiting on it.
+            let obsolete = self
+                .preview_rebuild_partial
+                .borrow()
                 .as_ref()
-                .is_some_and(|partial| !live.contains(&partial.tab_id))
-            {
-                *partial = None;
+                .is_some_and(|partial| {
+                    previews
+                        .iter()
+                        .find(|preview| preview.tab_id == partial.tab_id)
+                        .map_or(true, |preview| {
+                            partial.key
+                                != preview_quad_key(
+                                    preview,
+                                    &self.dimensions,
+                                    self.shape_generation,
+                                    self.preview_scale_estimate(preview),
+                                )
+                        })
+                });
+            if obsolete {
+                *self.preview_rebuild_partial.borrow_mut() = None;
             }
         }
         let started = crate::perf::now();
@@ -2501,8 +2583,19 @@ impl crate::TermWindow {
         // frame, so the picture is at worst one frame out of date and the cost
         // is spread instead of spiked.
         let mut budget = MAX_PREVIEW_QUAD_REBUILDS_PER_FRAME;
+        // A card part of the way through a build sliced across frames goes
+        // first. There is one slot for such a build, and a second card
+        // claiming the budget took it and threw the first card's progress
+        // away: two cards building at once restarted each other every frame,
+        // and only one small enough to finish inside a single slice ever did.
+        let continuing = self
+            .preview_rebuild_partial
+            .borrow()
+            .as_ref()
+            .map(|partial| partial.tab_id)
+            .filter(|&tab_id| previews.iter().any(|preview| preview.tab_id == tab_id));
         for preview in previews {
-            if self.paint_terminal_preview(layers, preview, &mut budget)? {
+            if self.paint_terminal_preview(layers, preview, &mut budget, continuing)? {
                 rebuilt += 1;
             }
         }
@@ -2532,6 +2625,21 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Whether `tab_id`'s card has a finished picture of what its terminal
+    /// shows now: a cached recording with something in it, and no rebuild of
+    /// it still under way across frames.
+    fn preview_thumbnail_recorded(&self, tab_id: TabId) -> bool {
+        self.preview_quad_cache
+            .borrow()
+            .get(&tab_id)
+            .is_some_and(|cached| cached.texture.is_some() || cached.heap.quad_count() > 0)
+            && !self
+                .preview_rebuild_partial
+                .borrow()
+                .as_ref()
+                .is_some_and(|partial| partial.tab_id == tab_id)
+    }
+
     /// The opacity a card's picture should draw at this frame: 1.0 for a
     /// settled card, ramping 0->1 across [`PREVIEW_CONTENT_FADE`] from the
     /// moment its terminal first shows visible content. Requests further
@@ -2542,7 +2650,7 @@ impl crate::TermWindow {
         let mut fades = self.preview_content_fade.borrow_mut();
         let entry = fades.entry(preview.tab_id).or_insert_with(|| {
             if snapshot_has_content(&preview.snapshot) {
-                PreviewContentFade::ContentSince(now)
+                PreviewContentFade::ContentSince(preview_fade_start(now, preview.prebuild))
             } else {
                 PreviewContentFade::Blank {
                     snapshot: snapshot_ptr,
@@ -2552,7 +2660,8 @@ impl crate::TermWindow {
         if let PreviewContentFade::Blank { snapshot } = entry {
             if *snapshot != snapshot_ptr {
                 if snapshot_has_content(&preview.snapshot) {
-                    *entry = PreviewContentFade::ContentSince(now);
+                    *entry =
+                        PreviewContentFade::ContentSince(preview_fade_start(now, preview.prebuild));
                 } else {
                     *snapshot = snapshot_ptr;
                 }
@@ -2594,6 +2703,7 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator<'_>,
         preview: &TerminalPreviewRequest,
         budget: &mut usize,
+        continuing: Option<TabId>,
     ) -> anyhow::Result<bool> {
         let key = preview_quad_key(
             preview,
@@ -2612,68 +2722,40 @@ impl crate::TermWindow {
             cached.invalidate_recording_masks(key.recording_revision);
         }
         let clip = quad_clip_rect(preview.clip, &self.dimensions);
-        let content_alpha = self.preview_content_alpha(preview) * preview.opacity.clamp(0.0, 1.0);
-
-        // A hit replays. A miss replays too -- but only when the miss is the
-        // snapshot alone and the budget is spent, because then the recorded
-        // quads are merely a refresh out of date, which at thumbnail size is
-        // not a difference anyone can see. A geometry miss is never replayed:
-        // those quads are wrong, not old.
-        let mut deferred = false;
-        let recorded_area = self
+        let shown = !preview.prebuild;
+        let has_picture = self
+            .preview_quad_cache
+            .borrow()
+            .contains_key(&preview.tab_id);
+        // A hit replays. Otherwise one card builds per frame, and a card part
+        // of the way through a sliced build goes first (`continuing`). Every
+        // other card shows what it last recorded -- a refresh behind, or
+        // stretched to a card that has changed size, as it is while its own
+        // build is under way -- and asks for the next frame. Cards that had
+        // never been built used to skip the queue: opening onto several of
+        // them built them all in one frame.
+        let hit = self
             .preview_quad_cache
             .borrow()
             .get(&preview.tab_id)
-            .filter(|cached| {
-                if cached.key == key {
-                    return true;
-                }
-                if cached.key.geometry == key.geometry && *budget == 0 {
-                    deferred = true;
-                    return true;
-                }
-                false
-            })
-            .map(|cached| cached.area);
-        if deferred {
-            // Come straight back rather than naming a time: this card owes a
-            // rebuild and should get it as soon as a frame has room.
-            self.update_next_frame_time(Some(Instant::now()));
-        }
-        if let Some(recorded_area) = recorded_area {
-            // Texture path: the card's picture already lives in its own
-            // texture; a single textured quad replaces the whole replay.
-            if self.card_texture_path_active()
-                && self.composite_cached_card(preview, content_alpha)?
-            {
-                return Ok(false);
+            .is_some_and(|cached| cached.key == key);
+        let may_build = *budget > 0 && continuing.map_or(true, |tab_id| tab_id == preview.tab_id);
+        if hit || !may_build {
+            if !hit {
+                // Come straight back rather than naming a time: this card owes
+                // a rebuild and should get it as soon as a frame has room.
+                self.update_next_frame_time(Some(Instant::now()));
             }
-            let cache = self.preview_quad_cache.borrow();
-            let cached = cache
-                .get(&preview.tab_id)
-                .expect("entry was present a statement ago and nothing removes it");
-            // Scrolling moves a card without changing what it shows. The quads
-            // carry the position they were recorded at, so a card that has
-            // moved is replayed through the same source->target mapping the
-            // flight animation uses. The key carries the card's *size*, so a
-            // matching key guarantees the two rects are the same shape and the
-            // mapping degenerates to a translation -- none of the softening
-            // that a genuinely rescaled replay costs. A card that has not moved
-            // takes the plain path, which is bit-for-bit what this drew before
-            // the cache existed.
-            if recorded_area == preview.area {
-                cached.heap.apply_to_clipped(layers, clip, content_alpha)?;
-            } else {
-                let source = quad_clip_rect(recorded_area, &self.dimensions);
-                let target = quad_clip_rect(preview.area, &self.dimensions);
-                cached
-                    .heap
-                    .apply_to_scaled(layers, source, target, clip, content_alpha)?;
+            if shown && has_picture {
+                let content_alpha =
+                    self.preview_content_alpha(preview) * preview.opacity.clamp(0.0, 1.0);
+                self.paint_cached_card_picture(layers, preview, clip, content_alpha)?;
             }
             return Ok(false);
         }
 
         *budget = budget.saturating_sub(1);
+        let content_alpha = self.preview_content_alpha(preview) * preview.opacity.clamp(0.0, 1.0);
 
         // Continue the sliced rebuild when the slot holds this card and the
         // key still describes the same picture; anything else in the slot is
@@ -2728,21 +2810,8 @@ impl crate::TermWindow {
             // stretches to the current rect even across a geometry change,
             // and a card that never had one simply stays background until
             // the first build lands.
-            if !(self.card_texture_path_active()
-                && self.composite_cached_card(preview, content_alpha)?)
-            {
-                let cache = self.preview_quad_cache.borrow();
-                if let Some(cached) = cache.get(&preview.tab_id) {
-                    if cached.area == preview.area {
-                        cached.heap.apply_to_clipped(layers, clip, content_alpha)?;
-                    } else {
-                        let source = quad_clip_rect(cached.area, &self.dimensions);
-                        let target = quad_clip_rect(preview.area, &self.dimensions);
-                        cached
-                            .heap
-                            .apply_to_scaled(layers, source, target, clip, content_alpha)?;
-                    }
-                }
+            if shown {
+                self.paint_cached_card_picture(layers, preview, clip, content_alpha)?;
             }
             *self.preview_rebuild_partial.borrow_mut() = Some(partial);
             // The rest of this card's build should get the very next frame.
@@ -2796,25 +2865,31 @@ impl crate::TermWindow {
                             quad_count,
                             area: preview.area,
                         });
-                    self.card_composites.borrow_mut().push(CardComposite {
-                        texture: Rc::clone(&tex),
-                        dest: preview.area,
-                        clip: preview.clip,
-                        opacity: content_alpha,
-                        zindex: 0,
-                    });
+                    if shown {
+                        self.card_composites.borrow_mut().push(CardComposite {
+                            texture: Rc::clone(&tex),
+                            dest: preview.area,
+                            clip: preview.clip,
+                            opacity: content_alpha,
+                            zindex: 0,
+                        });
+                    }
                     texture = Some(tex);
                     Ok(true)
                 }
                 Err(err) => {
                     log::warn!("card texture unavailable, replaying quads: {err:#}");
-                    heap.apply_to_clipped(layers, clip, content_alpha)
-                        .map(|()| true)
+                    if shown {
+                        heap.apply_to_clipped(layers, clip, content_alpha)?;
+                    }
+                    Ok(true)
                 }
             }
         } else {
-            heap.apply_to_clipped(layers, clip, content_alpha)
-                .map(|()| true)
+            if shown {
+                heap.apply_to_clipped(layers, clip, content_alpha)?;
+            }
+            Ok(true)
         };
         self.preview_quad_cache.borrow_mut().insert(
             preview.tab_id,
@@ -2915,6 +2990,55 @@ impl crate::TermWindow {
             zindex: 0,
         });
         Ok(true)
+    }
+
+    /// The terminal flying into its card in the transition under way, if any.
+    fn content_view_landing_tab(&self) -> Option<TabId> {
+        self.content_view_fade
+            .as_ref()
+            .and_then(|fade| fade.flight.as_ref())
+            .filter(|flight| flight.lands_in_card)
+            .and_then(|flight| flight.tab_id)
+    }
+
+    /// Draw the picture a card last recorded, wherever the card is now: its
+    /// texture stretched over the card's rectangle, or without one its quads
+    /// remapped onto it -- a card that has only moved, as when the overview
+    /// scrolls, takes the same mapping the flight uses and it degenerates to a
+    /// translation. Quads carry positions relative to the centre of the window
+    /// they were recorded in, so once the window itself has changed size they
+    /// would land in the wrong place and are left out.
+    fn paint_cached_card_picture(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        preview: &TerminalPreviewRequest,
+        clip: QuadClipRect,
+        content_alpha: f32,
+    ) -> anyhow::Result<()> {
+        if self.card_texture_path_active() && self.composite_cached_card(preview, content_alpha)? {
+            return Ok(());
+        }
+        let cache = self.preview_quad_cache.borrow();
+        let Some(cached) = cache.get(&preview.tab_id) else {
+            return Ok(());
+        };
+        let geometry = cached.key.geometry;
+        if geometry.pixel_width != self.dimensions.pixel_width
+            || geometry.pixel_height != self.dimensions.pixel_height
+            || geometry.dpi != self.dimensions.dpi
+        {
+            return Ok(());
+        }
+        if cached.area == preview.area {
+            cached.heap.apply_to_clipped(layers, clip, content_alpha)?;
+        } else {
+            let source = quad_clip_rect(cached.area, &self.dimensions);
+            let target = quad_clip_rect(preview.area, &self.dimensions);
+            cached
+                .heap
+                .apply_to_scaled(layers, source, target, clip, content_alpha)?;
+        }
+        Ok(())
     }
 
     /// Build one card's thumbnail into `layers`, whole.
@@ -5309,6 +5433,7 @@ mod tests {
             clip: area,
             hold_scale: false,
             opacity: 1.0,
+            prebuild: false,
         }
     }
 
@@ -5629,5 +5754,23 @@ mod atlas_policy_tests {
         let (level, kept) = sticky_allow_images(None, armed, hold_for);
         assert_eq!(level, AllowImage::Yes);
         assert_eq!(kept, None);
+    }
+}
+
+#[cfg(test)]
+mod overview_landing_tests {
+    use super::{preview_fade_start, PREVIEW_CONTENT_FADE};
+    use std::time::Instant;
+
+    #[test]
+    fn a_card_seen_on_screen_fades_in_from_now() {
+        let now = Instant::now();
+        assert_eq!(preview_fade_start(now, false), now);
+    }
+
+    #[test]
+    fn a_card_built_out_of_sight_is_settled_when_shown() {
+        let now = Instant::now() + PREVIEW_CONTENT_FADE;
+        assert_eq!(preview_fade_start(now, true), now - PREVIEW_CONTENT_FADE);
     }
 }
