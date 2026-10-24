@@ -1164,7 +1164,6 @@ impl SettingsSection {
                 "Tab Bar",
                 "Top Tab Bar",
                 "Auto-hide",
-                "Hide Tabs",
                 "Effective Color Scheme",
                 "App Icon",
                 "Window Opacity",
@@ -1796,7 +1795,6 @@ fn localized_window_tabs_label(mode: crate::native_settings::NativeWindowTabs) -
     crate::i18n::tr(match mode {
         NativeWindowTabs::Show => "settings-window-tabs-show",
         NativeWindowTabs::AutoHide => "settings-window-tabs-auto-hide",
-        NativeWindowTabs::Hide => "settings-window-tabs-hide",
     })
 }
 
@@ -19219,7 +19217,7 @@ impl SettingsWindow {
         }
     }
 
-    /// Show, auto-hide or hide the window tab row, in every window. Choosing
+    /// Show the window tab row or have it auto-hide, in every window. Choosing
     /// auto-hide here starts with the pin out: it is what was asked for.
     fn apply_window_tabs(&mut self, mode: crate::native_settings::NativeWindowTabs) {
         self.ui.open_dropdown = None;

@@ -465,14 +465,14 @@ impl NativeBottomQuoteMode {
 /// its height back to the terminal and brings it down over the top of the
 /// window while the pointer rests at the top edge, pushing the terminal
 /// area down rather than resizing it; its pin keeps it out
-/// (`window_tabs_pinned`). `Hide` leaves it out altogether, the tabs still
-/// there behind the keyboard and the command palette.
+/// (`window_tabs_pinned`). A file that chose to hide it outright, a choice
+/// since withdrawn, has it auto-hide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeWindowTabs {
     Show,
+    #[serde(alias = "hide")]
     AutoHide,
-    Hide,
 }
 
 impl Default for NativeWindowTabs {
@@ -483,7 +483,7 @@ impl Default for NativeWindowTabs {
 
 impl NativeWindowTabs {
     /// Every choice, in the order the settings window offers them.
-    pub(crate) const ALL: [Self; 3] = [Self::Show, Self::AutoHide, Self::Hide];
+    pub(crate) const ALL: [Self; 2] = [Self::Show, Self::AutoHide];
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -3580,7 +3580,6 @@ mod tests {
         for (written, expected) in [
             ("show", NativeWindowTabs::Show),
             ("auto_hide", NativeWindowTabs::AutoHide),
-            ("hide", NativeWindowTabs::Hide),
         ] {
             let json = format!(r#"{{"appearance": {{"window_tabs": "{written}"}}}}"#);
             let settings: ThinkTermNativeSettings =
@@ -3595,6 +3594,18 @@ mod tests {
                 out
             );
         }
+    }
+
+    /// Hiding the row outright was offered for a while; a file that chose
+    /// it has the row auto-hide, and says so when saved.
+    #[test]
+    fn a_window_tabs_choice_to_hide_reads_as_auto_hide() {
+        let json = r#"{"appearance": {"window_tabs": "hide"}}"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.appearance.window_tabs, NativeWindowTabs::AutoHide);
+        let out = serde_json::to_string(&settings).expect("serialises");
+        assert!(out.contains("\"window_tabs\":\"auto_hide\""), "{out}");
     }
 
     #[test]

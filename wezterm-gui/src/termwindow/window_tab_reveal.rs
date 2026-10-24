@@ -1,7 +1,7 @@
-//! The window tab row when it does not keep its place: hidden outright, or
-//! brought down from the top edge while the pointer rests there.
+//! The window tab row when it auto-hides: out of the layout, and brought
+//! down from the top edge while the pointer rests there.
 //!
-//! Hidden, the row gives its height back to the terminal. Brought down, it
+//! Away, the row gives its height back to the terminal. Brought down, it
 //! comes in over the window's top and pushes the terminal area down by the
 //! same amount -- painted lower, never resized, so nothing reflows and the
 //! last line or two drop out of view until it goes again. The hover is the
@@ -73,18 +73,6 @@ fn row_in_layout(mode: NativeWindowTabs, pinned: bool) -> bool {
     match mode {
         NativeWindowTabs::Show => true,
         NativeWindowTabs::AutoHide => pinned,
-        NativeWindowTabs::Hide => false,
-    }
-}
-
-/// Whether the top edge may bring the row down. A hidden row comes down
-/// only while it holds the window's own buttons: they have nowhere else to
-/// be, and a window that cannot be closed is worse than a row that shows.
-fn row_may_reveal(mode: NativeWindowTabs, pinned: bool, carries_window_buttons: bool) -> bool {
-    match mode {
-        NativeWindowTabs::Show => false,
-        NativeWindowTabs::AutoHide => !pinned,
-        NativeWindowTabs::Hide => carries_window_buttons,
     }
 }
 
@@ -169,12 +157,6 @@ impl TermWindow {
         }])
     }
 
-    /// The window's own minimise, maximise and close buttons are on the row,
-    /// as they are with integrated buttons and the right sidebar closed.
-    fn window_tab_row_carries_window_buttons(&self) -> bool {
-        self.fancy_tab_bar_shows_window_buttons() && self.right_sidebar_width() == 0
-    }
-
     /// A tab of the row is being renamed in place, which needs the row out.
     fn renaming_window_tab(&self) -> bool {
         self.inline_tab_rename
@@ -202,11 +184,8 @@ impl TermWindow {
         // whatever the mode. Unlike the sidebars, a terminal that is
         // connecting or offline does not hold the row back: it is the way
         // to another tab.
-        let eligible = (row_may_reveal(
-            self.window_tab_reveal.mode,
-            self.window_tab_reveal.pinned,
-            self.window_tab_row_carries_window_buttons(),
-        ) || self.renaming_window_tab()
+        let eligible = (!self.window_tab_reveal.in_layout()
+            || self.renaming_window_tab()
             || presented)
             && self.tab_bar_pixel_height().unwrap_or(0.0) > 0.0
             && !self.content_view_is_full_window()
@@ -280,7 +259,7 @@ impl TermWindow {
         let (mode, pinned) = crate::native_settings::window_tabs_choice();
         self.window_tab_reveal.mode = mode;
         self.window_tab_reveal.pinned = pinned;
-        if !row_may_reveal(mode, pinned, self.window_tab_row_carries_window_buttons()) {
+        if self.window_tab_reveal.in_layout() {
             self.window_tab_reveal.cancel();
         }
         if before != self.window_tab_reveal.in_layout() {
@@ -343,15 +322,5 @@ mod tests {
         assert!(row_in_layout(NativeWindowTabs::Show, false));
         assert!(row_in_layout(NativeWindowTabs::AutoHide, true));
         assert!(!row_in_layout(NativeWindowTabs::AutoHide, false));
-        assert!(!row_in_layout(NativeWindowTabs::Hide, false));
-    }
-
-    #[test]
-    fn a_hidden_row_comes_down_only_for_the_window_buttons() {
-        assert!(row_may_reveal(NativeWindowTabs::AutoHide, false, false));
-        assert!(!row_may_reveal(NativeWindowTabs::AutoHide, true, false));
-        assert!(!row_may_reveal(NativeWindowTabs::Show, false, true));
-        assert!(!row_may_reveal(NativeWindowTabs::Hide, false, false));
-        assert!(row_may_reveal(NativeWindowTabs::Hide, false, true));
     }
 }
