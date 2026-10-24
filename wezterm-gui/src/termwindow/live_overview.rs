@@ -160,10 +160,12 @@ fn preview_refresh_interval() -> Duration {
 /// overview used to do in a single frame -- takes 397ms. The budget covers a
 /// card's *first* capture as well as its refreshes for that last reason.
 const MAX_PREVIEW_CAPTURES_PER_FRAME: usize = 1;
-/// The first capturing frame after opening may seed this many cards at once:
-/// a one-frame cost spike at the exact moment a spike is least visible (the
-/// open transition is still running) in exchange for the overview arriving
-/// mostly populated instead of popping thumbnails in one per frame.
+/// The first capturing frame after opening may capture this many cards at
+/// once. A capture only reads the terminal's rows; building the picture from
+/// it is what costs, and that waits for the open transition to end
+/// (`card_build_held` in the renderer). Captured early, a card shows the
+/// picture it had last time while the terminal is still travelling, and is
+/// ready to build the moment the transition is over.
 const FIRST_FRAME_CAPTURE_BUDGET: usize = 4;
 /// How often a card re-asks what its terminal is running.
 ///

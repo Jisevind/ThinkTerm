@@ -143,6 +143,19 @@ fn preview_fade_start(now: Instant, prebuild: bool) -> Instant {
     }
 }
 
+/// Whether a card has to make do with the picture it already has on this
+/// frame: while a transition runs, only the card its terminal is landing in
+/// builds one.
+///
+/// A build is several milliseconds, and a transition's frames are the ones a
+/// stall shows in. Opening onto cards with nothing cached built four of them
+/// in each of the flight's first frames -- 25-36ms frames against 16.7ms,
+/// measured, which was the stall halfway through the open. The rest build
+/// once the transition is over.
+fn card_build_held(transition_running: bool, landing: Option<TabId>, tab_id: TabId) -> bool {
+    transition_running && landing != Some(tab_id)
+}
+
 /// Everything a card's recorded quads depend on.
 ///
 /// Equal keys mean the recorded heap still draws the right picture and can be
@@ -2588,12 +2601,17 @@ impl crate::TermWindow {
         // claiming the budget took it and threw the first card's progress
         // away: two cards building at once restarted each other every frame,
         // and only one small enough to finish inside a single slice ever did.
+        let transition_running = self.content_view_fade.is_some();
+        let landing = self.content_view_landing_tab();
         let continuing = self
             .preview_rebuild_partial
             .borrow()
             .as_ref()
             .map(|partial| partial.tab_id)
-            .filter(|&tab_id| previews.iter().any(|preview| preview.tab_id == tab_id));
+            .filter(|&tab_id| {
+                !card_build_held(transition_running, landing, tab_id)
+                    && previews.iter().any(|preview| preview.tab_id == tab_id)
+            });
         for preview in previews {
             if self.paint_terminal_preview(layers, preview, &mut budget, continuing)? {
                 rebuilt += 1;
@@ -2727,6 +2745,21 @@ impl crate::TermWindow {
             .preview_quad_cache
             .borrow()
             .contains_key(&preview.tab_id);
+        if card_build_held(
+            self.content_view_fade.is_some(),
+            self.content_view_landing_tab(),
+            preview.tab_id,
+        ) {
+            // A card never built gets no fade entry yet either: started now,
+            // its ramp would run out unseen before it has a picture to ramp.
+            if shown && has_picture {
+                let content_alpha =
+                    self.preview_content_alpha(preview) * preview.opacity.clamp(0.0, 1.0);
+                self.paint_cached_card_picture(layers, preview, clip, content_alpha)?;
+            }
+            return Ok(false);
+        }
+
         // A hit replays. Otherwise one card builds per frame, and a card part
         // of the way through a sliced build goes first (`continuing`). Every
         // other card shows what it last recorded -- a refresh behind, or
@@ -5759,7 +5792,7 @@ mod atlas_policy_tests {
 
 #[cfg(test)]
 mod overview_landing_tests {
-    use super::{preview_fade_start, PREVIEW_CONTENT_FADE};
+    use super::{card_build_held, preview_fade_start, PREVIEW_CONTENT_FADE};
     use std::time::Instant;
 
     #[test]
@@ -5772,5 +5805,18 @@ mod overview_landing_tests {
     fn a_card_built_out_of_sight_is_settled_when_shown() {
         let now = Instant::now() + PREVIEW_CONTENT_FADE;
         assert_eq!(preview_fade_start(now, true), now - PREVIEW_CONTENT_FADE);
+    }
+
+    #[test]
+    fn only_the_landing_card_builds_while_a_transition_runs() {
+        assert!(!card_build_held(true, Some(3), 3));
+        assert!(card_build_held(true, Some(3), 4));
+        assert!(card_build_held(true, None, 3));
+    }
+
+    #[test]
+    fn every_card_builds_once_the_transition_is_over() {
+        assert!(!card_build_held(false, None, 3));
+        assert!(!card_build_held(false, Some(3), 4));
     }
 }
