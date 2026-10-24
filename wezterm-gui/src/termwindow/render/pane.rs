@@ -2326,14 +2326,18 @@ impl crate::TermWindow {
             } else {
                 0
             };
+            // Cut at the pane area's bottom too: a window tab row brought down
+            // pushes the rows lower, and the last of them go under a terminal
+            // bar at the bottom rather than through it.
             let pane_clip = QuadClipRect::from_top_left_pixels(
                 left_pixel_x,
                 content_top,
                 left_pixel_x
                     + render_dims.cols as f32 * pane_render_metrics.cell_size.width as f32,
-                pane_top_pixel_y
+                (pane_top_pixel_y
                     + render_dims.viewport_rows as f32
-                        * pane_render_metrics.cell_size.height as f32,
+                        * pane_render_metrics.cell_size.height as f32)
+                    .min(self.pane_area_bottom()),
                 &self.dimensions,
             );
             let mut render = LineRender {

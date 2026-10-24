@@ -2507,10 +2507,11 @@ impl crate::TermWindow {
     /// The right-edge strip that arms a hover reveal, as (x, y, w, h) in
     /// window pixels. Computed against the docked rect so it exists while the
     /// panel does not; like the left one it leaves out the tab bar row, where
-    /// the pointer is on its way to the tabs or the sidebar button.
+    /// the pointer is on its way to the tabs or the sidebar button -- as much
+    /// of the row as is out, when it hides.
     pub(crate) fn right_sidebar_hover_hot_zone(&self) -> Option<(usize, usize, usize, usize)> {
         let rect = self.right_sidebar_rect_for_width(self.right_sidebar_docked_width())?;
-        let top_tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
+        let top_tab_bar_height = self.window_tab_row_drawn_height().ceil() as usize;
         let width = self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HOT_ZONE_WIDTH);
         let right_edge = rect.x.saturating_add(rect.width);
         crate::termwindow::sidebar_hover::hot_zone(
@@ -8415,9 +8416,10 @@ impl crate::TermWindow {
         let mut rect = self.right_sidebar_rect_for_width(self.right_sidebar_presented_width())?;
         // Off macOS the panel has no toggle of its own and the tab bar keeps
         // the window buttons at its right end; a hover-revealed panel stays
-        // below the tab bar so both remain reachable.
+        // below the tab bar so both remain reachable -- below as much of it
+        // as is out, when it hides.
         if !cfg!(target_os = "macos") && self.right_sidebar_collapsed {
-            let tab_bar = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
+            let tab_bar = self.window_tab_row_drawn_height().ceil() as usize;
             let top = rect.y.saturating_add(tab_bar);
             rect.height = rect.height.saturating_sub(top - rect.y);
             rect.y = top;

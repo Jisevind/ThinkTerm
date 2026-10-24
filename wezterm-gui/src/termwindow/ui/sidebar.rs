@@ -392,7 +392,14 @@ impl crate::TermWindow {
     /// the panel does not.
     pub(crate) fn workspace_sidebar_hover_hot_zone(&self) -> Option<(usize, usize, usize, usize)> {
         let rect = self.workspace_sidebar_rect_for_width(self.workspace_sidebar_docked_width())?;
-        let top_tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
+        // The traffic lights stay at the top-left when the window tab row
+        // hides; off macOS nothing of the row's does.
+        let top_tab_bar_height = if cfg!(target_os = "macos") {
+            self.tab_bar_pixel_height().unwrap_or(0.0)
+        } else {
+            self.window_tab_row_drawn_height()
+        }
+        .ceil() as usize;
         crate::termwindow::sidebar_hover::hot_zone(
             rect.x,
             rect.y,
