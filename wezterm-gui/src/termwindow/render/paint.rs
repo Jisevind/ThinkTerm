@@ -3074,6 +3074,22 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// After the glyph atlas has been rebuilt: drop every card's recorded
+    /// quads, which address glyphs where the old atlas kept them, but keep its
+    /// texture -- finished pixels a repack does not touch -- on screen until
+    /// the card has been rebuilt. A card without one has nothing left to show.
+    pub(crate) fn retire_preview_quads_for_new_atlas(&self) {
+        self.preview_quad_cache.borrow_mut().retain(|_, cached| {
+            if cached.texture.is_none() {
+                return false;
+            }
+            cached.heap.recycle();
+            // Matches no snapshot, so the card rebuilds when its turn comes.
+            cached.key.snapshot = 0;
+            true
+        });
+    }
+
     /// Build one card's thumbnail into `layers`, whole.
     ///
     /// Everything here is laid out against `preview.area` -- the card's full

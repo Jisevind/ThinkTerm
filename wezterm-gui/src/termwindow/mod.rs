@@ -4102,8 +4102,11 @@ impl TermWindow {
         // them would draw the overview in whatever now occupies those texels.
         // `PreviewQuadKey` also carries `shape_generation`, so this is belt and
         // braces -- but the two live in different files and the invariant
-        // belongs with the rest of the captures.
-        self.preview_quad_cache.borrow_mut().clear();
+        // belongs with the rest of the captures. A card's texture, though, is
+        // finished pixels a repack does not touch, and stays on screen until
+        // the card is rebuilt: dropped with the quads, every card went blank at
+        // once -- the one a terminal was landing in among them.
+        self.retire_preview_quads_for_new_atlas();
         // The half-built card holds the same kind of atlas-addressed quads.
         *self.preview_rebuild_partial.borrow_mut() = None;
         let Some(fade) = self.content_view_fade.as_mut() else {
