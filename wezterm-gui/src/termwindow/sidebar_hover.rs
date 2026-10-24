@@ -296,6 +296,27 @@ impl SidebarHoverReveal {
     pub(crate) fn cancel_immediately(&mut self) {
         self.phase = Phase::Hidden;
     }
+
+    /// Already out by other means -- a pin let go under the pointer: carry
+    /// on as if the pointer had brought it, retreating once it leaves.
+    pub(crate) fn present_immediately(&mut self) {
+        self.phase = Phase::Revealed;
+    }
+
+    /// Bring the panel out now, as if the dwell had just run out: for a
+    /// reveal asked for by something other than the pointer.
+    pub(crate) fn reveal_now(&mut self, now: Instant) {
+        self.phase = match std::mem::take(&mut self.phase) {
+            Phase::Retreating { mut travel } => {
+                travel.retarget(now, 1.0, REVEAL, Easing::OutCubic);
+                Phase::Revealing { travel }
+            }
+            phase @ (Phase::Revealing { .. } | Phase::Revealed | Phase::Departing { .. }) => phase,
+            Phase::Hidden | Phase::Arming { .. } | Phase::Suppressed => Phase::Revealing {
+                travel: Timeline::progress(now, REVEAL, Easing::OutCubic),
+            },
+        };
+    }
 }
 
 /// The left-edge strip that arms a reveal, given the panel's would-be rect.
@@ -670,6 +691,27 @@ mod tests {
         assert!(machine.needs_frames()); // Retreating
         machine.suppress_until_pointer_leaves();
         assert!(!machine.needs_frames()); // Suppressed
+    }
+
+    #[test]
+    fn a_reveal_asked_for_travels_out_and_holds_while_pinned() {
+        let start = Instant::now();
+        let mut machine = SidebarHoverReveal::default();
+        machine.reveal_now(start);
+        assert!(machine.is_presented());
+        assert!(machine.needs_frames());
+        // Held, with the pointer nowhere near: it lands and stays.
+        let mut now = start;
+        for _ in 0..200 {
+            let _ = machine.progress(now);
+            now += Duration::from_millis(16);
+            machine.step(pinned(PointerZone::Away), now);
+        }
+        assert_eq!(machine.progress(now), Some(1.0));
+        assert!(!machine.needs_frames());
+        // Let go, it leaves as a hover-revealed panel does.
+        machine.step(input(PointerZone::Away), now);
+        assert!(machine.needs_frames());
     }
 
     #[test]
