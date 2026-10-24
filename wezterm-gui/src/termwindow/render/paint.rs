@@ -4624,8 +4624,28 @@ impl crate::TermWindow {
         self.advance_right_sidebar_hover(frame_now);
         self.advance_window_tab_reveal(frame_now);
         self.advance_content_view_fade(frame_now);
-        // Card texture work is queued per pass; a retried pass re-queues it.
-        self.pending_card_renders.borrow_mut().clear();
+        // Card texture work is queued per pass, and a retried pass queues its
+        // own. A texture whose render is dropped here was never drawn into,
+        // and its card -- a cache hit on the retry -- would composite it
+        // blank: give it up, so the next composite renders the card's quads
+        // into a fresh one.
+        let dropped: Vec<_> = self
+            .pending_card_renders
+            .borrow_mut()
+            .drain(..)
+            .map(|render| render.texture)
+            .collect();
+        if !dropped.is_empty() {
+            for cached in self.preview_quad_cache.borrow_mut().values_mut() {
+                if cached
+                    .texture
+                    .as_ref()
+                    .is_some_and(|texture| dropped.iter().any(|gone| Rc::ptr_eq(gone, texture)))
+                {
+                    cached.texture = None;
+                }
+            }
+        }
         self.card_composites.borrow_mut().clear();
         // Truncate, not drop: the buffer's capacity is the whole point.
         self.card_frame_verts.borrow_mut().clear();
