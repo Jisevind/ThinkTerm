@@ -3106,7 +3106,7 @@ pub(crate) fn mark_onboarding_seen(settings: &mut ThinkTermNativeSettings) {
 }
 
 pub(crate) fn tab_font_size() -> f64 {
-    load()
+    load_shared()
         .chrome
         .tab_font_size
         .unwrap_or(DEFAULT_TAB_FONT_SIZE)
