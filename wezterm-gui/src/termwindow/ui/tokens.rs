@@ -41,6 +41,12 @@ pub const SIDEBAR_HOVER_GRACE_MS: u64 = 400;
 pub const WINDOW_TAB_REVEAL_HOT_ZONE_HEIGHT: usize = 20;
 /// The top strip's counterpart of `SIDEBAR_HOVER_STICKY_ZONE_WIDTH`.
 pub const WINDOW_TAB_REVEAL_STICKY_ZONE_HEIGHT: usize = 36;
+/// Over a pane bar's tabs and buttons, which the row's going leaves along
+/// the window's top, only this much of the strip counts: a pointer resting
+/// on one to click it is not asking for the row, one pushed on past it to
+/// the edge still is. So too over a blank standing in for the title bar,
+/// where the pointer comes to move the window.
+pub const WINDOW_TAB_REVEAL_EDGE_OVER_CONTROLS_HEIGHT: usize = 8;
 /// Off macOS, the top edge a window drawing its own frame leaves to the
 /// system for resizing, where the pointer never reaches the window: six
 /// logical pixels on X11 and Wayland, a little less on Windows.

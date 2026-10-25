@@ -20,7 +20,7 @@ use crate::termwindow::ui::tokens::{
     PANE_NAV_ACTION_ICON_SIZE, PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET,
     PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
     TAB_CONTENT_INSET, TAB_ICON_CIRCLE_INSET, TAB_ICON_GLYPH_RATIO, TAB_ICON_SIZE,
-    TAB_VERTICAL_PADDING,
+    TAB_MIN_WIDTH, TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, ScrollTrack, UIItem, UIItemType};
 use crate::ui::draw::DrawContext;
@@ -32,6 +32,7 @@ use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use crate::termwindow::render::split_slide::TabPlace;
+use crate::termwindow::window_tab_reveal::PaneBarWindowChrome;
 use mux::tab::{CollapsedPaneLayout, PaneStackTab, PositionedPane, SplitDirection};
 use mux::Mux;
 use ordered_float::NotNan;
@@ -169,7 +170,7 @@ impl crate::TermWindow {
     /// Icon, action-icon and button sizes for a nav bar of `nav_height`.
     /// The painter and the scroll clamp both size their geometry from these, so
     /// they are derived once.
-    fn pane_nav_button_metrics(&self, nav_height: usize) -> (usize, usize, usize) {
+    pub(crate) fn pane_nav_button_metrics(&self, nav_height: usize) -> (usize, usize, usize) {
         // Fixed chrome sizes, clamped only so a nav bar squeezed by a short
         // pane cannot overflow its own row. The tab icon deliberately matches
         // the window tab row's; it used to be capped at 24 here and computed
@@ -188,13 +189,52 @@ impl crate::TermWindow {
 
     /// Width the trailing action buttons claim from the nav bar's right edge:
     /// new tab, split down, split right and zoom, plus collapse wherever the
-    /// split shape allows it.
+    /// split shape allows it, and the room kept for the window's buttons.
     fn pane_nav_action_reserved_width(&self, pos: &PositionedPane, nav_height: usize) -> usize {
         let (_, _, button_size) = self.pane_nav_button_metrics(nav_height);
+        self.pane_nav_actions_width(pos, button_size)
+            .saturating_add(self.pane_bar_window_chrome_room(pos, button_size))
+    }
+
+    /// The trailing action buttons alone.
+    fn pane_nav_actions_width(&self, pos: &PositionedPane, button_size: usize) -> usize {
         let action_count = 4 + usize::from(self.can_collapse_pane_stack(pos));
         action_count
             .saturating_mul(button_size + self.ui_px(PANE_NAV_BUTTON_GAP))
             .saturating_add(self.ui_px(PANE_NAV_INSET))
+    }
+
+    /// `pos`'s bar, `width` wide, has room for the window's `parts` beside
+    /// all of its own: the sidebar's toggle when it holds that too, half a
+    /// tab at the least -- its icon, the start of its title and its close
+    /// button -- and its action buttons.
+    pub(crate) fn pane_bar_fits_window_chrome(
+        &self,
+        pos: &PositionedPane,
+        parts: PaneBarWindowChrome,
+        width: f32,
+    ) -> bool {
+        let (_, _, button_size) =
+            self.pane_nav_button_metrics(self.pane_nav_bar_height_for_pane(pos));
+        let tab_start = if self.pane_bar_sidebar_toggle_share(pos) > 0.0 {
+            self.pane_bar_sidebar_toggle_clear(pos)
+        } else {
+            self.pane_nav_tab_left_inset(pos) as f32
+        };
+        let buttons = self.pane_nav_actions_width(pos, button_size)
+            + self.pane_bar_window_chrome_width(parts, button_size);
+        tab_start + self.ui_f32(TAB_MIN_WIDTH / 2.0) + buttons as f32 <= width
+    }
+
+    /// The room `pos`'s bar keeps at its end for the window's buttons
+    /// (see `pane_bar_window_chrome`), shrinking as the row comes down.
+    fn pane_bar_window_chrome_room(&self, pos: &PositionedPane, button_size: usize) -> usize {
+        let parts = self.pane_bar_window_chrome(pos);
+        if !parts.any() {
+            return 0;
+        }
+        let width = self.pane_bar_window_chrome_width(parts, button_size);
+        (width as f32 * self.pane_bars_stand_in_share()).round() as usize
     }
 
     /// The band `pos`'s nav bar runs along, and where along it the buttons
@@ -266,8 +306,7 @@ impl crate::TermWindow {
         let Ok((pane_x, pane_width)) = self.pane_chrome_span(pos) else {
             return 0.0;
         };
-        let tab_start =
-            pane_x.max(0.0) as usize + self.pane_nav_tab_left_inset(pos.left, pos.top);
+        let tab_start = pane_x.max(0.0) as usize + self.pane_nav_tab_left_inset(pos);
         let max_tab_right = ((pane_x + pane_width).max(0.0) as usize)
             .saturating_sub(self.pane_nav_action_reserved_width(pos, nav_height));
         max_tab_right.saturating_sub(tab_start) as f32
@@ -1080,6 +1119,73 @@ impl crate::TermWindow {
         // capsule and 4 under it — the row read as sagging.
         let button_y = pane_y as usize + nav_height.saturating_sub(button_size) / 2;
         let mut button_x = (pane_x + pane_width) as usize;
+        // Standing in for a window tab row that is away, the bars along the
+        // top take what it held: the window's buttons end the top-right one,
+        // the sidebar's toggle starts the top-left one. They slide in from
+        // the bar's ends and fade up as the row goes, and back out as it
+        // comes, which carries its own; only all the way in do they work.
+        let mut window_items = Vec::new();
+        let bar_clip = QuadClipRect::from_top_left_pixels(
+            pane_x,
+            pane_y,
+            pane_x + pane_width,
+            pane_y + nav_height as f32,
+            &self.dimensions,
+        );
+        let window_chrome = self.pane_bar_window_chrome(pos);
+        let room = self.pane_bar_window_chrome_room(pos, button_size);
+        if window_chrome.any() {
+            let mut held = HeapQuadAllocator::default();
+            let mut held_layers = TripleLayerQuadAllocator::Heap(&mut held);
+            let left = self.paint_pane_bar_window_chrome(
+                &mut held_layers,
+                &mut window_items,
+                window_chrome,
+                button_x,
+                pane_y as usize,
+                nav_height,
+                button_size,
+                icon_size,
+            )?;
+            drop(held_layers);
+            let out = button_x.saturating_sub(left).saturating_sub(room) as f32;
+            held.apply_to_clipped_at(layers, out, 0.0, bar_clip, self.pane_bars_stand_in_share())
+                .context("pane bar window buttons")?;
+            if self.pane_bars_stand_in() {
+                self.window_tab_reveal
+                    .note_window_chrome(left, pane_y as usize + nav_height);
+            }
+        }
+        button_x = button_x.saturating_sub(room);
+        let toggle_share = self.pane_bar_sidebar_toggle_share(pos);
+        if toggle_share > 0.0 {
+            let toggle_x =
+                pane_x as usize + self.window_tab_leading_action_start_pixels().ceil() as usize;
+            let mut held = HeapQuadAllocator::default();
+            let mut held_layers = TripleLayerQuadAllocator::Heap(&mut held);
+            self.paint_window_sidebar_toggle_button(
+                &mut held_layers,
+                &mut window_items,
+                toggle_x,
+                button_y,
+                button_size,
+                self.window_tab_sidebar_toggle_icon_size(),
+                foreground,
+                muted_fg,
+            )?;
+            drop(held_layers);
+            // Out past the bar's start, just clear of its tabs on their way.
+            let out = ((toggle_x + button_size) as f32 - pane_x) * (1.0 - toggle_share);
+            held.apply_to_clipped_at(layers, -out, 0.0, bar_clip, toggle_share)
+                .context("pane bar sidebar toggle")?;
+            if toggle_share >= 1.0 {
+                self.window_tab_reveal
+                    .note_sidebar_toggle(toggle_x + button_size, pane_y as usize + nav_height);
+            }
+        }
+        if self.pane_bars_stand_in() {
+            self.ui_items.extend(window_items);
+        }
         let mut actions = vec![
             (SvgIcon::Plus, PaneNavAction::NewTab),
             (SvgIcon::SplitVertical, PaneNavAction::SplitDown),
@@ -1118,7 +1224,7 @@ impl crate::TermWindow {
         }
 
         let tabs = self.pane_nav_tabs(pos);
-        let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos.left, pos.top);
+        let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos);
         let tab_gap = self.ui_px(PANE_NAV_TAB_GAP);
         let viewport_width = self.pane_nav_tab_viewport_width(pos) as usize;
         let max_tab_right = tab_start.saturating_add(viewport_width);

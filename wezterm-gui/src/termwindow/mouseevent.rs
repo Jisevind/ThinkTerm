@@ -594,30 +594,46 @@ impl super::TermWindow {
         )
     }
 
-    pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize, pane_top: usize) -> usize {
+    pub(super) fn pane_nav_tab_left_inset(&self, pos: &PositionedPane) -> usize {
         // A window tab row out of the layout leaves the traffic lights and
         // the sidebar button beside them over the top-left pane's bar, whose
         // tabs then start where the row's do. Brought down, the row takes
         // them back and pushes the bar below them: its tabs go back to the
-        // edge as the row comes.
-        if pane_left == 0
-            && pane_top == 0
+        // edge as the row comes. Off macOS the bar holds the sidebar button
+        // itself (see `pane_bar_sidebar_toggle_share`), and makes way for it
+        // the same way.
+        let edge = self.ui_px(PANE_NAV_INSET) as f32;
+        if pos.left == 0
+            && pos.top == 0
             && cfg!(target_os = "macos")
             && !self.window_state.contains(WindowState::FULL_SCREEN)
             && self.workspace_sidebar_width() == 0
             && !self.window_tab_reveal.in_layout()
         {
-            let edge = self.ui_px(PANE_NAV_INSET) as f32;
             let clear = self.window_tab_left_padding_pixels().ceil()
                 + self.ui_px(TAB_ROW_START_PADDING) as f32;
             let away = 1.0 - self.window_tab_reveal.shown();
             return (edge + (clear - edge).max(0.0) * away).round() as usize;
         }
-        if pane_left == 0 && self.workspace_sidebar_width() > 0 {
+        let share = self.pane_bar_sidebar_toggle_share(pos);
+        if share > 0.0 {
+            let clear = self.pane_bar_sidebar_toggle_clear(pos);
+            return (edge + (clear - edge).max(0.0) * share).round() as usize;
+        }
+        if pos.left == 0 && self.workspace_sidebar_width() > 0 {
             self.ui_px(TAB_ROW_START_PADDING)
         } else {
             self.ui_px(PANE_NAV_INSET)
         }
+    }
+
+    /// Where `pos`'s tabs start past the sidebar's toggle, once the row is
+    /// all the way away and its bar holds that.
+    pub(super) fn pane_bar_sidebar_toggle_clear(&self, pos: &PositionedPane) -> f32 {
+        let (_, _, button_size) =
+            self.pane_nav_button_metrics(self.pane_nav_bar_height_for_pane(pos));
+        self.window_tab_leading_action_start_pixels().ceil()
+            + (button_size + self.ui_px(TAB_ROW_START_PADDING)) as f32
     }
 
     pub(super) fn window_tab_viewport_width(&self) -> f32 {
@@ -2070,7 +2086,8 @@ impl super::TermWindow {
         }
 
         // Hit-test first. Tab bar, sidebars, menus and OS chrome stay usable
-        // without silently taking a terminal away from another device.
+        // without silently taking a terminal away from another device, a
+        // pane bar's blank standing in for the title bar among them.
         let area = self.content_view_area();
         let point_is_in_terminal_area = !self.content_view_foreground()
             && (event.coords.x as f32) >= area.min_x()
@@ -2085,7 +2102,7 @@ impl super::TermWindow {
                     | UIItemType::ScrollThumb(_)
                     | UIItemType::BelowScrollThumb(_)
                     | UIItemType::Split(_)
-            )
+            ) && !self.pane_bar_blank_is_title_bar(&item)
         });
         let terminal_surface = point_is_in_terminal_area
             && (self.resolve_ui_item(&event).is_none() || terminal_ui_item);
@@ -8279,6 +8296,19 @@ impl super::TermWindow {
             _ => {}
         }
 
+        // A title bar's blank offers the system its drag ahead of a press.
+        // Windows then takes the press for its own and never passes it on,
+        // so only the active pane's does: a press on another's has to reach
+        // us to pick that pane.
+        if event.kind == WMEK::Move
+            && self.pane_bar_blank_is_title_bar(&item)
+            && Mux::get()
+                .get_active_tab_for_window(self.mux_window_id)
+                .is_some_and(|tab| tab.get_active_idx() == pane_index)
+        {
+            context.set_window_drag_position(event.screen_coords);
+        }
+
         if event.kind == WMEK::Press(MousePress::Right) {
             if let PaneNavAction::Activate(target_pane_id) = action {
                 self.show_term_context_menu(
@@ -8308,7 +8338,12 @@ impl super::TermWindow {
                     }
                     tab.set_active_idx(pane_index);
                 }
-                if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
+                // Along the top of a window whose tab row is away, the blank
+                // is the title bar's: it moves the window, and a double click
+                // zooms it rather than opening a tab.
+                if self.pane_bar_blank_is_title_bar(&item) {
+                    self.mouse_event_window_header_blank(event, context);
+                } else if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
                     self.spawn_pane_nav_tab(pane_id, pane_index);
                 }
             }

@@ -267,6 +267,17 @@ impl SidebarHoverReveal {
         matches!(self.phase, Phase::Arming { .. })
     }
 
+    /// How far a dwell that is counting down has got, 0 to 1.
+    pub(crate) fn arming_progress(&self, now: Instant) -> Option<f32> {
+        match self.phase {
+            Phase::Arming { since } => Some(
+                (now.saturating_duration_since(since).as_secs_f32() / DWELL.as_secs_f32())
+                    .min(1.0),
+            ),
+            _ => None,
+        }
+    }
+
     /// Whether the machine still owes frames — a travel in flight or a dwell
     /// or grace counting down. Feeds the unfocused-window frame gate.
     pub(crate) fn needs_frames(&self) -> bool {
@@ -381,6 +392,19 @@ mod tests {
             }
         }
         panic!("panel never settled");
+    }
+
+    #[test]
+    fn a_dwell_counts_up_while_it_runs_and_only_then() {
+        let start = Instant::now();
+        let mut machine = SidebarHoverReveal::default();
+        assert_eq!(machine.arming_progress(start), None);
+        machine.step(input(PointerZone::HotZone), start);
+        assert_eq!(machine.arming_progress(start), Some(0.0));
+        let half = at(start, SIDEBAR_HOVER_DWELL_MS / 2);
+        assert!((machine.arming_progress(half).unwrap() - 0.5).abs() < 0.01);
+        machine.step(input(PointerZone::HotZone), at(start, SIDEBAR_HOVER_DWELL_MS));
+        assert_eq!(machine.arming_progress(at(start, SIDEBAR_HOVER_DWELL_MS)), None);
     }
 
     #[test]

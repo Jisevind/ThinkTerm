@@ -7,19 +7,25 @@
 //! last line or two drop out of view until it goes again. The hover is the
 //! workspace sidebar's machine (`SidebarHoverReveal`): the same dwell, grace
 //! and travel, fed a strip along the top instead of the left edge.
+//!
+//! macOS keeps its traffic lights while the row is away. Elsewhere the row
+//! holds the window's own buttons and the sidebars' toggles, so the pane
+//! bars along the top hold them instead, and their blank moves the window.
 
 use crate::native_settings::NativeWindowTabs;
 use crate::quad::{HeapQuadAllocator, QuadClipRect, TripleLayerQuadAllocator};
 use crate::termwindow::sidebar_hover::{HoverFrame, HoverInput, PointerZone, SidebarHoverReveal};
 use crate::termwindow::ui::tokens::{
-    WINDOW_RESIZE_EDGE_HEIGHT, WINDOW_TAB_REVEAL_HOT_ZONE_HEIGHT,
-    WINDOW_TAB_REVEAL_STICKY_ZONE_HEIGHT,
+    WINDOW_RESIZE_EDGE_HEIGHT, WINDOW_TAB_REVEAL_EDGE_OVER_CONTROLS_HEIGHT,
+    WINDOW_TAB_REVEAL_HOT_ZONE_HEIGHT, WINDOW_TAB_REVEAL_STICKY_ZONE_HEIGHT,
 };
 use crate::termwindow::{
-    InlineTabRenameTarget, TermWindow, TermWindowNotif, UIItem, UIItemType,
+    InlineTabRenameTarget, PaneNavAction, TermWindow, TermWindowNotif, UIItem, UIItemType,
 };
+use mux::tab::PositionedPane;
+use mux::Mux;
 use std::time::Instant;
-use window::{WindowDecorations, WindowOps};
+use window::{MouseEvent, WindowDecorations, WindowOps, WindowState};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WindowTabReveal {
@@ -29,6 +35,12 @@ pub(crate) struct WindowTabReveal {
     /// How far out the row is, 0 to 1, as of the last step: what geometry
     /// reads between steps, so a frame and the clicks on it agree.
     shown: f32,
+    /// How far the dwell has counted, likewise.
+    arming: Option<f32>,
+    /// Where the pane bars along the top held what the row would, in the
+    /// last frame, and so far in this one.
+    held: PaneBarsHeld,
+    holding: PaneBarsHeld,
 }
 
 impl WindowTabReveal {
@@ -65,10 +77,77 @@ impl WindowTabReveal {
         self.hover.needs_frames()
     }
 
+    /// How far the dwell has counted while the pointer rests in the strip,
+    /// 0 to 1, as of the last step.
+    pub(crate) fn arming(&self) -> Option<f32> {
+        self.arming
+    }
+
     /// Focus loss: put the row away without a travel.
     pub(crate) fn cancel(&mut self) {
         self.hover.cancel_immediately();
         self.shown = 0.0;
+        self.arming = None;
+    }
+
+    /// A paint pass begins: what its pane bars hold is gathered afresh, and
+    /// the pointer goes by the last one's until it is done.
+    pub(crate) fn begin_paint(&mut self) {
+        self.holding = PaneBarsHeld::default();
+    }
+
+    /// A paint pass is done: the pointer goes by what its pane bars held.
+    pub(crate) fn finish_paint(&mut self) {
+        self.held = self.holding;
+    }
+
+    /// The top-right pane bar holds the row's buttons from `left` to its
+    /// end, down to `bottom`.
+    pub(crate) fn note_window_chrome(&mut self, left: usize, bottom: usize) {
+        self.holding.window_chrome = Some((left, bottom));
+    }
+
+    /// The top-left pane bar holds the sidebar's toggle up to `right`, down
+    /// to `bottom`.
+    pub(crate) fn note_sidebar_toggle(&mut self, right: usize, bottom: usize) {
+        self.holding.sidebar_toggle = Some((right, bottom));
+    }
+}
+
+/// Where the pane bars along the window's top hold what the row would, in
+/// window pixels.
+#[derive(Debug, Clone, Copy, Default)]
+struct PaneBarsHeld {
+    window_chrome: Option<(usize, usize)>,
+    sidebar_toggle: Option<(usize, usize)>,
+}
+
+impl PaneBarsHeld {
+    /// The pointer at `x`, `y` is over what they hold: on its way to a
+    /// button, not to the row.
+    fn covers(self, x: isize, y: isize) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let (x, y) = (x as usize, y as usize);
+        self.window_chrome
+            .is_some_and(|(left, bottom)| x >= left && y < bottom)
+            || self
+                .sidebar_toggle
+                .is_some_and(|(right, bottom)| x < right && y < bottom)
+    }
+}
+
+/// What the top-right pane bar takes over from a row that is away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PaneBarWindowChrome {
+    pub(crate) right_sidebar_toggle: bool,
+    pub(crate) window_buttons: bool,
+}
+
+impl PaneBarWindowChrome {
+    pub(crate) fn any(self) -> bool {
+        self.right_sidebar_toggle || self.window_buttons
     }
 }
 
@@ -162,6 +241,111 @@ impl TermWindow {
         }])
     }
 
+    /// Off macOS, while the row auto-hides, the pane bars along the window's
+    /// top keep room for what it holds that has nowhere else to be -- the
+    /// window's buttons and the sidebars' toggles -- as macOS keeps its
+    /// traffic lights: all of it while the row is away, none once it is
+    /// down, in step as it comes. 0 where they keep none.
+    pub(crate) fn pane_bars_stand_in_share(&self) -> f32 {
+        if cfg!(target_os = "macos")
+            || self.window_tab_reveal.in_layout()
+            || self.tab_bar_pixel_height().unwrap_or(0.0) <= 0.0
+        {
+            return 0.0;
+        }
+        1.0 - self.window_tab_reveal.shown
+    }
+
+    /// The row is away and the pane bars along the top draw what they keep
+    /// room for. Once it starts down, it carries its own.
+    pub(crate) fn pane_bars_stand_in(&self) -> bool {
+        self.pane_bars_stand_in_share() >= 1.0
+    }
+
+    /// As `pane_bars_stand_in_share`, for `pos`'s bar starting with the
+    /// workspace sidebar's toggle: the one at the top left, wherever the row
+    /// would draw one.
+    pub(crate) fn pane_bar_sidebar_toggle_share(&self, pos: &PositionedPane) -> f32 {
+        let share = self.pane_bars_stand_in_share();
+        if share > 0.0
+            && pos.left == 0
+            && pos.top == 0
+            && self.window_tab_shows_sidebar_toggle_action()
+        {
+            share
+        } else {
+            0.0
+        }
+    }
+
+    /// What `pos`'s bar ends with, as the bar at the top right standing in
+    /// for the row: the right sidebar's toggle, and the window's own
+    /// buttons unless an open sidebar holds them. A bar too narrow for them
+    /// all holds none, and the row has to come down for them.
+    pub(crate) fn pane_bar_window_chrome(&self, pos: &PositionedPane) -> PaneBarWindowChrome {
+        let top_right = pos.top == 0 && pos.left + pos.width >= self.terminal_size.cols;
+        if !top_right || self.pane_bars_stand_in_share() <= 0.0 {
+            return PaneBarWindowChrome::default();
+        }
+        let parts = PaneBarWindowChrome {
+            right_sidebar_toggle: self.right_sidebar_has_panels(),
+            window_buttons: self.fancy_tab_bar_shows_window_buttons()
+                && self.right_sidebar_width() == 0,
+        };
+        let fits = self
+            .pane_chrome_span(pos)
+            .is_ok_and(|(_, width)| self.pane_bar_fits_window_chrome(pos, parts, width));
+        if parts.any() && fits {
+            parts
+        } else {
+            PaneBarWindowChrome::default()
+        }
+    }
+
+    /// How far down from the window's top its chrome reaches at the right:
+    /// the row as it stands, or the pane bar holding what the row would.
+    pub(crate) fn window_top_right_chrome_height(&self) -> f32 {
+        let bar = self.window_tab_reveal.held.window_chrome;
+        self.window_tab_row_drawn_height().max(self.below_window_top(bar))
+    }
+
+    /// As `window_top_right_chrome_height`, at the left.
+    pub(crate) fn window_top_left_chrome_height(&self) -> f32 {
+        let bar = self.window_tab_reveal.held.sidebar_toggle;
+        self.window_tab_row_drawn_height().max(self.below_window_top(bar))
+    }
+
+    fn below_window_top(&self, held: Option<(usize, usize)>) -> f32 {
+        held.map_or(0.0, |(_, bottom)| {
+            bottom.saturating_sub(self.get_os_border().top.get() as usize) as f32
+        })
+    }
+
+    /// `item` is the blank of a pane bar along the window's top, and stands
+    /// in for the row's as the title bar: not where the system draws one,
+    /// nor in full screen, where there is no window to move, nor on the
+    /// strip of a collapsed stack, which runs the window's height.
+    pub(crate) fn pane_bar_blank_is_title_bar(&self, item: &UIItem) -> bool {
+        let UIItemType::PaneNav {
+            pane_id,
+            action: PaneNavAction::Background,
+            ..
+        } = item.item_type
+        else {
+            return false;
+        };
+        self.pane_bars_stand_in()
+            && !self.config.window_decorations.contains(WindowDecorations::TITLE)
+            && !self
+                .window_state
+                .intersects(WindowState::FULL_SCREEN | WindowState::SERVER_DECORATED)
+            && item.y <= self.get_os_border().top.get() as usize
+            && !Mux::get()
+                .get_active_tab_for_window(self.mux_window_id)
+                .and_then(|tab| tab.pane_stack_id(pane_id))
+                .is_some_and(|stack_id| self.collapsed_pane_layouts.contains_key(&stack_id))
+    }
+
     /// A tab of the row is being renamed in place, which needs the row out.
     fn renaming_window_tab(&self) -> bool {
         self.inline_tab_rename
@@ -205,16 +389,25 @@ impl TermWindow {
                 let right = self.terminal_viewport_right() as isize;
                 let row_bottom = top + self.window_tab_reveal_offset().ceil() as isize;
                 let edge = top + self.window_tab_resize_edge() as isize;
+                let below = |height: usize| y < edge + self.ui_px(height) as isize;
                 if x < left || x >= right {
                     PointerZone::Away
                 } else if presented && y < row_bottom {
                     PointerZone::Panel
-                } else if y < edge + self.ui_px(WINDOW_TAB_REVEAL_HOT_ZONE_HEIGHT) as isize {
-                    PointerZone::HotZone
-                } else if y < edge + self.ui_px(WINDOW_TAB_REVEAL_STICKY_ZONE_HEIGHT) as isize {
-                    PointerZone::NearHotZone
-                } else {
+                } else if self.window_tab_reveal.held.covers(x, y)
+                    || !below(WINDOW_TAB_REVEAL_STICKY_ZONE_HEIGHT)
+                {
                     PointerZone::Away
+                } else if self.pointer_on_pane_bar_control(event) {
+                    if below(WINDOW_TAB_REVEAL_EDGE_OVER_CONTROLS_HEIGHT) {
+                        PointerZone::HotZone
+                    } else {
+                        PointerZone::Away
+                    }
+                } else if below(WINDOW_TAB_REVEAL_HOT_ZONE_HEIGHT) {
+                    PointerZone::HotZone
+                } else {
+                    PointerZone::NearHotZone
                 }
             }
         };
@@ -230,6 +423,20 @@ impl TermWindow {
         }
     }
 
+    /// The pointer is over something of a pane bar's it may well be there
+    /// for rather than for the row, as the last frame laid them out: a tab,
+    /// a button, or a blank standing in for the title bar.
+    fn pointer_on_pane_bar_control(&self, event: &MouseEvent) -> bool {
+        self.resolve_ui_item(event).is_some_and(|item| match item.item_type {
+            UIItemType::PaneNav {
+                action: PaneNavAction::Background,
+                ..
+            } => self.pane_bar_blank_is_title_bar(&item),
+            UIItemType::PaneNav { .. } => true,
+            _ => false,
+        })
+    }
+
     /// Step the row's hover machine and keep its position for the frame.
     /// From the frame loop, so a resting pointer still brings it down at
     /// dwell expiry and a departed one still sends it back at grace expiry.
@@ -237,6 +444,7 @@ impl TermWindow {
         let input = self.window_tab_hover_input();
         let frame = self.window_tab_reveal.hover.step(input, now);
         self.window_tab_reveal.shown = self.window_tab_reveal.hover.progress(now).unwrap_or(0.0);
+        self.window_tab_reveal.arming = self.window_tab_reveal.hover.arming_progress(now);
         match frame {
             HoverFrame::None => {}
             HoverFrame::Now => {
@@ -245,6 +453,13 @@ impl TermWindow {
                 }
             }
             HoverFrame::At(due) => self.update_next_frame_time(Some(due)),
+        }
+        // The hint along the top fades up as the dwell counts, which takes
+        // every frame of it: a pointer only passing through barely shows it.
+        if self.window_tab_reveal.arming.is_some() {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
         }
     }
 
@@ -321,6 +536,20 @@ impl TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_buttons_a_pane_bar_holds_do_not_bring_the_row_down() {
+        let held = PaneBarsHeld {
+            window_chrome: Some((600, 30)),
+            sidebar_toggle: Some((40, 30)),
+        };
+        assert!(held.covers(700, 10));
+        assert!(held.covers(20, 10));
+        assert!(!held.covers(300, 10));
+        assert!(!held.covers(700, 30));
+        assert!(!held.covers(-1, 10));
+        assert!(!PaneBarsHeld::default().covers(700, 10));
+    }
 
     #[test]
     fn only_a_shown_or_pinned_row_keeps_its_place() {

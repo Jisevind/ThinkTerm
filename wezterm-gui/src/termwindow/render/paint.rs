@@ -1215,7 +1215,11 @@ impl crate::TermWindow {
             passes_used = pass + 1;
             self.frame_pane_output_generations.clear();
             self.track_pane_output_generations_for_frame = false;
-            match self.paint_pass() {
+            let painted = self.paint_pass();
+            if painted.is_ok() {
+                self.window_tab_reveal.finish_paint();
+            }
+            match painted {
                 Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
                     Ok(allocated) => {
                         if !allocated {
@@ -4659,6 +4663,7 @@ impl crate::TermWindow {
 
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
+        self.window_tab_reveal.begin_paint();
         // The Agents panel's arranged list lives while the panel is painted.
         if !std::mem::take(&mut self.right_sidebar_agents_painted) {
             self.right_sidebar_agents_list = None;
@@ -5409,6 +5414,29 @@ impl crate::TermWindow {
                     )
                     .context("paint right sidebar hover arming hint")?;
                 }
+            }
+
+            // The tab row's own, along the top edge, where the pointer goes
+            // by on its way to the pane bars far more often: it fades up as
+            // the dwell counts rather than flashing at every pass.
+            if let Some(arming) = self.window_tab_reveal.arming() {
+                let left = self.tab_bar_left_edge() as f32;
+                let hint_height =
+                    self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HINT_WIDTH) as f32;
+                let palette = self.chrome();
+                let mut hint_layers = layer.quad_allocator();
+                self.filled_rectangle(
+                    &mut hint_layers,
+                    2,
+                    euclid::rect(
+                        left,
+                        self.get_os_border().top.get() as f32,
+                        self.terminal_viewport_right() - left,
+                        hint_height,
+                    ),
+                    palette.sidebar_row_active_border.mul_alpha(0.7 * arming * arming),
+                )
+                .context("paint window tab row hover arming hint")?;
             }
         }
 

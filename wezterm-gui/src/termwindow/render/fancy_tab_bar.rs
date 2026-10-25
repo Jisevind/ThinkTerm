@@ -14,6 +14,7 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
     WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
 };
+use crate::termwindow::window_tab_reveal::PaneBarWindowChrome;
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup};
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
@@ -499,6 +500,93 @@ impl crate::TermWindow {
         Ok(ui_items)
     }
 
+    /// The window's own buttons at the end of the top-right pane bar, the
+    /// right sidebar's toggle before them and a rule between them and the
+    /// pane's buttons, while the pane bars stand in for a row that is away
+    /// (see `pane_bar_window_chrome`). Returns where the pane's buttons go on
+    /// from; `pane_bar_window_chrome_width` is the width this takes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_pane_bar_window_chrome(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        parts: PaneBarWindowChrome,
+        bar_right: usize,
+        bar_y: usize,
+        bar_height: usize,
+        button_size: usize,
+        icon_size: usize,
+    ) -> anyhow::Result<usize> {
+        let chrome = self.chrome();
+        let mut x = bar_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
+        if parts.window_buttons {
+            x = self.paint_window_tab_window_buttons(
+                layers,
+                ui_items,
+                x,
+                bar_y,
+                bar_height,
+                button_size,
+                icon_size,
+                chrome.text,
+                chrome.secondary_text,
+            )?;
+        }
+        if parts.right_sidebar_toggle {
+            x = x.saturating_sub(button_size);
+            self.paint_window_tab_right_sidebar_toggle_button(
+                layers,
+                ui_items,
+                x,
+                bar_y,
+                bar_height,
+                button_size,
+                icon_size,
+                chrome.text,
+                chrome.secondary_text,
+            )?;
+        }
+        x = x.saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP));
+        let rule_height = button_size * 3 / 5;
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(
+                x as f32,
+                (bar_y + bar_height.saturating_sub(rule_height) / 2) as f32,
+                1.0,
+                rule_height as f32,
+            ),
+            chrome.separator,
+        )
+        .context("pane bar window button rule")?;
+        debug_assert_eq!(
+            bar_right.saturating_sub(x),
+            self.pane_bar_window_chrome_width(parts, button_size)
+        );
+        Ok(x)
+    }
+
+    /// What `paint_pane_bar_window_chrome` takes from the bar's right end.
+    pub(crate) fn pane_bar_window_chrome_width(
+        &self,
+        parts: PaneBarWindowChrome,
+        button_size: usize,
+    ) -> usize {
+        let gap = self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP);
+        let window_buttons = if parts.window_buttons {
+            self.config.integrated_title_buttons.len() * (button_size + gap / 2) + gap / 2
+        } else {
+            0
+        };
+        let sidebar_toggle = if parts.right_sidebar_toggle {
+            button_size
+        } else {
+            0
+        };
+        self.ui_px(WINDOW_TAB_INSET) + 2 + window_buttons + sidebar_toggle + gap
+    }
+
     /// Paint only the essential native/client window chrome over a full-window
     /// ContentView. The normal tabs and sidebar actions stay suppressed, while
     /// the blank row retains window dragging and integrated buttons retain the
@@ -639,7 +727,7 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_window_sidebar_toggle_button(
+    pub(crate) fn paint_window_sidebar_toggle_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_items: &mut Vec<UIItem>,
