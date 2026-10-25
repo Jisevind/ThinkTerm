@@ -1479,6 +1479,8 @@ fn build_initial_mux(
 fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> anyhow::Result<()> {
     // Before anything reads the state: an import staged from Settings.
     crate::state_backup::enter_gui();
+    // The desktop's own machine keeps pane output unless told not to.
+    mux::kept_output::on_by_default();
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }
