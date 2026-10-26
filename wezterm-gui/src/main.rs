@@ -1379,12 +1379,22 @@ impl Publish {
     }
 }
 
+/// The socket this process serves `thinkterm cli` on, once it listens.
+static CLI_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Where `thinkterm cli` reaches this process: what the terminals it runs
+/// itself are given as `WEZTERM_UNIX_SOCKET`. None when it could not listen.
+pub(crate) fn cli_socket() -> Option<&'static std::path::Path> {
+    CLI_SOCKET.get().map(PathBuf::as_path)
+}
+
 fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::Result<()> {
     let mut listener =
         wezterm_mux_server_impl::local::LocalListener::with_domain(&config::UnixDomain {
             socket_path: Some(unix_socket_path.clone()),
             ..Default::default()
         })?;
+    let _ = CLI_SOCKET.set(unix_socket_path.clone());
     std::thread::spawn(move || {
         let name_holder;
         if should_publish {

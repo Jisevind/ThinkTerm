@@ -65,7 +65,7 @@ use thinkterm_plugin_panel::player::{
 use thinkterm_plugin_panel::{
     feature, Align, Answer, Area, Ask, Bounds, Button, Bytes, CloseButton, Color, Cursor, Draw,
     Drawn, Entry, EntryKind, Env, FieldPart, Font, Input, Line, Mods, MonoMetrics, Player, Rect,
-    Remote, Size, Text, TextMetrics, Token,
+    Remote, Size, Terminal, Text, TextMetrics, Token,
 };
 use url::Url;
 use wezterm_font::LoadedFont;
@@ -269,12 +269,14 @@ enum Status {
 
 /// What a panel and its extended view are painted with in one frame: the
 /// fonts, pixels to a unit, and where the terminal beside them is -- its
-/// directory here, or the other machine it runs on.
+/// directory here, or the other machine it runs on -- and how `thinkterm
+/// cli` reaches it.
 pub(crate) struct PanelPaint {
     fonts: PanelFonts,
     scale: f32,
     cwd: Option<String>,
     remote: Option<Remote>,
+    terminal: Option<Terminal>,
 }
 
 /// The fonts a panel's text is set in, for one paint.
@@ -388,6 +390,7 @@ impl TermWindow {
             scale: panel_scale(self.dimensions.dpi),
             remote,
             cwd,
+            terminal: self.plugin_panel_terminal(),
         })
     }
 
@@ -416,11 +419,13 @@ impl TermWindow {
             scale,
             cwd,
             remote,
+            terminal,
         } = paint;
         let scale = *scale;
         let mut env = panel_env(fonts, &chrome, content_width as f32, height as f32, scale);
         env.cwd = cwd.clone();
         env.remote = remote.clone();
+        env.terminal = terminal.clone();
         env.can_extend = self.right_sidebar_plugin_can_extend();
         self.follow_plugin_panel(plugin, env);
         // The extended view goes once nothing asks for it, or there is no
@@ -483,11 +488,13 @@ impl TermWindow {
             scale,
             cwd,
             remote,
+            terminal,
         } = paint;
         let scale = *scale;
         let mut env = panel_env(fonts, &chrome, content_width as f32, height as f32, scale);
         env.cwd = cwd.clone();
         env.remote = remote.clone();
+        env.terminal = terminal.clone();
         let (x, y, size) = close;
         env.close = Some(CloseButton {
             x: (x as f32 - content_x as f32) / scale,
@@ -794,6 +801,7 @@ impl TermWindow {
             plugins::close_panel(panel.shown.view);
         }
         self.plugin_panel_domains.clear();
+        self.plugin_panel_terminal = None;
         self.plugin_panel_reach = None;
     }
 
@@ -854,6 +862,27 @@ impl TermWindow {
             },
             Some(false) => self.plugin_panel_remote(pane.pane_id(), &pane),
         }
+    }
+
+    /// The terminal beside the panel as `thinkterm cli` reaches it, worked
+    /// out once for each pane in focus. While the window has none -- on
+    /// the way to a new tab's -- the one the panel was told of stays.
+    fn plugin_panel_terminal(&mut self) -> Option<Terminal> {
+        let Some(pane) = self.get_active_pane_no_overlay() else {
+            return self
+                .right_sidebar_plugin
+                .as_ref()
+                .and_then(|panel| panel.shown.player.env().terminal.clone());
+        };
+        let pane_id = pane.pane_id();
+        if let Some((beside, terminal)) = &self.plugin_panel_terminal {
+            if *beside == pane_id {
+                return terminal.clone();
+            }
+        }
+        let terminal = cli_terminal(&pane);
+        self.plugin_panel_terminal = Some((pane_id, terminal.clone()));
+        terminal
     }
 
     /// Whether the panes of domain `domain_id` run on this machine: `None`
@@ -1946,6 +1975,28 @@ fn local_path(url: &Url) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 
+/// Pane `pane` as `thinkterm cli` reaches it. One the session server keeps
+/// for this machine, by its number there and the server's socket: as the
+/// programs in it reach it. Any other by its number here and the socket
+/// this process serves the command line on -- which its programs are given
+/// too, and through which one on another machine is reached.
+fn cli_terminal(pane: &Arc<dyn Pane>) -> Option<Terminal> {
+    if crate::local_sessions::is_host_domain_id(pane.domain_id()) {
+        let client = pane.downcast_ref::<wezterm_client::pane::ClientPane>();
+        let host = crate::local_sessions::candidate(&config::configuration());
+        if let (Some(client), Some(host)) = (client, host) {
+            return Some(Terminal {
+                pane: client.remote_pane_id as u64,
+                socket: Some(host.socket_path().to_string_lossy().into_owned()),
+            });
+        }
+    }
+    Some(Terminal {
+        pane: pane.pane_id() as u64,
+        socket: Some(crate::cli_socket()?.to_string_lossy().into_owned()),
+    })
+}
+
 /// What the plugin is told of a panel this big, set in `fonts`.
 fn panel_env(fonts: &PanelFonts, chrome: &UiPalette, width: f32, height: f32, scale: f32) -> Env {
     let text = |(_, metrics): &(Rc<LoadedFont>, RenderMetrics), size: f64| TextMetrics {
@@ -1969,6 +2020,7 @@ fn panel_env(fonts: &PanelFonts, chrome: &UiPalette, width: f32, height: f32, sc
         locale: crate::i18n::current_locale().to_string(),
         cwd: None,
         remote: None,
+        terminal: None,
         can_extend: false,
         close: None,
         features: vec![feature::FIELDS.to_string(), feature::KEYS.to_string()],

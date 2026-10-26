@@ -58,7 +58,8 @@
 //! When the terminal beside a panel runs on another machine, the view's
 //! [`Env::remote`](panel::Env::remote) says which, and the plugin has
 //! ThinkTerm run programs and read files there with [`Emitter::ask`], over
-//! ThinkTerm's own connection to it.
+//! ThinkTerm's own connection to it. Wherever it runs, [`View::cli`] is
+//! `thinkterm cli` aimed at it: what it shows, what runs in it.
 //!
 //! The plugins built into ThinkTerm implement the same trait, and run
 //! inside the plugin host instead of in a program of their own.
@@ -182,6 +183,53 @@ impl View {
     /// The panel this view belongs to: itself, or the one it extends.
     pub fn panel(&self) -> u64 {
         self.extends.unwrap_or(self.id)
+    }
+
+    /// `thinkterm cli`, aimed at the terminal beside the view
+    /// ([`Env::terminal`]): the arguments that follow are one of its
+    /// commands. One about a single pane, `get-text` say, is about that
+    /// terminal when it names none; `list` and `events` are about every
+    /// pane, and `events --pane-id` with the terminal's narrows it. What it
+    /// prints comes back to the plugin, through `output()` or the child's
+    /// own output, and it reads nothing: the plugin's own input and output
+    /// are ThinkTerm's. It starts no server. `None` while the view is
+    /// beside no terminal, or its ThinkTerm does not say which.
+    ///
+    /// ```no_run
+    /// # fn screen(view: &thinkterm_plugin_sdk::View) -> Option<String> {
+    /// let out = view.cli()?.args(["get-text", "--trim"]).output().ok()?;
+    /// String::from_utf8(out.stdout).ok()
+    /// # }
+    /// ```
+    pub fn cli(&self) -> Option<std::process::Command> {
+        let terminal = self.env.terminal.as_ref()?;
+        // The one ThinkTerm ships beside the plugin host; on the PATH for
+        // a plugin started some other way.
+        let program = std::env::var_os("THINKTERM_CLI").unwrap_or_else(|| "thinkterm".into());
+        let mut command = std::process::Command::new(program);
+        command.arg("cli").arg("--no-auto-start");
+        match &terminal.socket {
+            Some(socket) => {
+                command.env("WEZTERM_UNIX_SOCKET", socket);
+            }
+            None => {
+                command
+                    .env_remove("WEZTERM_UNIX_SOCKET")
+                    .arg("--prefer-mux");
+            }
+        }
+        command
+            .env("WEZTERM_PANE", terminal.pane.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            // A console program, which would open a window of its own.
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        Some(command)
     }
 }
 

@@ -60,5 +60,5 @@ pub use scene::{
 };
 pub use wire::{
     feature, Answer, Ask, Button, Bytes, Click, CloseButton, Entry, EntryKind, Env, Focus, Input,
-    Key, Mods, MonoMetrics, Remote, Rows, RowsWanted, TextMetrics, Typed,
+    Key, Mods, MonoMetrics, Remote, Rows, RowsWanted, Terminal, TextMetrics, Typed,
 };

@@ -158,6 +158,9 @@ sorts first is used, and the other is shown as invalid.
 - **Typing and keys.** A panel can have fields to type in, and be sent the
   keys it takes while the user gives it the keyboard. See [Fields and the
   keyboard](#fields-and-the-keyboard).
+- **The terminal beside its panel.** A panel is told how `thinkterm cli`
+  reaches it, to read what it shows and follow what runs in it. See [The
+  terminal beside a panel](#the-terminal-beside-a-panel).
 - **Another machine's files.** When the terminal beside its panel runs on
   another machine reached over SSH, a plugin has ThinkTerm run programs and
   read files there. See [A terminal on another
@@ -265,10 +268,12 @@ how tall one is), whether the theme is dark, the language ThinkTerm speaks
 pane in focus in its window -- when that terminal runs on the machine the
 plugin runs on, and left out when there is none or it does not; `remote`
 when it runs on another machine instead (see [A terminal on another
-machine](#a-terminal-on-another-machine)); `can_extend` (see [The
-extended view](#the-extended-view)); and `features`, what the client does
-besides drawing and sending clicks: `fields` when it shows fields, `keys`
-when it gives a panel the keyboard on the user's key (see [Fields and the
+machine](#a-terminal-on-another-machine)); `terminal`, how `thinkterm cli`
+reaches that terminal (see [The terminal beside a
+panel](#the-terminal-beside-a-panel)); `can_extend` (see [The extended
+view](#the-extended-view)); and `features`, what the client does besides
+drawing and sending clicks: `fields` when it shows fields, `keys` when it
+gives a panel the keyboard on the user's key (see [Fields and the
 keyboard](#fields-and-the-keyboard)). It comes with `open` and again when any of it
 changes -- no more than ten times a second while a window is resized, the
 last always -- and the `rows` asked for after it are drawn for it. A click's
@@ -406,6 +411,45 @@ types next was meant for the panel, and goes nowhere until they press
 Escape or press somewhere. What a stopped plugin, or one starting again,
 last drew takes no typing: a press in its field gives it no keyboard.
 
+### The terminal beside a panel
+
+A panel's environment names the terminal beside it -- the pane in focus in
+its window -- as `thinkterm cli` on the plugin's machine reaches it, so the
+plugin reads what it shows and follows what runs in it with the command
+line any program has:
+
+```json
+"terminal":{"pane":12,"socket":"/home/user/.local/share/thinkterm/sock"}
+```
+
+For a terminal on the plugin's machine these are what the programs in it
+are given, `WEZTERM_PANE` and `WEZTERM_UNIX_SOCKET`: the plugin reaches it
+as they do. One on another machine is reached through the ThinkTerm that
+shows it, which passes on what is asked. Without a `socket` -- a browser's
+page cannot name a path on the server -- it is the session server on the
+plugin's machine, which `thinkterm cli --prefer-mux` finds. `terminal`
+names the pane in focus as soon as the user moves to it; `cwd` and `remote`
+follow once that pane has said where it is, so for a moment they can still
+be the last pane's. While the window has no pane in focus -- on the way to
+a new tab's -- it stays what it was.
+
+The plugin runs the `thinkterm` that ThinkTerm ships with, which
+`THINKTERM_CLI` names, with those two set:
+
+```sh
+WEZTERM_UNIX_SOCKET=/home/user/.local/share/thinkterm/sock WEZTERM_PANE=12 \
+  "$THINKTERM_CLI" cli --no-auto-start get-text --trim
+```
+
+A command about one pane is about that one when it names none: `get-text`
+reads what it shows. `list` says what runs in every pane, and `events`
+prints what happens in every one as it happens -- programs and commands
+finishing, titles, agents' status -- unless `--pane-id` names one.
+`thinkterm cli --help` lists the rest. The plugin's own standard input and
+output carry the protocol: a command it runs is given neither. In the Rust
+SDK, `view.cli()` is the command, ready for its arguments, with nothing on
+its input and its output piped back to the plugin.
+
 ### A terminal on another machine
 
 When the terminal beside a panel runs on another machine reached over SSH --
@@ -478,9 +522,12 @@ The program starts with these environment variables, in its own directory:
 | `THINKTERM_PLUGIN_DIR`  | its directory                                      |
 | `THINKTERM_PLUGIN_DATA` | a directory for its own files, created before start |
 | `THINKTERM_PLUGIN_API`  | `2`, the newest this ThinkTerm speaks              |
+| `THINKTERM_CLI`         | the `thinkterm` program ThinkTerm ships with       |
 
 `WEZTERM_PANE` and `WEZTERM_UNIX_SOCKET` are not passed on: the pane or mux
 the plugin server happened to be started from says nothing about a plugin.
+A panel's environment says which terminal is beside it (see [The terminal
+beside a panel](#the-terminal-beside-a-panel)).
 
 The program's first line must be, with the API it speaks -- 1, or 2 for a
 plugin with a panel -- and no newer than `THINKTERM_PLUGIN_API`: a ThinkTerm
@@ -585,6 +632,10 @@ fn main() -> std::io::Result<()> {
   is drawn again when it comes and when it goes. A click in either draws
   both again. `Input::Close` in an extended view is its close button:
   `view.env.close` is where that is.
+- `view.cli()` is `thinkterm cli` aimed at the terminal beside panel
+  `view`, as `view.env.terminal` names it: `None` while there is none.
+  Running it waits for the program: run it from a thread of the plugin's
+  own.
 - `Emitter::ask(view, machine, &ask, wait)` asks ThinkTerm to do something
   on the machine the terminal beside panel `view` runs on, when that is
   another -- `machine` from `view.env.remote` -- and waits for the answer.

@@ -4925,6 +4925,7 @@ impl<P: Platform, L: Link> App<P, L> {
             let inner = &mut *self.inner.borrow_mut();
             env.locale = thinkterm_i18n::current_locale().to_string();
             env.cwd = Self::focused_cwd(inner);
+            env.terminal = Self::focused_terminal(inner);
             // Its fields are the page's own; the keyboard comes to a panel
             // through them, and no key of the page's gives it.
             env.features = vec![thinkterm_plugin_panel::feature::FIELDS.to_string()];
@@ -4951,6 +4952,7 @@ impl<P: Platform, L: Link> App<P, L> {
         let moved = {
             let inner = &mut *self.inner.borrow_mut();
             let cwd = Self::focused_cwd(inner);
+            let terminal = Self::focused_terminal(inner);
             let locale = thinkterm_i18n::current_locale();
             let mut moved = false;
             let views = [
@@ -4958,9 +4960,13 @@ impl<P: Platform, L: Link> App<P, L> {
                 (&mut inner.plugin_extended_env, &mut inner.plugin_extended),
             ];
             for (env, model) in views {
+                // The pane in focus not known for the moment, the one told
+                // stays.
+                let terminal = terminal.clone().or_else(|| env.as_ref().and_then(|env| env.terminal.clone()));
                 match env.as_mut() {
-                    Some(env) if env.cwd != cwd || env.locale != locale => {
+                    Some(env) if env.cwd != cwd || env.terminal != terminal || env.locale != locale => {
                         env.cwd = cwd.clone();
+                        env.terminal = terminal;
                         env.locale = locale.to_string();
                         if let Some(model) = model.as_mut() {
                             model.set_env(env.clone());
@@ -4975,6 +4981,16 @@ impl<P: Platform, L: Link> App<P, L> {
         if moved {
             self.plugin_panel_tell_env();
         }
+    }
+
+    /// The pane in focus as `thinkterm cli` on the server's machine reaches
+    /// it, where the plugins the page reaches run: by the number the server
+    /// gave it, through the server, which the page knows no path for.
+    fn focused_terminal(inner: &Inner<P, L>) -> Option<thinkterm_plugin_panel::Terminal> {
+        inner.panes.contains_key(&inner.focused_pane).then(|| thinkterm_plugin_panel::Terminal {
+            pane: inner.focused_pane as u64,
+            socket: None,
+        })
     }
 
     /// The directory of the pane in focus, as a path on the server's

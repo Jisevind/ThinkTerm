@@ -36,6 +36,14 @@ pub struct Env {
     /// ThinkTerm for ([`Ask`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<Remote>,
+    /// That terminal, here or on another machine, as `thinkterm cli` on
+    /// the plugin's machine reaches it: to read what it shows and follow
+    /// what runs in it. It names the pane in focus as soon as the user
+    /// moves to it, before `cwd` and `remote` follow, and stays what it was
+    /// for the moment the window has none -- on the way to a new tab's.
+    /// None from a ThinkTerm that does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<Terminal>,
     /// Whether the panel would get its extended view were its frame to ask
     /// for one: the client shows them, and has the room. So a plugin knows
     /// whether to fit what it would put there into the panel itself. Never
@@ -69,6 +77,22 @@ impl Env {
     pub fn has(&self, feature: &str) -> bool {
         self.features.iter().any(|has| has == feature)
     }
+}
+
+/// A terminal as `thinkterm cli` reaches it ([`Env::terminal`]). For one on
+/// the plugin's machine, these are what the programs in it are given --
+/// `WEZTERM_PANE` and `WEZTERM_UNIX_SOCKET` -- so the plugin reaches it as
+/// they do; one on another machine it reaches through the ThinkTerm that
+/// shows it, which passes on what is asked of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Terminal {
+    /// Its pane id there, which `--pane-id` takes.
+    pub pane: u64,
+    /// The socket to reach it through, for `WEZTERM_UNIX_SOCKET`; none for
+    /// the session server on the plugin's machine, which `--prefer-mux`
+    /// finds -- a browser's page cannot name a path on the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
 }
 
 /// The other machine the terminal beside a panel runs on.

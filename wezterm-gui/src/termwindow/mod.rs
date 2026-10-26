@@ -3319,6 +3319,10 @@ pub struct TermWindow {
     /// The answer is the domain's, so another pane of one looked at already
     /// has it at once. One entry a domain, dropped with the panel.
     pub(crate) plugin_panel_domains: Vec<(DomainId, Option<bool>)>,
+    /// The pane in focus the plugin panel was last beside, and how
+    /// `thinkterm cli` reaches it: worked out once a pane, dropped with the
+    /// panel.
+    pub(crate) plugin_panel_terminal: Option<(PaneId, Option<thinkterm_plugin_panel::Terminal>)>,
     /// How the machine the pane in focus runs on is reached when that is
     /// another, for the plugin panel, and when that was found: for one
     /// pane, found again every few seconds.
@@ -5164,6 +5168,7 @@ impl TermWindow {
             plugin_panel_keys_held: false,
             plugin_field_snapshot: None,
             plugin_panel_domains: Vec::new(),
+            plugin_panel_terminal: None,
             plugin_panel_reach: None,
             right_sidebar_snippet_saving: false,
             right_sidebar_note: crate::markdown_editor::NoteHostState::default(),

@@ -365,7 +365,16 @@ impl Player {
         if env == self.env {
             return false;
         }
+        // Another terminal beside the panel -- a pane in the same directory
+        // picked -- is news for the plugin, not another size.
+        let terminal_only = Env {
+            terminal: self.env.terminal.clone(),
+            ..env.clone()
+        } == self.env;
         self.env = env;
+        if terminal_only {
+            return true;
+        }
         // Rows are drawn for a size: the ones on show are asked for again,
         // and what was asked for the old size is not taken when it comes,
         // nor asked for if it is not yet.
@@ -1678,7 +1687,7 @@ pub fn field_radius(field: &Field) -> f32 {
 mod tests {
     use super::*;
     use crate::scene::{Color, Jump, Token};
-    use crate::wire::{MonoMetrics, TextMetrics};
+    use crate::wire::{MonoMetrics, Terminal, TextMetrics};
     use serde_json::json;
 
     fn env(width: f32, height: f32) -> Env {
@@ -1702,6 +1711,7 @@ mod tests {
             locale: String::new(),
             cwd: None,
             remote: None,
+            terminal: None,
             can_extend: false,
             close: None,
             features: Vec::new(),
@@ -2003,6 +2013,29 @@ mod tests {
         assert!(player.set_env(env(300.0, 400.0)));
         assert_eq!(texts(&player)[0], "row 0");
         assert!(!player.wanted().is_empty());
+    }
+
+    #[test]
+    fn another_terminal_beside_the_panel_is_news_but_not_a_new_size() {
+        let mut player = Player::new(env(300.0, 400.0));
+        player.frame(Frame {
+            items: vec![list(1_000, "a", None)],
+            ..Frame::default()
+        });
+        let asked = player.wanted();
+        answer_these(&mut player, &asked);
+        assert_eq!(texts(&player)[0], "row 0");
+        let beside = Env {
+            terminal: Some(Terminal {
+                pane: 7,
+                socket: None,
+            }),
+            ..env(300.0, 400.0)
+        };
+        assert!(player.set_env(beside.clone()), "the plugin is told");
+        assert!(player.wanted().is_empty(), "no rows are asked for again");
+        assert_eq!(texts(&player)[0], "row 0");
+        assert!(!player.set_env(beside));
     }
 
     #[test]
