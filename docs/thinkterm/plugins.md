@@ -204,7 +204,7 @@ the rest are drawn.
 | Item     | Fields                                                                                                   |
 |----------|----------------------------------------------------------------------------------------------------------|
 | `rect`   | `x`, `y`, `w`, `h`; `fill`; `radius` (0); `border` (a one-unit line inside the edge)                     |
-| `text`   | `x`, `y`, `w`, `h`, `text`; `color` (`text`); `font` (`ui` or `mono`); `size` (`small`, `body`, `title`: the `ui` font's); `bold`; `align` (`left`, `center`, `right`) |
+| `text`   | `x`, `y`, `w`, `h`, `text`; `color` (`text`); `font` (`ui` or `mono`); `size` (`small`, `body`, `title`: the `ui` font's); `bold`; `align` (`left`, `center`, `right`); `wrap` |
 | `line`   | `points` (x, y, x, y ...), `color`; `width` (1)                                                          |
 | `area`   | `points` (left to right), `base`, `color`; `fade` (thins to nothing at `base`): the fill under a chart   |
 | `hit`    | `id`, `x`, `y`, `w`, `h`; `hover` (a colour to tint it with while the pointer is over it); `radius` (0, the tint's corners); `cursor` (`pointer`, `arrow`) |
@@ -216,6 +216,16 @@ the rest are drawn.
   an ellipsis in the `ui` font, at the edge in the `mono` font, whose
   columns a plugin lines up itself -- the environment says how wide one is,
   and a character most scripts write in one column takes two in CJK.
+- With `wrap`, text is broken into lines that fit its box's width -- after
+  a space, between the characters of a script written without spaces, at
+  its own line breaks, or else where a word overflows -- set from the
+  box's top, a `line` of its font each, as many as the box's height holds.
+  Where text is left over, the last ends in an ellipsis in the `ui` font;
+  one cut at the most characters a text holds (see [Limits](#limits)) ends
+  in `...` in either.
+  A box a whole number of lines tall holds that many, so a plugin sizes it
+  from the environment's `line` and never needs to measure text. A client
+  whose environment does not say `wrap` shows one line.
 - A hit's tint is painted where the hit is in the list: put the hit before
   what it should be under. Where hits overlap, the last one answers: a row
   can take clicks across its whole width and be tinted only in a rounded
@@ -274,7 +284,8 @@ panel](#the-terminal-beside-a-panel)); `can_extend` (see [The extended
 view](#the-extended-view)); and `features`, what the client does besides
 drawing and sending clicks: `fields` when it shows fields, `keys` when it
 gives a panel the keyboard on the user's key (see [Fields and the
-keyboard](#fields-and-the-keyboard)). It comes with `open` and again when any of it
+keyboard](#fields-and-the-keyboard)), `wrap` when it breaks a text into
+lines. It comes with `open` and again when any of it
 changes -- no more than ten times a second while a window is resized, the
 last always -- and the `rows` asked for after it are drawn for it. A click's
 `x` and `y` are within the hit. A `version` or a `layout` of 0, and a

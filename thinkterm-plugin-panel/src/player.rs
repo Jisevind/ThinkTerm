@@ -156,6 +156,7 @@ pub enum Op {
         size: Size,
         bold: bool,
         align: Align,
+        wrap: bool,
     },
     /// Through `points`, x, y and so on.
     Line {
@@ -1065,6 +1066,7 @@ impl Player {
                     size: text.size,
                     bold: text.bold,
                     align: text.align,
+                    wrap: text.wrap,
                 },
                 Drawn::Line(line) => Op::Line {
                     clip,
@@ -1526,6 +1528,13 @@ fn keep(items: &mut Vec<Item>, budget: &mut usize, nested: bool) {
             Item::Text(text) => {
                 if let Some((cut, _)) = text.text.char_indices().nth(TEXT_LIMIT) {
                     text.text.truncate(cut);
+                    // Whole in a box with room to spare, a text asked to wrap
+                    // would stop as if it were done: it ends in an ellipsis.
+                    if text.wrap {
+                        let marked = text.text.char_indices().nth(TEXT_LIMIT - 3);
+                        text.text.truncate(marked.map_or(0, |(at, _)| at));
+                        text.text.push_str("...");
+                    }
                 }
             }
             Item::Field(field) => {
@@ -1763,6 +1772,7 @@ mod tests {
                 size: Default::default(),
                 bold: false,
                 align: Default::default(),
+                wrap: false,
             }),
         ]
     }
@@ -2412,6 +2422,7 @@ mod tests {
             size: Default::default(),
             bold: false,
             align: Default::default(),
+            wrap: false,
         }));
         player.frame(Frame {
             items,
@@ -2443,6 +2454,7 @@ mod tests {
             size: Default::default(),
             bold: false,
             align: Default::default(),
+            wrap: false,
         });
         player.frame(Frame {
             items: vec![long],
@@ -2452,6 +2464,19 @@ mod tests {
             panic!()
         };
         assert_eq!(text.text.chars().count(), TEXT_LIMIT);
+
+        // One asked to wrap says it was cut.
+        let long =
+            Item::Text(Text::new(0.0, 0.0, 1.0, 1.0, "\u{4e2d}".repeat(TEXT_LIMIT + 1)).wrap());
+        player.frame(Frame {
+            items: vec![long],
+            ..Frame::default()
+        });
+        let Item::Text(text) = &player.frame.items[0] else {
+            panic!()
+        };
+        assert_eq!(text.text.chars().count(), TEXT_LIMIT);
+        assert!(text.text.ends_with("\u{4e2d}..."));
     }
 
     #[test]

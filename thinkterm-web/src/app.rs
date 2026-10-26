@@ -4928,7 +4928,10 @@ impl<P: Platform, L: Link> App<P, L> {
             env.terminal = Self::focused_terminal(inner);
             // Its fields are the page's own; the keyboard comes to a panel
             // through them, and no key of the page's gives it.
-            env.features = vec![thinkterm_plugin_panel::feature::FIELDS.to_string()];
+            env.features = vec![
+                thinkterm_plugin_panel::feature::FIELDS.to_string(),
+                thinkterm_plugin_panel::feature::WRAP.to_string(),
+            ];
             if extended {
                 env.can_extend = false;
                 inner.plugin_extended_env = Some(env.clone());

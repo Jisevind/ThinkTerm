@@ -302,6 +302,7 @@ export type PanelOp =
       size: 'small' | 'body' | 'title';
       bold: boolean;
       align: 'left' | 'center' | 'right';
+      wrap: boolean;
     }
   | { op: 'line'; clip: number; points: number[]; width: number; color: string }
   | { op: 'area'; clip: number; points: number[]; base: number; color: string; fade: boolean }

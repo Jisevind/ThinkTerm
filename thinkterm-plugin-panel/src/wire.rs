@@ -70,6 +70,10 @@ pub mod feature {
     /// It gives a panel the keyboard when the user asks, and sends the keys
     /// the panel takes.
     pub const KEYS: &str = "keys";
+    /// It breaks a text that asks for it into lines ([`Text::wrap`]).
+    ///
+    /// [`Text::wrap`]: crate::scene::Text::wrap
+    pub const WRAP: &str = "wrap";
 }
 
 impl Env {

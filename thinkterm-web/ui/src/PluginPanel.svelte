@@ -20,6 +20,7 @@
   import { focusTerminal } from './mobile.svelte';
   import type { PanelOp, PanelView, Painting } from './model';
   import { onMac } from './palette.svelte';
+  import { breakLines } from './wrap';
 
   let { extended = false }: { extended?: boolean } = $props();
 
@@ -183,6 +184,48 @@
     return result;
   }
 
+  // A text asked to wrap, as the lines its box holds -- `rows` of them at
+  // most -- and how wide each is, remembered as a cut is: where text is
+  // left over, the last ends in an ellipsis in the interface font.
+  const wraps = new Map<string, Cut[]>();
+
+  function wrap(ctx: CanvasRenderingContext2D, text: string, room: number, rows: number, ellipsize: boolean): Cut[] {
+    const key = `${ctx.font}\u0000${room}\u0000${rows}\u0000${text}`;
+    const known = wraps.get(key);
+    if (known !== undefined) return known;
+    const { lines, leftOver } = breakLines(text, room, rows, (part) => ctx.measureText(part).width);
+    const laid = lines.map((shown) => ({ shown, wide: ctx.measureText(shown).width }));
+    const last = laid.length - 1;
+    if (leftOver && ellipsize && last >= 0) laid[last] = cut(ctx, laid[last].shown + ELLIPSIS, room, true);
+    if (wraps.size >= CUTS) wraps.clear();
+    wraps.set(key, laid);
+    return laid;
+  }
+
+  /** One line of a text op, its middle at `middle`: placed across the
+      op's box as it says, and cut at its edge if it is wider still. */
+  function textLine(ctx: CanvasRenderingContext2D, op: Extract<PanelOp, { op: 'text' }>, { shown, wide }: Cut, middle: number) {
+    if (shown === '') return;
+    const left = Math.max(
+      op.x,
+      op.align === 'center' ? op.x + (op.w - wide) / 2 : op.align === 'right' ? op.x + op.w - wide : op.x,
+    );
+    // The monospaced font is cut at its box's edge, not ellipsized: a
+    // plugin lines its columns up itself. So is a line of either that is
+    // wider than its box all the same -- one character in a box narrower
+    // than it.
+    if (wide > op.w) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(op.x, op.y, op.w, op.h);
+      ctx.clip();
+      ctx.fillText(shown, left, middle);
+      ctx.restore();
+    } else {
+      ctx.fillText(shown, left, middle);
+    }
+  }
+
   function paint(painting: Painting | null) {
     const ctx = canvas?.getContext('2d');
     if (!ctx) return;
@@ -233,24 +276,17 @@
         ctx.font = font(op, family);
         ctx.fillStyle = css(rgba(op.color));
         ctx.textBaseline = 'middle';
-        const { shown, wide } = cut(ctx, op.text, op.w, op.font === 'ui');
-        const left = Math.max(
-          op.x,
-          op.align === 'center' ? op.x + (op.w - wide) / 2 : op.align === 'right' ? op.x + op.w - wide : op.x,
-        );
-        const middle = op.y + op.h / 2;
-        // The monospaced font is cut at its box's edge, not ellipsized: a
-        // plugin lines its columns up itself.
-        if (op.font === 'mono' && wide > op.w) {
-          ctx.save();
-          ctx.beginPath();
-          ctx.rect(op.x, op.y, op.w, op.h);
-          ctx.clip();
-          ctx.fillText(shown, left, middle);
-          ctx.restore();
-        } else {
-          ctx.fillText(shown, left, middle);
+        if (op.wrap) {
+          // From the box's top, a line of the font each, as many as the
+          // box holds: one made a whole number of lines tall holds them all.
+          const line = op.font === 'mono' ? MONO.line : TEXT[op.size].line;
+          const rows = Math.max(1, Math.floor((op.h + 0.5) / line));
+          wrap(ctx, op.text, op.w, rows, op.font === 'ui').forEach((laid, row) =>
+            textLine(ctx, op, laid, op.y + row * line + line / 2),
+          );
+          return;
         }
+        textLine(ctx, op, cut(ctx, op.text, op.w, op.font === 'ui'), op.y + op.h / 2);
         return;
       }
       case 'line': {
@@ -585,6 +621,7 @@
       document.fonts.add(face);
       face.load().then(() => {
         cuts.clear();
+        wraps.clear();
         sendEnv();
         refresh(true);
       }, () => {});

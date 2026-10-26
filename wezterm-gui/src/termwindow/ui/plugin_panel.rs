@@ -1735,9 +1735,10 @@ impl TermWindow {
         Ok(())
     }
 
-    /// One line of text in its box: centred in its height, placed across
-    /// it as asked, and cut to it -- with an ellipsis in the interface
-    /// font, at the edge in the monospaced one.
+    /// Text in its box: one line, centred in its height -- or, asked to
+    /// wrap, as many as the box holds, from its top -- each placed across
+    /// it as asked and cut to it: with an ellipsis in the interface font,
+    /// at the edge in the monospaced one.
     /// Only the glyphs within `across`, the draw's left and right edges, are
     /// laid: a line far wider than a list scrolled sideways costs what shows.
     #[allow(clippy::too_many_arguments)]
@@ -1756,20 +1757,103 @@ impl TermWindow {
             return Ok(());
         }
         let (font, metrics) = fonts.of(text);
+        let across = (clip_left, clip_right);
+        let mut line = |shown: &str, top: f32, budget: &mut usize| {
+            let at = (area, top);
+            self.paint_panel_text_line(
+                layers, text.align, shown, font, metrics, at, color, across, budget,
+            )
+        };
+        if text.wrap {
+            let line_height = metrics.cell_size.height as f32;
+            let lines = self.panel_text_lines(text, font, metrics, area)?;
+            for (row, shown) in lines.iter().enumerate() {
+                line(shown, area.min_y() + row as f32 * line_height, budget)?;
+            }
+            return Ok(());
+        }
         let top = area.min_y() + (area.height() - metrics.cell_size.height as f32) / 2.0;
         let shown = match text.font {
             Font::Ui => self.ellipsize_ui_text(font, &text.text, area.width() as usize)?,
             Font::Mono => std::borrow::Cow::Borrowed(text.text.as_str()),
         };
+        line(&shown, top, budget)
+    }
+
+    /// `text` broken into the lines its box holds ([`Text::wrap`]), as they
+    /// show: where text is left over, the last ends in an ellipsis in the
+    /// interface font.
+    fn panel_text_lines(
+        &self,
+        text: &Text,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        area: RectF,
+    ) -> anyhow::Result<Vec<String>> {
+        const ELLIPSIS: &str = "...";
+        let line_height = (metrics.cell_size.height as f32).max(1.0);
+        // A box made a whole number of lines tall holds them all, whatever
+        // its pixels round to.
+        let room = ((area.height() + 1.0) / line_height).floor().max(1.0) as usize;
+        let mut lines = Vec::new();
+        let mut left_over = false;
+        let width = area.width();
+        'text: for paragraph in text.text.lines() {
+            if lines.len() == room {
+                left_over = true;
+                break;
+            }
+            let xs = self.boundaries(font, metrics, paragraph)?;
+            let chars: Vec<char> = paragraph.chars().collect();
+            let at: Vec<usize> = paragraph
+                .char_indices()
+                .map(|(at, _)| at)
+                .chain(std::iter::once(paragraph.len()))
+                .collect();
+            for line in break_text(&chars, &xs, width) {
+                if lines.len() == room {
+                    left_over = true;
+                    break 'text;
+                }
+                let shown = &paragraph[at[line.start]..at[line.end]];
+                lines.push(shown.trim_end().to_string());
+            }
+        }
+        if left_over && text.font == Font::Ui {
+            if let Some(last) = lines.last_mut() {
+                let ended = format!("{last}{ELLIPSIS}");
+                *last = self
+                    .ellipsize_ui_text(font, &ended, area.width() as usize)?
+                    .into_owned();
+            }
+        }
+        Ok(lines)
+    }
+
+    /// One line of a panel's text, `shown`, its top at `top` and placed
+    /// across `area` as `align` says.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_panel_text_line(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        align: Align,
+        shown: &str,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        (area, top): (RectF, f32),
+        color: LinearRgba,
+        (clip_left, clip_right): (f32, f32),
+        budget: &mut usize,
+    ) -> anyhow::Result<()> {
         if shown.is_empty() {
             return Ok(());
         }
-        let (shaped, _) = self.cached_ui_shape(font, metrics, &shown)?;
+        let (shaped, _) = self.cached_ui_shape(font, metrics, shown)?;
         let width: f32 = shaped
             .iter()
             .map(|info| info.glyph.x_advance.get() as f32)
             .sum();
-        let left = match text.align {
+        let left = match align {
             Align::Left => area.min_x(),
             Align::Center => area.min_x() + (area.width() - width) / 2.0,
             Align::Right => area.max_x() - width,
@@ -1975,6 +2059,47 @@ fn local_path(url: &Url) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 
+/// Where `chars`, whose boundaries are at `xs` -- as many as it has
+/// characters, and one -- break into lines no wider than `width`: at the
+/// last place that keeps one within it, after a space or between the
+/// characters of a script written without spaces, or else where it
+/// overflows. Only between whole clusters -- a letter and its accents, an
+/// emoji's parts, which `xs` gives the cluster's start -- and a line's
+/// spaces stay at its end, hanging past the edge.
+fn break_text(chars: &[char], xs: &[f32], width: f32) -> Vec<std::ops::Range<usize>> {
+    let count = chars.len();
+    let bounds: Vec<usize> = (0..=count)
+        .filter(|&at| at == 0 || at == count || xs[at] > xs[at - 1])
+        .collect();
+    let mut lines = Vec::new();
+    let mut from = 0;
+    loop {
+        let start = bounds[from];
+        // A cluster at least, then as many more as fit.
+        let mut to = (from + 1).min(bounds.len() - 1);
+        while let Some(&next) = bounds.get(to + 1) {
+            let hangs = chars[bounds[to]..next].iter().all(|c| c.is_whitespace());
+            if !hangs && xs[next] - xs[start] > width {
+                break;
+            }
+            to += 1;
+        }
+        if bounds[to] < count {
+            if let Some(found) = (from + 1..=to)
+                .rev()
+                .find(|&at| field::breaks_before(chars, bounds[at]))
+            {
+                to = found;
+            }
+        }
+        lines.push(start..bounds[to]);
+        from = to;
+        if bounds[from] >= count {
+            return lines;
+        }
+    }
+}
+
 /// Pane `pane` as `thinkterm cli` reaches it. One the session server keeps
 /// for this machine, by its number there and the server's socket: as the
 /// programs in it reach it. Any other by its number here and the socket
@@ -2023,7 +2148,11 @@ fn panel_env(fonts: &PanelFonts, chrome: &UiPalette, width: f32, height: f32, sc
         terminal: None,
         can_extend: false,
         close: None,
-        features: vec![feature::FIELDS.to_string(), feature::KEYS.to_string()],
+        features: vec![
+            feature::FIELDS.to_string(),
+            feature::KEYS.to_string(),
+            feature::WRAP.to_string(),
+        ],
     }
 }
 
@@ -2215,6 +2344,47 @@ mod tests {
         assert_eq!(host_name("user@devbox:2222"), "devbox");
         assert_eq!(host_name("[fe80::1]:22"), "fe80::1");
         assert_eq!(host_name("fe80::1"), "fe80::1");
+    }
+
+    #[test]
+    fn text_breaks_after_a_space_between_unspaced_characters_or_where_it_overflows() {
+        // A column a character, two for Chinese.
+        let lines = |text: &str, width: f32| {
+            let chars: Vec<char> = text.chars().collect();
+            let mut xs = vec![0.0];
+            for ch in &chars {
+                let wide = if (*ch as u32) >= 0x2E80 { 2.0 } else { 1.0 };
+                xs.push(xs.last().unwrap() + wide);
+            }
+            super::break_text(&chars, &xs, width)
+                .into_iter()
+                .map(|line| {
+                    chars[line]
+                        .iter()
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lines("the quick brown fox", 10.0),
+            ["the quick", "brown fox"]
+        );
+        assert_eq!(
+            lines("a b c d", 3.0),
+            ["a b", "c d"],
+            "a space hangs past the edge"
+        );
+        assert_eq!(lines("abcdefghijkl", 5.0), ["abcde", "fghij", "kl"]);
+        assert_eq!(lines("中文的句子很长", 6.0), ["中文的", "句子很", "长"]);
+        assert_eq!(lines("中文。句子", 4.0), ["中", "文。", "句子"]);
+        assert_eq!(lines("", 4.0), [""]);
+
+        // A letter and its accent are one cluster: its start is theirs.
+        let chars: Vec<char> = "ab\u{301}c".chars().collect();
+        let broken = super::break_text(&chars, &[0.0, 10.0, 10.0, 20.0, 30.0], 10.0);
+        assert_eq!(broken, [0..1, 1..3, 3..4]);
     }
 
     #[test]

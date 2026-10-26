@@ -1034,7 +1034,7 @@ impl TermWindow {
     /// set on one line, from its left: as many as it has characters, and
     /// one. The characters inside a cluster -- a ligature's -- share the
     /// cluster's start.
-    fn boundaries(
+    pub(super) fn boundaries(
         &self,
         font: &Rc<LoadedFont>,
         metrics: &RenderMetrics,
@@ -1480,7 +1480,7 @@ fn wrap_line(
 /// Whether a line may break before character `at` of `chars`: after a
 /// space, or where the characters on either side are of a script written
 /// without spaces -- but not before the punctuation that closes one.
-fn breaks_before(chars: &[char], at: usize) -> bool {
+pub(super) fn breaks_before(chars: &[char], at: usize) -> bool {
     let (Some(before), Some(after)) = (chars.get(at.wrapping_sub(1)), chars.get(at)) else {
         return false;
     };

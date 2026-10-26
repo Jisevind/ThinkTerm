@@ -84,10 +84,10 @@ pub struct Rect {
     pub border: Option<Color>,
 }
 
-/// One line of text in a box: centred in its height, placed across its
-/// width as `align` says, and cut to fit -- with an ellipsis in the
-/// interface font, at the box's edge in the monospaced one, whose columns a
-/// plugin lines up itself.
+/// Text in a box: one line, centred in its height, placed across its width
+/// as `align` says, and cut to fit -- with an ellipsis in the interface
+/// font, at the box's edge in the monospaced one, whose columns a plugin
+/// lines up itself. Or, asked to `wrap`, as many lines as the box holds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Text {
     pub x: f32,
@@ -106,6 +106,17 @@ pub struct Text {
     pub bold: bool,
     #[serde(default, skip_serializing_if = "is_default")]
     pub align: Align,
+    /// Broken into lines that fit the box's width -- after a space, between
+    /// the characters of a script written without spaces, at the text's own
+    /// line breaks -- set from its top, each a line of its font tall
+    /// ([`TextMetrics::line`]), as many as its height holds and at least
+    /// one. Where text is left over, the last ends in an ellipsis in the
+    /// interface font. A client without [`feature::WRAP`] shows one line.
+    ///
+    /// [`TextMetrics::line`]: crate::wire::TextMetrics::line
+    /// [`feature::WRAP`]: crate::wire::feature::WRAP
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub wrap: bool,
 }
 
 /// A line through `points`, given as x, y, x, y and so on.
@@ -530,6 +541,7 @@ impl Text {
             size: Size::Body,
             bold: false,
             align: Align::Left,
+            wrap: false,
         }
     }
 
@@ -555,6 +567,12 @@ impl Text {
 
     pub fn align(mut self, align: Align) -> Self {
         self.align = align;
+        self
+    }
+
+    /// Breaks it into as many lines as its box holds.
+    pub fn wrap(mut self) -> Self {
+        self.wrap = true;
         self
     }
 }
