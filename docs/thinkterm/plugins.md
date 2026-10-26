@@ -656,7 +656,9 @@ fn main() -> std::io::Result<()> {
   The server's tests use that to exercise the protocol end to end.
 
 `thinkterm-plugin-example`, in `plugins/example`, is a complete plugin: a
-manifest and two calls. To install it and try it:
+manifest, two calls, and a panel that decodes what is typed in it or the
+lowest line that decodes on the terminal beside it. To install it and try
+it:
 
 ```sh
 cargo build --release -p thinkterm-plugin-example

@@ -4,13 +4,16 @@ id = "text-tools"
 name = "Text Tools"
 version = "0.1.0"
 description = "Decodes text, and makes UUIDs."
-api = 1
+api = 2
 
 [run]
 program = "thinkterm-plugin-example"
 
 [run.windows]
 program = "thinkterm-plugin-example.exe"
+
+[panel]
+icon = "puzzle"
 
 [locales.zh-CN]
 name = "文本工具"
