@@ -1868,14 +1868,13 @@ impl<P: Platform, L: Link> App<P, L> {
         let Some(reason) = inner.disconnected.clone() else {
             return;
         };
+        let mut args = thinkterm_i18n::FluentArgs::new();
+        args.set("reason", reason);
         let text = if inner.reconnect_attempts >= RECONNECT_DOUBT_AFTER {
-            format!(
-                "still trying to reconnect after {} attempts ({reason}). \
-                 The link may have expired, or the server may be down.",
-                inner.reconnect_attempts
-            )
+            args.set("n", inner.reconnect_attempts);
+            thinkterm_i18n::tr_args("web-toast-still-reconnecting", &args)
         } else {
-            format!("connection lost ({reason}); reconnecting…")
+            thinkterm_i18n::tr_args("web-toast-reconnecting", &args)
         };
         Self::set_status(&inner, &text);
     }
@@ -1890,8 +1889,12 @@ impl<P: Platform, L: Link> App<P, L> {
             if !inner.settings.auto_reconnect {
                 // Asked not to: the remark stays, sticky, until a reconnect
                 // is asked for.
-                let reason = inner.disconnected.clone().unwrap_or_default();
-                Self::set_status(&inner, &format!("connection lost ({reason})"));
+                let mut args = thinkterm_i18n::FluentArgs::new();
+                args.set("reason", inner.disconnected.clone().unwrap_or_default());
+                Self::set_status(
+                    &inner,
+                    &thinkterm_i18n::tr_args("web-toast-connection-lost", &args),
+                );
                 return;
             }
             inner.reconnect_pending = true;

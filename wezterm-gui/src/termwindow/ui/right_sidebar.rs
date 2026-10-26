@@ -17660,7 +17660,7 @@ impl crate::TermWindow {
             // timeout only by a refresh or reconnect.
             RemoteFileSearchStatus::Failed(message) => {
                 query_changed
-                    && message != crate::termwindow::remote_files::REMOTE_LISTING_TIMED_OUT
+                    && !crate::termwindow::remote_files::remote_listing_is_timed_out(message)
             }
         };
         if needs_listing {

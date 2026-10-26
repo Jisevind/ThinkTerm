@@ -42,14 +42,14 @@ const MAX_RECENTS: usize = 200;
 
 pub(crate) fn save_recent(command: &ExpandedCommand) -> anyhow::Result<()> {
     let mut recents = load_recents().unwrap_or_else(|_| vec![]);
-    if let Some(recent_idx) = recents.iter().position(|r| r.brief == command.brief) {
+    if let Some(recent_idx) = recents.iter().position(|r| r.brief == command.recent_key()) {
         let recent = recents.get_mut(recent_idx).unwrap();
         recent.frecency.register_access();
     } else {
         let mut frecency = Frecency::new();
         frecency.register_access();
         recents.push(Recent {
-            brief: command.brief.to_string(),
+            brief: command.recent_key().to_string(),
             frecency,
         });
     }
@@ -74,7 +74,7 @@ pub(crate) fn save_recent(command: &ExpandedCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Frecency score per command brief, from `recent-commands.json`. Empty when
+/// Frecency score per `ExpandedCommand::recent_key`, from `recent-commands.json`. Empty when
 /// nothing has been recorded yet (or the file is unreadable).
 pub(crate) fn frecency_scores() -> HashMap<String, f64> {
     let mut scores = HashMap::new();
@@ -132,6 +132,7 @@ pub(crate) fn build_commands(
                     menubar: &[],
                     icon: entry.icon.map(Cow::Owned),
                     accessory: None,
+                    english_brief: None,
                 });
             }
         }
@@ -151,7 +152,7 @@ pub(crate) fn build_commands(
     let scores = frecency_scores();
 
     commands.sort_by(|a, b| {
-        match (scores.get(&*a.brief), scores.get(&*b.brief)) {
+        match (scores.get(a.recent_key()), scores.get(b.recent_key())) {
             // Want descending frecency score, so swap a<->b
             // for the compare here
             (Some(a), Some(b)) => match b.partial_cmp(a) {

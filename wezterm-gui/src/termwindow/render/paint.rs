@@ -767,13 +767,48 @@ pub(crate) fn sticky_allow_images(
     }
 }
 
+/// What the cover over a terminal says, in the user's language. The gate's
+/// own `overlay_message` is the English the TUI shows.
+fn gate_message(gate: &wezterm_client::domain::RemoteFrontendGate) -> Option<(String, String)> {
+    use crate::i18n::{tr, tr_args};
+    use wezterm_client::domain::RemoteFrontendGate::*;
+    Some(match gate {
+        Visible => return None,
+        Claimable { owner: Some(owner) } => {
+            let hostname = owner.hostname.trim();
+            let title = if hostname.is_empty() {
+                tr("terminal-gate-busy")
+            } else {
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("host", hostname.to_string());
+                tr_args("terminal-gate-busy-on", &args)
+            };
+            (title, tr("terminal-gate-busy-hint"))
+        }
+        Claimable { owner: None } => (tr("terminal-gate-free"), tr("terminal-gate-free-hint")),
+        Connecting => (
+            tr("terminal-gate-connecting"),
+            tr("terminal-gate-wait-hint"),
+        ),
+        Reconnecting => (
+            tr("terminal-gate-reconnecting"),
+            tr("terminal-gate-reconnecting-hint"),
+        ),
+        Offline => (
+            tr("terminal-gate-offline"),
+            tr("terminal-gate-offline-hint"),
+        ),
+        Syncing => (tr("terminal-gate-syncing"), tr("terminal-gate-wait-hint")),
+    })
+}
+
 impl crate::TermWindow {
     fn paint_frontend_handoff_overlay(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
     ) -> anyhow::Result<bool> {
         let gate = self.frontend_terminal_gate();
-        let Some((title, hint)) = gate.overlay_message() else {
+        let Some((title, hint)) = gate_message(&gate) else {
             return Ok(false);
         };
         let now = Instant::now();
@@ -876,7 +911,7 @@ impl crate::TermWindow {
         if !gate.is_claimable() && !syncing_in_view {
             return Ok(false);
         }
-        let Some((title, hint)) = gate.overlay_message() else {
+        let Some((title, hint)) = gate_message(&gate) else {
             return Ok(false);
         };
         let text = format!("{title} \u{2014} {hint}");

@@ -104,3 +104,4 @@ objc.workspace = true
 objc2.workspace = true
 objc2-core-graphics.workspace = true
 plist.workspace = true
+thinkterm-i18n.workspace = true

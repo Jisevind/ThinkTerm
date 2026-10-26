@@ -903,7 +903,7 @@ impl TermWindow {
     fn plugin_panel_reach(&mut self) -> Result<Reach, String> {
         let pane_id = self
             .get_active_pane_no_overlay()
-            .ok_or_else(|| "no terminal is beside the panel".to_string())?
+            .ok_or_else(|| crate::i18n::tr("plugin-answer-no-terminal"))?
             .pane_id();
         self.plugin_panel_reach_of(pane_id).clone()
     }
@@ -940,9 +940,9 @@ impl TermWindow {
         let target = match self.active_remote_project_for_files() {
             Ok(Some(target)) => target,
             found => {
-                let why = found.err().unwrap_or_else(|| {
-                    "the terminal beside the panel runs on this machine".to_string()
-                });
+                let why = found
+                    .err()
+                    .unwrap_or_else(|| crate::i18n::tr("plugin-answer-local-terminal"));
                 self.plugin_panel_reach = Some((pane_id, Instant::now(), Err(why)));
                 return;
             }
@@ -989,7 +989,7 @@ impl TermWindow {
     fn plugin_remote_reach(&self) -> Result<Reach, String> {
         let target = self
             .active_remote_project_for_files()?
-            .ok_or_else(|| "the terminal beside the panel runs on this machine".to_string())?;
+            .ok_or_else(|| crate::i18n::tr("plugin-answer-local-terminal"))?;
         Self::reach_of(&target)
     }
 
@@ -1022,11 +1022,11 @@ impl TermWindow {
         // Asked for the terminal's machine before it moved to another: not
         // done where it is now.
         if reach.machine != machine {
-            let why = "the terminal beside the panel is on another machine now";
+            let why = crate::i18n::tr("plugin-answer-moved");
             return plugins::answer(view, id, &Answer::failed(why));
         }
         if !remote_source_is_authorized(&reach.source_key) {
-            let why = format!("ThinkTerm is not connected to {}", reach.host);
+            let why = not_connected_to(&reach.host);
             let connect = Connect {
                 host: reach.host,
                 machine: reach.machine,
@@ -1121,7 +1121,11 @@ impl TermWindow {
             PanelNews::Remote { id, machine, ask } => {
                 if self.plugin_view_numbered(view).is_none() {
                     // A view this window let go of meanwhile.
-                    return plugins::answer(view, id, &Answer::failed("the panel closed"));
+                    return plugins::answer(
+                        view,
+                        id,
+                        &Answer::failed(crate::i18n::tr("plugin-answer-closed")),
+                    );
                 }
                 return self.plugin_panel_ask(view, id, machine, ask);
             }
@@ -1883,6 +1887,14 @@ impl TermWindow {
     }
 }
 
+/// Why an ask about another machine is not done: no connection to it yet.
+/// A plugin shows it as it is, so it is in the user's language.
+fn not_connected_to(host: &str) -> String {
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("host", host.to_string());
+    crate::i18n::tr_args("plugin-answer-not-connected", &args)
+}
+
 /// Takes `cost` quads from `budget`; none, and false, when it has not that
 /// many left.
 fn spend(budget: &mut usize, cost: usize) -> bool {
@@ -2042,7 +2054,7 @@ async fn ask_there(reach: Reach, ask: Ask) -> Answer {
         Ok(lease) => lease,
         Err(RemoteAcquireError::Failed(why)) => return Answer::failed(why),
         Err(RemoteAcquireError::NotConnected) => {
-            return Answer::failed(format!("ThinkTerm is not connected to {}", reach.host))
+            return Answer::failed(not_connected_to(&reach.host))
         }
     };
     let backend = lease.backend();

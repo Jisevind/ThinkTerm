@@ -486,10 +486,21 @@ fn item_label(item: &PaletteItem) -> &str {
     }
 }
 
+fn menu_path(cmd: &ExpandedCommand, separator: &str) -> String {
+    cmd.menubar
+        .iter()
+        .map(|name| crate::commands::menu_title(name))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 fn item_haystack(item: &PaletteItem) -> String {
     match item {
+        // The menu path in English as well as shown, so English words
+        // still find a command whatever the language.
         PaletteItem::Leaf(cmd) => format!(
-            "{}: {}. {} {:?}",
+            "{} {}: {}. {} {:?}",
+            menu_path(cmd, " "),
             cmd.menubar.join(" "),
             cmd.brief,
             cmd.doc,
@@ -655,13 +666,17 @@ fn family_child(mut cmd: ExpandedCommand, kind: PaletteGroupKind) -> ExpandedCom
                 _ => None,
             }
         }
-        (_, PaletteGroupKind::LaunchMenu) => cmd
-            .brief
-            .strip_suffix(" (New Tab)")
-            .map(|label| label.to_string()),
+        (KeyAssignment::SpawnCommandInNewTab(spawn), PaletteGroupKind::LaunchMenu) => {
+            Some(crate::commands::launch_menu_label(spawn))
+        }
         _ => None,
     };
     if let Some(short) = short {
+        // Still remembered by its full name: that is what the palette's
+        // order looks its score up by.
+        if cmd.english_brief.is_none() {
+            cmd.english_brief = Some(cmd.brief.clone());
+        }
         cmd.brief = short.into();
     }
     cmd
@@ -921,6 +936,7 @@ fn thread_leaf(entry: ThreadSearchEntry, archived_suffix: &str) -> (ExpandedComm
             menubar: &[],
             icon: Some(icon.into()),
             accessory: Some(entry.space_name.into()),
+            english_brief: None,
         },
         haystack,
     )
@@ -1347,6 +1363,7 @@ impl crate::TermWindow {
             menubar: &[],
             icon: None,
             accessory: None,
+            english_brief: None,
         }));
         for name in names {
             items.push(PaletteItem::Leaf(ExpandedCommand {
@@ -1357,6 +1374,7 @@ impl crate::TermWindow {
                 menubar: &[],
                 icon: None,
                 accessory: None,
+                english_brief: None,
             }));
         }
 
@@ -1399,6 +1417,7 @@ impl crate::TermWindow {
                     menubar: &[],
                     icon: None,
                     accessory: None,
+                    english_brief: None,
                 })
             })
             .collect();
@@ -2324,7 +2343,7 @@ impl crate::TermWindow {
                         let prefix = if cmd.menubar.is_empty() {
                             None
                         } else {
-                            Some(format!("{} › ", cmd.menubar.join(" › ")))
+                            Some(format!("{} › ", menu_path(cmd, " › ")))
                         };
                         (
                             row_icon(cmd, &palette),
@@ -2704,6 +2723,7 @@ mod tests {
             menubar: &[],
             icon: None,
             accessory: None,
+            english_brief: None,
         })
     }
 
